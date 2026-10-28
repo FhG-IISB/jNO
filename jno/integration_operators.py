@@ -32,14 +32,11 @@ class IntegrationOperators:
         - 2-D: ⅓ × sum of incident triangle areas
         - 3-D: ¼ × sum of incident tetrahedron volumes
 
-        Parameters
-        ----------
-        mesh_connectivity : dict
-            Preprocessed mesh connectivity from the domain class.
+        Args:
+            mesh_connectivity (dict): Preprocessed mesh connectivity from the domain class.
 
-        Returns
-        -------
-        vols : ndarray of shape (n_points,)
+        Returns:
+            ndarray of shape (n_points,): vols
         """
         if "nodal_volumes" in mesh_connectivity:
             return np.asarray(mesh_connectivity["nodal_volumes"])
@@ -88,20 +85,16 @@ class IntegrationOperators:
         for polynomials up to ``degree``; many points per element make it far harder for an
         expressive integrand (e.g. a network) to alias the rule than the vertex rule can.
 
-        Parameters
-        ----------
-        mesh_connectivity : dict
-            Preprocessed mesh connectivity from the domain class (``points`` + ``triangles`` /
-            ``tetrahedra``).
-        degree : int
-            Polynomial degree the rule integrates exactly (basix quadrature degree).
-        cells : ndarray, optional
-            Element connectivity subset (e.g. a sub-region's triangles); defaults to all cells.
+        Args:
+            mesh_connectivity (dict): Preprocessed mesh connectivity from the domain class (``points`` +
+                ``triangles`` / ``tetrahedra``).
+            degree (int): Polynomial degree the rule integrates exactly (basix quadrature degree).
+            cells (ndarray, optional): Element connectivity subset (e.g. a sub-region's triangles); defaults
+                to all cells.
 
-        Returns
-        -------
-        (points, JxW) : tuple[ndarray, ndarray]
-            ``points`` of shape ``(n_cell * n_qp, dim)`` and ``JxW`` of shape ``(n_cell * n_qp,)``.
+        Returns:
+            tuple[ndarray, ndarray]: (points, JxW): ``points`` of shape ``(n_cell * n_qp, dim)`` and ``JxW``
+                of shape ``(n_cell * n_qp,)``.
         """
         import basix
         from basix import CellType

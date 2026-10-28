@@ -20,6 +20,7 @@ from .geometry import Path, Shape, shape
 from .info import info
 from .integration_operators import IntegrationOperators
 from .noise import noise
+from .peec import peec
 from .rcwa import Rcwa, RcwaError, rcwa
 from .stencils import fd
 from .trace import (
@@ -134,14 +135,61 @@ def le(expr, bound=0.0):
                   1e-3 * reg.mean])                 # a genuine penalty, summed
 
     With no constrained optimiser attached this raises at ``solve()`` rather than silently
-    ignoring the constraint.
+    ignoring the constraint. ``jno.le(g, b).auglag(mu=..., every=...)`` (or ``(g <= b).auglag()``)
+    enforces it with ANY optimiser through an augmented Lagrangian instead.
     """
     return Constraint(expr, bound, "le")
 
 
 def ge(expr, bound=0.0):
-    """An inequality constraint ``expr >= bound``. See :func:`le`."""
+    """An inequality constraint ``expr >= bound``, for a constrained optimiser (MMA, GCMMA) or ``.auglag()``.
+
+    The mirror of :func:`le`; see there for how constraints enter ``jno.core``.
+
+    Args:
+        expr: the constrained scalar expression.
+        bound: the lower bound.
+
+    Returns:
+        Constraint: the constraint row.
+    """
     return Constraint(expr, bound, "ge")
+
+
+def eq(expr, bound=0.0):
+    """An equality constraint ``expr == bound``, enforced through an augmented Lagrangian.
+
+    Only ``jno.eq(g, b).auglag(mu=..., every=...)`` is accepted in ``jno.core``: MMA and GCMMA take
+    inequalities only. (``g == b`` cannot be written as a comparison, because ``==`` on jNO
+    expressions tests whether two nodes are the same.) Its multiplier may take either sign.
+    """
+    return Constraint(expr, bound, "eq")
+
+
+def auglag(constraint, mu=10.0, every=100):
+    """``jno.auglag(c, ...)`` is ``c.auglag(...)``: enforce a constraint by an augmented Lagrangian.
+
+    The constraint stays a reported row; a multiplier penalty is added to the loss and the multiplier
+    is updated from the violation every ``every`` steps, so any optimiser can be used.
+
+    Args:
+        constraint: a :func:`le` / :func:`ge` / :func:`eq` constraint or a comparison ``a <= b`` /
+            ``a >= b``.
+        mu: starting penalty weight (> 0); it grows tenfold while the violation stops shrinking.
+        every: optimiser steps between multiplier updates.
+
+    Returns:
+        AugLagConstraint: the constraint; its multiplier is ``.multiplier``.
+
+    Raises:
+        TypeError: for anything that is not a constraint or comparison.
+    """
+    if not hasattr(constraint, "auglag"):
+        raise TypeError(
+            f"jno.auglag takes jno.le(...)/jno.ge(...)/jno.eq(...) or a comparison `a <= b`, "
+            f"got {type(constraint).__name__}."
+        )
+    return constraint.auglag(mu=mu, every=every)
 
 
 __all__ = [
@@ -149,12 +197,15 @@ __all__ = [
     "core",
     "le",
     "ge",
+    "eq",
+    "auglag",
     "Constraint",
     "sampler",
     "domain",
     "info",
     "shape",
     "Shape",  # deprecated alias of `shape`
+    "peec",
     "Path",
     "do",
     "fem",

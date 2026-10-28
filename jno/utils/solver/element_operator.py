@@ -48,6 +48,7 @@ class ElementGroup:
 
     @property
     def nbytes(self) -> int:
+        """Memory held by this group's blocks and index arrays, in bytes."""
         return int(self.blocks.nbytes + self.rows.nbytes + self.cols.nbytes)
 
     def matvec_into(self, v):
@@ -93,6 +94,10 @@ class ElementOperator:
     iterative solvers use — ``mv`` / ``__matmul__`` / ``__call__``, ``shape``, ``T``, ``diag()`` —
     and reports ``bcoo = None`` so anything requiring an assembled matrix refuses rather than
     silently materialising one.
+
+    Args:
+        groups: the element groups (blocks plus their global row/column indices).
+        shape: ``(n_rows, n_cols)`` of the global operator.
     """
 
     def __init__(self, groups: Sequence[ElementGroup], shape: Tuple[int, int], *, _transposed: bool = False):
@@ -103,23 +108,34 @@ class ElementOperator:
     # -- LinearOperator contract -------------------------------------------------------------
     @property
     def shape(self):
+        """``(n_rows, n_cols)`` (swapped for a transposed view)."""
         m, n = self._shape
         return (n, m) if self._transposed else (m, n)
 
     @property
     def bcoo(self):
-        """``None`` — there is no assembled matrix. See :meth:`assemble`."""
+        """Always ``None``: there is no assembled matrix; :meth:`assemble` builds one explicitly."""
         return None
 
     @property
     def dtype(self):
+        """The common dtype of the element blocks."""
         return self._groups[0].blocks.dtype if self._groups else jnp.result_type(float)
 
     @property
     def nbytes(self) -> int:
+        """Memory held by all element groups, in bytes."""
         return sum(g.nbytes for g in self._groups)
 
     def mv(self, v):
+        """Apply the operator, ``A v``, by gathering, multiplying per element and scattering back.
+
+        Args:
+            v: the vector, ``(n_cols,)``.
+
+        Returns:
+            The product, ``(n_rows,)``.
+        """
         v = jnp.asarray(v).reshape(-1)
         out = jnp.zeros((self.shape[0],), jnp.result_type(v.dtype, self.dtype))
         for g in self._groups:
@@ -145,6 +161,7 @@ class ElementOperator:
         return out
 
     def dense(self):
+        """The operator as a dense matrix (assembles it first; small systems and tests only)."""
         return self.assemble().todense()
 
     def assemble(self):

@@ -69,10 +69,34 @@ def small_inv(J):
     return jnp.linalg.inv(J)
 
 
-def small_matmul(a, b):
-    """``a @ b`` over the last two axes as a broadcast multiply and a sum -- for the 2x2 / 3x3 matrices of
-    element geometry, where a ``dot_general`` becomes a padded batched GEMM (see :func:`small_einsum`)."""
-    return jnp.sum(a[..., :, :, None] * b[..., None, :, :], axis=-2)
+def small_matmul(a, b, limit: int | None = None):
+    """``jnp.matmul(a, b)``, with a small product lowered as a broadcast multiply and a sum.
+
+    Same semantics as ``matmul`` (a 1-D operand gets a temporary axis, batch axes broadcast). When one
+    product is at most ``limit`` (default :data:`SMALL_CONTRACTION`) multiply-adds (``M·N·K``, batch
+    excluded) it avoids the ``dot_general`` that a GPU runs as a padded batched GEMM (see
+    :func:`small_einsum`): in a 3-D St.Venant-Kirchhoff residual the two 3x3 products ``FᵀF`` and ``F·S``
+    were 79% of the GPU time that way. Larger products are plain ``jnp.matmul``."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    if a.ndim == 0 or b.ndim == 0:
+        return jnp.matmul(a, b)  # raises like numpy
+    va, vb = a.ndim == 1, b.ndim == 1
+    a2 = a[None, :] if va else a
+    b2 = b[:, None] if vb else b
+    m, k, n = a2.shape[-2], a2.shape[-1], b2.shape[-1]
+    if k != b2.shape[-2] or m * n * k > (SMALL_CONTRACTION if limit is None else limit):
+        return jnp.matmul(a, b)
+    # The k-sum unrolled into multiplies and adds: all elementwise, so XLA fuses the product into the
+    # operations around it. A `reduce_sum` here is a fusion boundary, and under `jacfwd` each one became a
+    # separate write of a (cells, tangents, points, m, n) array.
+    out = a2[..., :, 0:1] * b2[..., 0:1, :]
+    for j in range(1, k):
+        out = out + a2[..., :, j : j + 1] * b2[..., j : j + 1, :]
+    if vb:
+        out = out[..., 0]
+    if va:
+        out = out[..., 0, :] if not vb else out[..., 0]
+    return out
 
 
 def small_einsum(subscripts: str, *operands, limit: int | None = None):

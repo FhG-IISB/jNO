@@ -9,12 +9,11 @@ Sections
 - **Losses**: mse, mae, rmse, huber, log_cosh, relative_l2
 - **PDEs**: poisson, heat, wave, burgers_1d, navier_stokes_incompressible_2d, …
 
-Examples
---------
->>> import jno
->>> pde = jno.fn.sin(u) + jno.fn.exp(-x)
->>> loss = jno.fn.mse(pred, target)
->>> custom = jno.fn(lambda a, b: a ** 2 + b, [u, v])
+Example:
+    >>> import jno
+    >>> pde = jno.fn.sin(u) + jno.fn.exp(-x)
+    >>> loss = jno.fn.mse(pred, target)
+    >>> custom = jno.fn(lambda a, b: a ** 2 + b, [u, v])
 """
 
 from __future__ import annotations
@@ -53,7 +52,9 @@ def _module_call(fn: Callable, args: list = [], name: str = "", reduces_axis: Op
 
         custom = jno.fn(lambda a, b: a ** 2 + b, [u, v], name="my_op")
     """
-    return FunctionCall(fn, args, name, reduces_axis)
+    from .jnp_ops import _u  # a typed view (u.scalar, a view-valued expression) is its Placeholder, as in jno.np.*
+
+    return FunctionCall(fn, [_u(a) for a in args], name, reduces_axis)
 
 
 def _to_scalar_loss(x):
@@ -568,79 +569,412 @@ adaptive = _AdaptiveNamespace()
 
 
 # ---------------------------------------------------------------------------
-# Unary / binary factories (same as jnp_ops but local)
+# Element-wise call helpers
 # ---------------------------------------------------------------------------
 
 
-def _unary(jnp_fn):
-    def wrapper(x):
-        return FunctionCall(jnp_fn, [x])
-
-    wrapper.__name__ = jnp_fn.__name__
-    wrapper.__doc__ = f"Element-wise ``{jnp_fn.__name__}`` on a traced expression."
-    return wrapper
+def _unary_call(jnp_fn, x) -> "FunctionCall":
+    """``jnp_fn(x)`` as a traced node."""
+    return FunctionCall(jnp_fn, [x])
 
 
-def _binary(jnp_fn):
-    def wrapper(x, y):
-        return FunctionCall(jnp_fn, [x, y])
-
-    wrapper.__name__ = jnp_fn.__name__
-    wrapper.__doc__ = f"Element-wise ``{jnp_fn.__name__}`` on traced expressions."
-    return wrapper
+def _binary_call(jnp_fn, x, y) -> "FunctionCall":
+    """``jnp_fn(x, y)`` as a traced node."""
+    return FunctionCall(jnp_fn, [x, y])
 
 
 # ============================================================================
 # Math — trigonometric
 # ============================================================================
-sin = _unary(jnp.sin)
-cos = _unary(jnp.cos)
-tan = _unary(jnp.tan)
-arcsin = _unary(jnp.arcsin)
-arccos = _unary(jnp.arccos)
-arctan = _unary(jnp.arctan)
-arctan2 = _binary(jnp.arctan2)
+def sin(x) -> FunctionCall:
+    """Element-wise sine, ``jnp.sin``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sin, x)
+
+
+def cos(x) -> FunctionCall:
+    """Element-wise cosine, ``jnp.cos``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cos, x)
+
+
+def tan(x) -> FunctionCall:
+    """Element-wise tangent, ``jnp.tan``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.tan, x)
+
+
+def arcsin(x) -> FunctionCall:
+    """Element-wise inverse sine, ``jnp.arcsin``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arcsin, x)
+
+
+def arccos(x) -> FunctionCall:
+    """Element-wise inverse cosine, ``jnp.arccos``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arccos, x)
+
+
+def arctan(x) -> FunctionCall:
+    """Element-wise inverse tangent, ``jnp.arctan``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arctan, x)
+
+
+def arctan2(x, y) -> FunctionCall:
+    """Element-wise four-quadrant inverse tangent ``arctan(x / y)`` with the sign of both arguments, ``jnp.arctan2``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.arctan2, x, y)
+
+
 atan2 = arctan2
+
 
 # ============================================================================
 # Math — hyperbolic
 # ============================================================================
-sinh = _unary(jnp.sinh)
-cosh = _unary(jnp.cosh)
-tanh = _unary(jnp.tanh)
-arcsinh = _unary(jnp.arcsinh)
-arccosh = _unary(jnp.arccosh)
-arctanh = _unary(jnp.arctanh)
+def sinh(x) -> FunctionCall:
+    """Element-wise hyperbolic sine, ``jnp.sinh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sinh, x)
+
+
+def cosh(x) -> FunctionCall:
+    """Element-wise hyperbolic cosine, ``jnp.cosh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cosh, x)
+
+
+def tanh(x) -> FunctionCall:
+    """Element-wise hyperbolic tangent, ``jnp.tanh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.tanh, x)
+
+
+def arcsinh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic sine, ``jnp.arcsinh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arcsinh, x)
+
+
+def arccosh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic cosine, ``jnp.arccosh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arccosh, x)
+
+
+def arctanh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic tangent, ``jnp.arctanh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arctanh, x)
+
 
 # ============================================================================
 # Math — exponential / logarithmic
 # ============================================================================
-exp = _unary(jnp.exp)
-exp2 = _unary(jnp.exp2)
-expm1 = _unary(jnp.expm1)
-log = _unary(jnp.log)
-log2 = _unary(jnp.log2)
-log10 = _unary(jnp.log10)
-log1p = _unary(jnp.log1p)
+def exp(x) -> FunctionCall:
+    """Element-wise exponential ``e**x``, ``jnp.exp``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.exp, x)
+
+
+def exp2(x) -> FunctionCall:
+    """Element-wise base-2 exponential ``2**x``, ``jnp.exp2``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.exp2, x)
+
+
+def expm1(x) -> FunctionCall:
+    """Element-wise ``exp(x) - 1``, accurate for small ``x``, ``jnp.expm1``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.expm1, x)
+
+
+def log(x) -> FunctionCall:
+    """Element-wise natural logarithm, ``jnp.log``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log, x)
+
+
+def log2(x) -> FunctionCall:
+    """Element-wise base-2 logarithm, ``jnp.log2``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log2, x)
+
+
+def log10(x) -> FunctionCall:
+    """Element-wise base-10 logarithm, ``jnp.log10``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log10, x)
+
+
+def log1p(x) -> FunctionCall:
+    """Element-wise ``log(1 + x)``, accurate for small ``x``, ``jnp.log1p``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log1p, x)
+
 
 # ============================================================================
 # Math — power / root / rounding
 # ============================================================================
-sqrt = _unary(jnp.sqrt)
-cbrt = _unary(jnp.cbrt)
-square = _unary(jnp.square)
-power = _binary(jnp.power)
-abs = _unary(jnp.abs)
-floor = _unary(jnp.floor)
-ceil = _unary(jnp.ceil)
-round = _unary(jnp.round)
-sign = _unary(jnp.sign)
+def sqrt(x) -> FunctionCall:
+    """Element-wise square root, ``jnp.sqrt``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sqrt, x)
+
+
+def cbrt(x) -> FunctionCall:
+    """Element-wise cube root, ``jnp.cbrt``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cbrt, x)
+
+
+def square(x) -> FunctionCall:
+    """Element-wise square ``x**2``, ``jnp.square``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.square, x)
+
+
+def power(x, y) -> FunctionCall:
+    """Element-wise power ``x**y``, ``jnp.power``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.power, x, y)
+
+
+def abs(x) -> FunctionCall:
+    """Element-wise absolute value, ``jnp.abs``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.abs, x)
+
+
+def floor(x) -> FunctionCall:
+    """Element-wise floor (round down), ``jnp.floor``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.floor, x)
+
+
+def ceil(x) -> FunctionCall:
+    """Element-wise ceiling (round up), ``jnp.ceil``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.ceil, x)
+
+
+def round(x) -> FunctionCall:
+    """Element-wise rounding to the nearest integer, ``jnp.round``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.round, x)
+
+
+def sign(x) -> FunctionCall:
+    """Element-wise sign (-1, 0 or 1), ``jnp.sign``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sign, x)
+
 
 # ============================================================================
 # Math — comparison
 # ============================================================================
-maximum = _binary(jnp.maximum)
-minimum = _binary(jnp.minimum)
+def maximum(x, y) -> FunctionCall:
+    """Element-wise maximum of the two arguments, ``jnp.maximum``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.maximum, x, y)
+
+
+def minimum(x, y) -> FunctionCall:
+    """Element-wise minimum of the two arguments, ``jnp.minimum``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.minimum, x, y)
 
 
 # ============================================================================
@@ -693,6 +1027,14 @@ def cosine_similarity(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> Func
 
         # or penalise gradient conflict directly
         conflict = (jno.fn.cosine_similarity(J1, J2) + 1).mse
+
+    Args:
+        a: the first set of vectors, ``(N, P)`` or ``(P,)``.
+        b: the second set, same shape.
+        eps: floor on the norms, to avoid dividing by zero.
+
+    Returns:
+        FunctionCall: ``(N,)`` similarities in ``[-1, 1]`` (a scalar for 1-D inputs).
     """
 
     def _impl(x, y, _eps=eps):
@@ -721,6 +1063,14 @@ def gradient_alignment(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> Fun
 
         alignment = jno.fn.gradient_alignment(J_pde, J_bc)
         crux = jno.core([pde, bc, alignment.tracker(100)])
+
+    Args:
+        a: the first Jacobian, ``(N_a, P)`` (or a ``(P,)`` gradient).
+        b: the second Jacobian, ``(N_b, P)``.
+        eps: floor on the norms, to avoid dividing by zero.
+
+    Returns:
+        FunctionCall: the scalar cosine similarity of the mean gradients.
     """
 
     def _impl(x, y, _eps=eps):
@@ -921,7 +1271,19 @@ def poisson(
     diffusion: float = 1.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Poisson residual: ``-diffusion * Δu - forcing``."""
+    """Poisson residual: ``-diffusion * Δu - forcing``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        forcing: the right-hand side (expression or number).
+        *variables: the coordinate Variables the Laplacian runs over.
+        diffusion: the diffusion coefficient.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return -diffusion * u.laplacian(*variables, scheme=scheme) - forcing
 
 
@@ -932,7 +1294,19 @@ def helmholtz(
     wave_number: float = 1.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Helmholtz residual: ``-Δu - k²u - forcing``."""
+    """Helmholtz residual: ``-Δu - k²u - forcing``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        forcing: the right-hand side (expression or number).
+        *variables: the coordinate Variables the Laplacian runs over.
+        wave_number: ``k``.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return -u.laplacian(*variables, scheme=scheme) - (wave_number**2) * u - forcing
 
 
@@ -944,7 +1318,20 @@ def heat(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Heat-equation residual: ``u_t - diffusivity * Δu - source``."""
+    """Heat-equation residual: ``u_t - diffusivity * Δu - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        t: the time Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        diffusivity: the thermal diffusivity.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return u.d(t, scheme=scheme) - diffusivity * u.laplacian(*spatial, scheme=scheme) - source
 
 
@@ -956,7 +1343,20 @@ def diffusion(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Diffusion residual: ``u_t - diffusivity * Δu - source`` (or steady when ``t=None``)."""
+    """Diffusion residual: ``u_t - diffusivity * Δu - source`` (steady when ``t=None``).
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        t: the time Variable, or ``None`` for the steady residual.
+        diffusivity: the diffusion coefficient.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     residual: Placeholder | float = 0.0
     if t is not None:
         residual = residual + u.d(t, scheme=scheme)
@@ -971,7 +1371,20 @@ def advection(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Advection residual: ``u_t + v·∇u - source`` (or steady when ``t=None``)."""
+    """Advection residual: ``u_t + v·∇u - source`` (steady when ``t=None``).
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        velocity: the velocity components, one per spatial Variable (expressions or numbers).
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        t: the time Variable, or ``None`` for the steady residual.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     if len(spatial) == 0:
         raise ValueError("advection requires at least one spatial variable")
 
@@ -990,7 +1403,20 @@ def wave(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Wave-equation residual: ``u_tt - speed² * Δu - source``."""
+    """Wave-equation residual: ``u_tt - speed² * Δu - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        t: the time Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        speed: the wave speed.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return u.d(t, scheme=scheme).d(t, scheme=scheme) - (speed**2) * u.laplacian(*spatial, scheme=scheme) - source
 
 
@@ -1002,7 +1428,20 @@ def burgers_1d(
     forcing: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """1D viscous Burgers residual: ``u_t + u u_x - viscosity * u_xx - forcing``."""
+    """1D viscous Burgers residual: ``u_t + u u_x - viscosity * u_xx - forcing``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        x: the space Variable.
+        t: the time Variable.
+        viscosity: the kinematic viscosity (default ``0.01/π``, the classic benchmark).
+        forcing: a forcing term (expression or number).
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return (
         u.d(t, scheme=scheme) + u * u.d(x, scheme=scheme) - viscosity * u.d(x, scheme=scheme).d(x, scheme=scheme) - forcing
     )
@@ -1015,7 +1454,19 @@ def burgers_inviscid_1d(
     forcing: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """1D inviscid Burgers (shock-forming) residual: ``u_t + ∂x(0.5 u²) - forcing``."""
+    """1D inviscid Burgers (shock-forming) residual: ``u_t + ∂x(0.5 u²) - forcing``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        x: the space Variable.
+        t: the time Variable.
+        forcing: a forcing term (expression or number).
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     flux = 0.5 * u**2
     return u.d(t, scheme=scheme) + flux.d(x, scheme=scheme) - forcing
 
@@ -1027,7 +1478,19 @@ def biharmonic(
     stiffness: float = 1.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Biharmonic residual: ``stiffness * Δ²u - forcing``."""
+    """Biharmonic residual: ``stiffness * Δ²u - forcing``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        forcing: the right-hand side (expression or number).
+        *variables: the coordinate Variables the Laplacian runs over.
+        stiffness: the bending stiffness.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     lap_u = u.laplacian(*variables, scheme=scheme)
     return stiffness * lap_u.laplacian(*variables, scheme=scheme) - forcing
 
@@ -1042,7 +1505,22 @@ def advection_diffusion_reaction(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """ADR residual: ``u_t + v·∇u - diffusivity * Δu + reaction_coeff * u - source``."""
+    """Advection–diffusion–reaction residual: ``u_t + v·∇u - diffusivity * Δu + reaction_coeff * u - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        velocity: the velocity components, one per spatial Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        t: the time Variable, or ``None`` for the steady residual.
+        diffusivity: the diffusion coefficient.
+        reaction_coeff: the linear reaction rate.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     if len(spatial) == 0:
         raise ValueError("advection_diffusion_reaction requires at least one spatial variable")
 
@@ -1063,7 +1541,20 @@ def allen_cahn(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Allen-Cahn residual: ``u_t - epsilon² * Δu + u³ - u - source``."""
+    """Allen–Cahn residual: ``u_t - epsilon² * Δu + u³ - u - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        t: the time Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        epsilon: the interface width.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return u.d(t, scheme=scheme) - (epsilon**2) * u.laplacian(*spatial, scheme=scheme) + u**3 - u - source
 
 
@@ -1076,7 +1567,21 @@ def fisher_kpp(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Fisher-KPP residual: ``u_t - diffusivity * Δu - growth_rate * u * (1 - u) - source``."""
+    """Fisher–KPP residual: ``u_t - diffusivity * Δu - growth_rate * u * (1 - u) - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        t: the time Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        diffusivity: the diffusion coefficient.
+        growth_rate: the logistic growth rate.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     return u.d(t, scheme=scheme) - diffusivity * u.laplacian(*spatial, scheme=scheme) - growth_rate * u * (1.0 - u) - source
 
 
@@ -1089,7 +1594,21 @@ def cahn_hilliard(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Cahn-Hilliard residual: ``u_t - mobility * Δ(-epsilon² Δu + u³ - u) - source``."""
+    """Cahn–Hilliard residual: ``u_t - mobility * Δ(-epsilon² Δu + u³ - u) - source``.
+
+    Args:
+        u: the unknown field (a network output or bound field).
+        t: the time Variable.
+        *spatial: the spatial coordinate Variables (``x``, ``y``[, ``z``]).
+        epsilon: the interface width.
+        mobility: the mobility.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     chemical_potential = -((epsilon**2) * u.laplacian(*spatial, scheme=scheme)) + u**3 - u
     return u.d(t, scheme=scheme) - mobility * chemical_potential.laplacian(*spatial, scheme=scheme) - source
 
@@ -1108,7 +1627,29 @@ def navier_stokes_incompressible_2d(
     continuity_source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> tuple[Placeholder, Placeholder, Placeholder]:
-    """2D incompressible Navier-Stokes residuals ``(mom_x, mom_y, continuity)``."""
+    """2D incompressible Navier–Stokes residuals ``(mom_x, mom_y, continuity)``.
+
+    ``ρ(u_t + u u_x + v u_y) + p_x - μ Δu - f_x``, the same for ``v`` with ``p_y`` and ``f_y``, and
+    ``u_x + v_y - continuity_source``.
+
+    Args:
+        u: the x-velocity.
+        v: the y-velocity.
+        p: the pressure.
+        x: the x Variable.
+        y: the y Variable.
+        t: the time Variable, or ``None`` for the steady equations.
+        density: ``ρ``.
+        viscosity: the dynamic viscosity ``μ``.
+        forcing_x: body force, x component.
+        forcing_y: body force, y component.
+        continuity_source: mass source in the continuity equation.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        tuple: the three residuals ``(mom_x, mom_y, continuity)``.
+    """
     ut: Placeholder | float = 0.0
     vt: Placeholder | float = 0.0
     if t is not None:
@@ -1153,11 +1694,32 @@ def maxwell_3d(
     Placeholder,
     Placeholder,
 ]:
-    """3D Maxwell residuals: Faraday, Ampere-Maxwell, Gauss(E), Gauss(B).
+    """3D Maxwell residuals: Faraday, Ampère–Maxwell, Gauss (E) and Gauss (B).
+
+    ``∂B/∂t + ∇×E``, ``∂E/∂t - c²∇×B + J/ε``, ``∇·E - ρ/ε`` and ``∇·B``, with ``c² = 1/(εμ)``.
+
+    Args:
+        ex: electric field, x component (the same for ``ey``, ``ez``).
+        ey: electric field, y component.
+        ez: electric field, z component.
+        bx: magnetic flux density, x component (the same for ``by``, ``bz``).
+        by: magnetic flux density, y component.
+        bz: magnetic flux density, z component.
+        x: the x Variable.
+        y: the y Variable.
+        z: the z Variable.
+        t: the time Variable.
+        current_x: current density, x component.
+        current_y: current density, y component.
+        current_z: current density, z component.
+        charge_density: the charge density ``ρ``.
+        permittivity: ``ε``.
+        permeability: ``μ``.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
 
     Returns:
-        Tuple ``(faraday_x, faraday_y, faraday_z,
-        ampere_x, ampere_y, ampere_z, gauss_e, gauss_b)``.
+        tuple: ``(faraday_x, faraday_y, faraday_z, ampere_x, ampere_y, ampere_z, gauss_e, gauss_b)``.
     """
     c2 = 1.0 / (permittivity * permeability)
 
@@ -1198,7 +1760,18 @@ def continuity(
     source: Placeholder | float = 0.0,
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
-    """Incompressible continuity residual: ``div(velocity_field) - source``."""
+    """Incompressible continuity residual: ``div(velocity_field) - source``.
+
+    Args:
+        velocity_field: the velocity components, one per Variable.
+        *variables: the coordinate Variables, in the same order as the components.
+        source: a source term (expression or number) subtracted from the residual.
+        scheme: derivative scheme for every derivative in the residual: ``"automatic_differentiation"``
+            (default) or ``"finite_difference"`` (see :meth:`Placeholder.d` for the sub-schemes).
+
+    Returns:
+        The residual expression; train it to zero, e.g. ``jno.core([r.mse])``.
+    """
     if len(velocity_field) == 0:
         raise ValueError("velocity_field must contain at least one component")
     if len(velocity_field) != len(variables):

@@ -53,7 +53,7 @@ class TestParameter:
                 return None
 
         p = parameter((2, 1), key=jax.random.PRNGKey(0)).initialize(jax.nn.initializers.ones)
-        initialized = TraceCompiler.build_single_layer_params(p.model, None, jax.random.PRNGKey(1), _NoopLogger())
+        initialized = TraceCompiler.build_single_layer_params(p.model, jax.random.PRNGKey(1), _NoopLogger())
         assert jnp.allclose(initialized(), jnp.ones((2, 1), dtype=initialized().dtype))
 
 

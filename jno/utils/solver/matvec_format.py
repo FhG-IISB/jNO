@@ -120,6 +120,12 @@ def csr_matvec(parts, shape, transpose=False):
 
     def mv(v):
         v = jnp.asarray(v)
+        # JAX's CSR kernels take one dtype: a complex vector on a real operator (a shifted pencil K - z M,
+        # a Bloch mode) is the product of its real and imaginary parts; a real vector on a complex one is cast
+        if jnp.iscomplexobj(v) and not jnp.iscomplexobj(d):
+            return mv(v.real) + 1j * mv(v.imag)
+        if jnp.iscomplexobj(d) and not jnp.iscomplexobj(v):
+            v = v.astype(d.dtype)
         if ghost:  # the ghost entry of the input is 0, and the ghost entry of the output is dropped
             v = jnp.concatenate([v, jnp.zeros((1,) + v.shape[1:], v.dtype)])
         if v.ndim == 1:

@@ -702,3 +702,29 @@ def test_cocg_key_covers_every_parameter():
     assert base.key != jno.solve.cocg(tol=1e-10, maxiter=2000).key
     assert base.key != jno.solve.cocg(tol=1e-8, maxiter=500).key
     assert base.key == jno.solve.cocg(tol=1e-8, maxiter=2000).key
+
+
+@pytest.mark.parametrize("check_every", [1, 8, 64])
+@pytest.mark.parametrize("dtype", [np.float64, np.complex128])
+def test_gmres_chunked_reaches_the_true_residual(dtype, check_every):
+    """Right preconditioning, so ``tol`` bounds ``||b - A x||`` itself, whatever the block length."""
+    rng = np.random.default_rng(3)
+    n = 120
+    A = 4 * np.eye(n) + rng.standard_normal((n, n)) / np.sqrt(n)
+    if dtype is np.complex128:
+        A = A + 1j * rng.standard_normal((n, n)) / np.sqrt(n)
+    b = rng.standard_normal(n).astype(dtype)
+    Aj, d = jnp.asarray(A), jnp.asarray(1 / np.diag(A))
+    solve = jax.jit(
+        lambda b: krylov.gmres_chunked(
+            lambda v: Aj @ v, b, M=lambda v: d * v, tol=1e-10, restart=16, check_every=check_every
+        )
+    )
+    x = np.asarray(solve(jnp.asarray(b)))
+    assert np.linalg.norm(A @ x - b) <= 1e-10 * np.linalg.norm(b)
+
+
+def test_gmres_chunked_survives_an_exact_breakdown():
+    """The identity breaks down after one step; the zero columns after it must not reach the solve."""
+    x = krylov.gmres_chunked(lambda v: 2.0 * v, jnp.ones(10, dtype=jnp.complex128), tol=1e-12)
+    assert np.allclose(np.asarray(x), 0.5, atol=0, rtol=1e-14)

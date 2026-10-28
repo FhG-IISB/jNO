@@ -4,17 +4,24 @@ import contextlib
 import contextvars
 import functools
 import inspect
-from typing import Any, Dict, List, NamedTuple, Tuple
+import itertools
+import math
+from typing import Any, Dict, List, NamedTuple
 
+import folx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import core as _jax_core
+from jax.experimental import jet
 
 from .trace import (
     Assembly,
     BinaryOp,
     Choice,
     Constant,
+    Constraint,
+    Flow,
     FrozenField,
     FunctionCall,
     GroupedAssembly,
@@ -34,11 +41,17 @@ from .trace import (
     TemporalDerivative,
     TensorTag,
     TestFunction,
+    Tracker,
     TunableModule,
     TunableModuleCall,
     Variable,
     collect_tags,
 )
+
+
+def _trace_state():
+    """An opaque token of the current JAX trace; equal only within the same trace (jit, vmap, jvp, scan body)."""
+    return _jax_core.get_opaque_trace_state(convention="flax")
 
 
 def _default_float_dtype():
@@ -463,6 +476,130 @@ def _context_tag(var, context) -> str:
     return region if region is not None and region in context else tag
 
 
+def _coord_order(c):
+    """A sort key for a coordinate of the shared pass: a column index, or ``("time", key)``."""
+    return (isinstance(c, tuple), str(c))
+
+
+@functools.lru_cache(maxsize=None)
+def _taylor_interpolation(order, n_coords):
+    """Directions and weights giving every mixed partial of ``order`` in ``n_coords`` coordinates from
+    univariate Taylor derivatives (Griewank, Utke & Walther, *Math. Comp.* 69 (2000) 1117, Sec. 3).
+
+    The ``order``-th derivative along a direction ``j`` is ``sum_{|i|=order} order!/i! j^i d^i f``; with the
+    directions the multi-indices ``|j| = order`` themselves this is a square, invertible map from the mixed
+    partials to the directional derivatives. Returns ``(multi_indices, inverse)``: ``d^i f = sum_j
+    inverse[i, j] D_j f``. Computed in float64, once per (order, coordinates).
+    """
+    multi = [m for m in itertools.product(range(order + 1), repeat=n_coords) if sum(m) == order]
+    fact = [math.factorial(k) for k in range(order + 1)]
+    matrix = np.array(
+        [
+            [
+                fact[order] / np.prod([fact[k] for k in i]) * np.prod([float(jd) ** ik for jd, ik in zip(j, i)])
+                for i in multi
+            ]
+            for j in multi
+        ]
+    )
+    return multi, np.linalg.inv(matrix)
+
+
+def mark_pointwise_targets(exprs, params, context, log=None, n_probe=3):
+    """Mark the target of every AD derivative in ``exprs`` pointwise or not, by measuring it.
+
+    An AD derivative is taken one point at a time (see ``TraceEvaluator._shared_ad_derivative``), which is the
+    derivative of the target only if the target's value at a point depends on that point alone. Whether it
+    does is measured, not assumed from the kind of network: the target is evaluated with the concrete weights
+    on ``n_probe`` points of its point set and differentiated with respect to all of them; any dependence of
+    the value at one point on another point marks it ``_jno_pointwise = False``. A pointwise target is
+    ``True``, with ``_jno_point_shape`` the per-point shape of its value. A target the probe cannot evaluate
+    (a stochastic node, a FEM solve) stays unmarked and keeps the per-node path.
+
+    Runs once per compile, eagerly, on a few points: microseconds to milliseconds per target.
+    """
+    from .trace import _contains_variational
+    from .utils.solver.solver_helper import iter_children
+
+    nodes, seen = [], set()
+
+    def walk(n):
+        if not isinstance(n, Placeholder) or id(n) in seen:
+            return
+        seen.add(id(n))
+        if (
+            isinstance(n, (Jacobian, Hessian))
+            and n.scheme == "automatic_differentiation"
+            and not isinstance(n.target, (TestFunction, FrozenField))
+        ):
+            nodes.append(n)
+        for c in iter_children(n) or ():
+            walk(c)
+
+    for e in exprs:
+        if not _contains_variational(e):
+            walk(e)
+    if not nodes:
+        return
+
+    small = {}  # one sample, one time step, n_probe points: the (N, D) layout one evaluation sees
+    for k, v in context.items():
+        if not hasattr(v, "ndim"):
+            small[k] = v
+        elif str(k).startswith("__time"):
+            small[k] = v[0] if v.ndim >= 2 else v
+        elif v.ndim == 4:
+            small[k] = v[0, 0, :n_probe]
+        elif v.ndim == 2:
+            small[k] = v[0]
+        else:
+            small[k] = v
+    # The weights may be sharded on the accelerator and the domain context pinned to the host; one device for
+    # both, as `core.eval` does, or every probe fails with "incompatible devices".
+    device = jax.devices()[0]
+    params, small = jax.device_put(params, device), jax.device_put(small, device)
+    evaluator = TraceEvaluator(params)
+    for node in nodes:
+        target = node.target
+        if hasattr(target, "_jno_pointwise"):
+            continue
+        tags = {v.tag for v in node.variables if getattr(v, "axis", "spatial") == "spatial"}
+        if not tags:
+            tags = {t for t in collect_tags(target) if getattr(small.get(t), "ndim", 0) == 2}
+        if len(tags) != 1:
+            continue
+        tag = tags.pop()
+        points = small.get(tag)
+        if getattr(points, "ndim", 0) != 2 or points.shape[0] < 2:
+            continue
+        n = points.shape[0]
+
+        def value(p, _t=target, _tag=tag):
+            return evaluator.evaluate(_t, {**small, _tag: p}, {}, None)
+
+        try:
+            out = jax.eval_shape(value, points)
+            lead = next((i for i, s in enumerate(out.shape) if s != 1), len(out.shape))
+            if 0 < lead < len(out.shape) and out.shape[lead] == n:
+                # one value per point behind unit axes, (1, n, ...): a layout the shared pass does not handle, so
+                # the target keeps its own per-node path
+                continue
+            if not out.shape or out.shape[0] != n:
+                target._jno_pointwise = False  # one value for the whole point set: a reduction
+                continue
+            jac = np.asarray(jax.jacfwd(lambda p: jnp.reshape(value(p), (n, -1)))(points))  # (n, m, n, D)
+        except Exception as err:  # noqa: BLE001 -- the probe is optional: an unprobeable target keeps its own path
+            if log is not None:
+                log.info(
+                    f"Not measured whether {target!r} is pointwise ({type(err).__name__}: {err}); its derivatives take the per-node path"
+                )
+            continue
+        across = np.abs(jac.transpose(0, 2, 1, 3))[~np.eye(n, dtype=bool)]
+        scale = float(np.abs(jac).max())
+        target._jno_pointwise = bool(across.size == 0 or float(across.max()) <= 1e-6 * max(scale, 1e-30))
+        target._jno_point_shape = tuple(out.shape[1:])
+
+
 class TraceEvaluator:
     """Evaluates traced expressions - designed for JIT compilation.
 
@@ -477,6 +614,9 @@ class TraceEvaluator:
     Node handlers are registered via the ``_HANDLERS`` class-level dispatch
     table.  To add support for a new trace node type, define a method
     ``_eval_<NodeType>(self, expr, ctx)`` and add an entry in ``_HANDLERS``.
+
+    Args:
+        params: the model parameters, ``{layer_id: module}``, the evaluated networks read.
     """
 
     # Sentinel: the sampled points ARE the mesh vertices, so the mesh→sampled map is the identity and the
@@ -497,13 +637,14 @@ class TraceEvaluator:
     class _EvalCtx:
         """Bundles the read-only state that every handler needs."""
 
-        __slots__ = ("context", "var_bindings", "key", "active_region")
+        __slots__ = ("context", "var_bindings", "key", "active_region", "roots")
 
-        def __init__(self, context, var_bindings, key, active_region=None):
+        def __init__(self, context, var_bindings, key, active_region=None, roots=None):
             self.context = context
             self.var_bindings = var_bindings
             self.key = key
             self.active_region = active_region
+            self.roots = roots  # the expressions evaluated in this context, when known: see `_shared_ad_derivative`
 
     # ------------------------------------------------------------------
     # Public entry-point
@@ -514,9 +655,19 @@ class TraceEvaluator:
         context: Dict[str, jnp.ndarray] = None,
         var_bindings: Dict = None,
         key=None,
-        active_region=None,
     ) -> jnp.ndarray:
-        """Evaluate expression for a SINGLE batch (no batch dimension)."""
+        """Evaluate an expression for a SINGLE batch (no batch dimension).
+
+        Args:
+            expr: the expression.
+            context: the point and parameter arrays by tag, ``(N, D)`` for points.
+            var_bindings: substitutions ``{id(Variable): node}`` applied while evaluating (used by kernel
+                integrals and point evaluations); empty for an ordinary evaluation.
+            key: PRNG key for noise nodes.
+
+        Returns:
+            jnp.ndarray: the value, ``(N,)`` or ``(N, K)``.
+        """
         ctx = self._EvalCtx(
             context=context or {},
             var_bindings=var_bindings or {},
@@ -527,192 +678,25 @@ class TraceEvaluator:
         # keys hold identities that only exist inside this call.
         self._mesh_eval_cache.clear()
         self._mesh_points_cache.clear()
-        return self._dispatch(expr, ctx)
+        # Nodes marked `_per_evaluation` (a FEM solve, a FEM / domain integral: values of the parameters only,
+        # never of the evaluation points) are computed ONCE per evaluation, however often the expression refers
+        # to them -- the shared node is combined, as a common subexpression. Without it every reference
+        # re-assembled and re-factored the same system inside one compiled program (6 factorisations of one
+        # form in an MMA gradient: out of device memory). Scoped to the outermost call, like the caches above.
+        outer = not getattr(self, "_in_evaluate", False)
+        if outer:
+            self._in_evaluate, self._per_eval_memo, self._per_eval_roots, self._node_memo = True, {}, [expr], {}
+        ctx.roots = self._per_eval_roots  # every expression of this evaluation shares its derivative passes
+        try:
+            return self._dispatch(expr, ctx)
+        finally:
+            if outer:
+                self._in_evaluate, self._per_eval_memo, self._per_eval_roots, self._node_memo = False, {}, [], None
 
     # ------------------------------------------------------------------
     # Shape tracing — walk the expression tree and record output shapes
     # ------------------------------------------------------------------
-    def trace_shapes(
-        self,
-        expr,
-        context: Dict[str, jnp.ndarray],
-        var_bindings: Dict = None,
-        key=None,
-    ) -> str:
-        """Return a human-readable tree showing the output shape at every node.
-
-        This wraps :meth:`_dispatch` so that each handler's output
-        shape is captured and printed alongside a concise node label.
-        The tree is indented to reflect nesting.
-
-        Typical usage (called from ``core._log_constraint_shapes``)::
-
-            evaluator = TraceEvaluator(params)
-            print(evaluator.trace_shapes(expr, ctx_dict))
-
-        The output looks like::
-
-            BinaryOp(-)                                  → (513, 1)
-              Jacobian([Var(t)], fd)                      → (513, 1)
-                BinaryOp(*)                               → (513, 1)
-                  ModelCall(DeepONet)                 → (513, 1)
-                    Variable(__time__[0:1])                → (1,)
-                    Concat(axis=-1)                        → (513, 2)
-                      Variable(interior[0:1])              → (513, 1)
-                      Variable(interior[1:2])              → (513, 1)
-                  Variable(interior[0:1])                  → (513, 1)
-              BinaryOp(*)                                  → (513, 1)
-                Literal(0.1)                               → scalar
-                Laplacian([Var(x), Var(y)], fd)            → (513, 1)
-                  ...
-        """
-        ctx = self._EvalCtx(
-            context=context or {},
-            var_bindings=var_bindings or {},
-            key=key,
-            active_region=None,
-        )
-        lines: list = []
-        self._trace_visit(expr, ctx, depth=0, lines=lines, seen=set())
-        return "\n".join(lines)
-
-    def _trace_visit(self, node, ctx, depth, lines, seen):
-        """Recursively visit *node*, evaluate it, and record its shape."""
-        pad = "  " * depth
-        uid, label = self._node_label(node)
-
-        try:
-            abstract = jax.eval_shape(lambda: self._dispatch(node, ctx))
-            shape_str = str(abstract.shape) if hasattr(abstract, "shape") else "scalar"
-        except Exception as exc:
-            # eval_shape can fail for any number of reasons (unbound vars,
-            # non-jit-traceable ops, etc.); fall back to structural inference
-            # rather than aborting constraint-shape logging.
-            self.log.debug(f"eval_shape fallback for {label}: {type(exc).__name__}: {exc}")
-            shape_str = self._infer_shape_from_children(node, ctx)
-
-        # Layout:
-        #   #3fa2c1  │    BinaryOp(-)                  → (513, 1)
-        #   ^uid^    ^indent + label^                  ^shape^
-        tree_part = f"{pad}{label}"
-        shape_col = max(60, len(tree_part) + 2)
-        tree_part = tree_part.ljust(shape_col) + f"→ {shape_str}"
-
-        # uid column is fixed 10 chars wide, separated by │
-        entry = f"{uid}  │  {tree_part}"
-        lines.append(entry)
-
-        self._trace_children(node, ctx, depth, lines, seen)
-
-    def _trace_children(self, node, ctx, depth, lines, seen):
-        """Descend into the children of *node* for shape tracing."""
-        if isinstance(node, BinaryOp):
-            self._trace_visit(node.left, ctx, depth + 1, lines, seen)
-            self._trace_visit(node.right, ctx, depth + 1, lines, seen)
-        elif isinstance(node, FunctionCall):
-            for arg in node.args:
-                if isinstance(arg, Placeholder):
-                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
-        elif isinstance(node, ModelCall):
-            for arg in node.args:
-                if isinstance(arg, Placeholder):
-                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
-        elif isinstance(node, TunableModuleCall):
-            for arg in node.args:
-                if isinstance(arg, Placeholder):
-                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
-        elif isinstance(node, Choice):
-            for opt in node.options:
-                if isinstance(opt, Placeholder):
-                    self._trace_visit(opt, ctx, depth + 1, lines, seen)
-        elif isinstance(node, OperationDef):
-            if node.op_id not in seen:
-                seen.add(node.op_id)
-                self._trace_visit(node.expr, ctx, depth + 1, lines, seen)
-        elif isinstance(node, OperationCall):
-            # Build rebound context then trace the inner OperationDef
-            self._trace_visit(node.operation, ctx, depth + 1, lines, seen)
-        elif isinstance(node, (Jacobian, Hessian)):
-            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
-        elif isinstance(node, Assembly):
-            self._trace_visit(node.expr, ctx, depth + 1, lines, seen)
-        elif isinstance(node, GroupedAssembly):
-            if node.volume_expr is not None:
-                self._trace_visit(node.volume_expr, ctx, depth + 1, lines, seen)
-            for bnd_expr in node.boundary_exprs.values():
-                self._trace_visit(bnd_expr, ctx, depth + 1, lines, seen)
-        # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
-
-    def _infer_shape_from_children(self, node, ctx):
-        """Best-effort shape inference when jax.eval_shape fails.
-
-        Falls back to simple broadcast / passthrough rules based on the
-        node type and its children's shapes.
-        """
-
-        def _child_shape(child):
-            try:
-                a = jax.eval_shape(lambda: self._dispatch(child, ctx))
-                return a.shape if hasattr(a, "shape") else ()
-            except Exception:
-                return None
-
-        if isinstance(node, BinaryOp):
-            ls = _child_shape(node.left)
-            rs = _child_shape(node.right)
-            if ls is not None and rs is not None:
-                try:
-                    out = jnp.broadcast_shapes(ls, rs)
-                    return str(out)
-                except Exception:
-                    return f"broadcast({ls}, {rs}) ??"
-            return f"({ls} {node.op} {rs}) ??"
-
-        if isinstance(node, (Jacobian, Hessian)):
-            # Derivative output typically has the same leading shape as
-            # the target expression.
-            ts = _child_shape(node.target)
-            if ts is not None:
-                return f"~{ts}  (derivative)"
-            return "??"
-        if isinstance(node, Assembly):
-            return f"({node.num_total_nodes},)"
-        if isinstance(node, GroupedAssembly):
-            return f"({node.num_total_nodes},)"
-        if isinstance(node, FunctionCall):
-            # Reductions like .mse produce ()
-            name = node._name or getattr(node.fn, "__name__", "")
-            if name in ("mse", "mean", "sum", "max", "min"):
-                return "()"
-            # Element-wise functions keep input shape
-            if node.args:
-                cs = _child_shape(node.args[0])
-                if cs is not None:
-                    return str(cs)
-            return "??"
-
-        if isinstance(node, ModelCall):
-            # Try to get the model output shape by actually running the
-            # forward pass.  Model calls are cheap; it is only AD
-            # derivatives that are expensive.
-            try:
-                result = self._dispatch(node, ctx)
-                return str(result.shape) if hasattr(result, "shape") else "scalar"
-            except Exception:
-                return "??"
-
-        if isinstance(node, OperationDef):
-            cs = _child_shape(node.expr)
-            if cs is not None:
-                return str(cs)
-            # Try running the whole OperationDef
-            try:
-                result = self._dispatch(node, ctx)
-                return str(result.shape) if hasattr(result, "shape") else "()"
-            except Exception:
-                return "??"
-
-        return "??"
+    # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
 
     # Dispatch table — maps node type → handler method name.
     # ORDER MATTERS: more specific types (Constant, Literal) come first
@@ -727,6 +711,7 @@ class TraceEvaluator:
         (BinaryOp, "_eval_binary_op"),
         (OperationCall, "_eval_operation_call"),
         (ModelCall, "_eval_flax_module_call"),
+        (Flow, "_eval_flow"),
         (ModelWeights, "_eval_model_weights"),
         (TunableModule, "_eval_tunable_module"),
         (TunableModuleCall, "_eval_tunable_module_call"),
@@ -746,7 +731,56 @@ class TraceEvaluator:
     ]
 
     def _dispatch(self, expr, ctx):
-        """Look up handler in the dispatch table and call it."""
+        """Look up handler in the dispatch table and call it -- once per node, context and trace.
+
+        An expression is a graph: ``u = net(x, y)[..., 0]`` appears in every term that reads ``u``, and each
+        output of one network call shares that call. Walking it as a tree traced the shared node once per
+        reference (seven forward passes of a network for two distinct calls in a Navier-Stokes loss), and
+        XLA's CSE merges such copies only sometimes -- never once they differ in shape, as a vmapped copy
+        does. So within one evaluation a node is evaluated once per context it is read in. The JAX trace
+        state is part of the key: a value traced inside a ``jvp``, ``vmap`` or ``scan`` is never handed to
+        code outside it.
+        """
+        memo = getattr(self, "_node_memo", None)
+        if memo is None:
+            return self._dispatch_memoised(expr, ctx)
+        trace = _trace_state()
+        entries = memo.setdefault(id(expr), [])
+        for node, seen_ctx, seen_trace, out in entries:
+            if node is expr and seen_trace == trace and self._same_eval_ctx(seen_ctx, ctx):
+                return out
+        out = None
+        if getattr(expr, "_jno_pointwise", False) and ctx.roots is not None and ctx.active_region is None:
+            out = self._shared_value(expr, ctx)
+        if out is None:
+            out = self._dispatch_memoised(expr, ctx)
+        entries.append((expr, ctx, trace, out))
+        return out
+
+    def _dispatch_memoised(self, expr, ctx):
+        """``_dispatch`` with the per-evaluation memo of solves and integrals."""
+        if getattr(expr, "_per_evaluation", False):
+            memo = getattr(self, "_per_eval_memo", None)
+            if memo is not None:
+                hit = memo.get(id(expr))
+                if hit is not None and hit[0] is expr:
+                    return hit[1]
+                if getattr(expr, "_solve_fls", None) is not None:
+                    from .utils.solver.shared_solve import solve_shared
+
+                    if solve_shared(self, expr, ctx, memo):  # solved with the solves that share its operator
+                        return memo[id(expr)][1]
+                elif getattr(expr, "_integral_spec", None) is not None:
+                    from .utils.solver.shared_integral import integrate_shared
+
+                    if integrate_shared(self, expr, ctx, memo):  # one kernel with the integrals of its structure
+                        return memo[id(expr)][1]
+                out = self._dispatch_uncached(expr, ctx)
+                memo[id(expr)] = (expr, out)
+                return out
+        return self._dispatch_uncached(expr, ctx)
+
+    def _dispatch_uncached(self, expr, ctx):
         for node_type, method_name in self._HANDLERS:
             if isinstance(expr, node_type):
                 # Assembly defines the active variational bucket for its subtree.
@@ -802,6 +836,466 @@ class TraceEvaluator:
                     local[k] = v
 
         return local
+
+    # ------------------------------------------------------------------
+    # Automatic-differentiation derivatives that share their passes
+    # ------------------------------------------------------------------
+    def _shared_ad_derivative(self, expr, ctx):
+        """``expr`` (a Jacobian or Hessian) from one pass shared with the other AD derivatives over its point set.
+
+        Each derivative node used to re-run its target under its own ``vmap`` and AD pass, so a Navier-Stokes
+        residual (eight derivative nodes over the three outputs of one network) did 3.3x the work of the
+        hand-written training step. Here every AD derivative that a context evaluates over the same points is
+        computed together, per point, with time as one more coordinate of the point: a Laplacian, and any
+        single second derivative (``u.xx``, ``u.tt``), from one forward-Laplacian pass that carries value,
+        gradient and the summed second derivative through the target at once (Li et al., *Nat. Mach. Intell.*
+        6, 209 (2024), via ``folx``); other first derivatives from one forward-mode pass per coordinate, and
+        mixed second derivatives from a forward pass over that one (Griewank & Walther, *Evaluating
+        Derivatives*, 2nd ed., SIAM 2008, ch. 13). A network read by several fields and derivatives is
+        evaluated once per pass. A derivative inside a derivative's target (a Laplacian of a Laplacian) gets a
+        shared pass of its own, per point.
+
+        Returns ``None`` -- the node takes its own path, unchanged -- outside an evaluation, in a FEM region,
+        for a scheme with an explicit submethod (``"automatic_differentiation:reverse"`` asks for that mode),
+        on a normal derivative, on stacked time windows, and on a time derivative of something that reads no
+        point set.
+        """
+        target = getattr(expr, "target", None)
+        if getattr(target, "_jno_pointwise", None) is False and expr.scheme == "automatic_differentiation":
+            raise ValueError(
+                f"{type(expr).__name__} of {target!r} by automatic differentiation: this target's value at a point "
+                "depends on the OTHER points as well (measured when the problem was compiled) -- an operator network "
+                "over the point set, attention across points, or a reduction over the points. An AD derivative is "
+                "taken one point at a time, so it would not be the derivative of this target. Differentiate on the "
+                "mesh instead (scheme='finite_difference'), or make the target pointwise."
+            )
+        memo = getattr(self, "_per_eval_memo", None)
+        if memo is None or not getattr(self, "_in_evaluate", False) or ctx.active_region is not None:
+            return None
+        request = self._ad_request(expr, ctx)
+        if request is None:
+            return None
+        entries = memo.setdefault(("shared-ad-derivatives", request[0]), [])
+        trace = _trace_state()
+        for seen_ctx, seen_trace, members, values in entries:
+            if seen_trace == trace and id(expr) in members and self._same_eval_ctx(seen_ctx, ctx):
+                return values.get(id(expr))
+        roots = ctx.roots if ctx.roots is not None else [expr]
+        group = [(n, r) for n in self._ad_derivative_nodes(roots) if (r := self._ad_request(n, ctx)) and r[0] == request[0]]
+        if all(n is not expr for n, _ in group):
+            group.append((expr, request))
+        values = self._shared_ad_pass(request[0], group, ctx)
+        entries.append((ctx, trace, {id(n) for n, _ in group}, values))
+        return values.get(id(expr))
+
+    @staticmethod
+    def _same_eval_ctx(a, b):
+        """Whether two evaluation contexts read the same arrays (each root's ``evaluate`` gets a fresh bindings dict)."""
+        return (
+            a.context is b.context
+            and a.key is b.key
+            and a.active_region is b.active_region
+            and a.var_bindings.keys() == b.var_bindings.keys()
+            and all(a.var_bindings[k] is b.var_bindings[k] for k in a.var_bindings)
+        )
+
+    def _shared_value(self, expr, ctx):
+        """The value of a pointwise ``expr`` from the shared derivative pass of this context, or ``None``.
+
+        A field that is both used and differentiated (``u`` in ``u * u.d(x)``) was evaluated twice: batched for
+        its value and per point inside the derivative pass, which XLA cannot merge (the shapes differ). For a
+        target measured pointwise (:func:`mark_pointwise_targets`) the two are the same numbers, so the value
+        comes from the pass.
+        """
+        for node in self._ad_derivative_nodes(ctx.roots):
+            request = self._ad_request(node, ctx)
+            if request is None or request[1] is not expr:
+                continue
+            self._shared_ad_derivative(node, ctx)
+            trace = _trace_state()
+            for seen_ctx, seen_trace, members, values in self._per_eval_memo.get(("shared-ad-derivatives", request[0]), []):
+                if seen_trace == trace and id(node) in members and self._same_eval_ctx(seen_ctx, ctx):
+                    return values.get(-id(expr))
+            return None
+        return None
+
+    def _ad_derivative_nodes(self, roots):
+        """The Jacobian/Hessian nodes reachable from ``roots`` without a change of context.
+
+        The walk stops at every node that evaluates its children in a context of its own (a derivative's
+        target, an integral, an assembly, an operation call), so a node found here is never computed under
+        a context it does not see.
+        """
+        cache = self.__dict__.setdefault("_ad_nodes_cache", {})
+        key = tuple(id(r) for r in roots)
+        hit = cache.get(key)
+        if hit is not None and all(a is b for a, b in zip(hit[0], roots)):
+            return hit[1]
+        found, seen = [], set()
+
+        def walk(node):
+            if not isinstance(node, Placeholder) or id(node) in seen:
+                return
+            seen.add(id(node))
+            if isinstance(node, (Jacobian, Hessian)):
+                found.append(node)
+                return
+            if isinstance(node, BinaryOp):
+                children = (node.left, node.right)
+            elif isinstance(node, (FunctionCall, ModelCall)):
+                children = node.args
+            elif isinstance(node, OperationDef):
+                children = (node.expr,)
+            elif isinstance(node, Constraint):
+                children = (node.residual,)
+            elif isinstance(node, Tracker):
+                children = (node.expr,)
+            else:
+                return
+            for child in children:
+                walk(child)
+
+        for root in roots:
+            walk(root)
+        if len(cache) > 256:
+            cache.clear()
+        cache[key] = (list(roots), found)
+        return found
+
+    def _ad_request(self, node, ctx):
+        """What a derivative node needs from the shared pass: ``(tag, target, kind, coords)``, or ``None``.
+
+        ``tag`` names the ``(N, D)`` point set; a coordinate is a column ``d`` of it or ``("time", key)``, the
+        scalar time of this evaluation. ``kind`` is ``"jacobian"`` (first derivatives along ``coords``),
+        ``"laplacian"``, ``"hessian"``, or ``"second"`` (a Jacobian of a Jacobian, ``coords`` = (inner,
+        outer)).
+        """
+        if not isinstance(node, (Jacobian, Hessian)) or node.scheme != "automatic_differentiation":
+            return None
+        if scheme_family(resolve_scheme(node.scheme)) != "automatic_differentiation":
+            return None  # jno.setup(diff_type=...) made a bare scheme mean another family
+        if isinstance(node.target, (TestFunction, FrozenField)):
+            return None
+        coords, tags = [], set()
+        for v in node.variables:
+            b = ctx.var_bindings.get(id(v), v)
+            if not isinstance(b, Variable):
+                return None
+            if getattr(b, "axis", "spatial") == "temporal":
+                key = b.tag if b.tag in ctx.context else "__time__"
+                if getattr(ctx.context.get(key), "size", 0) != 1:
+                    return None  # stacked time windows: the per-node path
+                coords.append(("time", key))
+                continue
+            d = getattr(b, "dim", None)
+            if not (isinstance(d, (list, tuple)) and len(d) == 2 and d[1] is not None and d[1] - d[0] == 1):
+                return None  # a normal (``u.d(n)``) spans several coordinates
+            tags.add(_context_tag(b, ctx.context))
+            coords.append(int(v.dim[0]))
+        if not tags:  # time only: the points are the ones the target reads
+            tags = {
+                t
+                for t in collect_tags(node.target)
+                if not str(t).startswith("__time") and getattr(ctx.context.get(t), "ndim", 0) == 2
+            }
+        if len(tags) != 1:
+            return None
+        tag = tags.pop()
+        if getattr(ctx.context.get(tag), "ndim", 0) != 2:
+            return None
+        coords = tuple(coords)
+        poly = self._ad_polynomial(node, ctx, tag, coords)
+        # Order 3 and up by Taylor passes: one pass gives u, u_x, u_xx and u_xxx along an axis together (KdV), and
+        # the biharmonic operator was measured 1.13-1.6x faster than by nested passes.
+        if poly is not None and len(next(iter(poly[1]))) >= 3:
+            return tag, poly[0], "taylor", tuple(sorted(poly[1].items(), key=lambda kv: [_coord_order(c) for c in kv[0]]))
+        if isinstance(node, Hessian):
+            return tag, node.target, "laplacian" if getattr(node, "trace", False) else "hessian", coords
+        if isinstance(node.target, Jacobian) and len(coords) == 1:
+            inner = self._ad_request(node.target, ctx)
+            if inner is not None and inner[0] == tag and inner[2] == "jacobian" and len(inner[3]) == 1:
+                return tag, inner[1], "second", (inner[3][0], coords[0])
+        return tag, node.target, "jacobian", coords
+
+    def _ad_polynomial(self, node, ctx, tag, coords):
+        """``node`` as ``(base target, {multi-index: coefficient})``: a linear combination of mixed partials of
+        one order of a target that is not itself a derivative, or ``None``.
+
+        Covers chains of single-coordinate Jacobians and Laplacians (``u.d(x).d(x).d(x)``, ``d/dx Lap u``,
+        ``Lap Lap u``, with time as a coordinate); a multi-index is the sorted tuple of its coordinates.
+        """
+        if isinstance(node, Hessian):
+            if not getattr(node, "trace", False) or len(set(coords)) != len(coords):
+                return None
+            step = [(c, c) for c in coords]
+        elif len(coords) == 1:
+            step = [coords]
+        else:
+            return None
+        target = node.target
+        if isinstance(target, (Jacobian, Hessian)):
+            inner = self._ad_request(target, ctx)
+            if inner is None or inner[0] != tag:
+                return None
+            base, kind, dims = inner[1], inner[2], inner[3]
+            if kind == "taylor":
+                poly = dict(dims)
+            elif kind == "jacobian" and len(dims) == 1:
+                poly = {dims: 1.0}
+            elif kind == "laplacian" and len(set(dims)) == len(dims):
+                poly = {(d, d): 1.0 for d in dims}
+            elif kind == "second":
+                poly = {tuple(sorted(dims, key=_coord_order)): 1.0}
+            else:
+                return None
+        else:
+            base, poly = target, {(): 1.0}
+        out = {}
+        for mi, c in poly.items():
+            for add in step:
+                key = tuple(sorted(mi + tuple(add), key=_coord_order))
+                out[key] = out.get(key, 0.0) + c
+        return base, out
+
+    def _shared_ad_pass(self, tag, members, ctx):
+        """The values of ``members`` (``[(node, request)]``, all over ``tag``) from one pass: ``{id(node): value}``.
+
+        Second derivatives are served for scalar targets only (as the per-node path computes them); a member
+        asking one of a vector target is left out and takes its own path.
+        """
+        points = ctx.context[tag]
+        n_points, n_space = points.shape
+
+        def coords_of(r):
+            return [c for mi, _ in r[3] for c in mi] if r[2] == "taylor" else list(r[3])
+
+        times = sorted({c[1] for _, r in members for c in coords_of(r) if isinstance(c, tuple)})
+        column = {("time", k): n_space + j for j, k in enumerate(times)}
+
+        def remap(kind, cs):
+            if kind == "taylor":
+                return tuple((tuple(column.get(c, c) for c in mi), w) for mi, w in cs)
+            return tuple(column.get(c, c) for c in cs)
+
+        members = [(n, (t, tgt, kind, remap(kind, cs))) for n, (t, tgt, kind, cs) in members]
+        targets, index = [], {}
+        for _, (_, target, _, _) in members:
+            if id(target) not in index:
+                index[id(target)] = len(targets)
+                targets.append(target)
+        # The time of this evaluation is ONE scalar shared by all points. It stays an unbatched argument, so what
+        # depends on time alone (the branch net of a DeepONet in t) is computed once, not once per point.
+        time_now = (
+            jnp.stack([jnp.reshape(ctx.context[k], (-1,))[0].astype(points.dtype) for k in times])
+            if times
+            else jnp.zeros((0,), points.dtype)
+        )
+
+        # One point's view of the context: every entry with one row per point is mapped over (the rule of
+        # `_build_local_context`), the rest is shared. Mapping `vmap` over the arrays, rather than over an index
+        # that slices them, keeps the per-point rows out of gathers.
+        rows = {
+            k: v
+            for k, v in ctx.context.items()
+            if k != "__active_spatial_n__"
+            and not isinstance(v, dict)
+            and getattr(v, "ndim", 0) >= 1
+            and (k == tag or v.shape[0] == n_points)
+        }
+        shared = {k: v for k, v in ctx.context.items() if k not in rows and k != "__active_spatial_n__"}
+        row0 = {k: v[0] for k, v in rows.items()}
+
+        def at(row):
+            """The targets at one point (``row``: its entries of the context), as a function of its coordinates
+            ``zs`` and the times ``ts``."""
+            local = {"__active_spatial_n__": 1, **shared, **{k: v[jnp.newaxis] for k, v in row.items()}}
+
+            def values(zs, ts, squeeze=True):  # the targets usually share one network call: evaluated once
+                point = {**local, tag: zs[jnp.newaxis, :]}
+                for j, k in enumerate(times):
+                    point[k] = jnp.reshape(ts[j], jnp.shape(ctx.context[k])).astype(ctx.context[k].dtype)
+                    if k != "__time__" and "__time__" in ctx.context:  # the global time stays coherent
+                        point["__time__"] = jnp.reshape(ts[j], jnp.shape(ctx.context["__time__"]))
+                point_ctx = self._EvalCtx(point, ctx.var_bindings, ctx.key, roots=targets)
+                outs = tuple(self._dispatch(t, point_ctx) for t in targets)
+                return tuple(jnp.squeeze(o) for o in outs) if squeeze else outs
+
+            return values
+
+        def restricted(f, zs, sub):
+            """``f`` as a function of the coordinates ``sub`` alone, the others held; and their current values."""
+
+            where = {c: i for i, c in enumerate(sub)}
+
+            def g(q):  # rebuilt by stacking, not `.at[].set`: a scatter has no Taylor (jet) rule
+                z2 = jnp.stack([q[where[c]] if c in where else zs[c] for c in range(n_space)])
+                t2 = (
+                    jnp.stack([q[where[n_space + j]] if n_space + j in where else time_now[j] for j in range(len(times))])
+                    if times
+                    else time_now
+                )
+                return f(z2, t2)
+
+            return g, jnp.stack([zs[c] if c < n_space else time_now[c - n_space] for c in sub])
+
+        scalar = [s.ndim == 0 for s in jax.eval_shape(at(row0), points[0], time_now)]
+        served = [(n, r) for n, r in members if r[2] == "jacobian" or scalar[index[id(r[1])]]]
+        if not served:
+            return {}
+        first = sorted({d for _, r in served if r[2] == "jacobian" for d in r[3]})
+        # A Laplacian over distinct coordinates, and a single second derivative, come from one forward-Laplacian
+        # pass over their coordinates (value, gradient and the SUMMED second derivative together): half the work
+        # of one second-order pass per coordinate. A repeated coordinate (u.xx + u.xx) keeps the per-coordinate
+        # sum; a mixed one (u.d(x).d(y), a full Hessian) a forward pass over a forward pass.
+        lap_sets, pairs = set(), set()
+        for _, (_, _, kind, dims) in served:
+            if kind == "laplacian":
+                if len(set(dims)) == len(dims):
+                    lap_sets.add(tuple(sorted(dims)))
+                else:
+                    pairs |= {(d, d) for d in dims}
+            elif kind == "hessian":
+                pairs |= {tuple(sorted((a, b))) for a in dims for b in dims}
+            elif kind == "second":
+                if dims[0] == dims[1]:
+                    lap_sets.add((dims[0],))
+                else:
+                    pairs.add(tuple(sorted(dims)))
+        lap_sets = sorted(lap_sets)
+        # Derivatives of order 3 and up (u_xxx, Lap Lap u, d/dt Lap u): every mixed partial of one order is a fixed
+        # combination of univariate Taylor derivatives along a few directions (`_taylor_interpolation`), so each
+        # (order, coordinates) group costs one Taylor pass per direction it needs.
+        taylor = {}  # (order, coords) -> {direction: {id(node): weight}}
+        for node, (_, _, kind, poly) in served:
+            if kind != "taylor":
+                continue
+            order = len(poly[0][0])
+            group = tuple(sorted({c for mi, _ in poly for c in mi}))
+            multi, inverse = _taylor_interpolation(order, len(group))
+            weights = np.zeros(len(multi))
+            for mi, coeff in poly:
+                weights += coeff * inverse[multi.index(tuple(mi.count(c) for c in group))]
+            per_direction = taylor.setdefault((order, group), {})
+            for j, w in zip(multi, weights):
+                if abs(w) > 1e-12 * np.abs(weights).max():
+                    per_direction.setdefault(j, {})[id(node)] = float(w)
+
+        def taylor_series(f, zs, order, group, direction):
+            """The targets and their derivatives 1..``order`` along ``direction`` (in the ``group`` coordinates):
+            ``(values, [derivatives of order 1, ..., order])``, each a tuple over the targets."""
+            g, cur = restricted(f, zs, group)
+            v = jnp.asarray(direction, cur.dtype)
+            zero = jnp.zeros_like(v)
+            values, series = jet.jet(g, (cur,), ((v,) + (zero,) * (order - 1),))
+            return values, [tuple(terms[k] for terms in series) for k in range(order)]
+
+        def taylor_derivative(f, zs, order, group, direction):
+            return taylor_series(f, zs, order, group, direction)[1][order - 1]
+
+        unsupported = set()  # a network with an operation `jet` has no rule for: those members keep their own path
+        for order, group in list(taylor):
+            try:
+                jax.eval_shape(
+                    lambda zs: taylor_derivative(at(row0), zs, order, group, (1,) + (0,) * (len(group) - 1)), points[0]
+                )
+            except (NotImplementedError, KeyError) as err:  # jet: a primitive without a Taylor rule
+                self.log.info(f"Order-{order} derivatives by Taylor passes unavailable ({err}); they take the nested path")
+                unsupported |= {nid for per in taylor.pop((order, group)).values() for nid in per}
+        if unsupported:
+            served = [(n, r) for n, r in served if id(n) not in unsupported]
+
+        # the values of the targets measured pointwise, for `_shared_value`: one entry per point, shaped as
+        # the batched evaluation would shape it
+        raw_shapes = jax.eval_shape(lambda zs: at(row0)(zs, time_now, squeeze=False), points[0])
+        shared_values = [
+            k
+            for k, t in enumerate(targets)
+            if getattr(t, "_jno_pointwise", False)
+            and raw_shapes[k].shape[:1] == (1,)
+            and tuple(raw_shapes[k].shape[1:]) == tuple(getattr(t, "_jno_point_shape", ()))
+        ]
+
+        index_of_node = {id(n): index[id(r[1])] for n, r in served}
+
+        def per_point(row):
+            f, zs = at(row), row[tag]
+            d1, d2, lap = {}, {}, {}
+            primal = None  # the targets' values, as a by-product of a pass that computes them anyway
+
+            # Taylor passes first: one along a coordinate axis (direction K e_c) carries every lower derivative
+            # along c too -- its k-th term over K^k -- so u_x, u_xx and u itself come from the pass that gives u_xxx
+            taylor_out = {}
+            for (order, group), per_direction in taylor.items():
+                for direction, weights in per_direction.items():
+                    values, series = taylor_series(f, zs, order, group, direction)
+                    for nid, w in weights.items():
+                        taylor_out[nid] = taylor_out.get(nid, 0.0) + w * series[order - 1][index_of_node[nid]]
+                    axis = [i for i, j in enumerate(direction) if j]
+                    if len(axis) == 1:
+                        c, scale = group[axis[0]], float(direction[axis[0]])
+                        primal = primal or values
+                        d1.setdefault(c, tuple(t / scale for t in series[0]))
+                        if order >= 2:
+                            lap.setdefault((c,), tuple(t / scale**2 for t in series[1]))
+                            d2.setdefault((c, c), lap[(c,)])
+
+            for dims in lap_sets:
+                if dims in lap:  # a single second derivative a Taylor pass already gave
+                    continue
+                g, cur = restricted(f, zs, dims)
+                lapl = folx.forward_laplacian(g)(cur)
+                primal = primal or tuple(t.x for t in lapl)
+                lap[dims] = tuple(t.laplacian for t in lapl)
+                jacs = [t.jacobian.dense_array for t in lapl]  # (len(dims), *value_shape) each
+                for i, d in enumerate(dims):
+                    d1.setdefault(d, tuple(j[i] for j in jacs))
+            for a, b in sorted(pairs):
+                if (a, b) in d2:
+                    continue
+                g, cur = restricted(f, zs, (a,) if a == b else (a, b))
+                e_a, e_b = (jnp.ones(1, cur.dtype),) * 2 if a == b else tuple(jnp.eye(2, dtype=cur.dtype))
+
+                def along(w, g=g, e_a=e_a):
+                    return jax.jvp(g, (w,), (e_a,))[1]
+
+                d1[a], d2[(a, b)] = jax.jvp(along, (cur,), (e_b,))
+            for d in first:
+                if d not in d1:
+                    g, cur = restricted(f, zs, (d,))
+                    value, d1[d] = jax.jvp(g, (cur,), (jnp.ones(1, cur.dtype),))
+                    primal = primal or value
+
+            out = {}
+            for node, (_, target, kind, dims) in served:
+                k = index[id(target)]
+                if kind == "taylor":
+                    out[id(node)] = jnp.asarray(taylor_out[id(node)])[jnp.newaxis]
+                elif kind == "jacobian":
+                    comps = [d1[d][k] for d in dims]
+                    if comps[0].ndim == 0:
+                        out[id(node)] = jnp.stack(comps)  # (n_vars,)
+                    else:
+                        out[id(node)] = comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+                elif kind == "laplacian":
+                    key = tuple(sorted(dims))
+                    out[id(node)] = lap[key][k] if key in lap else sum(d2[(d, d)][k] for d in dims)
+                elif kind == "hessian":
+                    out[id(node)] = jnp.stack([jnp.stack([d2[tuple(sorted((a, b)))][k] for b in dims]) for a in dims])
+                elif dims[0] == dims[1]:
+                    out[id(node)] = lap[(dims[0],)][k][jnp.newaxis]
+                else:
+                    out[id(node)] = d2[tuple(sorted(dims))][k][jnp.newaxis]
+            if shared_values:
+                primal = primal or f(zs, time_now)
+                for k in shared_values:  # values keyed -id: derivatives are +id(node)
+                    out[-id(targets[k])] = jnp.reshape(primal[k], raw_shapes[k].shape[1:])
+            return out
+
+        values = jax.vmap(per_point)(rows)
+        for node, (_, _, kind, _) in served:
+            if kind == "laplacian":
+                values[id(node)] = values[id(node)][:, jnp.newaxis]
+        return values
 
     def _mesh_field_values(self, target, tag, bound_var, ctx, family):
         """Evaluate ``target`` on the mesh and flatten it for a per-channel kernel.
@@ -1231,7 +1725,29 @@ class TraceEvaluator:
                 arg_values.append(jnp.asarray(arg))
                 arg_sources.append(False)
 
-        flax_mod = expr.model
+        return self._apply_model(expr.model, arg_values, arg_sources, ctx)
+
+    def _apply_model(self, flax_mod, arg_values, arg_sources, ctx):
+        """Apply a wrapped :class:`~jno.trace.Model` to already-evaluated argument VALUES.
+
+        Split out of :meth:`_eval_flax_module_call` so that every path which runs a model shares one
+        implementation: the ordinary ``ModelCall`` and the ODE march behind :class:`~jno.trace.Flow`.
+        Calling the Equinox module directly instead would bypass ``Model.freeze`` / ``.lora`` /
+        ``.dtype`` -- invisible in the output, wrong in the gradient.
+
+        ``arg_sources`` flags which arguments are *spatial* (per-point coordinates), which is what
+        decides whether a bare ``(N,)`` gets the trailing channel axis.
+        """
+        # `.derives(expr)`: the value is COMPUTED from the rest of the state, not stored. Dispatched
+        # here, where the parameter would have been read -- once per solve, on the whole field --
+        # so the per-cell / per-node threading downstream sees an ordinary parameter value.
+        _derived = getattr(flax_mod, "_derived_expr", None)
+        if _derived is not None:
+            out = jnp.asarray(self._dispatch(_derived, ctx))
+            if out.ndim == 1 and out.shape[0] > 1 and getattr(flax_mod, "_fem_field", None) is not None:
+                out = out[:, jnp.newaxis]  # the channel axis a field parameter carries; see below
+            return out
+
         model = self.params.get(flax_mod.layer_id)
 
         if model is None:
@@ -1242,6 +1758,11 @@ class TraceEvaluator:
 
             No cross-argument broadcasting — that is the network's job.
             """
+            # A non-array argument is a pytree state from an ODE march (``Model.flow``): the network
+            # takes it whole, so there is no channel axis to fix up. Pass it through untouched rather
+            # than letting ``jnp.asarray`` flatten a dict into an object array.
+            if not (hasattr(val, "ndim") or isinstance(val, (int, float, complex, list, tuple))):
+                return val
             val = jnp.asarray(val)
             if is_spatial:
                 if val.ndim == 0:
@@ -1268,6 +1789,10 @@ class TraceEvaluator:
             return "mlp" in mod_name or "mlp" in cls_name
 
         def _broadcast_pointwise_args(args):
+            # A pytree argument (a marched ODE state) has no single leading shape to broadcast against;
+            # leave the whole call alone and let the network handle its own structure.
+            if any(not hasattr(a, "ndim") for a in args):
+                return list(args)
             arrs = [jnp.asarray(a) for a in args]
 
             if len(arrs) <= 1:
@@ -1341,10 +1866,39 @@ class TraceEvaluator:
         # coordinate nature, so it keeps its declared shape -- ``parameter((N,))`` evaluates to (N,), not a
         # spurious (N, 1) (needed for building a geometry functional from coordinate parameters).
         _bare_parameter = getattr(flax_mod, "_is_parameter", False) and getattr(flax_mod, "_fem_field", None) is None
-        if result.ndim == 1 and result.shape[0] > 1 and not _bare_parameter:
+        # `hasattr(ndim)`: a velocity field marched by ``Model.flow`` may return a pytree, which has
+        # no channel axis to repair.
+        if hasattr(result, "ndim") and result.ndim == 1 and result.shape[0] > 1 and not _bare_parameter:
             result = result[:, jnp.newaxis]
 
         return result
+
+    def _eval_flow(self, expr, ctx):
+        """March a :class:`~jno.trace.Flow` — the velocity network integrated as ``dx/dt = v(x, t)``.
+
+        Shares :meth:`_apply_model` with the ordinary ``ModelCall`` and :func:`~jno.trace.march_velocity`
+        with the eager ``Model.flow`` path, so a march inside a constraint and one run after training
+        are the same computation.
+        """
+        from .trace import _diffusion_from_noise, march_velocity
+
+        x0 = self._dispatch(expr.x0, ctx) if isinstance(expr.x0, Placeholder) else expr.x0
+        cond = [self._dispatch(c, ctx) if isinstance(c, Placeholder) else c for c in expr.cond]
+        n_args = 2 + len(cond)
+
+        def apply(state, t):
+            return self._apply_model(expr.model, [state, t, *cond], [False] * n_args, ctx)
+
+        diffusion = _diffusion_from_noise(expr.noise)
+        key = expr.key if expr.key is not None else ctx.key
+        if diffusion is not None and key is None:
+            raise ValueError(
+                "flow(noise=...) needs a PRNG key, and this evaluation has none -- `core.eval()` "
+                "without a key runs noise-free so post-training evaluation is deterministic. For a "
+                "march that would silently become a plain ODE, so it raises instead. Pass "
+                "key=jax.random.PRNGKey(seed) to flow(), or evaluate inside solve()."
+            )
+        return march_velocity(apply, x0, expr.ts, expr.save, diffusion=diffusion, key=key)
 
     def _eval_tunable_module(self, expr, ctx):
         if expr._current_instance is None:
@@ -1499,8 +2053,14 @@ class TraceEvaluator:
             if n is None:
                 n = 1
 
-        ndim = int(expr.params.get("ndim", 1))
-        shape = (n, ndim)
+        if getattr(expr, "like", None) is not None:
+            # Shape borrowed from another expression, resolved HERE rather than written down, so it
+            # tracks batchsize / points= / time windows. Only the reference's shape is used; XLA drops
+            # the value as dead code, so `like=<a whole network call>` costs nothing at runtime.
+            shape = jnp.shape(self._dispatch(expr.like, ctx))
+        else:
+            ndim = int(expr.params.get("ndim", 1))
+            shape = (n, ndim)
 
         if ctx.key is None:
             return jnp.zeros(shape)
@@ -1509,25 +2069,12 @@ class TraceEvaluator:
         # from the step key — reproducible when the solver seed is fixed.
         subkey = jax.random.fold_in(ctx.key, expr._noise_id)
 
-        dist = expr.distribution
-        if dist == "gaussian":
-            return jax.random.normal(subkey, shape) * expr.params.get("std", 1.0)
-        elif dist == "uniform":
-            return jax.random.uniform(
-                subkey,
-                shape,
-                minval=expr.params.get("low", -1.0),
-                maxval=expr.params.get("high", 1.0),
-            )
-        elif dist == "laplace":
-            std = expr.params.get("std", 1.0)
-            # Inverse-CDF of Laplace via Uniform(-0.5, 0.5)
-            u = jax.random.uniform(subkey, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
-            return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
-        else:
-            raise ValueError(
-                f"Unknown noise distribution {expr.distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'."
-            )
+        # The one implementation, shared with the SDE increment inside `march_velocity`, so a noise
+        # node draws the same way in a term list and in a march. A schedule (callable) parameter has
+        # no march time here and raises rather than being misused as a number.
+        from .trace import draw_distribution
+
+        return draw_distribution(expr.distribution, expr.params, shape, subkey, t=None)
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
@@ -1679,6 +2226,9 @@ class TraceEvaluator:
         - Temporal variables: differentiate w.r.t. the scalar time value
           using AD (default) or central FD when scheme='finite_difference'.
         """
+        shared = self._shared_ad_derivative(expr, ctx)
+        if shared is not None:
+            return shared
         target = expr.target
         variables = expr.variables
         # A bare 'automatic_differentiation' means 'whatever the run configured'
@@ -1717,8 +2267,10 @@ class TraceEvaluator:
                     comps = [dN[..., dim_idx] for dim_idx in requested_dims]
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
-                eye = jnp.eye(n_comp, dtype=dN.dtype)
-                comps = [dN[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
+                eye = jnp.eye(n_comp, dtype=dN.dtype).reshape((n_comp,) + tuple(value_shape))  # one-hot per component
+                comps = [
+                    dN[..., dim_idx].reshape(dN.shape[:2] + (1,) * eye.ndim) * eye[None, None] for dim_idx in requested_dims
+                ]
 
                 # one derivative:
                 #   (Nq_total, nloc, basis_comp, phys_comp)
@@ -1747,8 +2299,11 @@ class TraceEvaluator:
                     comps = [dN_face[..., dim_idx] for dim_idx in requested_dims]
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
-                eye = jnp.eye(n_comp, dtype=dN_face.dtype)
-                comps = [dN_face[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
+                eye = jnp.eye(n_comp, dtype=dN_face.dtype).reshape((n_comp,) + tuple(value_shape))
+                comps = [
+                    dN_face[..., dim_idx].reshape(dN_face.shape[:2] + (1,) * eye.ndim) * eye[None, None]
+                    for dim_idx in requested_dims
+                ]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             raise ValueError(f"Unknown active support '{support}'")
@@ -2130,6 +2685,9 @@ class TraceEvaluator:
         replace the spatial context with the full mesh points without
         losing the time value.
         """
+        shared = self._shared_ad_derivative(expr, ctx)
+        if shared is not None:
+            return shared
         target = expr.target
         variables = expr.variables
         # A bare 'automatic_differentiation' means 'whatever the run configured'
@@ -2731,8 +3289,9 @@ class TraceEvaluator:
         if n_comp == 1:
             return shape_vals
 
-        eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
-        return shape_vals[:, :, None, None] * eye[None, None, :, :]
+        # one-hot per component, (n_comp, *value_shape): eye(n) for a vector, eye(n*m) reshaped for a matrix
+        eye = jnp.eye(n_comp, dtype=shape_vals.dtype).reshape((n_comp,) + tuple(value_shape))
+        return shape_vals.reshape(shape_vals.shape[:2] + (1,) * eye.ndim) * eye[None, None]
 
     @staticmethod
     def _normalize_value_coeff(coeff, n_q_total):
@@ -2878,8 +3437,7 @@ class TraceEvaluator:
             raise ValueError(f"Unsupported normalized coeff shape {coeff.shape}")
 
     def _assemble_grad_basis_integrand(self, coeff_vec, v_grads_JxW_flat, flat_entity_nodes, num_total_nodes):
-        """
-        Assemble coeff : grad(phi)-type terms.
+        """Assemble coeff : grad(phi)-type terms.
 
         Supported canonical cases
         -------------------------
@@ -2891,10 +3449,9 @@ class TraceEvaluator:
             coeff_vec         : (Nq_total, vec, dim)
             v_grads_JxW_flat  : (Nq_total, n_loc, test_vec, dim)
 
-        Notes
-        -----
-        The assembler may provide test_vec = 1 even for vector-valued problems. In that case
-        the test gradient weights are broadcast over the coefficient component axis.
+        Note:
+            The assembler may provide test_vec = 1 even for vector-valued problems. In that case
+            the test gradient weights are broadcast over the coefficient component axis.
         """
         coeff_vec = jnp.asarray(coeff_vec)
         v_grads_JxW_flat = jnp.asarray(v_grads_JxW_flat)
@@ -3310,60 +3867,3 @@ class TraceEvaluator:
                     total = total.at[d_nodes, :].set(0.0)
 
         return total
-
-    @staticmethod
-    def _node_label(node) -> Tuple[str, str]:
-        """Return (uid, label) — rendered separately by _trace_visit."""
-        uid = f"#{id(node) % 0xFFFFFF:06x}"
-        if isinstance(node, Variable):
-            tag = node.tag
-            dim = node.dim
-            axis = getattr(node, "axis", "spatial")
-            axis_str = f", {axis}" if axis != "spatial" else ""
-            return uid, f"Variable({tag}[{dim[0]}:{dim[1]}]{axis_str})"
-        if isinstance(node, TensorTag):
-            return uid, f"TensorTag({node.tag})"
-        if isinstance(node, Constant):
-            val = node.value
-            if hasattr(val, "shape") and val.shape == ():
-                val = float(val)
-            return uid, f"Constant({node.tag}.{node.key}={val})"
-        if isinstance(node, Literal):
-            v = node.value
-            if hasattr(v, "shape"):
-                v = float(v) if v.shape == () else v.shape
-            return uid, f"Literal({v})"
-        if isinstance(node, BinaryOp):
-            return uid, f"BinaryOp({node.op})"
-        if isinstance(node, FunctionCall):
-            name = node._name or getattr(node.fn, "__name__", "fn")
-            return uid, f"FunctionCall({name})"
-        if isinstance(node, ModelCall):
-            mod = node.model
-            mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
-            lid = getattr(mod, "layer_id", "?")
-            return uid, f"ModelCall({mod_name}, layer={lid})"
-        if isinstance(node, TunableModuleCall):
-            return uid, f"TunableModuleCall(id={node.model.layer_id})"
-        if isinstance(node, Choice):
-            return uid, f"Choice(name={node.name}, selected={node.selected})"
-        if isinstance(node, OperationDef):
-            vars_str = ", ".join(str(v) for v in node._collected_vars)
-            return uid, f"OperationDef[{node.op_id}]({vars_str})"
-        if isinstance(node, OperationCall):
-            return uid, f"OperationCall[{node.operation.op_id}]"
-        if isinstance(node, Jacobian):
-            vars_str = ", ".join(str(v) for v in node.variables)
-            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
-            return uid, f"Jacobian([{vars_str}]{scheme_str})"
-        if isinstance(node, Hessian):
-            kind = "Laplacian" if node.trace else "Hessian"
-            vars_str = ", ".join(str(v) for v in node.variables)
-            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
-            return uid, f"{kind}([{vars_str}]{scheme_str})"
-        if isinstance(node, NetworkGradient):
-            return uid, f"NetworkGradient(model={node.model_node!r})"
-        if isinstance(node, Noise):
-            params_str = ", ".join(f"{k}={v}" for k, v in node.params.items())
-            return uid, f"Noise({node.distribution}, {params_str})"
-        return uid, type(node).__name__

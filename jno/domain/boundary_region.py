@@ -16,6 +16,45 @@ _FIELD_BY_ARITY = {2: "edges", 3: "triangles", 4: "quads"}
 _SLACK_TRI = 1e-6  # relative, and above float32 eps (~1.2e-7); see the barycentric test in `contains`
 _SLACK_QUAD = 1e-6
 
+#: Bytes one batch of :func:`map_points` may hold. A region test compares a point with EVERY facet, so a
+#: batch of ``B`` points materialises ``B x n_facets`` intermediates; one vmap over all boundary nodes was
+#: quadratic in the mesh size -- 6 GB of host memory at 206k DOFs on a 3-D box, the build's peak.
+_POINT_BUDGET_BYTES = 256 << 20
+#: Per (point, facet) pair: the triangle test keeps ~24 float64 intermediates of the facet axis alive.
+_BYTES_PER_PAIR = 24 * 8
+
+
+def point_chunk(n_entities: int, budget: int = None) -> int:
+    """Points per batch so that ``batch x n_entities`` pairs stay within ``budget`` bytes (at least 1)."""
+    budget = _POINT_BUDGET_BYTES if budget is None else int(budget)
+    return max(1, budget // (max(1, int(n_entities)) * _BYTES_PER_PAIR))
+
+
+def map_points(fn, pts, n_entities: int, *, with_index: bool = False, budget: int = None) -> np.ndarray:
+    """``fn`` over every row of ``pts`` -- ``fn(p)`` or, ``with_index``, ``fn(p, i)`` -- in memory-bounded batches.
+
+    One compiled ``vmap`` serves every batch: the last batch is padded to the batch size, so the program
+    compiles once, and the padding rows are dropped from the result. ``n_entities`` is the number of
+    facets ``fn`` tests a point against (:attr:`BoundaryRegion.n_entities`); it sizes the batch."""
+    import jax
+    import jax.numpy as jnp
+
+    pts = np.asarray(pts)
+    n = int(pts.shape[0])
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+    chunk = min(n, point_chunk(n_entities, budget))
+    run = jax.jit(jax.vmap(fn))
+    out = []
+    for s in range(0, n, chunk):
+        blk = pts[s : s + chunk]
+        k = blk.shape[0]
+        if k < chunk:
+            blk = np.concatenate([blk, np.repeat(blk[-1:], chunk - k, axis=0)])
+        args = (jnp.asarray(blk),) if not with_index else (jnp.asarray(blk), jnp.arange(s, s + chunk))
+        out.append(np.asarray(run(*args))[:k].reshape(-1))
+    return np.concatenate(out)
+
 
 @dataclass
 class BoundaryRegion:
@@ -34,6 +73,17 @@ class BoundaryRegion:
         The three callers that build a sub-region from a parent's facets used to choose the field with
         ``edges if dim == 2 else triangles``, so a quadrilateral facet was written into ``triangles``
         and read back as a triangle. Dispatching in one place makes that impossible.
+
+        Args:
+            tag: the region's tag.
+            dim: the spatial dimension.
+            points: the mesh points.
+            ents: the facets, ``(E, k, dim)`` vertex coordinates (``k = 2`` edges, ``3`` triangles,
+                ``4`` quadrilaterals).
+            tol: membership tolerance.
+
+        Returns:
+            BoundaryRegion: the region.
         """
         ents = np.asarray(ents)
         field = _FIELD_BY_ARITY.get(int(ents.shape[1])) if ents.ndim == 3 else None
@@ -43,6 +93,16 @@ class BoundaryRegion:
                 f"k in {sorted(_FIELD_BY_ARITY)}, got {np.shape(ents)}."
             )
         return cls(tag=tag, dim=dim, points=points, tol=tol, **{field: ents})
+
+    @property
+    def n_entities(self) -> int:
+        """How many entities :meth:`contains` tests a point against (its facets, else its points)."""
+        f = self.facets
+        return int(len(f)) if f is not None else int(len(self.points))
+
+    def contains_points(self, pts) -> np.ndarray:
+        """:meth:`contains` for every row of ``pts``, in memory-bounded batches (:func:`map_points`)."""
+        return map_points(self.contains, pts, self.n_entities).astype(bool)
 
     @property
     def facets(self) -> Optional[np.ndarray]:
@@ -81,6 +141,14 @@ class BoundaryRegion:
         return jnp.any((plane_dist <= self.tol) & inside)
 
     def contains(self, p):
+        """Whether a point lies on this region (on one of its edges in 2-D, its facets in 3-D).
+
+        Args:
+            p: the point; only its first ``dim`` coordinates are used.
+
+        Returns:
+            A boolean (traceable) scalar.
+        """
         import jax.numpy as jnp
 
         p = jnp.asarray(p)[: self.dim]

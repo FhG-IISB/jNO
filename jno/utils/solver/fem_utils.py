@@ -407,11 +407,113 @@ def _drop_scalar_component_axis(grad_list):
     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
 
-def _expand_test_shape_vals(shape_vals, n_comp):
+def _component_basis(n_comp, value_shape, dtype, symmetric=False):
+    """The one-hot basis of a field's components, ``(n_comp, *value_shape)``.
+
+    A test function of a field with ``n_comp`` components is ``n_comp`` basis functions per node, the
+    ``c``-th carrying a one in component ``c`` (row-major over ``value_shape``) and zeros elsewhere. For a
+    vector field this is ``eye(n)``; for a matrix field ``(n, m)`` it is ``eye(n*m)`` reshaped to
+    ``(n*m, n, m)``, so a contraction over the value axes (``inner(S, T, 2)``, ``trace(T)``, ``T[..., i, j]``)
+    leaves the DOF-component axis, exactly as it does for a vector."""
+    vs = tuple(value_shape or ())
+    if symmetric:
+        return _symmetric_basis(vs[0], dtype)  # (n(n+1)/2, n, n)
+    if not vs:
+        vs = (n_comp,)
+    return jnp.reshape(jnp.eye(n_comp, dtype=dtype), (n_comp,) + vs)
+
+
+def _is_symmetric_field(node) -> bool:
+    """True for a square matrix field stored by its upper triangle (``symmetric=True``). Read from the
+    instance dict: a trace node synthesises unknown attributes into nodes, so ``getattr`` would lie."""
+    return bool(getattr(node, "__dict__", {}).get("symmetric", False))
+
+
+def _is_constant_field(node) -> bool:
+    """True for a constant unknown (``domain.unknown(..., constant=True)``): one value over the domain."""
+    return bool(getattr(node, "__dict__", {}).get("_is_constant", False))
+
+
+def _field_num_components(node) -> int:
+    """Number of values STORED per node for ``node``'s field: ``n(n+1)/2`` for a symmetric ``n x n`` matrix,
+    the product of ``value_shape`` otherwise."""
+    vs = tuple(getattr(node, "value_shape", ()) or ())
+    if _is_symmetric_field(node):
+        n = int(vs[0])
+        return n * (n + 1) // 2
+    return _value_shape_num_components(vs)
+
+
+def _symmetric_basis(n, dtype=None):
+    """``E`` of shape ``(n(n+1)/2, n, n)``: stored value ``c`` (upper triangle, row-major -- ``xx, xy, yy`` in
+    2-D, ``xx, xy, xz, yy, yz, zz`` in 3-D) is entry ``(i, j)`` AND ``(j, i)`` of the full matrix. The full
+    matrix is ``sum_c s_c E_c``; a test function's ``c``-th basis matrix is ``E_c`` itself, so testing with it
+    is testing with the symmetric part -- the Galerkin choice for a symmetric unknown."""
+    iu, ju = np.triu_indices(int(n))
+    E = np.zeros((iu.size, n, n))
+    E[np.arange(iu.size), iu, ju] = 1.0
+    E[np.arange(iu.size), ju, iu] = 1.0
+    return jnp.asarray(E, dtype=dtype)
+
+
+def _symmetric_storage_index(n, i, j) -> int:
+    """Stored index of entry ``(i, j)`` of a symmetric ``n x n`` field (the upper-triangle slot of the pair)."""
+    i, j = (i, j) if i <= j else (j, i)
+    return int(i * n - i * (i - 1) // 2 + (j - i))
+
+
+def _unpack_components(flat, node, axis=1):
+    """The stored components on ``axis`` of ``flat`` -> the field's ``value_shape`` in their place.
+
+    A full field reshapes; a symmetric one expands its ``n(n+1)/2`` stored values to the full ``n x n``
+    matrix through :func:`_symmetric_basis`, so every expression downstream sees an ordinary matrix."""
+    vs = tuple(getattr(node, "value_shape", ()) or ())
+    axis = axis % flat.ndim
+    if not _is_symmetric_field(node):
+        # The components are contiguous on `axis`: split them in place. Moving the axis to the end and
+        # back is the same values through two transposes, which under `jacfwd` XLA writes out.
+        return jnp.reshape(flat, flat.shape[:axis] + vs + flat.shape[axis + 1 :])
+    moved = jnp.moveaxis(flat, axis, -1)
+    if _is_symmetric_field(node):
+        out = jnp.tensordot(moved, _symmetric_basis(vs[0], moved.dtype), axes=([-1], [0]))  # (..., n, n)
+    else:
+        out = jnp.reshape(moved, moved.shape[:-1] + vs)
+    nv = len(vs)
+    return jnp.moveaxis(out, list(range(out.ndim - nv, out.ndim)), list(range(axis, axis + nv)))
+
+
+def _flat_component_index(field, ints):
+    """The flat (row-major) component a getitem key selects on a nodal field.
+
+    A vector field takes one index, ``u[..., i]``. A matrix field takes one per axis, ``S[..., i, j]`` ->
+    ``i * m + j``, which is where component ``(i, j)`` sits in the node-major DOF layout. A key with fewer
+    indices than the field has axes selects a slice (a row of a matrix), not one component, so it raises
+    rather than silently reading the last index alone."""
+    vs = tuple(getattr(field, "value_shape", ()) or ())
+    ints = [int(k) for k in ints]
+    if len(vs) <= 1:
+        return ints[-1]
+    if len(ints) != len(vs):
+        raise IndexError(
+            f"jno.fem: a field with value_shape={vs} needs {len(vs)} indices to select one component "
+            f"(e.g. S[{', '.join(['0'] * len(vs))}]); got {len(ints)}. A row of a matrix field is not a single "
+            "component -- differentiate the components one at a time."
+        )
+    flat = 0
+    for k, n in zip(ints, vs):
+        if not -n <= k < n:
+            raise IndexError(f"jno.fem: index {k} is out of range for an axis of length {n} (value_shape={vs}).")
+        flat = flat * n + (k % n)
+    if _is_symmetric_field(field):
+        return _symmetric_storage_index(vs[0], ints[0] % vs[0], ints[1] % vs[1])
+    return flat
+
+
+def _expand_test_shape_vals(shape_vals, n_comp, value_shape=None, symmetric=False):
     if n_comp == 1:
         return shape_vals
-    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
-    return shape_vals[:, :, None, None] * eye[None, None, :, :]
+    basis = _component_basis(n_comp, value_shape, shape_vals.dtype, symmetric)  # (n_comp, *value_shape)
+    return shape_vals.reshape(shape_vals.shape + (1,) * basis.ndim) * basis[None, None]
 
 
 def _infer_trial_metadata(expr) -> Dict[str, Any]:
@@ -446,7 +548,7 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
 
     trial = unique_trials[0] if unique_trials else None
     value_shape = getattr(trial, "value_shape", ()) if trial is not None else ()
-    vec = _value_shape_num_components(value_shape)
+    vec = _field_num_components(trial) if trial is not None else 1
 
     return {
         "trial": trial,
@@ -479,7 +581,9 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                     {
                         "field_key": key,
                         "value_shape": vs,
-                        "vec": _value_shape_num_components(vs),
+                        "vec": _field_num_components(node),
+                        "symmetric": _is_symmetric_field(node),
+                        "constant": _is_constant_field(node),
                         "order": int(getattr(node, "order", 1)),
                         "space": str(getattr(node, "space", "Lagrange")),
                     }
@@ -489,6 +593,9 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
             walk(child)
 
     walk(expr)
+    if any(f["constant"] for f in fields):  # constants last -- the same order the native assembler uses
+        fields = [f for f in fields if not f["constant"]] + [f for f in fields if f["constant"]]
+        seen = {f["field_key"]: i for i, f in enumerate(fields)}
     return fields, dict(seen)
 
 
@@ -580,7 +687,9 @@ def _gather_runtime_parameter_tags(node, out=None):
 
     if out is None:
         out = []
-    if _is_runtime_scalar_parameter(node):
+    from .parametric_helpers import _is_global_scalar
+
+    if _is_runtime_scalar_parameter(node) or _is_global_scalar(node):
         name = _parameter_name(node)
         if name not in out:
             out.append(name)
@@ -881,6 +990,49 @@ def _broadcast_ok(s1, s2) -> bool:
     return True
 
 
+#: Node types whose value varies over the quadrature points (or with the solution). A subtree with none of
+#: them is a CONSTANT: it carries value axes only, no quadrature axis.
+_VARYING_NODES = (
+    Variable,
+    TrialFunction,
+    TestFunction,
+    StateField,
+    ModelCall,
+    FrozenField,
+    HistoryRef,
+    Cellwise,
+    RegionMask,
+    TagMask,
+    Tracker,
+    OperationCall,
+    DiffSlot,
+)
+
+
+def _scalar_times_constant_matrix(a, b, left, right):
+    """``s * M`` with ``s`` a per-point scalar and ``M`` a constant matrix: ``(n_quad, *M.shape)``.
+
+    A per-point scalar is laid out ``(n_quad, 1)`` (its historical phantom axis) or ``(n_quad,)``, and a
+    constant matrix has no quadrature axis at all. At equal rank :func:`_prefix_align` leaves them alone and
+    plain broadcasting fails (``(14, 1) * (3, 3)``); at rank 1 it pads the scalar to ``(n_quad, 1)``, with
+    the same result. Worse, both SUCCEED when ``n_quad`` equals the matrix's row count (three quadrature
+    points times a 3 x 3 matrix) and return a 3 x 3 that is no longer per point. Shape alone cannot tell a constant from a per-point array, so the trace decides: the matrix side
+    must contain no varying node. ``tr(A) / 3 * I`` (a deviator) is the case that needs it."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    for s_, m_, s_node, m_node, flip in ((a, b, left, right, False), (b, a, right, left, True)):
+        if (
+            (s_.ndim == 1 or (s_.ndim == 2 and s_.shape[-1] == 1))  # (n_quad,) or (n_quad, 1): one value per point
+            and m_.ndim == 2
+            and min(m_.shape) > 1
+            and not contains_node_type(m_node, _VARYING_NODES)
+            and contains_node_type(s_node, _VARYING_NODES)
+        ):
+            s2 = s_.reshape(s_.shape[:1] + (1, 1))
+            m2 = m_[None]
+            return (m2, s2) if flip else (s2, m2)
+    return a, b
+
+
 def _prefix_align(a, b):
     """Broadcast-align two kernel quantities for an elementwise op.
 
@@ -1062,6 +1214,56 @@ def _frozen_cell_values(local, node):
             "not thread frozen fields. It is currently wired for the native steady/linear volume path."
         )
     return table[node.frozen_id]
+
+
+def _coef_slot(local, key, what):
+    """The field slot of a coefficient field on its own element space (a frozen N1E / RT / P_k / DG field or
+    such a field parameter): ``{shape_vals, shape_grads, cell_sol, space}`` with the KNOWN cell values as
+    ``cell_sol``, built by the non-nodal assembler (``local["coef_fields"]``). Raises where it is absent."""
+    table = local.get("coef_fields")
+    if not table or key not in table:
+        raise NotImplementedError(
+            f"jno.fem: {what} lives on its own element space (N1E / N2E / RT / DG / P_k), which is evaluated "
+            "in VOLUME terms of the non-nodal assembler (a form with such an unknown). This assembly path "
+            "(a boundary term, or the nodal Lagrange / 1-D assembler) does not thread it."
+        )
+    return table[key]
+
+
+def _slot_value(slot, value_shape):
+    """A field's value at the quad points from its slot -- the TrialFunction rule, slot data in place of the
+    live solution."""
+    vals, cell_sol = slot["shape_vals"], slot["cell_sol"]
+    if slot["space"] != "Lagrange":
+        return jnp.einsum("qn,n->q", vals, cell_sol) if vals.ndim == 2 else jnp.einsum("qnc,n->qc", vals, cell_sol)
+    flat = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
+    return flat[..., 0] if len(value_shape) == 0 else _reshape_components_last(flat, value_shape)
+
+
+def _slot_gradient(slot, value_shape, dims):
+    """d(field)/d(x_dims) at the quad points from its slot -- the TrialFunction rule."""
+    grads, cell_sol = slot["shape_grads"], slot["cell_sol"]
+    if slot["space"] != "Lagrange":
+        g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+        contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
+        return contracted[..., 0] if len(dims) == 1 else contracted
+    grad_list = [jnp.sum(grads[:, :, d : d + 1] * cell_sol[None, :, :], axis=1) for d in dims]
+    if len(value_shape) == 0:
+        return _drop_scalar_component_axis(grad_list)
+    flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
+    if len(dims) == 1:
+        return _reshape_components_last(flat, value_shape)
+    return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+
+
+def _is_space_frozen(node, local=None) -> bool:
+    """A frozen field evaluated from a coefficient slot: one on its own element space (anything but P1
+    Lagrange), or any frozen field the caller put a slot in for (an integral over a domain does, for all)."""
+    if not isinstance(node, FrozenField):
+        return False
+    if local is not None and ("frozen", node.frozen_id) in (local.get("coef_fields") or {}):
+        return True
+    return not (str(node.space).upper() == "LAGRANGE" and int(node.order) == 1)
 
 
 def _field_hess(local, node):
@@ -1393,8 +1595,9 @@ def _eval_integrand(domain, node, local):
         if _field_space(local, node) != "Lagrange":
             # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
             return shape_vals
-        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
-        return _expand_test_shape_vals(shape_vals, n_comp)
+        value_shape = getattr(node, "value_shape", ())
+        n_comp = _field_num_components(node)
+        return _expand_test_shape_vals(shape_vals, n_comp, value_shape, _is_symmetric_field(node))
 
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
@@ -1414,7 +1617,7 @@ def _eval_integrand(domain, node, local):
             # ``maximum(H.i(-1), u)`` silently became ``(n_quad, n_quad)`` and the state readout then
             # produced a buffer of the wrong rank. Squeeze here, at the one place the axis is created.
             return flat_interp[..., 0]
-        return _reshape_components_last(flat_interp, value_shape)
+        return _unpack_components(flat_interp, node, axis=-1)
 
     if isinstance(node, DiffSlot):
         # The hole a `Diff` differentiates through: its value is injected by the branch below.
@@ -1490,6 +1693,9 @@ def _eval_integrand(domain, node, local):
         return buf_c[:, -node.offset - 1]  # offset -1 -> slot 0, -2 -> slot 1, ...  -> (n_quad, *value_shape)
 
     if isinstance(node, FrozenField):
+        if _is_space_frozen(node, local):
+            slot = _coef_slot(local, ("frozen", node.frozen_id), f"the frozen {node.space} field {node.name}")
+            return _slot_value(slot, getattr(node, "value_shape", ()))
         # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the
         # TrialFunction value branch but with frozen values instead of the live cell solution.
         if _field_space(local, node) != "Lagrange":
@@ -1500,7 +1706,7 @@ def _eval_integrand(domain, node, local):
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
             return flat_interp
-        return _reshape_components_last(flat_interp, value_shape)
+        return _unpack_components(flat_interp, node, axis=-1)
 
     if isinstance(node, Jacobian):
         dims = []
@@ -1520,16 +1726,20 @@ def _eval_integrand(domain, node, local):
                 # pick the requested directions -> (n_quad, n_dof, n_comp[, len(dims)]). trace() then gives div.
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 return g[..., 0] if len(dims) == 1 else g
-            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
+            value_shape = getattr(node.target, "value_shape", ())
+            n_comp = _field_num_components(node.target)
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
-            eye = jnp.eye(n_comp, dtype=grads.dtype)
-            comps = [grads[..., dim0][:, :, None, None] * eye[None, None, :, :] for dim0 in dims]
+            sym = _is_symmetric_field(node.target)
+            comps = [_expand_test_shape_vals(grads[..., dim0], n_comp, value_shape, sym) for dim0 in dims]
             if len(comps) == 1:
                 return comps[0]
             return jnp.stack(comps, axis=-1)
 
+        if _is_space_frozen(node.target, local):
+            slot = _coef_slot(local, ("frozen", node.target.frozen_id), f"the frozen {node.target.space} field")
+            return _slot_gradient(slot, getattr(node.target, "value_shape", ()), dims)
         if isinstance(node.target, FrozenField):
             # gradient of a KNOWN field: contract the SAME physical shape gradients with the frozen
             # nodal slice instead of the live cell solution (byte-identical to the TrialFunction case).
@@ -1542,9 +1752,7 @@ def _eval_integrand(domain, node, local):
             if len(value_shape) == 0:
                 return _drop_scalar_component_axis(grad_list)
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            if len(dims) == 1:
-                return _reshape_components_last(flat, value_shape)
-            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape[, len(dims)])
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)
@@ -1553,14 +1761,18 @@ def _eval_integrand(domain, node, local):
                 g = jnp.stack([grads[..., d] for d in dims], axis=-1)
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
-            grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             value_shape = getattr(node.target, "value_shape", ())
-            if len(value_shape) == 0:
-                return _drop_scalar_component_axis(grad_list)
-            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
-            if len(dims) == 1:
-                return _reshape_components_last(flat, value_shape)
-            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+            if len(value_shape) == 0 or len(dims) == 1:
+                grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
+                if len(value_shape) == 0:
+                    return _drop_scalar_component_axis(grad_list)
+                return _unpack_components(grad_list[0], node.target, axis=1)  # (n_quad, *value_shape)
+            # Every direction in ONE multiply-and-sum over the basis, already (n_quad, n_comp, n_dirs): the
+            # per-direction products, their stack and the layout moves between them were what `jacfwd`
+            # carried through the element tangent as separate writes.
+            g = grads[:, :, jnp.asarray(dims)] if list(dims) != list(range(grads.shape[-1])) else grads
+            flat = jnp.sum(g[:, :, None, :] * cell_sol[None, :, :, None], axis=1)
+            return _unpack_components(flat, node.target, axis=1)  # (n_quad, *value_shape, len(dims))
 
         # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``.
         # For a NON-NODAL field the value-component cannot be differentiated directly, but
@@ -1584,6 +1796,15 @@ def _eval_integrand(domain, node, local):
                 if isinstance(field, TestFunction):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
+            if ints and _is_space_frozen(field, local):  # a known coefficient field: its slot, the trial rule
+                comp = ints[-1]
+                slot = _coef_slot(local, ("frozen", field.frozen_id), f"the frozen {field.space} field")
+                if slot["space"] != "Lagrange":
+                    gc = slot["shape_grads"][:, :, comp, :]
+                    g = jnp.stack([gc[..., d] for d in dims], axis=-1)
+                    return jnp.einsum("qn...,n->q...", g[..., 0] if len(dims) == 1 else g, slot["cell_sol"])
+                comps = [jnp.sum(slot["shape_grads"][..., d] * slot["cell_sol"][None, :, comp], axis=1) for d in dims]
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
             if ints and isinstance(field, (TrialFunction, TestFunction)):
                 # Lagrange component gradient. Conventions match the whole-field branches exactly, so
                 # component and whole-field spellings mix freely in one term:
@@ -1592,8 +1813,8 @@ def _eval_integrand(domain, node, local):
                 #                                                       column ``i`` (node-major ravel)
                 # A scalar field (n_comp == 1) takes the whole-field shapes, so ``u[0]`` on a scalar is
                 # the field itself rather than a differently-shaped twin.
-                comp = ints[-1]
-                n_comp = _value_shape_num_components(getattr(field, "value_shape", ()))
+                comp = _flat_component_index(field, ints)
+                n_comp = _field_num_components(field)
                 if not 0 <= comp < n_comp:
                     raise IndexError(
                         f"jno.fem: component {comp} is out of range for a field with "
@@ -1665,7 +1886,8 @@ def _eval_integrand(domain, node, local):
         if _field_space(local, node.target) != "Lagrange":
             raise NotImplementedError("Second derivatives are assembled for nodal Lagrange fields only.")
         value_shape = getattr(node.target, "value_shape", ())
-        n_comp = _value_shape_num_components(value_shape)
+        n_comp = _field_num_components(node.target)
+        sym = _is_symmetric_field(node.target)
         _, _, cell_sol = _field_data(local, node.target)
         # The C1 families (Hermite / Argyris / Morley) present themselves to this evaluator AS Lagrange --
         # their M(cell) DOF-transform is baked into the shape data, so the guard above does not exclude them
@@ -1696,25 +1918,26 @@ def _eval_integrand(domain, node, local):
             if is_test:
                 if n_comp == 1:
                     return lap
-                eye = jnp.eye(n_comp, dtype=lap.dtype)
-                return lap[:, :, None, None] * eye[None, None, :, :]  # (n_quad, n_dof, n_comp, n_comp)
+                return _expand_test_shape_vals(lap, n_comp, value_shape, sym)  # (n_quad, n_dof, n_comp, *value_shape)
             # ``cell_sol`` is (n_local, vec), so this contracts every component at once: (n_quad, vec).
             # A scalar field keeps its historical phantom (n_quad, 1); a vector one gets Delta u itself.
             flat = jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)
-            return flat if len(value_shape) == 0 else _reshape_components_last(flat, value_shape)
+            return flat if len(value_shape) == 0 else _unpack_components(flat, node.target, axis=-1)
         if is_test:
             if n_comp == 1:
                 return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
-            eye = jnp.eye(n_comp, dtype=hsub.dtype)
-            return hsub[:, :, None, None, :, :] * eye[None, None, :, :, None, None]
+            basis = _component_basis(n_comp, value_shape, hsub.dtype, sym)  # (n_comp, *value_shape)
+            nb = basis.ndim
+            return hsub.reshape(hsub.shape[:2] + (1,) * nb + hsub.shape[2:]) * basis.reshape((1, 1) + basis.shape + (1, 1))
         h = jnp.einsum("qnij,nc->qcij", hsub, cell_sol)  # (n_quad, vec, L, L)
         if len(value_shape) == 0:
             return h[:, 0]  # (n_quad, L, L) trial Hessian -- scalar carries no component axis
-        return jnp.reshape(h, h.shape[:1] + tuple(value_shape) + h.shape[2:])
+        return _unpack_components(h, node.target, axis=1)  # (n_quad, *value_shape, L, L)
 
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)
         b = _eval_integrand(domain, node.right, local)
+        a, b = _scalar_times_constant_matrix(a, b, node.left, node.right)
         a, b = _prefix_align(a, b)
         if node.op == "+":
             return a + b
@@ -1743,6 +1966,10 @@ def _eval_integrand(domain, node, local):
             return _eval_frozen_coefficient(domain, node.model, local)
         if _is_runtime_scalar_parameter(node):
             name = _parameter_name(node)
+            _space = getattr(node.model, "_fem_space", None)
+            if _space is not None:  # a field parameter on its own element space (N1E / RT / P_k / DG)
+                slot = _coef_slot(local, ("param", name), f"the field parameter {name!r}")
+                return _slot_value(slot, _space[2] if _space[0] in ("Lagrange", "DG") else ())
             val = _runtime_parameter_value_from_internal_vars(local, name)
             if val is None:
                 raise KeyError(
@@ -1768,6 +1995,13 @@ def _eval_integrand(domain, node, local):
         )
 
     if isinstance(node, FunctionCall):
+        from .parametric_helpers import _is_global_scalar, _parameter_name
+
+        if _is_global_scalar(node):
+            # one value per solve (another solver's readout): crux evaluated it, the kernel reads it
+            val = _runtime_parameter_value_from_internal_vars(local, _parameter_name(node))
+            if val is not None:
+                return val
         args = [_eval_integrand(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
         return node.fn(*args, **kwargs)
@@ -3492,35 +3726,24 @@ def build_periodic_prolongation(
     integral (L2) constraint, so it is more accurate for fields the main space cannot
     represent — measured at 4-40% lower RMS error on a non-matching 3-D interface.
 
-    Parameters
-    ----------
-    points:
-        ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
-    pairs:
-        Ordered ``(main_tag, secondary_tag)`` boundary pairings, e.g.
-        ``[("left", "right"), ("bottom", "top")]``.
-    tag_indices:
-        Mapping from boundary tag name to the global node ids on that tag.
-    vec:
-        Number of scalar components per node. ``vec > 1`` returns the
-        node-major expansion ``kron(P_node, I_vec)``.
-    tol:
-        Coordinate-matching tolerance for the in-interface coordinates. When
-        ``None`` it is derived from the bounding-box diagonal.
-    facets:
-        Optional ``{main_tag: (n_facets, k) node-id array}`` of the main
-        boundary facets, required only for the non-matching (interpolatory) path.
+    Args:
+        points: ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
+        pairs: Ordered ``(main_tag, secondary_tag)`` boundary pairings, e.g. ``[("left", "right"),
+            ("bottom", "top")]``.
+        tag_indices: Mapping from boundary tag name to the global node ids on that tag.
+        vec: Number of scalar components per node. ``vec > 1`` returns the node-major expansion
+            ``kron(P_node, I_vec)``.
+        tol: Coordinate-matching tolerance for the in-interface coordinates. When ``None`` it is derived
+            from the bounding-box diagonal.
+        facets: Optional ``{main_tag: (n_facets, k) node-id array}`` of the main boundary facets,
+            required only for the non-matching (interpolatory) path.
 
-    Returns
-    -------
-    dict with keys:
-        ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
-        ``P_node``          : node-level prolongation (``vec == 1`` form).
-        ``kept_nodes``      : sorted global ids of the retained (main/free) nodes.
-        ``secondary_to_main`` : resolved secondary-node -> main-node mapping (exact ties).
-        ``n_full``          : full node count.
-        ``n_red``           : reduced node count.
-        ``vec``             : component count used.
+    Returns:
+        dict with keys: ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
+            ``P_node``          : node-level prolongation (``vec == 1`` form). ``kept_nodes``      :
+            sorted global ids of the retained (main/free) nodes. ``secondary_to_main`` : resolved
+            secondary-node -> main-node mapping (exact ties). ``n_full``          : full node count.
+            ``n_red``           : reduced node count. ``vec``             : component count used.
     """
     pts = np.asarray(points, dtype=np.float64)
     n_nodes = pts.shape[0]
@@ -4341,6 +4564,37 @@ def bcoo_set_unit_diag(A, dofs):
 #: ``None`` = automatic (device-derived), ``False``/``0`` = no chunking, positive int = cells per chunk.
 #: A list rather than a plain global so the context manager can restore the previous value on nesting.
 _CHUNK_OVERRIDE = [None]
+#: Whether the ``jno.fem`` call being assembled was GIVEN a ``quad_degree`` (set and restored by ``jno.fem``,
+#: like ``_CHUNK_OVERRIDE``). Read by :func:`quad_floor`: a default is raised to what the field needs, a
+#: request is honoured as written.
+_QUAD_EXPLICIT = [False]
+#: Floors already reported during the current ``jno.fem`` call, so one request is reported once.
+_QUAD_REPORTED: set = set()
+
+
+def quad_floor(quad_degree: int, minimum: int, what: str) -> int:
+    """The quadrature degree to use where ``minimum`` integrates ``what`` exactly.
+
+    Without an explicit ``jno.fem(quad_degree=...)`` the degree is raised to ``minimum`` -- the default
+    then integrates a field's mass term exactly, which is what a form that cannot be inspected needs. An
+    explicit degree is used AS ASKED, also below ``minimum``: a form with only gradients of a P1 field is
+    exact at degree 0, and raising the request silently cost 4x the points. Below ``minimum`` it is
+    reported once, naming what is then integrated inexactly."""
+    q = int(quad_degree)
+    if q >= minimum:
+        return q
+    if not _QUAD_EXPLICIT[0]:
+        return int(minimum)
+    if (q, minimum, what) not in _QUAD_REPORTED:
+        _QUAD_REPORTED.add((q, minimum, what))
+        _log.warning(
+            f"jno.fem: quad_degree={q} is below {minimum}, the degree that integrates {what} exactly. "
+            f"Using {q} as asked: exact for a form of degree <= {q} (only gradients of a P1 field: degree 0), "
+            "inexact for such a term. Omit quad_degree for the default."
+        )
+    return q
+
+
 #: Set when an assembly consumed the override, so ``jno.fem`` can refuse an explicit ``chunk=`` that
 #: reached an assembler with no element loop instead of silently ignoring it.
 _CHUNK_CONSUMED = [False]
@@ -4679,7 +4933,7 @@ def _elem_run(fn, chunk, scatter):
     if chunk is None:
         return jax.vmap(fn), (), chunk
     c = int(chunk)
-    return (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), (), chunk
+    return (lambda *a: jax.lax.map(jax.checkpoint(lambda z: fn(*z)), a, batch_size=c)), (), chunk
 
 
 def _spec_key(spec, lifted):
@@ -4774,12 +5028,19 @@ def _array_digest(leaf):
     if isinstance(leaf, jax.Array):
         extra = (bool(getattr(leaf, "weak_type", False)), str(getattr(leaf, "sharding", "")))
     arr = np.ascontiguousarray(np.asarray(leaf))
+    # `memoryview(...).cast("B")` refuses a view with a zero in its shape, so an EMPTY array took
+    # the whole `jno.fem(...)` build down with a TypeError raised from inside a CACHE KEY -- a
+    # failure with no relation to what the user did. Empty arrays are ordinary here: a region
+    # predicate that resolves to no nodes, an axis with no free coordinates, a design whose
+    # non-design mask covers everything. Shape and dtype already identify such an array uniquely;
+    # there are no bytes to hash, so hash none.
+    _blob = b"" if arr.size == 0 else memoryview(arr).cast("B")
     digest = (
         "arr",
         arr.dtype.str,
         arr.shape,
         extra,
-        _hashlib.blake2b(memoryview(arr).cast("B"), digest_size=16).digest(),
+        _hashlib.blake2b(_blob, digest_size=16).digest(),
     )
     _LEAF_DIGEST_CACHE[key] = (leaf, digest)
     while len(_LEAF_DIGEST_CACHE) > _LEAF_DIGEST_CACHE_MAX:
@@ -5027,7 +5288,7 @@ def _structure_token(obj, seen, renumber):
     return _leaf_content_token(obj, seen)
 
 
-def _fn_content_key(fn, chunk, seen=None, renumber=None):
+def _fn_content_key(fn, chunk, seen=None, renumber=None, path=()):
     """The CONTENT twin of :func:`_bake_fingerprint`: everything a jit of ``fn`` would bake, keyed by
     value -- recursing through nested functions (fresh objects per build, identical code and captures
     across rebuilds), containers walked canonically (see :func:`_structure_token`). ``None`` disables
@@ -5048,7 +5309,78 @@ def _fn_content_key(fn, chunk, seen=None, renumber=None):
     tok = _structure_token((captured, fn.__defaults__ or ()), seen, renumber)
     if tok is None:
         return None
-    return (fn.__code__, tok, chunk)
+    glob = _globals_token(fn, renumber, path + (id(fn),))
+    if glob is None:
+        return None
+    return (fn.__code__, tok, glob, chunk)
+
+
+def _global_names(code):
+    """The module-level names ``code`` may read: its ``co_names`` and those of every code object nested
+    in it (a lambda or comprehension inside the function reads the same globals). Attribute names are
+    in ``co_names`` too; only the ones that are also keys of ``__globals__`` count, and a spurious one
+    only makes the key stricter."""
+    names, stack = set(), [code]
+    while stack:
+        c = stack.pop()
+        names.update(c.co_names)
+        stack.extend(k for k in c.co_consts if hasattr(k, "co_names"))
+    return sorted(names)
+
+
+_LIBRARY_ROOTS = frozenset({"jno", "jax", "jaxlib", "numpy", "scipy", "equinox", "optax", "lineax", "optimistix"})
+
+
+def _is_library(obj):
+    return (getattr(obj, "__module__", None) or "").split(".")[0] in _LIBRARY_ROOTS
+
+
+def _globals_read(fn):
+    """``(name, value)`` for every module-level name ``fn``'s code reads -- for USER code only. A
+    function defined in jNO or a library it builds on is not redefined while a process runs, and its
+    globals are that library's internals (caches, registries), so they are left out of the key."""
+    if _is_library(fn):
+        return []
+    g = getattr(fn, "__globals__", None) or {}
+    return [(n, g[n]) for n in _global_names(fn.__code__) if n in g]
+
+
+def _globals_token(fn, renumber, path):
+    """Content token of the module-level values ``fn`` reads, or ``None`` (no content key).
+
+    A jit bakes a global's value at trace time exactly as it bakes a closure cell, so a sweep that
+    changes ``P = 10.0`` or redefines ``def source(x)`` between two builds is a different program. Keying
+    only the code, closure and defaults reused the first build's kernel for every later value: the
+    same solution each time, without a warning. Modules, classes and library functions are keyed by
+    name (stable within a process); a user function recurses into its own code, closure and globals.
+    ``path`` holds the functions above this one along global edges: a global naming one of them (a
+    recursive helper) is keyed by that position, its content is already in the key."""
+    import types as _types
+
+    parts = []
+    for name, val in _globals_read(fn):
+        if isinstance(val, _types.ModuleType):
+            t = ("module", val.__name__)
+        elif isinstance(val, type):
+            t = ("type", val.__module__, val.__qualname__)
+        elif isinstance(val, _types.FunctionType) and not _is_library(val):
+            if id(val) in path:
+                t = ("cycle", path.index(id(val)))
+            else:
+                sub = _fn_content_key(val, None, None, renumber, path)
+                t = None if sub is None else ("fn",) + sub
+        elif callable(val) and (_is_library(val) or getattr(val, "__module__", None) == "builtins"):
+            # a user callable that is not a plain function (a jitted wrapper, an instance) is not keyed
+            # by name: redefining it keeps the name, so it falls through and bails below
+            qual = getattr(val, "__qualname__", None) or getattr(val, "__name__", None)
+            mod = getattr(val, "__module__", None)
+            t = None if not (qual and mod) else ("callable", mod, qual)
+        else:
+            t = _structure_token(val, set(), renumber)
+        if t is None:
+            return None
+        parts.append((name, t))
+    return tuple(parts)
 
 
 def _baked_arrays(obj, seen=None):
@@ -5095,7 +5427,9 @@ def _bake_fingerprint(fn, chunk):
         captured = tuple(c.cell_contents for c in (fn.__closure__ or ()))
     except ValueError:  # a cell that is not filled yet (recursive closure)
         return None
-    baked = (captured, fn.__defaults__ or ())
+    # the module-level values the code reads are baked too (see `_globals_token`); by identity here, so
+    # a global rebound to a new value or a redefined function is a new key
+    baked = (captured, fn.__defaults__ or (), tuple(v for _, v in _globals_read(fn)))
     leaves, treedef = jax.tree_util.tree_flatten(baked)
     if any(isinstance(leaf, jax.core.Tracer) for leaf in leaves):
         return None
@@ -5111,14 +5445,18 @@ def _chunked_scatter(fn, xs, c, out, index):
     Nothing is padded. Padding used to concatenate a filler tail onto every input -- a full copy of each,
     the index block included: on a 24^3 P1/P1 Navier-Stokes tangent that was 81 MiB of index copies (the
     one-int32-per-raw-triplet scatter map) in the compiled march, for 7 filler cells. The overlap costs at
-    most one chunk of element work, which the filler tail cost too."""
+    most one chunk of element work, which the filler tail cost too.
+
+    Each chunk's element kernel is wrapped in ``jax.checkpoint``: under reverse mode a scan otherwise
+    stacks every chunk's residuals, so chunking bounded the FORWARD intermediates but not the
+    backward's. With the remat the backward holds one chunk's intermediates at a time."""
     n = xs[0].shape[0]
     nb = -(-n // c)
     if nb * c == n:
         blocks = tuple(x.reshape((nb, c) + x.shape[1:]) for x in xs) + (index.reshape((nb, c) + index.shape[1:]),)
 
         def body(acc, blk):
-            r = jax.vmap(fn)(*blk[:-1])
+            r = jax.vmap(jax.checkpoint(fn))(*blk[:-1])
             return acc.at[blk[-1].reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
         return jax.lax.scan(body, out, blocks)[0]
@@ -5129,7 +5467,7 @@ def _chunked_scatter(fn, xs, c, out, index):
         idx = jax.lax.dynamic_slice_in_dim(index, start, c)
         fresh = (start + jnp.arange(c)) >= i * c  # cells the previous chunk has not already added
         idx = jnp.where(fresh.reshape((c,) + (1,) * (idx.ndim - 1)), idx, out.shape[0])
-        r = jax.vmap(fn)(*blk)
+        r = jax.vmap(jax.checkpoint(fn))(*blk)
         return acc.at[idx.reshape(-1)].add(r.reshape(-1).astype(acc.dtype), mode="drop"), None
 
     return jax.lax.scan(body_slid, out, jnp.arange(nb))[0]
@@ -5205,7 +5543,7 @@ def elem_map(fn, xs, chunk, *, scatter=None):
         run, arrays = jax.vmap(fn), xs
     else:
         c = int(chunk)
-        run, arrays = (lambda *a: jax.lax.map(lambda z: fn(*z), a, batch_size=c)), xs
+        run, arrays = (lambda *a: jax.lax.map(jax.checkpoint(lambda z: fn(*z)), a, batch_size=c)), xs
 
     fp = _bake_fingerprint(fn, chunk)
     if fp is None:  # traced or unpinnable: jit anyway (inlined under a trace), just do not cache
@@ -5463,6 +5801,113 @@ def compress_plan(indices):
         ):
             _PLAN_CACHE.popitem(last=False)
     return plan
+
+
+#: Raw triplets per batch in :func:`compress_plan_blocks`: ~24 bytes each of transient (an int64 key, the
+#: sort scratch of one batch), so ~200 MB whatever the mesh size.
+_PLAN_BATCH = 8 << 20
+
+
+def _block_len(blk) -> int:
+    kind, r, c = blk
+    return int(r.shape[0]) * int(r.shape[1]) * int(c.shape[1]) if kind == "outer" else int(r.shape[0])
+
+
+def _block_keys(blk, stride: int, batch: int):
+    """The int64 keys ``row * stride + col`` of one block, in its raw (flattened) order, ``batch`` at a time."""
+    kind, r, c = blk
+    if kind == "flat":
+        for s in range(0, r.shape[0], batch):
+            k = r[s : s + batch].astype(np.int64)
+            k *= stride
+            k += c[s : s + batch]
+            yield k
+        return
+    per = max(1, int(r.shape[1]) * int(c.shape[1]))
+    cells = max(1, batch // per)
+    for s in range(0, r.shape[0], cells):
+        k = r[s : s + cells, :, None].astype(np.int64) * stride + c[s : s + cells, None, :]
+        yield k.reshape(-1)
+
+
+def compress_plan_blocks(blocks):
+    """:func:`compress_plan` of a pattern given as BLOCKS, without ever materialising the raw triplets.
+
+    ``blocks`` lists, in raw order, ``("outer", rows, cols)`` -- per cell, every ``rows[e, a]`` against every
+    ``cols[e, b]``, flattened in ``(e, a, b)`` order: an element block -- or ``("flat", rows, cols)``, plain
+    triplets. Returns the same ``(idx, inverse32, nse)`` as ``compress_plan`` of the concatenated triplets,
+    bit for bit: the sorted unique keys are built a batch at a time, and the inverse is a ``searchsorted``
+    of each batch into them, written straight into the int32 array that is the plan's only per-triplet
+    output. The raw pattern of a 3-D P1 vector problem is ~280 triplets per DOF, and building it whole --
+    rows, columns, their stack, a host copy, an int64 key, its argsort and sorted copy -- was ~43 bytes
+    each: 18 GB of host memory at 1.5M DOFs, the build's peak. Here the transient is one batch.
+
+    Memoized like :func:`compress_plan`, on the blocks' content."""
+    blocks = [(k, np.ascontiguousarray(r, dtype=np.int32), np.ascontiguousarray(c, dtype=np.int32)) for k, r, c in blocks]
+    total = sum(_block_len(b) for b in blocks)
+    if total == 0:
+        return None
+    h = _hashlib.blake2b(digest_size=16)
+    for kind, r, c in blocks:
+        h.update(kind.encode())
+        h.update(np.asarray(r.shape + c.shape, np.int64).tobytes())
+        h.update(memoryview(r).cast("B"))
+        h.update(memoryview(c).cast("B"))
+    key = ("blocks", h.digest(), total)
+    hit = _PLAN_CACHE.get(key)
+    if hit is not None:
+        _PLAN_CACHE.move_to_end(key)
+        return hit
+    stride = max(int(c.max()) for _k, r, c in blocks if r.size and c.size) + 1
+    uniq = np.zeros(0, np.int64)
+    pending, n_pending = [], 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            u = np.unique(k)
+            pending.append(u)
+            n_pending += u.shape[0]
+            # merge when the pending uniques outgrow what is merged: amortised O(nse log nse), bounded memory
+            if n_pending > max(_PLAN_BATCH, uniq.shape[0]):
+                uniq = np.unique(np.concatenate([uniq, *pending]))
+                pending, n_pending = [], 0
+    if pending:
+        uniq = np.unique(np.concatenate([uniq, *pending]))
+    del pending
+    inv32 = np.empty(total, np.int32)
+    off = 0
+    for b in blocks:
+        for k in _block_keys(b, stride, _PLAN_BATCH):
+            inv32[off : off + k.shape[0]] = np.searchsorted(uniq, k)
+            off += k.shape[0]
+    idx = np.empty((uniq.shape[0], 2), np.int32)
+    idx[:, 0] = uniq // stride
+    idx[:, 1] = uniq % stride
+    plan = (idx, inv32, int(uniq.shape[0]))
+    if plan[0].nbytes + plan[1].nbytes <= _PLAN_CACHE_MAX_BYTES:
+        _PLAN_CACHE[key] = plan
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX or (
+            len(_PLAN_CACHE) > 1 and sum(p[0].nbytes + p[1].nbytes for p in _PLAN_CACHE.values()) > _PLAN_CACHE_MAX_BYTES
+        ):
+            _PLAN_CACHE.popitem(last=False)
+    return plan
+
+
+def raw_pattern_from_blocks(blocks):
+    """The raw ``(n, 2)`` int32 triplet array the blocks stand for -- the uncompressed fallback only.
+
+    ``jnp``, so it also takes a TRACED block (a contact gap table inside a compiled march), which is exactly
+    when the host plan cannot be built and this fallback runs."""
+    rows, cols = [], []
+    for kind, r, c in blocks:
+        r, c = jnp.asarray(r).astype(jnp.int32), jnp.asarray(c).astype(jnp.int32)
+        if kind == "outer":
+            sh = (r.shape[0], r.shape[1], c.shape[1])
+            rows.append(jnp.broadcast_to(r[:, :, None], sh).reshape(-1))
+            cols.append(jnp.broadcast_to(c[:, None, :], sh).reshape(-1))
+        else:
+            rows.append(r.reshape(-1))
+            cols.append(c.reshape(-1))
+    return jnp.stack([jnp.concatenate(rows), jnp.concatenate(cols)], axis=1)
 
 
 def compress_eager(A):

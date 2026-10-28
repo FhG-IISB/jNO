@@ -198,7 +198,7 @@ problem repeats**.
     factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below
 
 ??? measured "`backend="cudss"` — NVIDIA cuDSS"
-    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's subspace iteration needs every sweep), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead
+    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's block Krylov sweep needs), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead
 
 ??? measured "`backend="pardiso"` — Intel MKL PARDISO"
     Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64
@@ -207,6 +207,40 @@ problem repeats**.
     Neither cuDSS nor PARDISO signals singularity through an exception or a NaN — both return a
     finite, plausible-looking vector. jNO checks (the refinement residual for cuDSS, the
     perturbed-pivot count for PARDISO) and **raises** instead.
+
+    Host **SuperLU** (`backend="host"`, and the default `lu()` / `newton(direct=True)` on the CPU, which
+    is JAX's `spsolve` calling scipy) fails in three different ways, depending on pivoting luck:
+
+    - it **aborts** ("failed to factorize matrix at line 413 in file …/dpanel_bmod.c", after a burst
+      of BLAS "On entry to DTRSV parameter number 6 had an illegal value" lines printed from C, which
+      jNO cannot suppress). `fem.solve` turns this into a `RuntimeError` naming a *singular /
+      structurally rank-deficient operator*, its size, SuperLU's own message and the same hints the
+      cuDSS error gives. Measured on a three-field u–p–s saddle with continuous P1 stress (a
+      known-incompatible space, singular by construction) at 3334 DOFs.
+    - `splu` (`backend="host"`) reports *Factor is exactly singular*. That is named the same way, with
+      the exact matrix size.
+    - JAX's `spsolve` answers an exactly singular matrix with **NaN**. The Newton verdict then reports
+      a *non-finite residual* and points at a singular tangent, not at `max_steps`.
+
+    The same form at 2582 DOFs or fewer factors **without complaint** and returns a finite answer
+    that is wrong in the null space. Nothing per-solve detects that, because detecting it would cost a
+    residual product on every solve. Inside a Newton solve the convergence verdict catches it only if
+    the wrong null-space component also stops the residual from falling. A consistent singular system
+    can still converge, with an arbitrary null-space component. Outside Newton, check `‖Ax − b‖`
+    yourself, or use cuDSS or PARDISO, which check.
+    Naming the error costs nothing on a successful solve, because it runs only on the failure path.
+
+### Forms that share an operator — one factorisation
+
+Several forms that differ only in their **load** — one per drive, load case, incident direction or
+sample — have the same operator. When one evaluation (a `jno.core` loss, a `crux.eval([...])` list) solves
+several of them with the same solver spec, jNO factorizes once: every member's system is assembled,
+the first member's matrix takes the whole block of right-hand sides, and each member gets its column
+back. cuDSS and PARDISO take the block in one call, for the forward solve and the adjoint alike; host
+SuperLU reuses its cached factorization. Nothing is passed to ask for it. Each column is still checked
+against its **own** member's matrix by the residual gate, so two forms that only looked alike raise
+instead of sharing a wrong factorization. Likewise, a solve (or an integral) that an expression refers to
+several times is evaluated once per evaluation.
 
 ### Batched solves and operator storage — `jno.setup(lu_stack=, matvec_format=)`
 
@@ -241,9 +275,9 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.fsai(power=…)` | factored sparse approximate inverse `M⁻¹ = GᵀG` — two sparse products, no triangular solves | **SPD only** — the rung between `jacobi` and multigrid, when the factor is reused ([below](#fsai-jnoprecondfsai)) |
 | `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `nullspace="rigid"` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
-| `jno.precond.amg(cycles=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; needs the optional `pyamg` |
+| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace="rigid"` for elasticity; needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
-| `.cached(refresh=…)` | reuse an expensive setup across solves | Newton loops and transients, where the operator barely changes between solves |
+| `reuse=` (on every spec) | keep an expensive setup across solves: `True` once, `k` every k-th solve | Newton loops, transients and optimisation loops, where the operator barely changes between solves |
 | `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
@@ -261,8 +295,9 @@ fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1))
 fem.solve(linear=jno.solve.fgmres(tol=1e-10),
           precond=jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30)))
 
-# reuse an expensive setup across a Newton loop or a march
-fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.amg(cycles=1).cached())
+# reuse an expensive setup across solves: build once, pass the SAME spec every time
+M = jno.precond.amg(nullspace="rigid", reuse=True)   # rigid-body modes for a displacement field
+fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
 
 # three more with the same shape, each needing something the others do not:
 jno.precond.gmg(n_pre=2, n_post=2)      # geometric MG — needs a STRUCTURED grid
@@ -366,16 +401,16 @@ inside `lax.scan` where every operator is traced — so it used to refuse every 
 now builds it once, before the scan, from the step tangent (a state-dependent mass `c(u) u_t` included).
 
 A frozen setup stays correct — a preconditioner changes convergence speed, never the answer — but goes
-stale when the operator moves. `cached(spec, refresh=k)` spells the cadence, and the march then runs as
+stale when the operator moves. `reuse=k` spells the cadence, and the march then runs as
 `ceil(n/k)` scans, re-composed against the carried state:
 
 ```python
 fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg())                      # frozen once
-fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.cached(jno.precond.amg(), refresh=25))
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.amg(reuse=25))
 ```
 
 Measured where a melt pool's coefficients move ~`1e13` between solid and molten: frozen once, the Krylov
-residual stalls at `2.9e-03`; at `refresh=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
+residual stalls at `2.9e-03`; at `reuse=25` it reaches `1.5e-04`. `theta()`/`exponential()` integrate
 the march themselves and are not chunked, so a cadence beside one raises rather than never firing.
 
 A frozen preconditioner is probed once and refused if it makes a random residual worse — but only when it
@@ -395,7 +430,7 @@ fem.solve(linear=jno.solve.fgmres(),
 ```
 
 For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
-so the velocity block AMG is built on is the Oseen operator. `cached(spec, refresh=k)` is **refused**
+so the velocity block AMG is built on is the Oseen operator. `reuse=k` is **refused**
 here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
 which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
 
@@ -600,10 +635,15 @@ such a menu are things you can write.
     `linear=jno.solve.amg()` (ONE AmgX crossing per solve, with warm structure-keyed re-setup measured
     ~10x cheaper on repeats).
 
-??? note "`.cached(refresh=…)`"
-    on any spec — reuse an expensive setup across solves: `False` frozen, `True`
-    rebuild on shape/sparsity change, an **int k** to rebuild every k-th materialization (the cadence
-    for a march whose operator values drift step by step), or a `ctx -> key` callable.
+??? note "`reuse=`"
+    on every spec — keep an expensive setup across solves, the keyword `lu` and `newton` use too: `False`
+    (default) rebuilds every solve, `True` builds on the first solve and keeps it (pass the SAME spec
+    object), an **int k** rebuilds every k-th solve (the cadence for a march whose operator values drift
+    step by step). A solve whose preconditioner is kept compiles once and is reused.
+
+    It replaces `jno.precond.cached(spec)` and `spec.cached()`: `cached(spec)` is `spec` with `reuse=True`,
+    `cached(spec, refresh=k)` is `reuse=k`. `refresh=True` (rebuild when the operator's sparsity changes) and
+    `refresh=callable` (a custom key) have no equivalent; a kept setup is rebuilt only by `reuse=k`.
 
     The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and the
     viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, 2014, §9.2):
@@ -687,7 +727,7 @@ sparsity pattern poisons the factor with NaN rather than applying a stale one.
     | `amg` | 48 ms | 52 ms | |
 
     The setup costs about one to two solves (101, 115, 530 ms there), so FSAI pays when the factor is
-    **reused**: a constant-operator march, `.cached()` across solves, several right-hand sides.
+    **reused**: a constant-operator march, `reuse=True` across solves, several right-hand sides.
     `power=2` grows the setup steeply (7.1 s on the P2 case, for 32 iterations) — start with `power=1`.
 
 ### Overlapping Schwarz — `jno.precond.schwarz()`
@@ -773,7 +813,7 @@ otherwise. Its `direct=` argument picks how each linear step is solved:
 | `direct=` | tangent | linear step |
 |---|---|---|
 | `None` *(default)* | **assembled** `J(u)` (a BCOO), wherever the assembler provides one | Jacobi-BiCGStab, or the `linear=`/`precond=` slots. The BiCGStab answer is verified (one SpMV) and re-solved with Jacobi-GMRES when its relative residual is not small |
-| `False` | **matrix-free** — `J·v` from a JVP, no tangent stored | BiCGStab, or the `linear=` slot |
+| `False` | **matrix-free** — `J·v` from a JVP, no tangent stored | Jacobi-BiCGStab, or the `linear=`/`precond=` slots. The Jacobi diagonal comes from a diagonal-only pass of the assembler, so `precond=jno.precond.jacobi()` works here too |
 | `True` | **assembled** | a sparse LU each step, or the `linear=` slot's direct solver (see *Sparse-direct Newton* below) |
 
 When each one falls back:
@@ -784,9 +824,31 @@ When each one falls back:
 - `direct=True` needs the assembled tangent and raises without one; an explicit matrix-free
   `nonlinear=` beside a direct `linear=` raises too.
 
-Because the default hands its linear step an assembled matrix, a `precond=` that needs one (`jacobi`)
-composes with it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit
-in memory. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
+Because the default hands its linear step an assembled matrix, a `precond=` that needs one composes with
+it; `direct=False` has no matrix and is the choice when the assembled tangent would not fit in memory. Its
+Jacobi preconditioner needs only the tangent's diagonal, which the assembler computes without the matrix:
+the same element loop, keeping each element block's diagonal entries (as deal.II's
+`MatrixFreeTools::compute_diagonal` does), so the memory is one vector. Each Newton step uses the diagonal
+at its own iterate. Each matrix-free step costs more than a sparse product (it re-runs the element kernel),
+so prefer the default while the tangent fits. All three modes are differentiable (implicit differentiation through `lax.custom_root`).
+
+**Each linear step is solved only as far as that step needs (inexact Newton).** On the assembled tangent
+and on the matrix-free path alike, a Krylov linear step (the default Jacobi-BiCGStab, or any of `cg`,
+`bicgstab`, `gmres`, `fgmres`, `minres`, `cocg` in the `linear=` slot) is asked for the Eisenstat–Walker
+forcing term (Eisenstat & Walker,
+*SIAM J. Sci. Comput.* 17 (1996) 16, choice 2) instead of its own `tol`: loose far from the root, tightening
+as Newton converges. The contract is unchanged — Newton stops on its own residual bound,
+`‖r‖ ≤ atol + rtol·‖r₀‖` — so the slot's `tol` no longer sets how far each step is solved. A direct linear
+step (`lu`, `dense`) is exact anyway, and a residual linear in the unknown keeps one exact step.
+
+A nonlinear root is therefore accurate to `atol + rtol·‖r₀‖` (default `1e-8` each) and no further: the last
+steps are no longer solved far past the bound the loop stops on. To compare a nonlinear solve below that —
+two routes to the same root, a convergence study — ask Newton for it:
+`fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12))`.
+
+```python
+fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace="rigid", reuse=True))  # forcing included
+```
 
 ### Picard / lagged coefficients — `jno.lag`
  When a solution-dependent coefficient's Newton tangent
@@ -1065,6 +1127,11 @@ tells the two apart, and guessing wrong would apply a preconditioner you did not
 need eager preparation (`form`, which assembles an auxiliary operator) require `fem.solve(precond=...)`
 — a direct call has no owning FEM.
 
+A direct call to a Krylov solver also takes `rtol=` for that one call, overriding the spec's `tol`
+(`jno.solve.cg()(A, b, rtol=1e-4)`) — how Newton passes its forcing term. `cg`, `bicgstab`, `gmres`,
+`fgmres`, `minres` and `cocg` accept it; the other solvers raise a `TypeError` that says to set the
+tolerance on the spec.
+
 `solve_fn=` is the level below that: instead of a *slot*, you take the assembled system and return
 the answer. jNO does nothing to it — no firewall, no convergence gate — so it is the escape hatch for
 a solver that fits none of the shapes above:
@@ -1124,9 +1191,8 @@ are logged as `WARNING: gmsh: …`.
 After any `fem.solve()`, `fem.stats` reports what happened
 without changing the solve's return: `mode`, `dofs`, `wall_s` (dispatch time — JAX is async; block on
 the result for compute time), the `linear`/`precond` slot reprs, `nonlinear` (driver, final residual
-norm against its bound, converged flag, and the step count where the driver runs its forward loop
-eagerly — `newton_direct` reports steps; the drivers whose loop lives inside `custom_root` report
-`None`), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
+norm against its bound, converged flag, and the step count — every driver reports it), `linear_iterations`
+(below), and `amgx_cache` occupancy when jaxamg served the solve. Populated on eager paths; a solve
 wrapped whole in `jit`/`vmap`/`grad` records the slots but no residuals — reporting needs a concrete
 value. The *convergence check* below is not so limited: it fires under a transform too.
 
@@ -1141,6 +1207,30 @@ fem.stats
 `solve_index` counts solves on the form (the first one includes tracing and compilation), and a solve
 that **raised** still writes `fem.stats`, with an `error` entry. It used to leave the previous solve's
 stats in place, and those would read as this solve's.
+
+### Krylov iterations — `fem.stats["linear_iterations"]`
+
+How many iterations each linear solve took — the number that says whether a preconditioner works:
+
+```python
+fem.solve(nonlinear=jno.solve.newton(direct=False))
+fem.stats["linear_iterations"]
+# {'solves': 4, 'iterations': [...], 'total': ..., 'max': ...,
+#  'by': ['the newton_krylov inner Jacobi-BiCGStab']}   # one count per Newton step
+```
+
+`iterations` lists each forward solve's count in the order they finished, and `transpose` the adjoint
+solves' when a gradient ran any. `breakdown: True` flags a BiCGStab that stopped on one. The default
+solve, `cg`, `bicgstab`, `minres`, `fgmres`, `cocg`, `chebyshev`, the matrix-free Newton's inner
+Jacobi-BiCGStab and the assembled-tangent Krylov all report. Upstream restarted `gmres` exposes no count and is
+listed under `uncounted`; a direct factorisation reports `None`. Counts are recorded for an eager,
+steady, non-adaptive solve. A march records none per step — its compiled step makes no host call, and
+`fem.stats["march"]` is its record — and neither does a deferred node evaluated later under `jno.core`.
+
+`cg` and `bicgstab` are `jax.scipy`'s own loops, keeping the iteration count they discard: the same
+arithmetic (`x` identical on CPU, within 1e-10 on GPU from reduction order) and the same time. The count
+reaches the host through one callback per solve, a fixed ~0.08 ms (CPU) / ~0.15 ms (GPU): +7–11 % on a
+790-DOF solve, unmeasurable at 46,691 DOFs.
 
 ### A march records every step — `fem.stats["march"]`
 
@@ -1439,8 +1529,10 @@ block layout for you. Its default solver stays **sparse-direct**, not the matrix
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 
-One exception keeps a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
-directly rather than the block, so the Re/Im legs are retained for it.
+Two exceptions keep a dedicated path: a **complex-native** preconditioner (`ams`) solves `A_r + i·A_i`
+directly rather than the block, so the Re/Im legs are retained for it; and `lu(backend="cudss")` on a
+complex-symmetric operator factors the `n×n` complex matrix with LDLᵀ inside the program instead of the
+real `2n` block.
 
 ??? note "Bloch (quasi-periodic) ties"
     A **Bloch** (quasi-periodic) tie fuses like everything else. Its complex prolongation `P` cannot

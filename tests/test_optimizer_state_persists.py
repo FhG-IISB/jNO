@@ -97,3 +97,23 @@ def test_changing_the_optimizer_reinitialises_rather_than_reusing():
     crux2 = jno.core([(u - 1.0).mse])
     crux2.solve(20)  # must not raise
     assert np.isfinite(float(np.asarray(crux2.eval([(u - 1.0).mse])[0]).ravel()[0]))
+
+
+def test_a_callback_that_stops_early_counts_only_the_epochs_run():
+    """`_total_epochs` is where a later solve's schedules continue from: a callback that stops a
+    10-epoch solve after 3 must leave it at 3, not 10, or the next solve skips 7 steps of its schedule."""
+    from jno.utils.adaptive.callbacks import Callback
+
+    class StopAt(Callback):
+        def on_epoch_end(self, *, epoch, **kwargs):
+            return epoch >= 2
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.35).domain()
+    x, y, _ = d.variable("interior", split=True)
+    net = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([(net(x, y).scalar - 1.0).mse])
+    crux.solve(10, callbacks=[StopAt()])
+    assert crux._total_epochs == 3
+    crux.solve(2)
+    assert crux._total_epochs == 5

@@ -65,19 +65,40 @@ _LINE = 1
 _POINT = 15  # 1-node point element (the boundary block of a 1-D domain)
 
 
-def _emit_node(node, occ, split_full=False):
+def _size_at(size, occ, dimtags):
+    """A shape's target size as a number: a callable ``f(x, y, z)`` is read at the centre of mass of the
+    first entity of ``dimtags``. ``None`` when no size applies."""
+    if size is None:
+        return None
+    if callable(size):
+        if not dimtags:
+            return None
+        return float(size(*occ.getCenterOfMass(*dimtags[0])))
+    return float(size)
+
+
+def _emit_node(node, occ, split_full=False, size=None, offset=None):
     """Recursively build the OCC entities for a plan node; return a list of dimtags.
 
     ``split_full`` builds a full (2pi) revolve as two fused half-sweeps -- used only as a retry
-    when the single-sweep periodic surface cannot be meshed (see :func:`build`).
+    when the single-sweep periodic surface cannot be meshed (see :func:`build`). ``size`` is the target
+    mesh size in force here (the nearest enclosing ``.size()``), which decides how an extrusion is meshed.
+    ``offset`` is a translation pushed down from enclosing ``translate`` nodes: applied to an extrusion's BASE
+    (moving an extruded solid afterwards drops gmsh's layered-mesh constraint; measured: a translated foil
+    meshed exactly like a free one), to anything else at the end.
     """
     kind = node[0]
+    if offset is not None and kind not in ("extrude", "translate"):
+        ent = _emit_node(node, occ, split_full, size)
+        occ.translate(ent, *offset)
+        return ent
+    sub = lambda sh: sh._size if sh._size is not None else size  # noqa: E731  -- the size a child inherits
     if kind == "leaf":
         return [node[1].build(occ)]
     if kind == "regions":
         pieces: List[tuple] = []
-        for _name, sub in node[1]:
-            pieces.extend(_emit_node(sub._node, occ, split_full))
+        for _name, part in node[1]:
+            pieces.extend(_emit_node(part._node, occ, split_full, sub(part)))
         # Fragment every piece against the others: shared interfaces become conforming
         # (element edges align), and each material region survives as its own volume entity.
         # `conforming=False` skips it, so each piece is meshed on its own and two touching regions
@@ -90,17 +111,34 @@ def _emit_node(node, occ, split_full=False):
         out, _ = occ.fragment(pieces[:1], pieces[1:])
         return out
     if kind in ("cut", "fuse", "inter"):
-        a = _emit_node(node[1]._node, occ, split_full)
-        b = _emit_node(node[2]._node, occ, split_full)
+        a = _emit_node(node[1]._node, occ, split_full, sub(node[1]))
+        b = _emit_node(node[2]._node, occ, split_full, sub(node[2]))
         op = {"cut": occ.cut, "fuse": occ.fuse, "inter": occ.intersect}[kind]
         out, _ = op(a, b)
         return out
     if kind == "extrude":
-        base = _emit_node(node[1]._node, occ, split_full)
-        ext = occ.extrude(base, 0.0, 0.0, node[2])
+        base = _emit_node(node[1]._node, occ, split_full, sub(node[1]))
+        if offset is not None:
+            occ.translate(base, *offset)
+        height = node[2]
+        h = _size_at(sub(node[1]), occ, base)
+        if h is not None and abs(height) < h:
+            # A THIN extrusion (a foil, a film, a PCB copper layer): isotropic tets at the in-plane size cannot
+            # fit through the thickness, so gmsh would either refine everything down to the thickness or emit
+            # slivers. One structured layer (prisms split into tets) keeps the in-plane size and the exact
+            # thickness. Measured on a 35 um copper layer at a 1.28 mm in-plane size:
+            # free meshing gave a worst aspect of 147.
+            from ..utils.logger import get_logger
+
+            get_logger().info(
+                f"jno.shape: extrusion {abs(height):.3g} thick at mesh size {h:.3g} -- meshed as one structured layer"
+            )
+            ext = occ.extrude(base, 0.0, 0.0, height, numElements=[1], recombine=False)
+        else:
+            ext = occ.extrude(base, 0.0, 0.0, height)
         return [dt for dt in ext if dt[0] == 3]
     if kind == "revolve":
-        base = _emit_node(node[1]._node, occ, split_full)
+        base = _emit_node(node[1]._node, occ, split_full, sub(node[1]))
         ap, ad, ang = node[2], node[3], node[4]
         if split_full and abs(ang - 2.0 * math.pi) < 1e-9:
             # A detached full solid of revolution makes a periodic surface gmsh cannot mesh;
@@ -113,22 +151,23 @@ def _emit_node(node, occ, split_full=False):
         rev = occ.revolve(base, *ap, *ad, ang)
         return [dt for dt in rev if dt[0] == 3]
     if kind == "translate":
-        ent = _emit_node(node[1]._node, occ, split_full)
-        occ.translate(ent, *node[2])
-        return ent
+        moved = tuple(
+            float(a) + float(b) for a, b in zip(offset or (0.0, 0.0, 0.0), tuple(node[2]) + (0.0,) * (3 - len(node[2])))
+        )
+        return _emit_node(node[1]._node, occ, split_full, sub(node[1]), moved)
     if kind == "rotate":
-        ent = _emit_node(node[1]._node, occ, split_full)
+        ent = _emit_node(node[1]._node, occ, split_full, sub(node[1]))
         occ.rotate(ent, *node[2], *node[3], node[4])
         return ent
     if kind == "sweep":
-        profile = _emit_node(node[1]._node, occ, split_full)  # [(2, tag)]
+        profile = _emit_node(node[1]._node, occ, split_full, sub(node[1]))  # [(2, tag)]
         wire = node[2]._wire(occ)
         pipe = occ.addPipe(profile, wire)
         return [dt for dt in pipe if dt[0] == 3]
     if kind == "fillet":
         import gmsh
 
-        vols = _emit_node(node[1]._node, occ, split_full)
+        vols = _emit_node(node[1]._node, occ, split_full, sub(node[1]))
         radius, where = node[2], node[3]
         occ.synchronize()  # incremental sync so we can query the solid's edges
         faces = gmsh.model.getBoundary(vols, combined=False, oriented=False, recursive=False)
@@ -688,7 +727,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
     gmsh.model.add(f"jno_shape_{next(_MODEL_SEQ)}")
     try:
         occ = gmsh.model.occ
-        _emit_node(shape._node, occ, split_full)
+        _emit_node(shape._node, occ, split_full, shape._size)
         occ.synchronize()
         dim = shape.dim
         leaves = shape.leaves()
@@ -801,7 +840,7 @@ def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
     gmsh.model.add(f"jno_tess_{next(_MODEL_SEQ)}")
     try:
         occ = gmsh.model.occ
-        _emit_node(shape._node, occ, split_full)
+        _emit_node(shape._node, occ, split_full, shape._size)
         occ.synchronize()
         dim = shape.dim
         labels = classify_boundary(dim, shape)

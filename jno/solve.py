@@ -30,6 +30,7 @@ import numpy as _np
 
 if TYPE_CHECKING:  # runtime import stays lazy inside remesh()/relocate()
     from .utils.solver.fem_adapt import AdaptSpec
+    from .utils.solver.hmatrix import HierarchicalSpec
     from .utils.solver.march_checkpoint import CheckpointSpec
 
 from .utils.solver.solver_api import (
@@ -55,10 +56,12 @@ __all__ = [
     "cocg",
     "chebyshev",
     "amg",
+    "hierarchical",
     "newton",
     "picard",
     "staggered",
     "eigs",
+    "contour",
     "logdet",
     "trace",
     "applyfun",
@@ -113,7 +116,16 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
 
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
-            the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
+            on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w
+            sigma``) it factors the ``n x n`` complex matrix with LDL^T inside the compiled program (no host
+            round trip; jit and grad run on the GPU) rather than LU on the real ``2n`` block. A REAL steady
+            linear form whose operator jNO can show symmetric (its bilinear terms are the same set with trial
+            and test swapped, its essential conditions eliminated symmetrically) is factored LDL^T inside the
+            program too; anything it cannot show symmetric stays on LU, through a host callback. A pattern
+            that is not symmetric stays on LU; values that are not (only checkable after the solve, under
+            a trace) fail the residual gate. Two solves of one form in one program get a factor slot each.
+            The in-program path compiles a small extension with ``nvcc`` on first use (cached afterwards).
+            It is the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
             the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
             survives a change of values. Measured on an RTX 3070 (fp64 at 1/64 rate -- the
             *unfavourable* card) against host SuperLU: factorization 3.4 ms vs 79.9 ms on a
@@ -179,6 +191,20 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             "cudss": cudss_lu_solve,
             "pardiso": pardiso_lu_solve,
         }[backend]
+        if op.bcoo is not None and backend == "cudss" and getattr(op, "solver_context", None):
+            # A fused COMPLEX form ([[R, -I], [I, R]]) with a symmetric R + jI: factor the n x n complex
+            # symmetric matrix (LDL^T) inside the compiled program instead of LU on the real 2n block through
+            # a host callback. A REAL form whose operator is provably symmetric (the weak form is, and there are
+            # no essential-BC rows -- `operator_key.symmetric_operator`): LDL^T inside the program too, so no host
+            # round trip and the adjoint reuses the factors. None where it does not apply (no GPU extension, a
+            # non-symmetric pattern): LU below.
+            ctx = op.solver_context
+            if ctx.get("complex_n") is not None or ctx.get("symmetric"):
+                from .utils.solver.linear import cudss_ldl_solve
+
+                x = cudss_ldl_solve(op.bcoo, b, ctx)
+                if x is not None:
+                    return x
         if op.bcoo is not None:
             # Only the opted-in case changes the call: `reuse=True` is the long-standing behaviour and
             # keeps the long-standing two-argument convention, so nothing that wraps or stubs
@@ -209,7 +235,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
     # reported (or cached) as though they were the same solver
     name = {"device": "lu", "host": "lu-host", "cudss": "lu-cudss", "pardiso": "lu-pardiso"}[backend]
     # `multi_rhs` lets a caller holding a BLOCK of right-hand sides (the shift-invert eigensolver's
-    # subspace iteration) hand the whole block over in one call instead of looping its columns.
+    # block Krylov sweep) hand the whole block over in one call instead of looping its columns.
     # `host_kernel` names the numpy-level solve this spec corresponds to, for the callers that run
     # on the host and cannot go back through JAX -- notably ARPACK's shift-invert OPinv in the
     # non-symmetric eigensolver. "device" has none: it IS a JAX primitive.
@@ -217,6 +243,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         "vmap": "yes",
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
+        "solver_context": backend == "cudss",
     }
     return LinearSolver(_fn, name=name, direct=True, traits=traits)
 
@@ -235,13 +262,14 @@ def dense() -> LinearSolver:
 
 
 def _unit_scaled(M, b):
-    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for ``jax.scipy.sparse.linalg.gmres``.
+    """``M`` rescaled so that ``‖M b‖ = ‖b‖``, for a left-preconditioned GMRES.
 
-    JAX's GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below ``tol·‖b‖``, an
-    UNpreconditioned norm. A preconditioner far from unit scale moves that test by its scale: with Jacobi
-    on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of 1.5e-4 read as 7.5e-9
-    and was returned without a single iteration. A constant multiple of ``M`` leaves the Krylov iterates
-    unchanged and puts both norms on the same scale, so ``tol`` means what it says."""
+    Left-preconditioned GMRES stops when the PRECONDITIONED residual ``‖M(b − Ax)‖`` falls below
+    ``tol·‖b‖``, an UNpreconditioned norm. A preconditioner far from unit scale moves that test by its
+    scale: with Jacobi on rows of size ~2e4 (a Newmark wave step), a warm start at a true residual of
+    1.5e-4 read as 7.5e-9 and was returned without a single iteration. A constant multiple of ``M``
+    leaves the Krylov iterates unchanged and puts both norms on the same scale, so ``tol`` means what
+    it says."""
     Mb = jnp.linalg.norm(M(b))
     scale = jnp.where(Mb > 0, jnp.linalg.norm(b) / jnp.where(Mb > 0, Mb, 1.0), 1.0)
     return lambda r: scale * M(r)
@@ -254,25 +282,62 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
     # lets a non-symmetric preconditioner be transposed for it (see `_firewalled`). The extra
     # `custom_linear_solve` costs nothing: the outer one intercepts differentiation, so the inner is
     # never transposed.
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
+        tol_ = tol if rtol is None else rtol  # a per-call tolerance (traced allowed) replaces the spec's
         if name == "cg" and (getattr(M, "low_precision", False) or getattr(M, "nonsymmetric", False)):
             # A float32 preconditioner is only approximately symmetric: standard CG's beta then loses
             # conjugacy and was measured stopping at a TRUE residual of 6e-6 against a requested 1e-8
             # (float32 FSAI, 3-D elasticity), silently. Flexible CG is robust to that at no extra products.
             from .utils.solver.krylov import flexible_cg
 
-            raw = lambda mv, rhs, M, x0: flexible_cg(mv, rhs, M=M, x0=x0, tol=tol, atol=atol, maxiter=maxiter or 20_000)  # noqa: E731
+            raw = _counting(
+                lambda mv, rhs, M, x0: flexible_cg(
+                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, maxiter=maxiter or 20_000, return_iters=True
+                ),
+                "jno.solve.cg (flexible)",
+            )
+        elif name in ("cg", "bicgstab"):
+            # jax.scipy's own loops, keeping the iteration count they discard (fem.stats, #104).
+            from .utils.solver.krylov import bicgstab_counted, cg_counted
+
+            method = cg_counted if name == "cg" else bicgstab_counted
+            raw = _counting(
+                lambda mv, rhs, M, x0: method(mv, rhs, x0=x0, tol=tol_, atol=atol, maxiter=maxiter, M=M),
+                f"jno.solve.{name}",
+            )
+        elif name == "gmres":
+            # Ours, not jax's: jax's batched GMRES finishes every restart cycle whatever the residual
+            # (30 preconditioner applies where 3 suffice, under a multigrid M), and its incremental one
+            # reads a loop predicate back to the host several times per step, which on a GPU drains
+            # the stream each time. `gmres_chunked` checks every few steps. Left-preconditioned with
+            # M rescaled, so it stops on the same quantity jax's did and `tol` keeps its meaning.
+            from .utils.solver.krylov import gmres_chunked
+            from .utils.solver.solver_api import record_iterations
+
+            restart = fixed["restart"]
+
+            def raw(mv, rhs, M, x0, _side="forward"):
+                if M is not None:
+                    M = _unit_scaled(M, rhs)
+                # `maxiter` counts restart cycles, as it does for jax's (whose default is 10 n of them)
+                cycles = maxiter if maxiter is not None else 10 * rhs.shape[0]
+                record_iterations(None, f"jno.solve.{name}", side=_side)
+                return gmres_chunked(
+                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, restart=restart, maxiter=cycles * restart, side="left"
+                )
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
+            from .utils.solver.solver_api import record_iterations
 
-            method = _scaled_gmres if name == "gmres" else getattr(jax.scipy.sparse.linalg, name)
-
-            def raw(mv, rhs, M, x0):
-                if name == "gmres" and M is not None:
+            def raw(mv, rhs, M, x0, _side="forward"):
+                if M is not None:
                     M = _unit_scaled(M, rhs)
-                return method(mv, rhs, x0=x0, tol=tol, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
+                # Upstream restarted GMRES exposes no count; say so in fem.stats rather than omit it.
+                record_iterations(None, f"jno.solve.{name}", side=_side)
+                return _scaled_gmres(mv, rhs, x0=x0, tol=tol_, atol=atol, maxiter=maxiter, M=M, **fixed)[0]
 
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name)
+        gate = None if atol or rtol is not None else tol
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=(name == "cg"), name=name, tol=gate)
 
     # `key` must name every argument that changes the iteration -- see LinearSolver. `fixed` is
     # per-method extra configuration (GMRES's restart), so it goes in sorted rather than by position.
@@ -281,6 +346,7 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
         name=name,
         key=(tol, atol, maxiter, tuple(sorted(fixed.items()))),
         settings=dict(tol=tol, atol=atol, maxiter=maxiter, **fixed),
+        accepts_rtol=True,
     )
 
 
@@ -299,14 +365,39 @@ def bicgstab(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = 2
 
 
 def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None, restart: int = 30) -> LinearSolver:
-    """Restarted GMRES (``jax.scipy.sparse.linalg.gmres``) -- non-symmetric systems where
-    BiCGStab's erratic convergence hurts; memory grows with ``restart``. For an *iterative*
+    """Restarted GMRES (:func:`jno.utils.solver.krylov.gmres_chunked`) --
+    non-symmetric systems where BiCGStab's erratic convergence hurts; memory grows with ``restart``.
+    Stops on the preconditioned residual, as JAX's GMRES does. For an *iterative*
     (e.g. multigrid-with-tolerance) preconditioner a flexible variant (FGMRES) is required --
     planned; see ``plans/fem-solver-api.md``."""
-    return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
+    return _krylov("gmres", tol, atol, maxiter, restart=restart)
 
 
-def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):
+def _raw_on(raw, mv, rhs, M, x0, side):
+    """Call a raw iteration, labelled with the side it solves when it records (:func:`_counting`); a raw
+    handed to :func:`_firewalled` from elsewhere takes no label."""
+    import inspect
+
+    if "_side" in inspect.signature(raw).parameters:
+        return raw(mv, rhs, M=M, x0=x0, _side=side)
+    return raw(mv, rhs, M=M, x0=x0)
+
+
+def _counting(counted, who: str):
+    """A raw ``(mv, rhs, M, x0) -> x`` iteration from one returning ``(x, k[, broke])``, recording ``k`` for
+    ``fem.stats`` (#104). ``_side`` tells the firewall's transpose solve apart from the forward one."""
+
+    def raw(mv, rhs, M, x0, _side="forward"):
+        from .utils.solver.solver_api import record_iterations
+
+        out = counted(mv, rhs, M, x0)
+        record_iterations(out[1], who, side=_side, broke=out[2] if len(out) > 2 else None)
+        return out[0]
+
+    return raw
+
+
+def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str, tol=None):
     """Run a raw (non-differentiable) iteration inside ``lax.custom_linear_solve``.
 
     The differentiability firewall: gradients w.r.t. ``b`` and anything the matvec closes over
@@ -315,11 +406,19 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
     only affects convergence speed, never the converged solution).
     """
-    from .utils.solver.solver_api import residual_gate
+    from .utils.solver.solver_api import gate_rtol_for, residual_gate
 
-    fwd = lambda _mv, rhs: residual_gate(op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward")
+    # the gate follows the tolerance the solve was asked for (gate_rtol_for): a fixed 1e-4 gate let a
+    # solve asked for 1e-8 stop on its step cap at 1.8e-5 and return a 1.7 %-wrong answer without a word
+    g = gate_rtol_for(tol)
+    fwd = lambda _mv, rhs: residual_gate(
+        op.mv, rhs, raw(op.mv, rhs, M=M, x0=x0), f"jno.solve.{name}", side="forward", rtol=g
+    )
     if symmetric:
-        rev = fwd
+        # custom_linear_solve runs the SAME solve for the transpose; label it as such in fem.stats.
+        rev = lambda _mv, rhs: residual_gate(  # noqa: E731
+            op.mv, rhs, _raw_on(raw, op.mv, rhs, M, x0, "transpose"), f"jno.solve.{name}", side="transpose", rtol=g
+        )
     else:
         # The reverse pass solves A^T y = v and MUST be preconditioned by M^T, not M: a
         # preconditioner never changes the converged solution, but for a non-symmetric M
@@ -334,7 +433,7 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
         # no-op under tracers besides. A Krylov iteration that leaves on its step cap returns its last
         # iterate silently, so a broken adjoint arrived as a perfectly plausible gradient.
         rev = lambda _mv, rhs: residual_gate(
-            op.T.mv, rhs, raw(op.T.mv, rhs, M=M_T, x0=None), f"jno.solve.{name}", side="transpose"
+            op.T.mv, rhs, _raw_on(raw, op.T.mv, rhs, M_T, None, "transpose"), f"jno.solve.{name}", side="transpose", rtol=g
         )
     return jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
 
@@ -346,13 +445,17 @@ def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> Line
     recipe with inexact inner solves), which plain GMRES's fixed-``M`` assumption forbids.
     Memory: two ``(restart, n)`` bases."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import fgmres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter)
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
+        tol_ = tol if rtol is None else rtol
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, restart=restart, maxiter=maxiter, return_iters=True),
+            "jno.solve.fgmres",
+        )
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter))
+    return LinearSolver(_fn, name="fgmres", key=(tol, restart, maxiter), accepts_rtol=True)
 
 
 def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -362,13 +465,17 @@ def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     erratic; ``O(1)`` memory where GMRES grows with ``restart``. The preconditioner must be
     symmetric positive definite even when ``A`` is indefinite."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import minres as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
+        tol_ = tol if rtol is None else rtol
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, maxiter=maxiter, return_iters=True),
+            "jno.solve.minres",
+        )
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
+    return LinearSolver(_fn, name="minres", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter), accepts_rtol=True)
 
 
 def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
@@ -384,15 +491,19 @@ def cocg(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
     ``fgmres``. Unlike CG on an SPD matrix, COCG can break down (the bilinear form is indefinite);
     it then returns its last iterate and the residual guard raises."""
 
-    def _fn(op: LinearOperator, b, *, M, x0):
+    def _fn(op: LinearOperator, b, *, M, x0, rtol=None):
         from .utils.solver.krylov import cocg as _raw
 
-        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        tol_ = tol if rtol is None else rtol
+        raw = _counting(
+            lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol_, maxiter=maxiter, return_iters=True),
+            "jno.solve.cocg",
+        )
         # symmetric=True means A == A^T, which is exactly COCG's precondition — so
         # lax.custom_linear_solve reuses the forward solve for the transpose (adjoint) solve.
-        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg")
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="cocg", tol=tol if rtol is None else None)
 
-    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter))
+    return LinearSolver(_fn, name="cocg", key=(tol, maxiter), settings=dict(tol=tol, maxiter=maxiter), accepts_rtol=True)
 
 
 def chebyshev(
@@ -430,7 +541,12 @@ def chebyshev(
             safety=safety,
             lmin_ratio=lmin_ratio,
         )
-        raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        raw = _counting(
+            lambda mv, rhs, M, x0: chebyshev_iteration(
+                mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter, return_iters=True
+            ),
+            "jno.solve.chebyshev",
+        )
         return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
 
     # `jit: False` -- `spectrum_bounds` measures the spectrum and then branches on what it measured
@@ -588,6 +704,8 @@ def _root_driver(
             inner_tol=inner_tol,
             inner_maxit=inner_maxit,
             linear_solve=linear_solve,
+            # the assembler's diagonal-only pass, when it offers one: Jacobi without the matrix
+            jacobian_diag=getattr(jacobian, "diag", None),
             damping=damping,
             line_search=line_search,
             ls_max=ls_max,
@@ -639,15 +757,24 @@ def newton(
       3-D P1 ``-div((1+u^2) grad u)`` problem (RTX 3070): 2.3-3.4x faster than the matrix-free Newton at
       10k-87k DOF, same root. A problem with no assembled tangent (a residual-only operator) falls back to
       the matrix-free mode automatically.
-    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default BiCGStab,
-      or the ``linear=`` slot). No tangent is ever stored, so it is the choice when the assembled tangent
-      would not fit in memory. The previous default.
+    * **``direct=False`` (matrix-free)** -- ``J @ v`` from a JVP, inner matrix-free solve (default
+      Jacobi-BiCGStab, its diagonal from a diagonal-only pass of the assembler; or the ``linear=`` /
+      ``precond=`` slots, ``precond=jno.precond.jacobi()`` included). No tangent is ever stored, so it is the
+      choice when the assembled tangent would not fit in memory. The previous default.
     * **``direct=True`` (sparse-direct)** -- factorize the ASSEMBLED tangent each step with a sparse LU
       (or the ``linear=`` slot's direct solver). Robust on **indefinite / ill-conditioned** systems -- a
       Taylor-Hood velocity/pressure saddle, a stiff Carman-Kozeny phase-change drag -- where an iterative
       inner solve has no saddle-point preconditioner and stalls.
 
     All three are differentiable (implicit differentiation via ``lax.custom_root``).
+
+    **Inexact steps.** With an iterative linear step (the default Jacobi-BiCGStab, or ``cg``/``bicgstab``/
+    ``gmres``/``fgmres``/``minres``/``cocg`` in ``linear=``), on the assembled and the matrix-free path alike,
+    each step is solved to the Eisenstat-Walker forcing term (choice 2), not to ``inner_tol`` or the slot's
+    ``tol``. Newton still stops on its own residual, ``||r|| <= atol + rtol * ||r0||``, so the root is that
+    accurate and no more: ask for ``rtol``/``atol`` below the default to compare a solve tighter than 1e-8.
+    ``inner_tol`` applies where steps are exact -- a residual linear in the unknown, a direct linear step.
+
     ``damping < 1`` relaxes each update; ``line_search=True`` adds residual-norm Armijo backtracking (up
     to ``ls_max`` halvings, constant ``ls_c``) so a stiff problem converges without hand-tuning.
 
@@ -1003,6 +1130,70 @@ def staggered(
     return spec
 
 
+class _Contour:
+    """Spec for the contour-integral eigensolver; see :func:`contour`."""
+
+    __slots__ = ("centre", "radius", "points", "probes", "rank", "tol", "maxiter", "seed")
+
+    def __init__(self, centre, radius, points, probes, rank, tol, maxiter, seed):
+        self.centre, self.radius, self.points = complex(centre), float(radius), int(points)
+        self.probes, self.rank = probes, rank
+        self.tol, self.maxiter, self.seed = float(tol), int(maxiter), int(seed)
+
+    def __repr__(self):
+        return f"jno.solve.contour(centre={self.centre}, radius={self.radius}, points={self.points}, rank={self.rank})"
+
+
+def contour(
+    *,
+    centre,
+    radius,
+    points: int = 48,
+    probes: int | None = None,
+    rank: int | None = None,
+    tol: float = 1e-11,
+    maxiter: int = 1500,
+    seed: int = 0,
+) -> _Contour:
+    """Ask for every eigenvalue **inside a circle in the complex plane** — Beyn's contour-integral
+    method — instead of "the k smallest".
+
+    ``fem.eigs(mass=[...], contour=jno.solve.contour(centre=10.0, radius=8.0))``
+
+    That is the question a band structure or a resonance search actually asks, and answering it this
+    way buys three things the Krylov paths cannot give:
+
+    * **Differentiable, eigenVECTORS included.** The method is ``points`` shifted linear solves, an
+      SVD and one small dense eigenproblem — all pure JAX — so ``jax.grad`` flows through the modes,
+      not just the eigenvalues. A mode-shape objective (radiative Q, mode volume, field overlap)
+      differentiates here; on the Arnoldi path it returns NaN by construction.
+    * **Non-Hermitian and even NONLINEAR pencils are native.** ``centre``/``radius`` name a region;
+      whatever is inside comes back. A frequency-dependent material needs no auxiliary field and no
+      polynomial linearisation — measured on a Lorentz slab, the dispersive problem solved directly
+      at half the system size and 3e-14 relative accuracy.
+    * **The shifted solves are independent**, so they ``vmap``; the work is ``points x probes``
+      matrix-free solves rather than one long serial iteration.
+
+    ``points`` sets the accuracy (trapezoid on a circle is spectrally accurate, so digits come
+    quickly). ``probes`` is the size of the random probing block and must EXCEED the number of
+    eigenvalues inside — saturation is detected and raises rather than returning a wrong answer.
+    ``rank`` defaults to reading the singular-value gap, which is correct but data-dependent; pass it
+    explicitly when differentiating, and prefer **one more than the number of eigenvalues inside**
+    (measured: one spare is exact and differentiable, two spare still gives the right values but
+    breaks the gradient by differentiating the SVD through numerically-zero singular values).
+    """
+    if radius <= 0:
+        raise ValueError(f"jno.solve.contour: radius must be positive, got {radius}.")
+    if points < 8:
+        raise ValueError(f"jno.solve.contour: points={points} is too few for the quadrature (>= 8).")
+    if probes is not None and rank is not None and probes <= rank:
+        raise ValueError(
+            f"jno.solve.contour: probes={probes} must exceed rank={rank} — the probing block has to "
+            f"be wider than the invariant subspace it is sampling, or saturation cannot be detected."
+        )
+    return _Contour(centre, radius, points, probes, rank, tol, maxiter, seed)
+
+
 def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):
     """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
     ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
@@ -1033,9 +1224,11 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
     transformation is its own preconditioner. The Rayleigh-Ritz runs in the **M-inner product**, so the
     consistent (non-lumped) mass matrix of an ordinary FEM form is handled directly. ``tol``/``maxiter``
     tune the iterative paths (defaults ``1e-6`` / ``200``) and are rejected on the dense path, so a
-    tolerance can never be silently ignored. If the budget is exhausted before ``tol`` — or a shift
-    lands on an eigenvalue and the inner factorization degenerates — the result is **NaN-poisoned**
-    rather than silently under-converged — jNO never fails silently.
+    tolerance can never be silently ignored. If the budget is exhausted before ``tol`` the LOBPCG
+    result is **NaN-poisoned** rather than silently under-converged. The shift-invert path **raises**
+    ``ShiftInvertNotConverged`` (from :mod:`jno.utils.solver.eigen`, a ``RuntimeError``) instead -- for
+    an exhausted budget, and for a shift on an eigenvalue whose inner factorization degenerates -- and
+    NaN-poisons only under ``jit``/``vmap``, where nothing can be raised. jNO never fails silently.
 
     **Differentiable** on both paths: ``∂λ/∂θ`` for **simple** eigenvalues (degenerate/crossing
     eigenvalues make the derivative ill-defined — use the trace of the cluster). The dense path
@@ -1210,29 +1403,44 @@ def checkpoint(
     keep: str = "last",
     resume: bool = True,
 ) -> CheckpointSpec:
-    """**Checkpoint a moving-mesh march** to disk: ``fem.solve(adapt=..., checkpoint=...)``.
+    """**Checkpoint a march** to disk: ``fem.solve(checkpoint=...)``.
 
     A march holds every frame in memory and returns them only when ``solve()`` returns, so a run
     that dies -- OOM, a kill, a power cut -- yields **nothing**, however far it got. This writes
     frames to ``path`` as they are produced and records what the march needs to restart, so a dead
-    run costs the last partial chunk instead of everything.
+    run costs the last partial chunk instead of everything. Three marches write themselves down:
 
-    The restart is not new machinery: a topology rebuild already re-enters the march with
-    ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``. That tuple is the
-    checkpoint; this only writes it down.
+    - a **transient** (``u.t``) march, with a built-in scheme -- the default theta, or ``time=``
+      ``theta`` / ``bdf2`` / ``sdirk`` / ``rosenbrock`` / ``exponential``;
+    - a **load-path** march (``.i(k)`` with ``domain(tau=...)``), on its fixed grid or an explicit
+      ``tau=<schedule>``;
+    - a **moving mesh** (a geometry term) with ``adapt=jno.solve.remesh(...)``. Its restart is the
+      tuple a topology rebuild already re-enters the march with,
+      ``{"start", "old": (points, cells, state, layout), "budget", "carry"}``.
 
-    ``every`` -- steps between writes. A write also happens at every rebuild, which is where the
+    The fixed-mesh marches (transient, load path) are compiled loops, and checkpointing runs them as a
+    host loop of compiled chunks of ``every`` steps instead. The arithmetic is the same -- the transient
+    trajectory is bit-identical on CPU and within 1 ulp on GPU, the load path agrees to round-off (2.8e-17) -- but a chain of
+    scans is not one scan, so **a checkpointed march cannot be differentiated**: under ``jit`` / ``grad`` /
+    ``jno.core`` it raises. Checkpoint the forward run (``fem.solve(<param>=value, checkpoint=...)``) and
+    differentiate without it. (Unrelated to ``jax.checkpoint``, which is gradient rematerialisation.)
+
+    Every other solve refuses ``checkpoint=`` rather than accept it and write nothing: a steady solve, an
+    adaptive time step, a sharded or ``solve_fn=`` integrator, adaptive / arc-length / contact load
+    stepping, and a fixed-mesh ``adapt=``.
+
+    ``every`` -- steps between writes. A moving mesh also writes at every rebuild, which is where the
     field layout changes and therefore where a restart has to begin anyway.
 
-    ``keep`` -- ``"last"`` (default) flushes each chunk and **drops it from memory**; the returned
-    trajectory loads frames from disk on demand, so a march no longer has to fit in RAM. ``"all"``
-    keeps everything resident as before, and checkpoints purely for crash-resilience.
+    ``keep`` -- ``"last"`` (default) **drops written frames from memory**: a moving mesh's trajectory
+    loads them from disk on demand, and a fixed-mesh march returns its frames as a ``numpy.memmap`` of
+    ``<path>/frames.npy``. ``"all"`` keeps everything resident, and checkpoints purely for
+    crash-resilience.
 
-    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over.
-    A finished run (``complete`` in its manifest) is never resumed; delete the directory to redo it.
-
-    Note this is about the TRAJECTORY, not the solver's working set: per-step memory is already flat
-    (measured: 752 steps added 2 MB). What grows a long adaptive march is the rebuild path.
+    ``resume`` -- when ``path`` holds an unfinished run, continue it instead of starting over. A finished
+    run (``complete`` in its manifest) is never resumed; delete the directory to redo it. A fixed-mesh
+    store records what identifies its march (grid, sizes, scheme, initial state, parameters, operators),
+    and resuming a DIFFERENT march into it raises instead of splicing the two together.
 
     Example::
 
@@ -1241,6 +1449,7 @@ def checkpoint(
             adapt=jno.solve.remesh(alpha=1.2, every=1),
             checkpoint=jno.solve.checkpoint("runs/ball", every=500),
         )
+        u = fem_heat.solve(checkpoint=jno.solve.checkpoint("runs/heat", every=200)).fn()  # transient
 
     Returns:
         CheckpointSpec: pass as ``fem.solve(checkpoint=...)``.
@@ -1499,17 +1708,21 @@ def relocate(
 
         - ``"equidistribution"`` (default) equidistributes an **arclength monitor** — it targets *resolution*,
           and wins where a feature is under-resolved or moving.
-        - ``"energy"`` descends the **FE Dirichlet energy**, and it is the error norm **only on a
-          SOURCE-FREE problem**. The Ritz functional is ``J(v) = 1/2 a(v,v) - (f,v)``, and it is ``J`` that
-          satisfies ``J_h - J_exact = 1/2 ||u - u_h||_E^2``. With no body load ``J = E``, so descending the
-          energy descends the error -- that is the L-shape column below. Add a source and ``J_h = -E_h`` at
-          the discrete solution, so minimising the error means **maximising** ``E``: descending it walks
-          away from the solution, and squashing elements is the cheapest way to lower ``∫|∇u|²``. Measured
-          on an L-shape driven by a compact bump: the optimiser duly cut ``E`` from 0.12252 to 0.10788
-          while the true error ROSE 3.6x and the mesh's smallest angle collapsed 40.8° -> 3.2°. Until this
-          is fixed, use the default on any problem carrying a source or reaction term. For a Ritz method
-          ``E_h - E_exact = 1/2 ||u - u_h||_E^2`` (source-free), so there the energy *is* the error norm and
-          descending it minimises the error directly.
+        - ``"energy"`` descends the **Ritz functional** ``J(u_h) = 1/2 a(u_h, u_h) - l(u_h)`` of the form's own
+          weak terms. Galerkin orthogonality makes ``J(u_h) - J(u) = 1/2 ||u - u_h||_E^2``, so lowering it lowers
+          the **energy-norm error** directly. With no load it is the Dirichlet energy (up to the factor 2).
+          Measured on ``-lap u = 1`` on an L-shape: the error fell to 0.76x at fixed DOFs, where the default
+          raised it to 1.31x. (It used to descend ``a(u_h, u_h)`` whatever the load; with a source that is
+          ``-2 J``, and it made the same error 6x WORSE -- #114.) It exists only for a **linear, symmetric,
+          single-field steady** form and is refused by name otherwise (nonlinear, transient, complex,
+          coupled/saddle, advective).
+
+          **Integrate the load accurately.** ``J`` is the DISCRETE functional, with the load at the form's
+          quadrature, and moving vertices changes that quadrature's error too. On a smooth bump source at the
+          default degree the descent lowered ``J`` by inflating the quadrated load, and landed ABOVE the
+          converged energy -- an "improvement" that was a quadrature artifact. ``jno.fem(..., quad_degree=4)``
+          removed it (error 0.70x, measured; 8 gives the same). A load the quadrature integrates exactly
+          (constant / polynomial of the right degree) is safe at any degree.
         - ``"huang"`` is Huang's equidistribution–alignment functional (see :class:`AdaptSpec`).
 
         **Or a weak-form expression**, when the mesh has a job the three functionals cannot state. They are
@@ -2147,3 +2360,54 @@ def contact(*, capture: float | None = None, rounds: int = 12, tol: float = 1e-4
     return ContactSpec(
         capture=None if capture is None else float(capture), rounds=int(rounds), tol=float(tol), relax=float(relax)
     )
+
+
+def hierarchical(*, tol: float = 1e-6, leaf: int = 64, eta: float = 2.0, floor: int = 2000) -> "HierarchicalSpec":
+    """**Hierarchical (H-matrix) compression** of an integral-equation operator, for `jno.peec`.
+
+    PEEC is fast only on a uniform lattice: identical bars on a regular grid make the partial
+    inductance block-Toeplitz, so an FFT applies it in ``O(N log N)``. Anything else -- a bond wire
+    welded to a trace layer, two parts at different pitches, a locally refined mesh -- has no such
+    structure and is formed **densely**. That is why welding is expensive: a 6,806-bar lattice solves
+    in 0.213 s and adding one 19-filament wire takes it to 33.4 s, and a 12,000-element module
+    allocated 2.7 GB to build a 46 MB coupling block.
+
+    This compresses those blocks instead. Clusters that are far apart compared to their own size
+    couple through a numerically low-rank block, found by ACA from sampled rows and columns::
+
+        emag = jno.peec([v(*at("A")) - v(*at("B")) - 1.0], freq=1e6)
+        sol = emag.solve(operator=jno.solve.hierarchical(tol=1e-6))
+
+    **Opt-in, and exact without it.** The default path is unchanged, so this changes no existing
+    answer; ask for it and the operator becomes approximate to ``tol``, which the solver's residual
+    check still guards.
+
+    **Correct and verified, but not yet worth switching on.** A bar lattice compresses 3.27x at
+    1,540 elements rising to 5.76x at 4,589, accurate to 8.2e-09 -- and yet a whole welded solve is
+    3-5x SLOWER with it at every size measured, and peaks higher. A dense matvec is one BLAS call
+    where a compressed one is hundreds of small matmuls (0.018 s against 0.186 s at 1,540 elements),
+    and at a few thousand elements the operator is not the memory bottleneck either. Where the
+    crossover lies is not established; see :mod:`~jno.utils.solver.hmatrix` for the numbers.
+
+    Args:
+        tol: relative accuracy asked of each compressed block.
+        leaf: cluster size at which the tree stops splitting. Smaller compresses BETTER (4.85x at 64
+            against 2.46x at 256): larger leaves mean coarser blocks, and less of the matrix reaches
+            an admissible pair.
+        eta: admissibility constant. Barely matters here -- 4.85x at 2 against 4.93x at 4 -- so it is
+            rarely worth changing.
+        floor: blocks smaller than this on their short side are left EXACT. Below it compression does
+            not pay (1.38x at 370 elements), and a slower approximate operator is a defect rather
+            than a trade.
+
+    Returns:
+        The spec to pass as ``solve(operator=...)``.
+
+    **Limits, up front.** ACA suits asymptotically smooth kernels; ``1/r`` and its derivatives are
+    fine, an oscillatory ``exp(ikr)/r`` at high ``kr`` is not. The build is host work that only pays
+    above a few thousand elements. And a block ACA cannot compress to under half its size is kept
+    dense, so on a small or poorly separated network this correctly does nothing at all.
+    """
+    from .utils.solver.hmatrix import HierarchicalSpec
+
+    return HierarchicalSpec(tol=tol, leaf=leaf, eta=eta, floor=floor)

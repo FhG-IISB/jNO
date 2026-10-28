@@ -104,8 +104,9 @@ def test_nedelec_tet_curl_curl_exact_bilinear():
 
 
 def test_3d_nonnodal_only_nedelec_supported():
-    """On a 3D tet mesh only N1E is wired; the 2D-only families (here Morley) must raise a clear
-    NotImplementedError rather than silently mis-map their 2D edge/vertex machinery onto a tet."""
+    """On a 3D tet mesh the H(curl)/H(div)/P0/Lagrange families are wired; the 2D-only plate families
+    (here Morley) must raise a clear NotImplementedError rather than silently mis-map their 2D
+    edge/vertex machinery onto a tet."""
     d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
     u, phi = d.fem_symbols(space="Morley")
     coords = d.variable("interior", split=True)

@@ -1,0 +1,2176 @@
+"""``jno.peec`` — partial-element circuits: the conductors, and what is impressed on them.
+
+A partial-element method never meshes. A conductor becomes filaments carrying its centreline and
+cross-section, and the operator is Ruehli's Neumann double integral over their pairs (Ruehli,
+*Inductance calculations in a complex integrated circuit environment*, IBM J. Res. Dev. 16(5), 1972;
+*Equivalent circuit models for three-dimensional multiconductor systems*, IEEE Trans. MTT 22(3),
+1974). So the whole input is the geometry plus what is impressed on its terminals::
+
+    i, v = e.peec_symbols()
+    emag = jno.peec([
+        v(*dcp) - v(*dcn) - 1.0,     # a volt across the DC link
+        i(*ac) - 0.0,                # the load terminal is open
+    ], freq=1e6)
+
+Four constraint forms and only four -- a source ``v(A) - v(B) - g``, a fixed potential ``v(A) - g``,
+a fixed current ``i(A) - g``, and a two-terminal device ``v(A) - v(B) - Z*i(A)``. The first three are
+the whole vocabulary of a port; the fourth is Ohm's law, and it is what puts a COMPONENT in the
+network without meshing it as metal::
+
+    v(*m_d) - v(*m_s) - 5e-3 * i(*m_d),      # a MOSFET's on-resistance
+
+A device parameter belongs in the circuit, not in the geometry: voxelise a 0.18 mm die on a 0.285 mm
+grid and its resistance follows the grid, which is both wrong and the reason the grid had to be fine.
+
+The material is the other half of the input, and it is a **design variable as often as it is a
+constant**. ``.attach(sigma=...)`` takes three spellings, and a gradient flows back through all
+three::
+
+    .attach(sigma=5.8e7)                             # a material
+    .attach(sigma=lambda x, y, z: SIG * rho(x, y))   # a FIELD: the density is the design
+    .attach(sigma=SIG * rho)                         # one value per element
+
+A callable is evaluated at each element -- cell centres for a solid's lattice, midpoints for a wire
+-- and its arity is positional, exactly as an attached FEM coefficient's is, so ``lambda x, y`` is a
+planar field. That is the usual one: a trace is thin, and its material varies across the board
+rather than through the 0.57 mm of it. Reach for the callable over the vector, because it says
+nothing about the pitch and so survives a change of ``size=``, which a per-element vector cannot.
+
+A field is what makes a density (SIMP) topology optimisation expressible here. What it does NOT do
+is move the geometry: the lattice is fixed, so a cell whose conductivity goes to zero is still a
+cell, still joined by bars, and still counted as metal by the thickness runs behind the skin term.
+That is the ordinary fixed-mesh treatment, and it is why a converged density has to be read back out
+as a shape rather than assumed to be one.
+
+A design loop wants the geometry decided ONCE. Everything structural -- which cells are metal,
+which nodes a pad owns, which filaments weld to which -- is host work on concrete geometry, so the
+first ``solve()`` does it and keeps it, and every later solve reuses it::
+
+    emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6)
+    loss = jax.jit(lambda rho: emag.solve(sigma={"trace": f(rho)}).L)
+
+A solve after the first is pure jax, so it jits and composes into ``jno.core`` through ``jno.fn``
+exactly as ``fem.solve()`` does -- which is what puts a PEEC objective behind ``.optimizer()``,
+``jno.optimizers.mma`` and ``jno.le``. Measured on a 1,540-bar plate: **42x** on the value and 23x
+on the gradient, because the host pass, not the solve, was the cost. The same host/traced split as
+:class:`jno.trace.FemLinearSystem`.
+
+**Scope, up front.** A conductor is either a :meth:`jno.shape.line` tube or a closed-form solid,
+which voxelises onto a lattice shared with every other solid on it. A network containing a lattice
+is applied matrix-free -- that block by FFT -- and solved by GMRES; a network of wires alone has no
+such structure, forms the dense operator, and is therefore the small-network path. Each filament
+carries ONE current and its self-term is the DC geometric mean distance, so the skin effect WITHIN a
+filament is not represented -- see ``freq``. A network freezes its STRUCTURE at the first solve: a
+design variable may change a conductivity and stretch the built cells (a parameter in a shape's
+coordinates), never add or renumber them, so make a new ``jno.peec`` for a new topology.
+"""
+
+from __future__ import annotations
+
+import pathlib
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import scipy.sparse as sparse
+
+from .geometry import parametric as _par
+from .utils.solver.peec import (
+    FacesGrid,
+    Filaments,
+    GradedGrid,
+    bar_filaments,
+    element_centres,
+    line_filaments,
+    port_spec,
+    resolve_sigma,
+    solve_network,
+    terminal_nodes,
+)
+
+__all__ = ["peec"]
+
+MU0 = 4e-7 * np.pi
+
+#: Quadrature the discretisation is built at: `quad` points along an element and `quad_t` across it.
+#: They must agree between the line and bar halves of a welded network — see `_discretise`.
+_QUAD, _QUAD_T = 3, 2
+
+
+def _unit_permeability(v) -> bool:
+    """Whether a declared ``mu_r`` is concretely 1, so the region is air.
+
+    Only a CONCRETE one: a traced permeability has no value to compare, and a design variable that
+    happens to pass through 1 would divide by a zero susceptibility. That edge is documented rather
+    than guarded, because guarding it would mean changing the mesh mid-optimisation.
+    """
+    try:
+        return bool(np.asarray(v).shape == () and float(np.asarray(v)) == 1.0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _domain_of(constraints):
+    for c in constraints:
+        for var in (getattr(c, "_coord_vars", None) or {}).values():
+            d = getattr(var, "_domain", None)
+            if d is not None:
+                return d
+    raise ValueError(
+        "jno.peec: no domain found on any constraint. Bind each terminal to its region first, as in "
+        "`p = e.variable('DC+', split=True)[:3]`, then write the port on it."
+    )
+
+
+class Dissipation(dict):
+    """``{region: W/m^3}`` of heat, and the same split by the property that CAUSED it.
+
+    The mapping itself is the total, so the thermal side is unchanged and a region that dissipates
+    two ways never contributes half of itself by accident::
+
+        for region, value in emag.dissipation().items():
+            d.attach(region, q=value)
+        d.attach(q=0.0)          # every other region
+        q = d.q
+
+    ``.sigma`` is the ohmic loss and ``.mu_r`` the core loss, each named after what the region
+    attached -- the same spelling in and out, as with ``.attach(k=...)`` and ``d.k``, so no channel
+    needs a vocabulary invented for it. A region declaring both appears in both, under its own name.
+
+    Args:
+        channels: ``{property: {region: W/m^3}}`` per loss mechanism (``"sigma"``, ``"mu_r"``); the
+            mapping itself becomes their per-region sum.
+    """
+
+    def __init__(self, channels):
+        self._channels = dict(channels)
+        total: dict = {}
+        for ch in self._channels.values():
+            for region, q in ch.items():
+                total[region] = total[region] + q if region in total else q
+        super().__init__(total)
+
+    def _channel(self, name):
+        ch = self._channels.get(name) or {}
+        if not ch:
+            have = sorted(k for k, v in self._channels.items() if v)
+            raise ValueError(
+                f"jno.peec: nothing in this model dissipates through {name!r}, so there is no "
+                f"{name} loss to read. Dissipating properties here: {have or 'none'}. Attach "
+                f"{name}= on the region that should carry it."
+            )
+        return dict(ch)
+
+    @property
+    def sigma(self):
+        """``{region: W/m^3}`` of OHMIC loss -- the conductors, from the currents solved for."""
+        return self._channel("sigma")
+
+    @property
+    def mu_r(self):
+        """``{region: W/m^3}`` of CORE loss -- the magnetisation working against a complex ``mu_r``.
+
+        A real permeability is lossless and there is nothing here; the imaginary part of ``mu_r`` is
+        the lossy component, exactly as a complex permittivity carries dielectric loss.
+        """
+        return self._channel("mu_r")
+
+
+class PEECSolution:
+    """What a solved network hands back.
+
+    ``Z``/``R``/``L`` describe the source port; with an array ``freq`` each is an array over it.
+
+    Built by :meth:`BuiltPEEC.solve`, not by hand.
+
+    Args:
+        freq: the frequency, or the array of frequencies, solved at.
+        cur: filament currents (per frequency for an array ``freq``).
+        fil: the filament set (geometry, lengths, areas, owners).
+        terms: per-terminal injected currents.
+        port: the source-port voltage(s).
+        res: per-filament resistance at the solve frequency (surface resistance included).
+        vol: per-filament volume, for the dissipation density.
+        owner: per-filament region index.
+        names: the region names ``owner`` indexes.
+        link: the flux-linkage readout, when the problem has coupled coils.
+        pot: node potentials.
+        pads: the terminal node sets the solve used.
+        mag: ``(currents, reluctances, volumes, owners, names)`` of the magnetic network, or Nones.
+        lp_apply: the partial-inductance apply the solve used, reused by ``L``.
+    """
+
+    def __init__(
+        self,
+        freq,
+        cur,
+        fil,
+        terms,
+        port,
+        res,
+        vol=None,
+        owner=None,
+        names=(),
+        link=None,
+        pot=None,
+        pads=None,
+        mag=(None, None, None, None, ()),
+        lp_apply=None,
+    ):
+        self._vol, self._owner, self._names = vol, owner, tuple(names)
+        #: the partial-inductance apply the solve itself used, so `L` does not build it again
+        self._lp_apply = lp_apply
+        #: nodal potentials, and the node set each terminal owns -- what `voltage` reads. Kept
+        #: because an OPEN terminal carries no current, so `current`/`Z` say nothing about it: the
+        #: induced voltage on a transformer's unloaded secondary is only in `phi`.
+        self._pot, self._pads = pot, dict(pads or {})
+        #: the magnetic mesh's own breakdown -- current, reluctance, volume, owner, names. It is a
+        #: SECOND mesh, so it needs all five: a region that is both conductor and core is meshed
+        #: twice and its two losses are summed per unit of each mesh's own volume.
+        self._mag_cur, self._mag_res, self._mag_vol, self._mag_owner, self._mag_names = mag
+        #: total flux linkage per element, magnetisation included -- set only when a core is in the
+        #: model. `L` reads it instead of `Lp I`, which is the same number when there is no core.
+        self._link = link
+        self.freq = freq
+        self.i = cur  # (n_filament,) or (n_freq, n_filament) complex
+        self._fil = fil  # the discretisation; the partial-inductance MATRIX is formed only on demand
+        self._terms, self._port, self._R = terms, port, res
+
+    @property
+    def partial(self):
+        """The dense ``(n, n)`` partial inductances, henry — formed HERE, not at solve time.
+
+        It is the one object in a partial-element method that is never sparse, and the solve is
+        built specifically to avoid it: a lattice applies it by FFT and a welded network by blocks.
+        Forming it anyway to compute one readout cost more than everything else put together --
+        measured on the example module at a 2 mm pitch, 3.7 GB of a 5.3 GB peak, against 0.84 GB for
+        the solve itself. It is quadratic in the SUB-POINT count, not the element count, so three
+        Gauss points per element make it nine times worse again.
+
+        Ask for it when you want the matrix. :attr:`L` no longer does.
+        """
+        from .utils.solver.kernel import pair_matrix
+
+        f = self._fil
+        return pair_matrix(f.pos, f.mom, lambda r: 1.0 / r, f.self_g, group=f.group) * (MU0 / (4 * jnp.pi))
+
+    @property
+    def Z(self):
+        """Terminal impedance of the source port, ohm."""
+        return self._port
+
+    @property
+    def R(self):
+        """Resistive part of the port impedance, ohm."""
+        return jnp.real(self._port)
+
+    @property
+    def L(self):
+        """Loop inductance from the field energy, ``I' Lp I / I_port^2``, henry.
+
+        Computed from the energy rather than ``Im(Z)/w`` so it is defined at DC too, and so it stays
+        the loop inductance the currents actually produce -- at a frequency where they redistribute,
+        that is a different (smaller) number than the DC one, which is the effect worth seeing.
+
+        With a CORE the flux a circuit links is not ``Lp I`` alone -- the magnetisation links its own,
+        and that is the entire reason for putting a core there. The energy is then ``Re(I^H Lambda)``
+        against the total linkage, which the coupled solve already knows. It is the same number as
+        ``I^H Lp I`` when there is no core, exactly and not approximately: the circuit equation says
+        ``j w Lambda = A' phi - Z_int I``, which reduces to ``j w Lp I`` with the coupling absent.
+        """
+        from .utils.solver.kernel import pair_quadratic
+        from .utils.solver.peec import lattice_apply, welded_apply
+
+        f = self._fil
+        cur = jnp.atleast_2d(self.i)
+        scale = MU0 / (4 * jnp.pi)
+        if self._link is not None:
+            lam = jnp.atleast_2d(self._link)
+            num = jnp.stack([jnp.vdot(c, lk).real for c, lk in zip(cur, lam)])
+            out = num / jnp.abs(jnp.atleast_1d(self._port_current)) ** 2
+            return out if jnp.ndim(self._port) else out[0]
+
+        # I^H Lp I, not I^T Lp I: the currents are complex, and the magnetic energy is the HERMITIAN
+        # form. The transpose form is complex, and its real part goes negative once the phases spread
+        # -- an inductance a passive loop cannot have.
+        #
+        # Computed as a QUADRATIC FORM, never through the matrix. Lp is real and symmetric, so
+        # I^H Lp I = Re(I)' Lp Re(I) + Im(I)' Lp Im(I) exactly -- the cross terms cancel by symmetry.
+        #
+        # Each half is `x . (Lp x)` through the SAME apply the matrix-free solve is built on. It used
+        # to be `pair_quadratic`, which also never forms the matrix but does walk every pair, and so
+        # is O(N^2) behind a solve that is linear in the bars. Measured, solve against readout:
+        #
+        #     bars      6,688    23,688    57,472
+        #     solve      0.24 s    0.79 s    2.29 s
+        #     pair sum   1.43 s   16.2  s   76.5  s
+        #
+        # -- the inductance cost thirty times the answer it was reporting on. A lattice's Lp is
+        # block-Toeplitz, so `lattice_apply` is the same quadrature in O(N log N); `test_peec_fft`
+        # already pins that apply against the dense `pair_matrix` on every case, which is what makes
+        # this a change of EVALUATION and not of value.
+        lat = getattr(f, "lattice", None)
+        welded = isinstance(lat, dict) and "welded" in lat
+        structured = lat is not None and (not welded or any(b[2] is not None for b in lat["welded"]))
+        # a GRADED lattice has no FFT (lattice_apply refuses it), so its energy takes the pair sum below
+        graded = (
+            (lat or {}).get("graded") if not welded else any(b[2] is not None and b[2].get("graded") for b in lat["welded"])
+        )
+        structured = structured and not graded
+
+        if structured:
+            ap = self._lp_apply
+            if ap is None:
+                ap = (welded_apply if welded else lattice_apply)(f, lambda r: 1.0 / r, mu_scale=scale)
+
+            def _energy(x):
+                return jnp.vdot(x, ap(x)).real
+        else:
+            # A polyline's filaments are not Toeplitz and welding several conductors breaks the
+            # structure even when each part had it, so there is nothing to exploit. The pair sum
+            # stays: it is chunked, never holds an (N, N) array, and rematerialises on the reverse
+            # pass, so the gradient is bounded too.
+            grp = np.asarray(f.group)  # structural: numpy, or a jit turns it into a tracer
+
+            def _energy(x):
+                m = jnp.asarray(f.mom) * x[grp][:, None]
+                return pair_quadratic(f.pos, m, lambda r: 1.0 / r, f.self_g, group=grp) * scale
+
+        num = jnp.stack([_energy(jnp.real(c)) + _energy(jnp.imag(c)) for c in cur])
+        out = num / jnp.abs(jnp.atleast_1d(self._port_current)) ** 2
+        return out if jnp.ndim(self._port) else out[0]
+
+    @property
+    def joule(self):
+        """Ohmic dissipation at the solved excitation, ``sum R_k |I_k|^2``, watt."""
+        cur = jnp.atleast_2d(self.i)
+        out = jnp.einsum("k,fk->f", self._R, jnp.abs(cur) ** 2)
+        return out if jnp.ndim(self._port) else out[0]
+
+    def dissipation(self):
+        """``{region: W/m^3}`` — the ohmic loss of each conductor, per unit of its own volume.
+
+        Shaped for :meth:`jno.domain.attach`, which is how a per-region quantity enters a weak
+        form, so the thermal side reads::
+
+            for region, value in emag.dissipation().items():
+                d.attach(region, q=value)
+            d.attach(q=0.0)
+            heat = d.k * grad(T) . grad(s) - d.q * s
+
+        Volumetric rather than total because that is what a source term is. The volume is the
+        DISCRETISATION's -- the summed filament volumes -- so it is consistent with the currents that
+        produced the loss rather than with the analytic solid, which a faceted mesh would not match.
+
+        Which elements a conductor owns is STRUCTURAL and is read from ``_owner`` on the host; only
+        the loss and the volume are jnp. That is what makes this callable inside a jit, and so what
+        lets a thermal objective built on it be driven by ``jno.core``.
+        """
+        if self._owner is None:
+            raise ValueError("jno.peec: this solution carries no per-conductor breakdown.")
+
+        def _per_region(power, owner, vol, names):
+            """`sum P / sum V` over each region's own elements, on the region's own mesh."""
+            own, vol = np.asarray(owner), jnp.asarray(vol)
+            out = {}
+            for k, name in enumerate(names):
+                sel = np.flatnonzero(own == k)
+                if sel.size == 0:  # a region the discretisation gave no elements owns no loss
+                    continue
+                q = jnp.sum(power[:, sel], axis=1) / jnp.sum(vol[sel])
+                out[name] = q[0] if jnp.ndim(self._port) == 0 else q
+            return out
+
+        cur = jnp.atleast_2d(self.i)
+        channels = {
+            "sigma": _per_region(jnp.einsum("k,fk->fk", self._R, jnp.abs(cur) ** 2), self._owner, self._vol, self._names)
+        }
+        if self._mag_cur is not None:
+            # `w Im(R_m) |I_m|^2`, and every part of that spelling is load-bearing.
+            #
+            # IMAGINARY, not real: a reluctance is `l / (mu0 chi A)`, so a lossless core has a real
+            # chi and a real R_m, and this channel is then identically zero -- which is the physics.
+            # The lossy component of `mu_r` is what puts an imaginary part in chi, and `1/chi` turns
+            # it into the imaginary part of the reluctance.
+            #
+            # And times OMEGA: R_m is a reluctance, so `R_m |I_m|^2` is not a power at all. The
+            # first version of this readout omitted the factor and took the real part, and it gave
+            # 1.36e-06 W where the port was delivering 8.58e-02 W more than the conductors were
+            # dissipating -- a number with the right shape, the right sign and no relation to the
+            # energy. The power balance below is what caught it.
+            w = 2 * np.pi * jnp.atleast_1d(jnp.asarray(self.freq))[:, None]
+            pm = w * jnp.einsum("k,fk->fk", jnp.imag(self._mag_res), jnp.abs(jnp.atleast_2d(self._mag_cur)) ** 2)
+            channels["mu_r"] = _per_region(pm, self._mag_owner, self._mag_vol, self._mag_names)
+        return Dissipation(channels)
+
+    def field(self, points):
+        """Magnetic flux density at ``points``, tesla — ``(n, 3)``, or ``(n_freq, n, 3)`` swept.
+
+        A partial-element method never meshes the air, so the field off the metal is not a solved
+        unknown: it is the Biot-Savart sum over the currents that WERE solved for::
+
+            B(r) = (mu0 / 4 pi) * sum_k I_k * (dl_k x (r - r_k)) / |r - r_k|^3
+
+        evaluated on the same sub-point quadrature the operator uses, so a curved wire is integrated
+        rather than treated as one straight segment. That makes it a READOUT: no second problem, no
+        boundary condition, and differentiable in the currents and in ``points`` alike -- which is
+        what an EMI objective over a keep-out volume needs.
+
+        Free space only. There is no magnetic material in this solver, so a nearby core would change
+        the answer and is not represented; see the scope note on the module.
+
+        Args:
+            points: ``(n, 3)`` positions, in metres. May be traced.
+
+        Returns:
+            The flux density, ``(n, 3)`` (or ``(n_freq, n, 3)`` for a frequency sweep).
+        """
+        pts = jnp.asarray(points, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3:
+            raise ValueError(f"jno.peec: field() takes (n, 3) positions in metres, got shape {tuple(np.shape(points))}.")
+        f = self._fil
+        src, mom, grp = jnp.asarray(f.pos), jnp.asarray(f.mom), jnp.asarray(f.group)
+        cur = jnp.atleast_2d(self.i)
+
+        # The kernel is singular ON a filament, and the field INSIDE metal is not what this computes
+        # either -- so a probe within a conductor's own cross-section is refused rather than answered.
+        # The scale is that cross-section, not an absolute tolerance: a busbar and a bond wire are
+        # both legal. (An on-AXIS point is not the dangerous case -- a straight filament's field
+        # vanishes there by symmetry; it is being inside and OFF axis that diverges.)
+        rad = np.sqrt(np.asarray(jax.lax.stop_gradient(jnp.asarray(f.area))) / np.pi)
+        if not isinstance(pts, jax.core.Tracer):
+            gap = np.linalg.norm(np.asarray(pts)[:, None, :] - np.asarray(jax.lax.stop_gradient(src))[None, :, :], axis=-1)
+            r_of = np.repeat(rad, np.asarray(np.bincount(np.asarray(f.group), minlength=rad.size)))
+            if np.any(gap < r_of[None, :]):
+                bad = int(np.argmin(gap.min(axis=1)))
+                raise ValueError(
+                    f"jno.peec: field() was asked for a point {tuple(np.asarray(pts)[bad])} lying INSIDE "
+                    "a conductor, where the Biot-Savart kernel is singular. This computes the free-space "
+                    "field the solved currents produce; the field inside the metal is not it. Evaluate "
+                    "off the conductor."
+                )
+
+        def _one(ik):
+            m = mom * ik[grp][:, None]  # the moment already carries dl and the quadrature weight
+            r = pts[:, None, :] - src[None, :, :]
+            inv = jnp.linalg.norm(r, axis=-1) ** -3
+            return (MU0 / (4 * jnp.pi)) * jnp.einsum("psi,ps->pi", jnp.cross(m[None, :, :], r), inv)
+
+        out = jnp.stack([_one(jnp.real(c)) + 1j * _one(jnp.imag(c)) for c in cur])
+        out = jnp.real(out) if not jnp.iscomplexobj(self.i) else out
+        return out if jnp.ndim(self._port) else out[0]
+
+    def export_vtk(self, save_path: str = "./runs/peec.vtk", freq_index: int | None = None):
+        """Write the solved currents to a file a viewer can open — the same verb as
+        :meth:`jno.domain.export_vtk`, and the same job.
+
+        A partial-element network is a set of straight segments, so it exports as one: each filament
+        a ``line`` cell between its two nodes, carrying its current magnitude, its phase, and the
+        current DENSITY (which is what tells a crowded corner from a wide one, since the elements are
+        not all the same size).
+
+        Args:
+            save_path: where to write. The extension picks the format, as meshio's do.
+            freq_index: which point of a swept solve to write. Required when ``freq`` was an array —
+                there is no single current field then, and picking one silently would be a guess.
+        """
+        import meshio
+
+        cur = np.asarray(jnp.atleast_2d(self.i))
+        if cur.shape[0] > 1 and freq_index is None:
+            raise ValueError(
+                f"jno.peec: this solution holds {cur.shape[0]} frequencies, so export_vtk cannot tell "
+                "which frequency to write. Say which: `export_vtk(path, freq_index=0)`."
+            )
+        ik = cur[0 if freq_index is None else int(freq_index)]
+
+        f = self._fil
+        nodes = np.asarray(f.nodes)
+        inc = f.incidence.tocsc()
+        # A filament's two ends are the two nonzeros of its incidence column: +1 leaves, -1 enters.
+        ends = np.zeros((inc.shape[1], 2), dtype=int)
+        for k in range(inc.shape[1]):
+            rows = inc.indices[inc.indptr[k] : inc.indptr[k + 1]]
+            vals = inc.data[inc.indptr[k] : inc.indptr[k + 1]]
+            ends[k] = (rows[np.argmax(vals)], rows[np.argmin(vals)])
+        area = np.asarray(jax.lax.stop_gradient(jnp.asarray(f.area)))
+        data = {
+            "current": [np.abs(ik)],
+            "current_density": [np.abs(ik) / np.maximum(area, 1e-300)],
+            "phase_deg": [np.degrees(np.angle(ik))],
+        }
+        pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        meshio.write_points_cells(save_path, nodes, [("line", ends)], cell_data=data)
+        return save_path
+
+    def current(self, terminal):
+        """Net current injected at ``terminal``, amp."""
+        if terminal not in self._terms:
+            raise ValueError(f"jno.peec: no terminal {terminal!r}. Known: {sorted(self._terms)}.")
+        return self._terms[terminal]
+
+    def voltage(self, a, b=None):
+        """Potential at terminal ``a``, or the difference ``a - b``, volt.
+
+        This is the readout an OPEN terminal needs. A transformer's unloaded secondary carries no
+        current, so ``current`` and the port impedance say nothing about it -- the induced voltage
+        is in the nodal potentials alone, and it is what a turns ratio is measured from.
+
+        Prefer the TWO-terminal form. A single potential is only defined against whatever the solve
+        pinned -- a declared ground, or the source's negative side when there is exactly one source
+        and no ground -- so it moves if that reference changes, while a difference does not.
+
+        A terminal's potential is its pad's, exactly as the source and device rows define it: the
+        pad's nodes are shorted to each other, so any of them carries it. A WEIGHTED terminal is
+        not shorted, and is then the weighted sum over the pad -- the same unnormalised weights the
+        constraint rows use, so ``voltage`` and the circuit agree by construction.
+        """
+        if self._pot is None:
+            raise ValueError(
+                "jno.peec: this solution carries no nodal potentials, so there is no voltage to "
+                "read. They are kept by `BuiltPEEC.solve`; a solution built by hand has none."
+            )
+        for t in (a, b):
+            if t is not None and t not in self._pads:
+                raise ValueError(f"jno.peec: no terminal {t!r}. Known: {sorted(self._pads)}.")
+        phi = jnp.atleast_2d(self._pot)
+
+        def at(t):
+            spec = self._pads[t]
+            ids, w = spec if isinstance(spec, tuple) else (spec, None)
+            ids = np.asarray(ids, dtype=int)
+            if w is None:  # shorted pad: every node carries the same potential
+                return phi[:, ids[0]]
+            return phi[:, ids] @ jnp.asarray(w).reshape(-1).astype(complex)
+
+        out = at(a) - (0.0 if b is None else at(b))
+        return out if jnp.ndim(self._port) else out[0]
+
+
+#: the `.attach(...)` properties a PEEC network reads; any other is named once by `peec._discretise`
+_PEEC_PROPS = frozenset({"sigma", "mu_r", "path", "radius", "faces"})  # the last three: to refuse by name
+
+
+def _model_calls(node):
+    """Trainable-parameter nodes inside an attached value, or nothing if it is a plain number."""
+    from jno.trace import Placeholder
+
+    if not isinstance(node, Placeholder):
+        return []
+    from jno._fem import _walk
+
+    return [n for n in _walk(node) if type(n).__name__ == "ModelCall"]
+
+
+def _parameters_in(values):
+    """``{name: ModelCall}`` for every ``jno.np.parameter`` reachable from these attached values."""
+    out = {}
+    for v in values:
+        for mc in _model_calls(v):
+            name = getattr(getattr(mc, "model", None), "_parameter_name", None)
+            if name is not None:
+                out[name] = mc
+    return out
+
+
+def _nodal_params(node):
+    """The NODAL FIELD parameters (``jno.np.parameter(<P1 symbol>)``) inside an attached value."""
+    return [mc for mc in _model_calls(node) if getattr(mc.model, "_fem_field", None) == "node"]
+
+
+_NODAL_STENCILS = {}
+
+
+def _nodal_stencil(mc, xyz):
+    """The P1 stencil of a nodal field parameter's mesh at points ``xyz`` -- host work, cached.
+
+    A lattice conductivity is one value per CELL and a nodal field is one value per mesh NODE, so the
+    field is read at the cell centres by the mesh's own P1 interpolation: the same shape functions the
+    FEM uses for it, which is what lets ONE design field drive both a PEEC conductivity and a FEM
+    coefficient. The stencil depends only on geometry, so a design loop pays for it once.
+    """
+    from .utils.solver.fem_adapt import _locate_barycentric
+
+    dom = mc.model._fem_field_domain
+    xyz = np.asarray(xyz, dtype=float)
+    key = (id(dom), xyz.shape, hash(xyz.tobytes()))
+    hit = _NODAL_STENCILS.get(key)
+    if hit is not None and hit[0] is dom:
+        return hit[1]
+    pts = np.asarray(dom.mesh.points, dtype=float)
+    cells = np.asarray(dom._cells_p1())
+    dim = pts.shape[1]
+    idx, w, inside = _locate_barycentric(pts, cells, xyz[:, :dim], tol=1e-9, k=12)
+    if not np.all(inside):
+        raise ValueError(
+            f"jno.peec: {int((~np.asarray(inside)).sum())} element centre(s) of a conductor whose "
+            "conductivity is a nodal field parameter lie outside that parameter's mesh, so the field "
+            "has no value there. Declare the parameter on the symbol of the domain the conductor is in."
+        )
+    out = (jnp.asarray(idx), jnp.asarray(w))
+    if len(_NODAL_STENCILS) > 32:
+        _NODAL_STENCILS.pop(next(iter(_NODAL_STENCILS)))
+    _NODAL_STENCILS[key] = (dom, out)
+    return out
+
+
+def _at_nodes(expr, params):
+    """An attached value holding a nodal field parameter, as a callable of position.
+
+    ``.attach(sigma=lambda x, y, z: ...)`` is already how a lattice takes a conductivity that varies in
+    space -- it is evaluated at each conductor's own element centres -- so a nodal field becomes exactly
+    that: the expression with the field read off at the points it is called with. Differentiable in
+    the field's values; the interpolation weights are geometry.
+    """
+
+    def at(x, y, z):
+        xyz = np.stack([np.asarray(x), np.asarray(y), np.asarray(z)], axis=1)
+        return _eval_material(expr, params, xyz=xyz)
+
+    return at
+
+
+def _field_symbols(node):
+    """The FEM trial-function symbols inside an attached value -- a conductivity written in terms of a
+    field another solver computes (``sigma(T)`` with ``T`` from ``d.fem_symbols()``)."""
+    from jno.trace import Placeholder, TrialFunction
+
+    if not isinstance(node, Placeholder):
+        return []
+    from jno._fem import _walk
+
+    out, seen = [], set()
+    for n in _walk(node):
+        if isinstance(n, TrialFunction) and id(n) not in seen:
+            seen.add(id(n))
+            out.append(n)
+    return out
+
+
+def _eval_field_material(expr, field_values, params=None, xyz=None):
+    """An attached material that depends on a FEM field, at given values of that field.
+
+    ``field_values`` maps each :class:`~jno.trace.TrialFunction` in ``expr`` to an array (one value per
+    PEEC element, or a scalar). The field is swapped for a tensor tag carrying those values and the
+    expression is evaluated by the trace evaluator, so a gradient reaches both the field values and any
+    trainable parameter in the expression.
+    """
+    import equinox as eqx
+
+    from jno.trace import TensorTag, substitute
+    from jno.trace_evaluator import TraceEvaluator
+
+    tags = {f: TensorTag(f"__peec_field_{i}") for i, f in enumerate(field_values)}
+    sub = substitute(expr, tags)
+    table = {}
+    for mc in _model_calls(sub):
+        mod = mc.model.module
+        name = getattr(mc.model, "_parameter_name", None)
+        val = (params or {}).get(name) if name is not None else None
+        if val is None:
+            val = _initial_value(mc)
+        if getattr(mc.model, "_fem_field", None) == "node":
+            if val is None:
+                val = mod.value
+            if xyz is None:
+                # the structural build's reference value: there are no centres in scope there, and
+                # all it needs is a representative number (the skin-depth guard, the lattice)
+                val = jnp.mean(jnp.asarray(val))
+            else:
+                idx, w = _nodal_stencil(mc, xyz)
+                val = (w * jnp.asarray(val).reshape(-1)[idx]).sum(axis=1)
+        if val is not None:
+            mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
+        table[mc.model.layer_id] = mod
+    ctx = {t.tag: jnp.asarray(field_values[f]) for f, t in tags.items()}
+    size = int(jnp.size(next(iter(ctx.values()))))
+    out = jnp.asarray(TraceEvaluator(table).evaluate(sub, context=ctx))
+    if out.size == size or size == 1:
+        # one value per element -- or a scalar field value combined with a per-element parameter
+        return out.reshape(-1)
+    return jnp.broadcast_to(out.reshape(()), (size,))
+
+
+def _eval_material(expr, params, xyz=None):
+    """An attached material expression at concrete parameter values -- a JAX array, differentiable.
+
+    The same substitution `jno.rcwa` makes for its permittivity: swap each trainable parameter's
+    value into the trace and evaluate. Position-dependent parameters are refused rather than
+    silently evaluated somewhere arbitrary -- a lattice conductivity is one value per CELL, and the
+    cell centres are not in scope here.
+    """
+    import equinox as eqx
+
+    from jno.trace import Placeholder, Variable
+    from jno.trace_evaluator import TraceEvaluator
+
+    if not isinstance(expr, Placeholder):
+        return expr
+    from jno._fem import _walk
+
+    if xyz is None and _nodal_params(expr):
+        # one value per mesh node: handed to the lattice as a callable of position, which is how it
+        # takes a conductivity that varies in space (see `_at_nodes`)
+        return _at_nodes(expr, params)
+    if any(isinstance(n, Variable) for n in _walk(expr)):
+        raise ValueError(
+            "jno.peec: this network's material depends on both a trainable parameter and POSITION, "
+            "which is not supported. A lattice conductivity is one value per cell, so give the "
+            "parameter that shape -- `jno.np.parameter((n_cells,))` -- and keep the spatial part in "
+            "its initial value, or use a plain callable of position with no parameter in it."
+        )
+    table = {}
+    for mc in _model_calls(expr):
+        mod = mc.model.module
+        name = getattr(mc.model, "_parameter_name", None)
+        val = params.get(name) if name is not None else None
+        if val is None:
+            val = _initial_value(mc)
+        if xyz is not None and getattr(mc.model, "_fem_field", None) == "node":
+            if val is None:  # no initializer: the module's own value, still one per node
+                val = mod.value
+            idx, w = _nodal_stencil(mc, xyz)
+            val = (w * jnp.asarray(val).reshape(-1)[idx]).sum(axis=1)
+        if val is not None:
+            mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(val))
+        table[mc.model.layer_id] = mod
+    out = TraceEvaluator(table).evaluate(expr, context={})
+    return jnp.asarray(out).reshape(-1) if xyz is not None else out
+
+
+def _initial_value(mc):
+    """A parameter's INITIALISED value, not the zeros it is born with.
+
+    `.initialize(...)` only records the initializer -- the training loop applies it -- so reading
+    `module.value` during the eager build gives zeros. A conductivity of zero is not a small number
+    here, it is a singular operator, and the failure surfaces as `Factor is exactly singular` from
+    inside a preconditioner callback with nothing pointing back to the material. So the initializer
+    is applied here instead.
+    """
+    from .geometry.parametric import initial_value
+
+    return initial_value(mc)
+
+
+class ParametricSolution:
+    r"""A solved network whose material carries ``jno.np.parameter``\ s.
+
+    Every readout is a **trace node** over those parameters rather than a number, so an objective is
+    written the way the rest of jNO writes one -- ``emag.solve().R`` straight into ``jno.core`` --
+    and crux threads the values. It is the same treatment :class:`jno.rcwa` gives its readouts, and
+    it fits PEEC unusually well: the structure is frozen at the first solve already, so only values are
+    ever traced.
+
+    ``solve(sigma=...)`` with concrete values is the way back to a plain number.
+
+    Args:
+        built: the :class:`BuiltPEEC` network.
+        exprs: the parameter expressions the material and geometry carry, by name.
+        params: the ``jno.np.parameter`` nodes they read.
+        solve_kw: the keyword arguments of the solve, passed on to every traced readout.
+        geometry: the line (wire) geometry, when vertices or radii are parameters.
+        faces: the solid geometry, when box faces are parameters.
+    """
+
+    def __init__(self, built, exprs, params, solve_kw=None, geometry=None, faces=None):
+        self._b0, self._exprs, self._params = built, dict(exprs), dict(params)
+        self._geom = dict(geometry or {})
+        #: solid region -> attached `faces=`, evaluated at the parameter values on every solve
+        self._faces = dict(faces or {})
+        #: what `solve(...)` was given besides the material -- `operator=` for a graded lattice --
+        #: replayed on every traced solve, so a parametric readout solves the network it was asked to
+        self._solve_kw = dict(solve_kw or {})
+
+    @property
+    def _b(self):
+        """The network's CURRENT discretisation: a `domain.rebuild` replaces the one this solution was
+        made from, and every readout node made before it must solve the new one."""
+        spec = getattr(self._b0, "_spec", None)
+        return self._b0 if spec is None else spec._build()
+
+    def _node(self, kind, *args, key=None, label=None):
+        from jno.trace import FunctionCall
+
+        names = list(self._params)
+        exprs = [self._params[n] for n in names]
+
+        shapes = {n: tuple(np.shape(self._params[n].model.module.value)) for n in names}
+
+        nodal = {n for n in names if getattr(self._params[n].model, "_fem_field", None) == "node"}
+
+        def fn(*values):  # crux threads the current parameter values in here
+            # a nodal field parameter arrives with the trailing channel axis the trace evaluator gives
+            # a field (see trace_evaluator); it is the same values, so drop it rather than refuse
+            values = tuple(
+                jnp.reshape(v, shapes[n]) if n in nodal and int(np.size(v)) == int(np.prod(shapes[n])) else v
+                for n, v in zip(names, values)
+            )
+            for nm, val in zip(names, values):
+                # A parameter arriving with the wrong SHAPE means this node is being evaluated
+                # somewhere that slices it -- a FEM region coefficient is evaluated PER QUADRATURE
+                # POINT, and hands each point a scalar. A PEEC readout is one value for the whole
+                # region, so evaluating it there would run an entire network solve per point, and
+                # the first thing it does instead is fail: `Factor is exactly singular`, raised from
+                # a preconditioner callback with nothing pointing back here.
+                got = tuple(np.shape(val))
+                if got != shapes[nm]:
+                    raise ValueError(
+                        f"jno.peec: the readout was handed {nm!r} with shape {got} where the "
+                        f"parameter is {shapes[nm]}, which means it is being evaluated per point -- "
+                        "typically `d.attach(region, q=sol.dissipation()[region])`. A PEEC "
+                        "readout is ONE value per region, not a field, so evaluate it once and pass "
+                        "the number:\n\n"
+                        "    q = sol.dissipation()['bar']            # a trace node\n"
+                        "    loss = jno.fn(lambda qb: <fem solve using d.attach('bar', q=qb)>, [q])\n\n"
+                        "The FEM takes a traced scalar there and stays differentiable through it."
+                    )
+            at = dict(zip(names, values))
+            mats = {r: _eval_material(e, at) for r, e in self._exprs.items()}
+            for r, m in mats.items():
+                # A degenerate material is a SINGULAR network, and the failure it produces is
+                # `Factor is exactly singular` raised from inside a preconditioner callback with
+                # nothing pointing back here. Checked only when the value is concrete -- under a
+                # trace there is nothing to look at, and the guard must not force one.
+                a = np.asarray(m) if isinstance(m, (int, float, np.ndarray)) else None
+                if a is None:
+                    try:
+                        a = np.asarray(jax.lax.stop_gradient(jnp.asarray(m)))
+                    except Exception:  # a tracer: no value to check, and none is required
+                        continue
+                if not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0):
+                    raise ValueError(
+                        f"jno.peec: the conductivity of {r!r} evaluated to zero (or non-finite) at "
+                        "the parameter values it was handed, so the network has no metal and the "
+                        "solve is singular. A `jno.np.parameter` is ZEROS until its initializer runs "
+                        "-- if this came from a solver that evaluates coefficients before "
+                        "initialising, that is the cause, and giving the material a non-zero floor "
+                        "(`CU * (0.01 + 0.99 * rho**3)`) both fixes it and is better conditioned."
+                    )
+            geo = {n: (_par.stack(p, at), _par.stack(r, at)) for n, (p, r) in self._geom.items()}
+            for n, f in self._faces.items():
+                geo[n] = _par.stack(f, at)
+            geo = geo or None
+            sol = self._b.solve(sigma=mats if mats else {}, geometry=geo, **self._solve_kw)
+            out = getattr(sol, kind)
+            if callable(out):
+                out = out(*args)
+            return out[key] if key is not None else out
+
+        node = FunctionCall(fn, exprs, name=label or f"peec_{kind}")
+        if kind in ("L", "R", "Z", "joule", "current", "voltage", "dissipation"):
+            # one number per solve: a FEM that uses it as a coefficient reads it once, not per point
+            from .utils.solver.parametric_helpers import mark_global_scalar
+
+            mark_global_scalar(node, f"__peec_{id(self)}_{label or kind}" + (f"_{key}" if key is not None else ""))
+        return node
+
+    @property
+    def Z(self):
+        """Terminal impedance of the source port, as a trace node."""
+        return self._node("Z")
+
+    @property
+    def R(self):
+        """Port resistance, as a trace node."""
+        return self._node("R")
+
+    @property
+    def L(self):
+        """Loop inductance from the field energy, as a trace node."""
+        return self._node("L")
+
+    @property
+    def joule(self):
+        """Total ohmic dissipation, as a trace node."""
+        return self._node("joule")
+
+    @property
+    def i(self):
+        """The filament currents, as a trace node."""
+        return self._node("i")
+
+    def current(self, terminal):
+        """Net current injected at ``terminal``, as a trace node."""
+        return self._node("current", terminal, label=f"peec_current_{terminal}")
+
+    def voltage(self, a, b=None):
+        """Terminal potential, or the difference ``a - b``, as a trace node."""
+        return self._node("voltage", a, b, label=f"peec_voltage_{a}")
+
+    def field(self, points):
+        """Magnetic flux density at ``points``, as a trace node."""
+        return self._node("field", points)
+
+    def dissipation(self):
+        """``{region: node}`` of W/m^3 -- one trace node per region, so a thermal objective composes.
+
+        The keys are read from the discretisation rather than from a solve, because which conductor
+        owns which element is structural and already frozen.
+        """
+        own = np.asarray(self._b.fil.part)
+        return {
+            name: self._node("dissipation", key=name, label=f"peec_dissipation_{name}")
+            for k, name in enumerate(self._b.part_names)
+            if np.any(own == k)
+        }
+
+
+# docstring-from: jno.peec.peec
+class PEEC:
+    """Build a partial-element circuit problem from its port constraints.
+
+    Args:
+        constraints: the ports — ``v(A) - v(B) - g``, ``v(A) - g``, ``i(A) - g``.
+        grid: how to discretise the solids. ``None`` is one uniform pitch from each shape's own
+            ``size=``, which keeps the operator translation-invariant and therefore an FFT.
+            :func:`jno.peec.graded` instead refines toward every conductor face, which is where the
+            current crowds — and gives up the FFT, so the solve then needs
+            ``operator=jno.solve.hierarchical(...)`` and says so if it is missing.
+        freq: frequency in Hz, scalar or array (``omega = 2 pi f`` inside). An array solves at each
+            and every port readout becomes an array over it.
+
+            **The filament self-term is the DC geometric mean distance**, so the skin effect WITHIN
+            a filament is not represented. Redistribution BETWEEN conductors is (that is what the
+            method is for); to capture it inside one, split a conductor that is wide against the
+            skin depth into filaments across its section.
+        operator, restart, matrix_free: how THIS network is solved -- the same settings
+            :meth:`BuiltPEEC.solve` takes, kept on the network so every solve uses them, the ones a
+            coupled solve of a network and the jno.fem problem its ``em.loss`` heats included. A keyword given to ``solve()`` overrides
+            them for that call. ``grid=jno.peec.faces(...)`` needs ``operator=jno.solve.hierarchical(...)``
+            (or ``matrix_free=False``, dense) here, since its lattice has no FFT.
+
+    Returns:
+        :class:`PEEC` — call ``.solve()``.
+    """
+
+    def __init__(self, constraints, freq=0.0, grid=None, operator=None, restart=None, matrix_free=None):
+        self.constraints = list(constraints)
+        self.grid = grid
+        #: how this network is solved, for every solve (a keyword to `solve()` overrides it there)
+        self._solve_kw = {
+            k: v for k, v in dict(operator=operator, restart=restart, matrix_free=matrix_free).items() if v is not None
+        }
+        if not self.constraints:
+            raise ValueError("jno.peec: no constraints. A network with nothing impressed on it carries no current.")
+        self.freq = np.atleast_1d(np.asarray(freq, dtype=float))
+        self._scalar_freq = np.ndim(freq) == 0
+        self.domain = _domain_of(self.constraints)
+        if hasattr(self.domain, "_register_solver"):
+            self.domain._register_solver(self)  # a `domain.rebuild` discretises this network again
+        self.sources, self.currents, self.grounds, self.devices = port_spec(self.constraints)
+        if len(self.sources) != 1:
+            raise ValueError(
+                f"jno.peec: {len(self.sources)} sources; the impedance readouts describe ONE port. Write "
+                "exactly one `v(A) - v(B) - volts`, and express the rest as fixed potentials or currents."
+            )
+
+    def _terminal_names(self):
+        return (
+            {t for s in self.sources for t in s[:2]}
+            | {t for t, _ in self.currents}
+            | {t for t, _ in self.grounds}
+            | {t for dv in self.devices for t in dv[:2]}
+        )
+
+    @property
+    def loss(self):
+        """The ohmic loss density of each conductor [W/m^3], as a coefficient a weak form can use.
+
+        It is the heat source of a thermal problem on the same geometry::
+
+            heat = jno.fem([d.k * inner(grad(T), grad(s)) - em.loss * s, T(sink) - 300.0])
+            T_conv = heat.solve()     # solved together with this network: em.solve() is the network there
+
+        The value of a conductor's loss is only known once this network is solved, so ``em.loss`` is a
+        placeholder that the coupled solve fills in -- region by region, one value per conductor, the
+        same mapping :meth:`PEECSolution.dissipation` returns. Solving the FEM problem on its own, without
+        this network, leaves it unfilled and the FEM refuses to solve.
+        """
+        if getattr(self, "_loss", None) is None:
+            from .architectures.models import parameter
+
+            named = self._terminal_names()
+            regions = [n for n in (getattr(self.domain, "_shape_regions", {}) or {}) if n not in named]
+            if not regions:
+                raise ValueError(
+                    "jno.peec: em.loss needs named conductor regions to put the loss on. Name the "
+                    "conductors -- `shape.name('trace')` -- so each one's loss can be a heat source."
+                )
+            self._loss_params = {n: parameter((1,), name=f"__peec_loss_{n}") for n in regions}
+            for p in self._loss_params.values():
+                p.model._peec_network = self  # how a jno.fem built on `em.loss` finds the network it couples to
+            self._loss = self.domain._by_region(self._loss_params, default=0.0)
+        return self._loss
+
+    def _discretise(self):
+        regions = dict(getattr(self.domain, "_shape_regions", {}) or {})
+        named = (
+            {t for s in self.sources for t in s[:2]}
+            | {t for t, _ in self.currents}
+            | {t for t, _ in self.grounds}
+            | {t for dv in self.devices for t in dv[:2]}  # a device's ends are terminals, not conductors
+        )
+        preds = dict(getattr(self.domain, "_tag_predicates", {}) or {})
+        # A terminal is a named SUBSET of a conductor, so `domain.tag` is its natural spelling: a tag
+        # carries no material semantics and no declaration-order priority, so a pad may sit wholly
+        # inside the conductor it marks. A region works too — the lookup reads its shape directly,
+        # deliberately bypassing the first-declared-wins rule that applies to MATERIALS — but then the
+        # pad must be declared before the conductor, or that rule subtracts it to nothing.
+        terms = {}
+        for t in sorted(named):
+            if t in regions and t in preds and not getattr(preds[t], "_jno_region", False):
+                # Silently picking one dropped a whole conductor: a pad tagged "DCP" on a trace region
+                # also named "DCP" made the TRACE the terminal, removed it from the network, and then
+                # failed far away with "no network node lies in that terminal".
+                raise ValueError(
+                    f"jno.peec: {t!r} is both a region and a tag of this domain, so the port written on "
+                    f"it is ambiguous -- and read as the region, it would remove that conductor from the "
+                    f"network. Rename the tag, e.g. `d.tag({(t + '_pad')!r}, ...)`."
+                )
+            if t in regions:
+                terms[t] = regions[t]
+            elif t in preds:
+                terms[t] = _from_predicate(preds[t])
+            else:
+                raise ValueError(
+                    f"jno.peec: {t!r} is neither a region nor a tag of this domain. Mark the terminal "
+                    f"first — `d.tag({t!r}, <predicate>)` — then write the port on it. Known regions "
+                    f"{sorted(regions)}, known tags {sorted(preds)}."
+                )
+        conductors = {n: sh for n, sh in regions.items() if n not in named}
+        if not conductors:
+            raise ValueError(
+                "jno.peec: every region is named by a port, so there is no conductor left to carry current. "
+                "A terminal marks part of a conductor; it is not a conductor of its own."
+            )
+
+        def _attached(name):
+            try:
+                return self.domain.attached(name)
+            except KeyError:  # nothing declared it at all: the same story as declaring it patchily
+                return {}
+
+        # WHAT A REGION CARRIES DECIDES WHAT IT IS -- there is no mode flag and no solver argument.
+        # `sigma` alone is a conductor; `mu_r` alone is a core that does not conduct, a ferrite or a
+        # powder; both together is a conducting magnetic material, a lamination or a lossy core.
+        sig, mur = _attached("sigma"), _attached("mu_r")
+        # The GEOMETRY may be a design variable too: a shape coordinate written in
+        # `jno.np.parameter`s (`jno.shape.box(0, 0, 0, w, ...)`, a line vertex, its radius) is built at
+        # the parameters' initial values and moved under a trace -- a wire's vertices and gauge
+        # (`line_filaments(points=, radii=)`), a solid's faces on a `faces` grid (`_with_solids`).
+        # Structure -- how many filaments or cells, which node is which, where it welds -- stays the
+        # reference's. Before the shape carried them, `.attach(path=, radius=, faces=)` did this.
+        for old in ("path", "radius", "faces"):
+            if _attached(old):
+                raise ValueError(
+                    f"jno.peec: `.attach({old}=...)` on {sorted(_attached(old))} is no longer read -- the "
+                    "geometry's design variables are the shape's own coordinates now. Write the parameter "
+                    "where the number was: `jno.shape.box(x0, y0, z0, w, y1, z1)` for a face, "
+                    "`jno.shape.line([(x, y, z + h), ...], r=rr)` for a wire's vertices and radius."
+                )
+        line_geom: dict = {}
+        solid_geom: dict = {}
+        # A property this network does not read is not an error -- the same domain may carry a
+        # `jno.fem` problem's coefficients -- but a misspelt `sigma` or `faces` would otherwise be
+        # dropped without a word, so it is named once.
+        _props = self.domain.__dict__.get("_region_attachments") or {}
+        _unread = {
+            p: sorted(r for r in regs if r in regions or r == type(self.domain)._DEFAULT_TARGET)
+            for p, regs in _props.items()
+            if p not in _PEEC_PROPS
+        }
+        _unread = {
+            p: [r if r != type(self.domain)._DEFAULT_TARGET else "<default>" for r in rs] for p, rs in _unread.items() if rs
+        }
+        if _unread:
+            from .utils.solver.peec import _warn_once
+
+            _warn_once(
+                "jno.peec: "
+                + "; ".join(f"{p!r} on {rs}" for p, rs in sorted(_unread.items()))
+                + " -- jno.peec reads only ['mu_r', 'sigma'], so these do nothing in the network. "
+                "Fine if they are coefficients of a jno.fem problem on the same domain; otherwise check "
+                "the spelling."
+            )
+        # `d.attach(sigma=...)` with no target is the default for every region that declares neither
+        # a conductivity nor a permeability -- the same rule `d.<name>` applies to a FEM coefficient.
+        _default = type(self.domain)._DEFAULT_TARGET
+        default_sig = sig.pop(_default, None)
+        mur.pop(_default, None)
+        if default_sig is not None:
+            for n in conductors:
+                if n not in sig and n not in mur:
+                    sig[n] = default_sig
+        param_exprs: dict = {}  # region -> attached expression, for the ones carrying a parameter
+        field_exprs: dict = {}  # region -> attached expression in terms of a FEM field (sigma(T))
+        lines, line_sig, solids = [], [], []
+        line_names, solid_names = [], []
+        magnetic, magnetic_names = [], []
+        for n, sh in conductors.items():
+            if n not in sig and n not in mur:
+                raise ValueError(
+                    f"jno.peec: region {n!r} declares neither a conductivity nor a permeability, so "
+                    "there is nothing to solve on it. Give it one: `.attach(sigma=...)` for metal, "
+                    "`.attach(mu_r=...)` for a core that does not conduct, or both for a conducting "
+                    "magnetic material."
+                )
+            node = getattr(sh, "_node", None)
+            kind = type(node[1]).__name__ if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+            if kind != "Line" and not getattr(sh, "is_analytic", lambda: False)():
+                raise NotImplementedError(_shape_msg(n, kind))
+            if n in mur:
+                if kind == "Line":
+                    raise NotImplementedError(
+                        f"jno.peec: {n!r} attaches mu_r to a Shape.line. A core carries FLUX through a "
+                        "cross-section, which a filament does not have -- model it as a solid."
+                    )
+                # What circulates in the magnetic mesh is the MAGNETISATION, whose constitutive
+                # quantity is chi = mu_r - 1. Air adds none, so a mu_r of exactly 1 is not a magnetic
+                # region at all -- it is dropped, which is exact rather than an approximation, and is
+                # what lets a unit-permeability core reproduce the coreless answer to the last bit
+                # instead of merely closely. It also keeps an infinite reluctance out of the solve.
+                if _unit_permeability(mur[n]):
+                    from .utils.solver.peec import _warn_once
+
+                    _warn_once(
+                        f"jno.peec: {n!r} attaches mu_r = 1, which is air: chi = mu_r - 1 is zero, so "
+                        "it adds no magnetisation and is not discretised as a core. Nothing is lost -- "
+                        "the answer is the one you would get without it -- but if a core was intended, "
+                        "its permeability is not set."
+                    )
+                else:
+                    magnetic.append((sh, mur[n]))
+                    magnetic_names.append(n)
+            if n not in sig:
+                if n not in {m for m in magnetic_names}:
+                    raise ValueError(
+                        f"jno.peec: region {n!r} declares mu_r = 1 and no conductivity, so it is air "
+                        "with a name. Give it a real permeability, give it a `sigma`, or leave it out "
+                        "of the network."
+                    )
+                continue
+            # NOT coerced to float: a conductivity may be a traced value, which is what closes the
+            # electro-thermal loop — sigma(T) falls as the conductor heats, and copper is about 31 %
+            # more resistive at 100 C than at 20 C.
+            if _field_symbols(sig[n]):
+                # A conductivity written in a FEM field -- `sigma0 / (1 + alpha (T - T0))` -- has no value
+                # until that field is solved, so this network can only be solved TOGETHER with the FEM
+                # problem that owns the field. The coupled driver sets a reference field value for the
+                # structural build (the lattice and the skin-depth guard need a number) and hands the
+                # field-dependent values in at every solve.
+                ref = getattr(self, "_field_reference", None)
+                if ref is None:
+                    names = sorted({f.name for f in _field_symbols(sig[n])})
+                    raise ValueError(
+                        f"jno.peec: the conductivity of {n!r} depends on the FEM field {names}, which only a "
+                        "FEM solve produces. Write the jno.fem problem of that field with this network's loss "
+                        "as its source -- `jno.fem([... - em.loss * s, ...])` -- and the two are solved "
+                        "together: `heat.solve()` (the converged field), `em.solve()` (the network there)."
+                    )
+                field_exprs[n] = sig[n]
+                _ref = _eval_field_material(sig[n], {f: jnp.asarray(ref) for f in _field_symbols(sig[n])})
+                sig[n] = _ref[0] if _ref.size == 1 else _ref
+            if kind == "Line":
+                wl = _par.world_line(sh)
+                if wl is not None and _par.any_expr(list(wl)):
+                    line_geom[n] = wl
+                val = sig[n]
+                if _model_calls(val):
+                    # A trainable parameter on a wire is recorded and evaluated at its CURRENT value for
+                    # the build, exactly as on a solid below; only the values are traced later.
+                    param_exprs[n] = val
+                    val = _eval_material(val, {})
+                lines.append(sh)
+                line_sig.append(val)
+                line_names.append(n)
+            else:
+                # ANY closed-form solid, not just a box: the lattice covers its bounding box and a
+                # mask says which cells are metal, so a cylinder, a sphere, a union or a CSG
+                # difference all voxelise the same way and all stay one Toeplitz block.
+                # A trainable parameter is recorded and replaced by its CURRENT value here: the
+                # discretisation is structure, it is frozen at build() anyway, and it must be
+                # concrete for the lattice's occupancy test. Only the VALUES are traced later.
+                if _par.has_params(sh._node):
+                    wb = _par.world_box(sh)
+                    if wb is None:
+                        raise NotImplementedError(
+                            f"jno.peec: the solid {n!r} has a `jno.np.parameter` in its coordinates, but it "
+                            "is not an axis-aligned box (a box, an extruded rect, either translated). A "
+                            "network moves a solid by moving its six faces' grid lines, which a CSG "
+                            "combination or another primitive does not have."
+                        )
+                    solid_geom[n] = wb
+                val = sig[n]
+                if _model_calls(val):
+                    param_exprs[n] = val
+                    val = _eval_material(val, {})
+                    # a nodal field comes back as a callable of position; the lattice evaluates it
+                    a = None if callable(val) else np.asarray(jax.lax.stop_gradient(jnp.asarray(val)))
+                    if a is not None and (not np.all(np.isfinite(a)) or not np.any(np.abs(a) > 0)):
+                        raise ValueError(
+                            f"jno.peec: the conductivity of {n!r} is a trainable parameter whose "
+                            "initial value makes it zero everywhere, so the network has no metal to "
+                            "carry current and the solve is singular. A `jno.np.parameter` starts as "
+                            "ZEROS -- give it a starting point with "
+                            "`.initialize(jax.nn.initializers.constant(0.5))` before attaching it."
+                        )
+                solids.append((sh, val))
+                solid_names.append(n)
+
+        parts, owners, blocks = [], [], []  # (Filaments, sigma), the shapes, and (names, resolver)
+        line_info = None
+        if lines:
+            # A WELDED network shares one near-field block, which is vectorised over a single
+            # sub-point count. A bar samples its VOLUME (quad x quad_t^2 points) because a lattice
+            # cell is a cube; a wire is thin and needs none of that, so it spends the matching count
+            # on points along its own length, where they do help it. With no solids there is nothing
+            # to match and a wire keeps the plain rule -- the count is a WELD constraint, not a
+            # property of a filament.
+            _lquad = _QUAD * _QUAD_T**2 if solids else _QUAD
+            fl = line_filaments(lines, quad=_lquad)
+            line_info = (
+                tuple(lines),
+                tuple(line_names),
+                _lquad,
+                int(np.asarray(fl.pos).shape[0]),
+                int(np.asarray(fl.length).size),
+            )
+            # Each conductor's conductivity is resolved over ITS OWN filaments, so a field sees the
+            # midpoints of the wire it belongs to and a per-element vector is that wire's own count.
+            cen, fpart = element_centres(fl), np.asarray(fl.part)
+            sel = [np.flatnonzero(fpart == i) for i in range(len(lines))]
+            inv = np.empty(len(fpart), dtype=int)
+            inv[np.concatenate(sel)] = np.arange(len(fpart))
+
+            # A wire is one-dimensional, so an anisotropic sigma reaches it as `t . sigma . t` along
+            # its own tangent rather than as a component -- see `resolve_sigma`.
+            _tan = np.asarray(fl.mom)[:: max(1, np.asarray(fl.mom).shape[0] // len(np.asarray(fl.length)))]
+
+            def line_resolve(vals, _s=sel, _i=inv, _c=cen, _n=tuple(line_names), _t=_tan):
+                return jnp.concatenate(
+                    [
+                        jnp.asarray(resolve_sigma(v, _c[q], f"conductor {nm!r}", tangent=_t[q]))
+                        for v, q, nm in zip(vals, _s, _n)
+                    ]
+                )[_i]
+
+            blocks.append((tuple(line_names), line_resolve))
+            parts.append((fl, line_resolve(line_sig)))
+            owners.append(lines)
+        if solids:
+            # ONE grid for every solid. Separate lattices couple through a block that is not Toeplitz,
+            # so a shared grid is what keeps the whole trace layer a single FFT: on the example module
+            # that is ten coplanar traces of equal thickness, which is the case it fits exactly.
+            shs = [sh for sh, _ in solids]
+            sgs = [sg for _, sg in solids]
+            # A conductor thick against the skin depth carries a current SHEET PER FACE (see
+            # `bar_filaments(freq=)`), so its inductance sees the current where its surface impedance
+            # puts it. Measured on a power module at 1 MHz against Ansys Q3D (20.641 nH), same
+            # geometry and 1 mm pitch: one current per conductor +20.1 %, sheets +3.1 %.
+            #
+            # The discretisation is fixed for the whole build, so a SWEEP is split at its LOWEST
+            # frequency: a conductor is paired only if it is skin-confined at every point, which
+            # leaves a sweep reaching down to where it is not on the one-current model it had before.
+            # A magnetic core keeps the one-current model too: its coupling is built for one
+            # sub-point offset per family, and a sheet family has its own.
+            _sheet_freq = 0.0 if magnetic else float(np.min(np.atleast_1d(self.freq)))
+            fb = bar_filaments(
+                shs,
+                quad=_QUAD,
+                quad_t=_QUAD_T,
+                sigma=sgs,
+                grid_shapes=[s for s, _ in magnetic],
+                edges=self.grid,
+                freq=_sheet_freq,
+            )
+            # what `BuiltPEEC._with_solids` needs: the solids by name, the lattice's traced pass, and
+            # where its rows start in the welded order (lines come first)
+            solid_info = (
+                tuple(solid_names),
+                tuple(shs),
+                fb.lattice,
+                0 if line_info is None else line_info[3],
+                0 if line_info is None else line_info[4],
+            )
+            if solid_geom and not fb.lattice.get("graded"):
+                raise ValueError(
+                    f"jno.peec: {sorted(solid_geom)} attach `faces=`, but a solid's faces can only move on a "
+                    "grid whose faces are grid lines. Build with grid=jno.peec.faces(pitch=...) and solve "
+                    "with operator=jno.solve.hierarchical(...)."
+                )
+            blocks.append((tuple(solid_names), fb.lattice["resolve"]))
+            parts.append((fb, fb.lattice["sigma"]))
+            owners.append(shs)
+
+        attached = dict(zip(line_names, line_sig))
+        attached.update({n: sg for n, (_sh, sg) in zip(solid_names, solids)})
+
+        def resolve_all(overrides=None):
+            """Per-filament conductivity in _weld's concatenation order. Safe to call under a trace.
+
+            Every piece it closes over is concrete geometry, so calling it again costs nothing but
+            the arithmetic -- which is what makes a design iteration cheap and a solve jittable.
+            """
+            vals = dict(attached)
+            for n, v in (overrides or {}).items():
+                if n not in vals:
+                    raise ValueError(
+                        f"jno.peec: sigma={{{n!r}: ...}} names no conductor of this network. Its "
+                        f"conductors are {sorted(vals)}. A terminal is not a conductor."
+                    )
+                vals[n] = v
+            return jnp.concatenate([jnp.asarray(fn([vals[n] for n in names])) for names, fn in blocks])
+
+        # part index -> region name, in the order _weld renumbers them: lines, then solids
+        fil, _sigma0 = _weld(parts, owners)
+        if line_names and solid_names:
+            # Mixing a Shape.line with a solid puts the whole network on the WELDED path, which is a
+            # different and far more expensive solver than a plain lattice -- and nothing else in the
+            # model announces that, so a single bond wire silently changes the complexity.
+            from .utils.solver.peec import _warn_once
+
+            _warn_once(
+                f"jno.peec: this network is WELDED -- {len(line_names)} line conductor(s) joined to "
+                f"{len(solid_names)} solid(s) -- so it solves on the welded path, not the lattice "
+                "one. A lattice applies its partial inductance by FFT behind a diagonal "
+                "preconditioner; a weld needs a dense cross block between the parts and a "
+                "whole-system near-field factorisation. Measured: 27,533 welded elements take 31 s "
+                "where 114,000 lattice bars take 1.2 s, and adding ONE wire to a 6,806-bar lattice "
+                "took it from 0.19 s to 19.8 s before that preconditioner existed. This is what "
+                "joining a bond wire to a trace layer costs, not a mistake -- but a model built from "
+                "solids alone stays on the fast path, so it is worth knowing which one you are on."
+            )
+        # The magnetic mesh is structurally the SAME object as the electric one: a core is voxels and
+        # the faces between them, exactly as a conductor is bars between cells. So `bar_filaments`
+        # builds it unchanged, carrying the permeability where a conductivity would sit.
+        mag = None
+        if magnetic:
+            if lines:
+                raise NotImplementedError(
+                    "jno.peec: a magnetic region together with a Shape.line is not supported yet. A "
+                    "welded network already needs a cross block and a whole-system factorisation, and "
+                    "adding a coupled magnetic system to that is untested -- so it is refused rather "
+                    "than guessed at. Model the winding as a solid, or drop the core."
+                )
+            # both meshes must land on ONE grid, or the coupling between them is not Toeplitz
+            # CHI, not mu_r. The lattice series-averages whatever it is handed along an element,
+            # and what adds in series is the reluctance -- so it is 1/chi that has to be averaged,
+            # which is the harmonic mean of chi. Handing it mu_r would average the wrong quantity,
+            # silently and only where two different core materials touch.
+            mag = bar_filaments(
+                [s for s, _ in magnetic],
+                sigma=[jnp.asarray(m) - 1.0 for _, m in magnetic],
+                grid_shapes=[s for s, _ in solids],
+            )
+        self._field_exprs = field_exprs
+        if line_geom and not lines:
+            line_geom = {}
+        return (
+            fil,
+            terms,
+            line_names + solid_names,
+            resolve_all,
+            mag,
+            tuple(magnetic_names),
+            param_exprs,
+            (line_geom, line_info if lines else None),
+            solid_info if solids else None,
+            solid_geom,
+        )
+
+    def _build(self) -> "BuiltPEEC":
+        """The discretisation, done once per network and kept: the jittable :class:`BuiltPEEC`.
+
+        Everything structural -- which cells are metal, which nodes a pad owns, which filaments weld
+        to which -- is decided on the HOST from concrete geometry. It runs on the first `solve()` and
+        every later solve reuses it, so a design loop pays for it once and the solve jits; under a
+        trace it runs at compile time (`jax.ensure_compile_time_eval`), since none of it reads a
+        traced value. Rebuilt only when the coupled driver changes the field reference it was built at.
+
+        **Scope, up front.** The STRUCTURE is frozen -- cell counts, ownership, numbering. A design
+        variable may change a conductivity, a wire's vertices and radius and, on a `faces` grid, a
+        box's faces (parameters in the shape's coordinates, or `solve(geometry=)`), all of which
+        stretch the built cells; anything else -- a new pitch, a conductor added or re-ordered, a
+        domain changed after the first solve -- answers for the geometry first built, silently. Make
+        a new `jno.peec` for a new one. The thickness runs behind the skin term are frozen with it, so
+        overriding a conductivity does not re-label which cells count as one material.
+        """
+        key = getattr(self, "_field_reference", None)
+        cached = getattr(self, "_built", None)
+        if cached is None or cached[0] != key:
+            with jax.ensure_compile_time_eval():
+                cached = (key, BuiltPEEC(self, *self._discretise()))
+            self._built = cached
+        return cached[1]
+
+    def cell_aspect(self):
+        """Per-cell aspect ratio of the network's solid grid at the design, as a trace node over the
+        parameters: each metal cell's longest side over its shortest (``1`` for a cube), one value per
+        metal cell. A face that a design moves stretches the cells between it and the next face, so
+        this is what a rebuild condition reads for a network::
+
+            d.rebuild(when=em.cell_aspect().max > 4)
+
+        A thin layer one cell thick has a large aspect at the reference already; compare with the
+        value there. Network without a solid conductor: refused.
+        """
+        return self._cell_node("aspect")
+
+    def cell_size(self):
+        """Per-cell size of the network's solid grid at the design, ``(dx dy dz)^(1/3)`` per metal
+        cell, as a trace node over the parameters. See :meth:`cell_aspect`.
+
+        Returns:
+            A trace node, one size per metal cell.
+        """
+        return self._cell_node("size")
+
+    def _cell_node(self, kind):
+        from .geometry import parametric as _par
+        from .trace import FunctionCall
+
+        b = self._build()
+        if b._solid_info is None:
+            raise ValueError(f"jno.peec: cell_{kind}() reads the solid grid, and this network has no solid conductor.")
+        names = list(b._params)
+        exprs = [b._params[n] for n in names]
+
+        def fn(*vals):
+            at = dict(zip(names, vals))
+            built = self._build()  # the current discretisation: a rebuild replaces it
+            lat = built._solid_info[2]
+            occ = np.nonzero(np.asarray(lat["cells"]))
+            geo = {n: _par.stack(f, at) for n, f in built._solid_geom.items()}
+            edges = built._moved_edges(geo) if geo else [jnp.asarray(e) for e in lat["edges"]]
+            w = jnp.stack([jnp.diff(edges[a])[occ[a]] for a in range(3)])
+            if kind == "aspect":
+                return jnp.max(w, axis=0) / jnp.min(w, axis=0)
+            return jnp.prod(w, axis=0) ** (1.0 / 3.0)
+
+        return FunctionCall(fn, exprs, name=f"peec_cell_{kind}")
+
+    def _rebuild(self):
+        """Forget the discretisation (`domain.rebuild` has moved the reference): the next solve builds
+        the network again at the new reference, and every readout node of this network follows."""
+        self._built = None
+        et = self.__dict__.get("_coupling")
+        if et is not None:
+            et._result = None
+
+    @property
+    def fil(self):
+        """The discretised network (filaments, nodes, and ``fil.lattice`` for a solid: its cell
+        counts ``n``, origin ``lo`` and pitch ``d``) -- what a per-cell parameter is laid out on.
+        Discretises the network if no solve has yet."""
+        return self._build().fil
+
+    @property
+    def nodes(self):
+        """``{terminal: node ids}`` -- which network nodes each terminal owns, the support a
+        ``solve(weights={terminal: w})`` distribution is laid out on (one weight per node)."""
+        return self._build().nodes
+
+    def solve(self, **kw):
+        """Solve at every frequency and return a :class:`PEECSolution`.
+
+        The first call discretises the network (host work, see :meth:`_build`); every later call
+        reuses that discretisation and is pure jax, so it jits and differentiates::
+
+            emag = jno.peec([v(*a) - v(*b) - 1.0], freq=1e6)
+            jax.jit(lambda s: emag.solve(sigma={"trace": s}).L)(sig)   # traced, every iteration
+
+        With a `jno.np.parameter` in the material or the geometry, the readouts are trace nodes for
+        `jno.core` instead. Keyword arguments are those of :meth:`BuiltPEEC.solve` -- ``sigma=``,
+        ``geometry=``, ``operator=`` for a graded lattice, and the rest.
+
+        Args:
+            **kw: passed to :meth:`BuiltPEEC.solve`: ``sigma=`` (conductivity overrides by region),
+                ``geometry=`` (parameter values for the geometry), ``operator=`` (for a graded lattice), ...
+
+        Returns:
+            PEECSolution | ParametricSolution: the solution (trace-node readouts when parameters are present).
+        """
+        heat = self.__dict__.get("_heat")
+        if heat is not None:
+            # A jno.fem problem is heated by this network's `em.loss`: the network is solved at the
+            # converged temperature of the pair -- the same solve `heat.solve()` returns.
+            if kw:
+                raise ValueError(
+                    f"jno.peec: this network heats a jno.fem problem (its `em.loss`), so it is solved at their "
+                    f"coupled fixed point with its own settings; solve() takes no keywords here (got {sorted(kw)}). "
+                    "Give them to jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            from .utils.solver.electrothermal import coupled
+
+            return coupled(self, heat).solve().em
+        return self._build().solve(**{**self._solve_kw, **kw})
+
+
+class BuiltPEEC:
+    """A PEEC network with its discretisation frozen: the jittable, differentiable half.
+
+    Made by the first :meth:`peec.solve` and kept on the network (:meth:`peec._build`). Holds the filaments, the terminal node sets and the conductivity
+    resolvers -- all of it concrete -- so :meth:`solve` touches nothing but jax and can be put
+    inside ``jax.jit``, ``jax.grad``, or a ``jno.fn`` term driven by ``jno.core``.
+
+    Args:
+        spec: the :class:`PEEC` problem it was built from.
+        fil: the filaments (geometry, lengths, areas, owners, skin data).
+        terms: the terminal node sets.
+        part_names: region names, indexed by the filaments' owners.
+        resolve: per-region conductivity resolvers (values or parameter expressions).
+        mag: the magnetic (core) network, or ``None``.
+        mag_names: region names of the magnetic network.
+        param_exprs: parameter expressions in the material and geometry, by name.
+        lines: wire (line-region) geometry, for parametric vertices and radii.
+        solids: the solid lattice cells.
+        solid_geom: the solid geometry, for parametric box faces.
+    """
+
+    def __init__(
+        self,
+        spec,
+        fil,
+        terms,
+        part_names,
+        resolve,
+        mag=None,
+        mag_names=(),
+        param_exprs=None,
+        lines=None,
+        solids=None,
+        solid_geom=None,
+    ):
+        self.fil, self.terminals, self.part_names = fil, tuple(terms), tuple(part_names)
+        self._spec = spec  # the network this discretises (what a parametric readout rebuilds from)
+        #: (names, shapes, lattice dict, first sub-point row, first element) of the solid block, for
+        #: `_with_solids`; None when the network has no solid
+        self._solid_info = solids
+        #: the magnetic mesh, when any region attached a `mu_r` -- a Filaments of the same shape as
+        #: the electric one, since a core is voxels and faces just as a conductor is.
+        self.mag, self.mag_names = mag, tuple(mag_names)
+        self.freq, self._scalar_freq = spec.freq, spec._scalar_freq
+        self.sources, self.currents, self.grounds, self.devices = (
+            spec.sources,
+            spec.currents,
+            spec.grounds,
+            spec.devices,
+        )
+        self._resolve = resolve
+        #: region -> attached material expression, for the regions whose material carries a
+        #: `jno.np.parameter`. Non-empty makes `solve()` hand back trace nodes instead of numbers.
+        self._param_exprs = dict(param_exprs or {})
+        #: line region -> (points, radius), entries numbers or expressions (`_par.world_line`), for wires whose geometry is a design variable
+        self._line_geom, self._line_info = lines if lines is not None else ({}, None)
+        #: solid region -> attached `faces=` (a 6-sequence or one expression), for solids whose faces
+        #: are a design variable
+        self._solid_geom = dict(solid_geom or {})
+        _geo_vals = [e for pr in self._line_geom.values() for e in _par.flat(list(pr))]
+        _geo_vals += [e for f in self._solid_geom.values() for e in _par.flat(f)]
+        self._params = _parameters_in(list(self._param_exprs.values()) + _geo_vals)
+        # Which nodes each pad owns is STRUCTURAL -- `terminal_nodes` reads coordinates, which are
+        # tracers under a gradient -- so it is resolved once here, on the reference geometry.
+        self.nodes = {t: terminal_nodes(fil, sh) for t, sh in terms.items()}
+        # The through-thickness guard, here rather than per solve: it reads the conductivity, which
+        # inside a jit has no value. The declared one is the conservative case (see the note there),
+        # and the geometry it also reads is frozen, so once is both enough and the only chance.
+        from .utils.solver.peec import _check_unresolved_thickness
+
+        sig0 = self._resolve(None)
+        for f in self.freq:
+            _check_unresolved_thickness(fil, sig0, 2 * np.pi * float(f), MU0)
+
+    def _with_lines(self, geometry):
+        """The network with its wires moved: ``{line region: (points, radius)}``, either may be None.
+
+        The lattice and every structural decision stay as built; the wire block of the filaments is
+        recomputed from the given vertices and gauge and spliced in front of it -- lines come first
+        in the welded order.
+        """
+        shapes, names, quad, nsub, nel = self._line_info
+        pts, rad = [], []
+        for sh, nm in zip(shapes, names):
+            p, r = (geometry or {}).get(nm, (None, None))
+            node = sh._node[1]
+            pts.append(
+                jnp.asarray(np.asarray(node.points, dtype=float)) if p is None else jnp.reshape(jnp.asarray(p), (-1, 3))
+            )
+            rad.append(float(node.r) if r is None else jnp.reshape(jnp.asarray(r), ()))
+        fl = line_filaments(list(shapes), quad=quad, points=pts, radii=rad)
+        f = self.fil
+        return f._replace(
+            pos=jnp.concatenate([fl.pos, jnp.asarray(f.pos)[nsub:]]),
+            mom=jnp.concatenate([fl.mom, jnp.asarray(f.mom)[nsub:]]),
+            self_g=jnp.concatenate([jnp.asarray(fl.self_g), jnp.asarray(f.self_g)[nel:]]),
+            length=jnp.concatenate([jnp.asarray(fl.length), jnp.asarray(f.length)[nel:]]),
+            area=jnp.concatenate([jnp.asarray(fl.area), jnp.asarray(f.area)[nel:]]),
+            skin=jnp.concatenate([jnp.asarray(fl.skin).reshape(-1) * jnp.ones(nel), jnp.asarray(f.skin)[nel:]]),
+        )
+
+    def _moved_edges(self, geometry):
+        """The grid lines per axis with the solids' faces at ``geometry``; see `_with_solids`.
+
+        Concrete geometry gives concrete lines (and the guards below raise by name); traced gives
+        traced. The reference lines are ``self._solid_info[2]["edges"]``: comparing the two tells how
+        far each cell has stretched from the width it was built at, which is how a caller decides
+        when a stretched network should be rebuilt instead.
+        """
+        names, shapes, lat, _nsub0, _nel0 = self._solid_info
+        ref = [np.asarray(e, dtype=float) for e in lat["edges"]]
+        span = [float(e[-1] - e[0]) for e in ref]
+        # host: every solid's six faces as grid-line indices (the reference, so it is structural)
+        face_idx = {}
+        for nm, sh in zip(names, shapes):
+            bnd = np.asarray(sh.bounds(), dtype=float).reshape(2, -1)
+            idx = []
+            for a in range(3):
+                for side in (0, 1):
+                    q = float(bnd[side, a]) if a < bnd.shape[1] else float(ref[a][side * (len(ref[a]) - 1)])
+                    k = int(np.argmin(np.abs(ref[a] - q)))
+                    if abs(ref[a][k] - q) > 1e-9 * max(span[a], 1e-30):
+                        raise ValueError(
+                            f"jno.peec: the {'xyz'[a]}{'01'[side]} face of {nm!r} at {q:.9g} m is not a grid line "
+                            f"(nearest {ref[a][k]:.9g} m). A face can only move with a line that is on it: "
+                            "build with grid=jno.peec.faces(pitch=...)."
+                        )
+                    idx.append(k)
+            face_idx[nm] = idx
+        anchors = [
+            sorted({0, len(ref[a]) - 1} | {face_idx[nm][2 * a + side] for nm in names for side in (0, 1)}) for a in range(3)
+        ]
+        given = [{} for _ in range(3)]
+        for nm, val in geometry.items():
+            vals = list(val) if isinstance(val, (list, tuple)) else list(jnp.reshape(jnp.asarray(val), (-1,)))
+            if len(vals) != 6:
+                raise ValueError(
+                    f"jno.peec: geometry={{{nm!r}: ...}} needs 6 values (x0, y0, z0, x1, y1, z1) for a solid, got {len(vals)}."
+                )
+            for a in range(3):
+                for side in (0, 1):
+                    k, v = face_idx[nm][2 * a + side], vals[3 * side + a]
+                    if k in given[a]:
+                        other, v0 = given[a][k]
+                        both = not isinstance(v, jax.core.Tracer) and not isinstance(v0, jax.core.Tracer)
+                        if both and abs(float(v) - float(v0)) > 1e-12 * max(span[a], 1e-30):
+                            raise ValueError(
+                                f"jno.peec: {nm!r} and {other!r} share the grid line at {ref[a][k]:.9g} m on "
+                                f"{'xyz'[a]} and were given different values ({float(v):.9g} and {float(v0):.9g}). "
+                                "A shared face has one position; give both solids the same value."
+                            )
+                        continue
+                    given[a][k] = (nm, v)
+        edges = []
+        for a in range(3):
+            e = jnp.asarray(ref[a])
+            if given[a]:
+                ks = np.array(sorted(given[a]))
+                e = e.at[ks].set(jnp.stack([jnp.asarray(given[a][k][1], dtype=float).reshape(()) for k in ks]))
+            # the lines between two anchors keep their reference fraction of the gap
+            an = np.asarray(anchors[a])
+            lo_i = np.searchsorted(an, np.arange(len(ref[a])), side="right") - 1
+            lo_i = np.clip(lo_i, 0, len(an) - 2)
+            klo, khi = an[lo_i], an[lo_i + 1]
+            frac = (ref[a] - ref[a][klo]) / np.maximum(ref[a][khi] - ref[a][klo], 1e-300)
+            is_anchor = np.isin(np.arange(len(ref[a])), an)
+            e_new = e[klo] + jnp.asarray(frac) * (e[khi] - e[klo])
+            e = jnp.where(jnp.asarray(is_anchor), e, e_new)
+            # Under a trace a crossing cannot raise, and an optimiser's line search DOES visit designs
+            # that cross (an infeasible trial point). So every cell keeps at least a fifth of its
+            # reference width and the lines after it shift along: the solve stays finite there, and
+            # at any design that satisfies the line rules the floor is inactive, so nothing changes
+            # and the gradient is the exact one. The concrete check below still refuses by name.
+            dref = jnp.asarray(np.diff(ref[a]))
+            dnew = jnp.maximum(e[1:] - e[:-1], 0.2 * dref)
+            e_floor = e[0] + jnp.concatenate([jnp.zeros(1), jnp.cumsum(dnew)])
+            if not isinstance(e, jax.core.Tracer):
+                d = np.diff(np.asarray(e))
+                if not np.all(d > 0):
+                    k = int(np.argmin(d))
+                    raise ValueError(
+                        f"jno.peec: the moved grid lines on {'xyz'[a]} are not strictly increasing between "
+                        f"{float(np.asarray(e)[k]):.9g} and {float(np.asarray(e)[k + 1]):.9g} m -- a face crossed "
+                        "another, or a cell closed. The cell counts are structure: rebuild at this design."
+                    )
+            edges.append(e_floor)
+        return edges
+
+    def _with_solids(self, geometry, fil):
+        """The network with its solids' faces moved: ``{solid region: (x0, y0, z0, x1, y1, z1)}``.
+
+        Only on a grid whose every face is a grid line (``grid=jno.peec.faces(...)``): a face given
+        here moves its line, and every line between two FACE lines keeps its reference fraction of
+        the gap, so cell counts, ownership and numbering stay as built while the cells stretch. The
+        lattice block of ``fil`` is recomputed from the moved lines by the discretisation's own traced
+        pass; wires are not touched (give their points through ``geometry`` as well when they must
+        follow a face), and ``nodes`` stays at the reference, since which nodes a pad owns is
+        structural.
+
+        Guards, where a value is concrete: the lines must stay strictly increasing, and a line that
+        two solids share must be given one value. Under a trace neither can be checked: a cell is then
+        kept at least a fifth of its reference width (the lines after it shift), which is inactive at
+        every design that obeys the line rules and keeps an optimiser's infeasible trial points finite.
+        A design that would cross lines needs a rebuild at that design, not a stretched one.
+        """
+        if self._solid_info is None:
+            raise ValueError("jno.peec: geometry= names a solid, but this network has no solid conductor.")
+        names, shapes, lat, nsub0, nel0 = self._solid_info
+        if not lat.get("graded"):
+            raise ValueError(
+                "jno.peec: a solid's geometry can only move on a grid whose faces are grid lines. This "
+                "network was built on a uniform lattice, whose partial inductance is applied by FFT and "
+                "needs one fixed pitch -- a moved face would be silently ignored. Build it with "
+                "grid=jno.peec.faces(pitch=...) and solve with operator=jno.solve.hierarchical(...)."
+            )
+        edges = self._moved_edges(geometry)
+        pos, mom, self_g, ln, area, skin, _nodes = lat["regeom"](edges)
+        f = fil
+        nsub1 = nsub0 + int(pos.shape[0])  # shapes are static under a trace; values are not
+        nel1 = nel0 + int(ln.shape[0])
+        cat = lambda new, old, i0, i1: jnp.concatenate([jnp.asarray(old)[:i0], jnp.asarray(new), jnp.asarray(old)[i1:]])
+        return f._replace(
+            pos=cat(pos, f.pos, nsub0, nsub1),
+            mom=cat(mom, f.mom, nsub0, nsub1),
+            self_g=cat(self_g, f.self_g, nel0, nel1),
+            length=cat(ln, f.length, nel0, nel1),
+            area=cat(area, f.area, nel0, nel1),
+            skin=cat(skin, f.skin, nel0, nel1),
+        )
+
+    def solve(self, sigma=None, devices=None, weights=None, restart=None, matrix_free=None, operator=None, geometry=None):
+        """Solve at every frequency and return a :class:`PEECSolution`.
+
+        Args:
+            sigma: optional ``{conductor: value}`` overriding what the geometry declared, in any
+                spelling ``.attach(sigma=...)`` takes -- a scalar, a callable of position, or a
+                vector per element. This is where a traced design variable enters a jitted loop:
+                the shape captured at build time cannot close over a tracer that does not exist
+                yet, so the value is handed in at solve instead.
+            devices: optional ``{terminal: Z}`` overriding a two-terminal device's impedance, keyed
+                by the terminal its constraint was written on. The same story as ``sigma`` and for
+                the same reason: a device value that DEPENDS on the solved state cannot be a
+                constant in the constraint list. A SiC die's on-resistance rises about 0.5 %/K, so
+                an electro-thermal fixed point has to re-impress it every pass -- and it is the
+                dominant feedback, since the dies carry most of the loss and only theirs runs away.
+            weights: optional ``{terminal: w}`` making a terminal a prescribed current DISTRIBUTION
+                over its nodes instead of a short across them -- one weight per node of its support.
+
+                This is what makes a terminal's POSITION a design variable. Unweighted, a pad is an
+                equipotential node SET, and which nodes are in the set is a step function of where
+                the pad is: sliding a die a quarter of a millimetre changes the answer by nothing at
+                all, and then by 8 % when a node crosses the boundary. Weighted, the support is a
+                frozen superset covering the travel and the weights are smooth in the position, so
+                the gradient exists -- the same structure-frozen, values-traced split as ``sigma``.
+            restart: GMRES restart depth on the matrix-free path. The default of 16 is where the
+                curve flattens for a few thousand elements, and it is not where it flattens for
+                twenty thousand: on the example module at a 0.7 mm pitch (21,980 bars) it leaves a
+                9.3e-06 residual where 1e-6 is wanted, while 48 converges -- and finishes SOONER,
+                176 s against the 290 s the shallower one spends failing. Raise it when the solve
+                refuses; a deeper restart holds ``restart`` more vectors, which is megabytes.
+            matrix_free: ``None`` decides by structure -- a network containing a bar lattice is
+                applied by FFT, anything else forms the dense operator. ``False`` forces the dense
+                path, exact but O(N^2) memory, so for small networks only.
+            operator: ``jno.solve.hierarchical(...)`` to compress a WELDED network's dense blocks --
+                the cross coupling between parts and a non-lattice part's own partial inductance.
+                Opt in: without it the operator is exact, so no existing answer moves. **It does
+                not yet pay on a bar lattice** -- ACA fails on the structural zeros between
+                perpendicular bar families, those blocks are detected and stored densely, and the
+                measured compression is 1.00x. See :mod:`~jno.utils.solver.hmatrix`.
+        """
+        if (self._param_exprs or self._line_geom or self._solid_geom) and sigma is None:
+            # The material carries a trainable parameter, so the readouts are trace nodes over it and
+            # crux threads the values -- the same treatment `jno.rcwa` gives its readouts. Naming
+            # concrete values in `sigma=` is the way back to a number.
+            kw = {
+                k: v
+                for k, v in dict(
+                    devices=devices, weights=weights, restart=restart, matrix_free=matrix_free, operator=operator
+                ).items()
+                if v is not None
+            }
+            if operator is not None:
+                # A compressed operator's cluster tree and pivots are STRUCTURE, built from concrete
+                # geometry and cached per network. Built here, once, at the declared material, the
+                # traced solves `jno.core` runs later find them cached instead of trying to build
+                # them from tracers.
+                self.solve(sigma={}, **kw)
+            return ParametricSolution(self, self._param_exprs, self._params, kw, self._line_geom, self._solid_geom)
+        fil, nodes, terms = self.fil, self.nodes, self.terminals
+        if geometry:
+            line_names = set(self._line_info[1]) if self._line_info is not None else set()
+            solid_names = set(self._solid_info[0]) if self._solid_info is not None else set()
+            unknown = [k for k in geometry if k not in line_names and k not in solid_names]
+            if unknown:
+                raise ValueError(
+                    f"jno.peec: geometry={{{unknown[0]!r}: ...}} names no conductor of this network. Its "
+                    f"conductors are {sorted(line_names | solid_names)}."
+                )
+            gl = {k: v for k, v in geometry.items() if k in line_names}
+            gs = {k: v for k, v in geometry.items() if k in solid_names}
+            if gl:
+                fil = self._with_lines(gl)
+            if gs:
+                fil = self._with_solids(gs, fil)
+        if weights:
+            nodes = dict(nodes)
+            for name, w in weights.items():
+                if name not in nodes:
+                    raise ValueError(
+                        f"jno.peec: weights={{{name!r}: ...}} names no terminal of this network. "
+                        f"Its terminals are {sorted(nodes)}."
+                    )
+                nodes[name] = (np.asarray(nodes[name]), w)
+        sigma = self._resolve(sigma)
+        dev = self.devices
+        if devices:
+            at = {d[0]: i for i, d in enumerate(dev)}
+            dev = list(dev)
+            for name, z in devices.items():
+                if name not in at:
+                    raise ValueError(
+                        f"jno.peec: devices={{{name!r}: ...}} names no device of this network. A device is "
+                        f"keyed by the terminal its constraint was written on -- `v(A) - v(B) - Z*i(A)` is "
+                        f"keyed 'A'. This network's devices are {sorted(at)}."
+                    )
+                a, b, _z = dev[at[name]]
+                dev[at[name]] = (a, b, z)
+            dev = tuple(dev)
+
+        cur, port, drive, inject, link, pot, mcur = [], [], [], [], [], [], []
+        for f in self.freq:
+            c, phi, inj, im = solve_network(
+                fil,
+                sigma,
+                nodes,
+                self.sources,
+                self.grounds,
+                self.currents,
+                dev,
+                # the DECLARED impedances, always concrete, for the host-built preconditioner
+                device_host={d[0]: d[2] for d in self.devices},
+                omega=2 * np.pi * float(f),
+                **({} if restart is None else {"restart": int(restart)}),
+                **({} if matrix_free is None else {"matrix_free": bool(matrix_free)}),
+                **({} if operator is None else {"operator": operator}),
+                **({} if self.mag is None else {"mag": self.mag, "chi": self.mag.lattice["sigma"]}),
+                magnetic_current=True,
+                geometry_host=None if fil is self.fil else self.fil,
+            )
+            cur.append(c)
+            inject.append(inj)
+            pot.append(phi)
+            if im is not None:
+                mcur.append(im)
+            if self.mag is not None:
+                # The TOTAL flux linkage, magnetisation included, read straight off the circuit
+                # equation `Z_int I + j w (Lp I + K' I_m) = A' phi`. So it needs no magnetic unknown
+                # of its own, and with no core it is `Lp I` to the last bit -- which is what
+                # `test_the_two_inductance_forms_agree_without_a_core` pins.
+                from .utils.solver.kernel import internal_impedance as _zint
+                from .utils.solver.peec import _bcoo
+
+                w_f = 2 * np.pi * float(f)
+                z = _zint(fil.length, fil.area, fil.skin, fil.round_, w_f, sigma, MU0, fil.span)
+                inc = fil.incidence.tocoo()
+                # sparse, like everywhere else the incidence is applied: dense it is an
+                # (elements x nodes) complex matrix, which on a real core model is gigabytes
+                at = _bcoo(inc.data.astype(complex), inc.col, inc.row, inc.shape[::-1])
+                link.append((at @ phi - z * c) / (1j * w_f))
+            a, _b, g = self.sources[0]
+            drive.append(inj[a])
+            port.append(g / inj[a])
+        from .utils.solver.kernel import internal_impedance
+        from .utils.solver.peec import last_lp_apply as _last_lp
+
+        # the SURFACE resistance, so the Joule readout matches the solve rather than a DC restatement
+        w = 2 * np.pi * float(self.freq[0])
+        res = jnp.real(internal_impedance(fil.length, fil.area, fil.skin, fil.round_, w, sigma, MU0, fil.span))
+
+        cur = jnp.stack(cur)
+        port = jnp.stack([jnp.asarray(p) for p in port])
+        mag_break = (None, None, None, None, ())
+        if mcur:
+            from .utils.solver.kernel import magnetic_reluctance
+
+            mc = jnp.stack(mcur)
+            chi = self.mag.lattice["sigma"]
+            mag_break = (
+                mc[0] if self._scalar_freq else mc,
+                magnetic_reluctance(self.mag.length, self.mag.area, jnp.asarray(chi) + 1.0, MU0),
+                jnp.asarray(self.mag.area) * jnp.asarray(self.mag.length),
+                np.asarray(self.mag.part),
+                self.mag_names,
+            )
+        sol = PEECSolution(
+            self.freq[0] if self._scalar_freq else self.freq,
+            cur[0] if self._scalar_freq else cur,
+            fil,
+            {
+                t: (
+                    jnp.stack([jnp.asarray(m[t]) for m in inject])[0]
+                    if self._scalar_freq
+                    else jnp.stack([jnp.asarray(m[t]) for m in inject])
+                )
+                for t in terms
+            },
+            port[0] if self._scalar_freq else port,
+            res,
+            link=(None if not link else (link[0] if self._scalar_freq else jnp.stack(link))),
+            vol=jnp.asarray(fil.area) * jnp.asarray(fil.length),
+            owner=np.asarray(fil.part),
+            names=self.part_names,
+            pot=(jnp.stack(pot)[0] if self._scalar_freq else jnp.stack(pot)),
+            # the pads AFTER `weights=` was applied, so `voltage` reads the terminal the solve saw
+            pads=nodes,
+            mag=mag_break,
+            lp_apply=_last_lp(fil, MU0),
+        )
+        drive = jnp.stack([jnp.asarray(x) for x in drive])
+        sol._port_current = drive[0] if self._scalar_freq else drive
+        return sol
+
+
+class _from_predicate:
+    """A ``domain.tag`` predicate, wearing the ``.contains(points)`` face :func:`terminal_nodes` reads."""
+
+    def __init__(self, pred):
+        self._pred = pred
+
+    def contains(self, pts):
+        pts = np.asarray(pts)
+        return np.asarray(self._pred(*[pts[:, i] for i in range(pts.shape[1])])).reshape(-1)
+
+
+def _shape_msg(name, kind):
+    return (
+        f"jno.peec: conductor {name!r} ({kind or 'a CSG'} plan) has no closed-form membership, and the "
+        "lattice is built by asking which cells lie inside it. Everything analytic works — a box, a "
+        "cylinder, a sphere, a union, a difference — as does Shape.line, which keeps its exact "
+        "cross-section instead of being voxelised. A swept or filleted solid does not."
+    )
+
+
+def _weld(parts, owners):
+    """One network from several discretisations, JOINED where the conductors are in contact.
+
+    Each conductor is discretised on its own, so its node numbering is local: welding renumbers and
+    stacks the incidences block-diagonally. That alone leaves the parts electrically separate, and a
+    bond wire landing on a trace would carry no current -- so nodes are then tied where the geometry
+    says the metal touches: a node lying INSIDE another conductor joins that conductor's nearest node.
+
+    Contact is read from the geometry, never invented. Two conductors that merely pass close by stay
+    separate, which is what a clearance is for.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    fils = [f for f, _ in parts]
+    inc = sparse.block_diag([f.incidence for f in fils], format="csr")
+    shift = lambda key: _renumber([np.asarray(getattr(f, key)) for f in fils])
+    cat = lambda key: jnp.concatenate([jnp.asarray(getattr(f, key)) for f in fils])
+    nodes = np.concatenate([np.asarray(f.nodes) for f in fils])
+    bounds = np.cumsum([0] + [len(np.asarray(f.nodes)) for f in fils])
+    inc, nodes = _join_contacts(inc, nodes, bounds, owners)
+    welded = Filaments(
+        cat("pos"),
+        cat("mom"),
+        cat("self_g"),
+        shift("group"),
+        inc,
+        cat("length"),
+        cat("area"),
+        jnp.asarray(nodes),
+        shift("part"),
+        cat("skin"),
+        np.concatenate([np.asarray(f.round_) for f in fils]),
+        np.concatenate([np.asarray(f.span) for f in fils]),
+        # Each block keeps whatever structure it had — a lattice stays a lattice — and the blocks
+        # couple through a cross term. That is what lets a trace layer stay an FFT while the bond
+        # wires landing on it stay exact.
+        {"welded": _spans(fils)},
+        # Element pairings survive the weld. Dropping them left the two current sheets of a slab in
+        # the network as INDEPENDENT elements -- each taking the whole conductor's surface impedance,
+        # two of them in parallel, with none of the coupling that makes them one conductor. The
+        # geometry still said "two sheets" while the physics said "two conductors", and the loop
+        # inductance of a real module fell 3.3x the moment the pairing threshold was crossed.
+        _pairs(fils),
+    )
+    # jnp, not numpy: a per-filament conductivity may be TRACED -- a density field, or sigma(T) --
+    # and a welded network is exactly where that matters, since a real module is traces AND wires.
+    return welded, jnp.concatenate([jnp.asarray(g) for _f, g in parts])
+
+
+def _join_contacts(inc, nodes, bounds, owners):
+    """Tie nodes that lie inside another conductor to that conductor's nearest node."""
+    root = np.arange(len(nodes))
+
+    def find(a):
+        while root[a] != a:
+            root[a] = root[root[a]]
+            a = root[a]
+        return a
+
+    for i in range(len(bounds) - 1):
+        mine = np.arange(bounds[i], bounds[i + 1])
+        for j in range(len(bounds) - 1):
+            if i == j:
+                continue
+            theirs = np.arange(bounds[j], bounds[j + 1])
+            inside = np.zeros(len(mine), dtype=bool)
+            for sh in owners[j]:
+                inside |= np.asarray(sh.contains(nodes[mine])).reshape(-1)
+            for k in np.flatnonzero(inside):
+                a = mine[k]
+                near = theirs[int(np.argmin(((nodes[theirs] - nodes[a]) ** 2).sum(1)))]
+                ra, rb = find(a), find(near)
+                if ra != rb:
+                    root[ra] = rb
+    lab = np.array([find(a) for a in range(len(nodes))])
+    keep, inverse = np.unique(lab, return_inverse=True)
+    # merging rows is a left-multiply by the (kept x all) membership matrix, which keeps it sparse
+    pick = sparse.coo_matrix((np.ones(len(nodes)), (inverse, np.arange(len(nodes)))), shape=(len(keep), len(nodes))).tocsr()
+    return (pick @ inc).tocsr(), nodes[keep]
+
+
+def _pairs(fils):
+    """The sheet pairings, renumbered into the WELDED network's element numbering.
+
+    None when nothing anywhere is paired, which is what an unpaired network expects to see.
+    """
+    out, off, live = [], 0, False
+    for f in fils:
+        k = int(np.asarray(f.length).shape[0])
+        pr = getattr(f, "pair", None)
+        if pr is None:
+            out.append(-np.ones(k, dtype=int))
+        else:
+            pr = np.asarray(pr, dtype=int)
+            live = live or bool((pr >= 0).any())
+            out.append(np.where(pr >= 0, pr + off, -1))  # welding stacks the blocks, so shift
+        off += k
+    return np.concatenate(out) if live else None
+
+
+def _spans(fils):
+    """``(lo, hi, lattice)`` per welded block, in element numbering."""
+    out, off = [], 0
+    for f in fils:
+        k = len(np.asarray(f.length))
+        out.append((off, off + k, getattr(f, "lattice", None)))
+        off += k
+    return out
+
+
+def _renumber(blocks):
+    """Concatenate integer label blocks, offsetting each so labels stay unique across them."""
+    out, off = [], 0
+    for b in blocks:
+        out.append(b + off)
+        off += int(b.max()) + 1
+    return np.concatenate(out)
+
+
+def peec(constraints, *, freq=0.0, grid=None, operator=None, restart=None, matrix_free=None):
+    """Build a partial-element circuit problem from its port constraints.
+
+    Args:
+        constraints: the ports — ``v(A) - v(B) - g``, ``v(A) - g``, ``i(A) - g``.
+        grid: how to discretise the solids. ``None`` is one uniform pitch from each shape's own
+            ``size=``, which keeps the operator translation-invariant and therefore an FFT.
+            :func:`jno.peec.graded` instead refines toward every conductor face, which is where the
+            current crowds — and gives up the FFT, so the solve then needs
+            ``operator=jno.solve.hierarchical(...)`` and says so if it is missing.
+        freq: frequency in Hz, scalar or array (``omega = 2 pi f`` inside). An array solves at each
+            and every port readout becomes an array over it.
+
+            **The filament self-term is the DC geometric mean distance**, so the skin effect WITHIN
+            a filament is not represented. Redistribution BETWEEN conductors is (that is what the
+            method is for); to capture it inside one, split a conductor that is wide against the
+            skin depth into filaments across its section.
+        operator, restart, matrix_free: how THIS network is solved -- the same settings
+            :meth:`BuiltPEEC.solve` takes, kept on the network so every solve uses them, the ones a
+            coupled solve of a network and the jno.fem problem its ``em.loss`` heats included. A keyword given to ``solve()`` overrides
+            them for that call. ``grid=jno.peec.faces(...)`` needs ``operator=jno.solve.hierarchical(...)``
+            (or ``matrix_free=False``, dense) here, since its lattice has no FFT.
+
+    Returns:
+        :class:`PEEC` — call ``.solve()``.
+    """
+    return PEEC(constraints, freq=freq, grid=grid, operator=operator, restart=restart, matrix_free=matrix_free)
+
+
+def _graded(fine, halo):
+    """Refine the grid toward every conductor face: ``grid=jno.peec.graded(fine=..., halo=...)``.
+
+    One pitch cannot serve a real layout. Every module here puts a 1.00 mm minimum trace on a plate
+    tens of millimetres across, and resolving that trace uniformly costs one to three million
+    elements — so the runs that could be afforded had ONE cell across the narrowest conductor, and
+    current crowding has no edge to crowd against in a discretisation with no edge.
+
+    Grading toward the faces puts the elements where that happens. Measured on layout1's plate-less
+    loop against a converged Ansys Q3D reference of 54.505 nH::
+
+        uniform 1.0 mm    13 381 elements    58.803 nH    +7.88 %
+        uniform 0.5 mm    53 458 elements    57.957 nH    +6.33 %
+        uniform 0.4 mm    83 705 elements    57.340 nH    +5.20 %
+        graded             8 192 elements    57.299 nH    +5.13 %
+        graded            14 111 elements    56.604 nH    +3.85 %
+
+    8 192 graded elements match 83 705 uniform ones, and 14 111 beat them while still falling —
+    where the uniform sequence had flattened.
+
+    Args:
+        fine: cell size near a conductor face, metres.
+        halo: how far that fine spacing reaches either side of a face, metres. The base spacing away
+            from every face stays each shape's own ``size=``.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        A graded grid is **not** translation-invariant, so there is no FFT for it. Pass
+        ``operator=jno.solve.hierarchical(...)`` to ``solve()``; `lattice_apply` refuses a graded
+        lattice rather than returning the uniform-grid answer, which would be right where the
+        spacing is constant and wrong everywhere it changes.
+    """
+    fine, halo = float(fine), float(halo)
+    if fine <= 0 or halo <= 0:
+        raise ValueError(f"jno.peec.graded: fine={fine} and halo={halo} must both be positive lengths in metres.")
+    if halo < fine:
+        raise ValueError(
+            f"jno.peec.graded: halo={halo} is smaller than fine={fine}, so the refined band around a "
+            "face is narrower than one refined cell and nothing is resolved. Give halo at least a few "
+            "times fine -- it is the distance the fine spacing reaches, not the cell size."
+        )
+    return GradedGrid(fine=fine, halo=halo)
+
+
+peec.graded = _graded
+
+
+def _faces(pitch):
+    """A grid line on every conductor face, uniform in between: ``grid=jno.peec.faces(pitch=...)``.
+
+    The grid on which a solid's GEOMETRY is a design variable. Every face of every solid is a cell
+    boundary, so ``BuiltPEEC.solve(geometry={"trace": (x0, y0, z0, x1, y1, z1)})`` can move that
+    face with its line while the cells between two face lines stretch -- cell counts, ownership and
+    node numbering stay as built, and the loop inductance is differentiable in a trace's width,
+    length and position, a die's position and a layer's thickness, exactly as it already is in a
+    wire's vertices. Between consecutive faces the cells are ``max(1, round(gap / pitch))`` equal
+    ones, so a clearance narrower than the pitch is still one cell rather than a short.
+
+    Args:
+        pitch: the cell size between faces, metres; one number or one per axis.
+
+    Returns:
+        A grid spec for ``jno.peec(..., grid=...)``.
+
+    Note:
+        Like a graded grid this one is not translation-invariant: solve with
+        ``operator=jno.solve.hierarchical(...)``. Under ``geometry=`` the hierarchical structure is
+        built once from the reference geometry and refilled from the moved one, so a design that
+        moves a face far -- past another line, or so that a cell closes -- needs a rebuild at that
+        design rather than a stretch.
+    """
+    return FacesGrid(pitch=pitch)
+
+
+peec.faces = _faces

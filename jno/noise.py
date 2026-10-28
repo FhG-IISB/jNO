@@ -40,6 +40,15 @@ to match the trailing dimension of the expression you are adding noise to::
 
     # 3-D position  (N, 3)
     xyz + jno.noise.gaussian(std=0.01, ndim=3)
+
+For a shape ``ndim`` cannot express — matching a field-valued expression rather than a trailing
+component count, e.g. the prior of a flow-matching path — pass ``like=`` an existing traced
+expression instead::
+
+    x0 = jno.noise.gaussian(std=1.0, like=x1)      # x0 takes x1's shape exactly
+
+``like`` is resolved from the reference at evaluation time, so it tracks ``batchsize``,
+``solve(points=...)`` and time windows automatically. Mutually exclusive with ``ndim``.
 """
 
 from typing import Any
@@ -47,38 +56,96 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from .trace import FunctionCall, Noise, _next_op_id
+from .trace import FunctionCall, Noise, Placeholder, _next_op_id
+
+
+def _param(name, dist, value):
+    """A distribution parameter: a number, or a **schedule** -- a callable of the march time.
+
+    A schedule is what an SDE sampler's ``sigma_t`` is, so ``jno.noise.*`` accepts one; it is only
+    meaningful inside ``Model.flow(..., noise=...)`` and raises anywhere else, at the point of use.
+    """
+    if callable(value):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise TypeError(
+            f"jno.noise.{dist}: {name}= expects a number or a schedule (a callable of the march "
+            f"time t, for use with Model.flow(noise=...)), got {type(value).__name__}."
+        ) from None
+
+
+def _resolve_shape_args(name, ndim, like):
+    """Validate the ``ndim`` / ``like`` pair and return the kwargs for the Noise node.
+
+    Also reports whether a shape was **explicitly asked for**, which the caller records on the node.
+    ``ndim`` defaults to 1, so the resulting params cannot distinguish "the user wants a trailing
+    axis of 1" from "nothing was said" -- and ``flow(noise=...)`` has to refuse the former (its
+    shape comes from the state) while accepting the latter.
+    """
+    if like is not None:
+        if ndim is not None:
+            raise ValueError(
+                f"jno.noise.{name}: pass either ndim= or like=, not both. `like` takes its shape from "
+                f"the referenced expression, which is what ndim would otherwise be describing."
+            )
+        if not isinstance(like, Placeholder):
+            raise TypeError(
+                f"jno.noise.{name}: like= expects a traced jNO expression (a Placeholder), got "
+                f"{type(like).__name__}. For a fixed shape use ndim=, or wrap the array with "
+                f"jno.np.function(lambda: arr, [], 'ref')."
+            )
+        return {}, like, True
+    return {"ndim": 1 if ndim is None else int(ndim)}, None, ndim is not None
 
 
 class _NoiseNamespace:
     """Namespace exposed as ``jno.noise``."""
 
-    def gaussian(self, std: float = 1.0, ndim: int = 1) -> Noise:
+    def gaussian(self, std: float = 1.0, ndim: int = None, *, like=None) -> Noise:
         """Zero-mean Gaussian noise ~ N(0, std²).
 
-        Parameters
-        ----------
-        std : float
-            Standard deviation of the noise.
-        ndim : int
-            Number of output dimensions (last axis size). Use ``ndim=2`` for
-            2-D vector noise, ``ndim=3`` for 3-D, etc.  Default ``1``.
+        Args:
+            std (float or callable): Standard deviation of the noise: a number, or a schedule ``lambda t:
+                ...`` (a callable of the march time, only inside ``Model.flow(..., noise=...)``).
+            ndim (int): Number of output dimensions (last axis size). Use ``ndim=2`` for 2-D vector noise,
+                ``ndim=3`` for 3-D, etc.  Default ``1``. Mutually exclusive with ``like``.
+            like (Placeholder, optional): Draw with the shape of another traced expression instead of ``(N,
+                ndim)`` — e.g. a data field, so the prior of a flow-matching path lives in the data's space
+                by construction:: x0 = jno.noise.gaussian(std=1.0, like=x1) Resolved at evaluation time from
+                the reference's own shape, so it follows ``batchsize``, ``solve(points=...)`` and time
+                windows automatically; a shape written by hand would go stale under those and fail by
+                broadcasting rather than by raising. Mutually exclusive with ``ndim``.
         """
-        return Noise("gaussian", std=float(std), ndim=int(ndim))
+        shape_kw, like, shape_explicit = _resolve_shape_args("gaussian", ndim, like)
+        return Noise("gaussian", like=like, shape_explicit=shape_explicit, std=_param("std", "gaussian", std), **shape_kw)
 
-    def uniform(self, low: float = -1.0, high: float = 1.0, ndim: int = 1) -> Noise:
+    def uniform(self, low: float = -1.0, high: float = 1.0, ndim: int = None, *, like=None) -> Noise:
         """Uniform noise ~ U(low, high).
 
-        Parameters
-        ----------
-        low : float
-            Lower bound of the uniform distribution.
-        high : float
-            Upper bound of the uniform distribution.
-        ndim : int
-            Number of output dimensions. Default ``1``.
+        Args:
+            low (float or callable): Lower bound of the uniform distribution: a number, or a schedule
+                ``lambda t: ...`` (a callable of the march time, only inside ``Model.flow(...,
+                noise=...)``).
+            high (float or callable): Upper bound of the uniform distribution, likewise.
+            ndim (int): Number of output dimensions. Default ``1``. Mutually exclusive with ``like``.
+            like (Placeholder, optional): Draw with the shape of another traced expression instead of ``(N,
+                ndim)`` — e.g. a data field, so the prior of a flow-matching path lives in the data's space
+                by construction:: x0 = jno.noise.uniform(-1.0, 1.0, like=x1) Resolved at evaluation time
+                from the reference's own shape, so it follows ``batchsize``, ``solve(points=...)`` and time
+                windows automatically; a shape written by hand would go stale under those and fail by
+                broadcasting rather than by raising. Mutually exclusive with ``ndim``.
         """
-        return Noise("uniform", low=float(low), high=float(high), ndim=int(ndim))
+        shape_kw, like, shape_explicit = _resolve_shape_args("uniform", ndim, like)
+        return Noise(
+            "uniform",
+            like=like,
+            shape_explicit=shape_explicit,
+            low=_param("low", "uniform", low),
+            high=_param("high", "uniform", high),
+            **shape_kw,
+        )
 
     def grf(
         self,
@@ -184,17 +251,19 @@ class _NoiseNamespace:
 
         return FunctionCall(_grf, list(coords), name="grf")
 
-    def laplace(self, std: float = 1.0, ndim: int = 1) -> Noise:
+    def laplace(self, std: float = 1.0, ndim: int = None, *, like=None) -> Noise:
         """Zero-mean Laplace noise with the given standard deviation.
 
-        Parameters
-        ----------
-        std : float
-            Standard deviation (scale = std / sqrt(2)).
-        ndim : int
-            Number of output dimensions. Default ``1``.
+        Args:
+            std (float or callable): Standard deviation (scale = std / sqrt(2)): a number, or a schedule
+                ``lambda t: ...`` (a callable of the march time, only inside ``Model.flow(...,
+                noise=...)``).
+            ndim (int): Number of output dimensions. Default ``1``. Mutually exclusive with ``like``.
+            like (Placeholder, optional): Draw with the shape of another traced expression instead of ``(N,
+                ndim)``. See :meth:`gaussian` for the full explanation and an example.
         """
-        return Noise("laplace", std=float(std), ndim=int(ndim))
+        shape_kw, like, shape_explicit = _resolve_shape_args("laplace", ndim, like)
+        return Noise("laplace", like=like, shape_explicit=shape_explicit, std=_param("std", "laplace", std), **shape_kw)
 
 
 noise = _NoiseNamespace()

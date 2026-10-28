@@ -165,3 +165,37 @@ def test_a_remeshing_transient_refuses_a_parametric_form_without_values():
     pytest.importorskip("mmgpy", reason="mmgpy required for adaptive remeshing")
     with pytest.raises(NotImplementedError, match="Name the values"):
         _heat(_param("k"), False, size=0.2).solve(adapt=jno.solve.remesh(every=2, max_dofs=200))
+
+
+# ---------------------------------------------------------------------------------------------------
+# a field parameter given a value of the wrong size
+# ---------------------------------------------------------------------------------------------------
+def _field_form(space, transient):
+    d = jno.shape.rect(0, 0, 1, 1, size=0.25).domain(**({"time": (0.0, 0.1, 3)} if transient else {}))
+    c = d.variable("interior", split=True)
+    x, y = c[0], c[1]
+    u, phi = d.fem_symbols()
+    _r, s = d.fem_symbols(**({"space": "P0"} if space == "P0" else {}), names=("r", "s"))
+    k = jno.np.parameter(s, name="k")
+    k.dtype(jnp.float64)
+    grad, inner = jno.np.grad, jno.np.inner
+    bind = dict(x=x, y=y, **({"t": c[2]} if transient else {}))
+    terms = [k * inner(grad(u, [x, y]), grad(phi, [x, y])) - phi.bind(**bind), u(*d.variable("boundary", split=True)) - 0.0]
+    if transient:
+        terms += [u.bind(**bind).t * phi.bind(**bind), u(*d.variable("initial", split=True)) - 0.0]
+    n = len(d.mesh.cells_dict["triangle"]) if space == "P0" else len(d.mesh.points)
+    return jno.fem(terms), n
+
+
+@pytest.mark.parametrize("transient", [False, True], ids=["steady", "transient"])
+@pytest.mark.parametrize("space", ["P0", "P1"])
+def test_a_field_parameter_of_the_wrong_size_is_refused(space, transient):
+    """A per-cell / per-node value vector of the wrong length used to be accepted: the element kernels
+    gather from it, and JAX clamps an out-of-range gather, so a vector of boundary-FACET values (or half
+    the cells) solved without a word. The right size, as (n,) or (n, 1), still solves."""
+    fem, n = _field_form(space, transient)
+    for good in (jnp.ones(n), jnp.ones((n, 1))):
+        fem.solve(linear=jno.solve.lu(), k=good)
+    for bad in (n // 2, n + 1, 1):
+        with pytest.raises(ValueError, match=rf"'k'.*{n}"):
+            fem.solve(linear=jno.solve.lu(), k=jnp.ones(bad))

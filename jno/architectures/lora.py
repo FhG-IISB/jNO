@@ -115,22 +115,41 @@ except AttributeError:
 class LoRAWrapper(eqx.Module):
     """Base class for LoRA-style parameter-efficient adapters.
 
-    Subclass this to support LoRA on any layer type.  Three things required:
+    Subclass this to support LoRA on any layer type:
 
     1. Set ``adapter_fields`` to the names of the trainable adapter attributes.
-    2. Implement ``applies_to(leaf)`` — return ``True`` for leaves this wrapper
-       can handle.
+    2. Implement ``applies_to(leaf)``: ``True`` for leaves this wrapper can handle.
     3. Implement ``__init__(base, rank, alpha, *, key)`` and ``__call__``.
-    4. Implement ``merge()`` — collapse adapters back into the base layer.
+    4. Implement ``merge()``: collapse the adapters back into the base layer.
+
+    Pass the class to ``model.lora(wrapper=...)`` to use it.
     """
 
     adapter_fields: ClassVar[tuple[str, ...]] = ()
 
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         raise NotImplementedError(f"{cls.__name__}.applies_to() is not implemented")
 
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         raise NotImplementedError(f"{type(self).__name__}.merge() is not implemented")
 
 
@@ -143,13 +162,21 @@ class LoRALinear(LoRAWrapper):
     """Linear layer with frozen base weights and trainable LoRA adapters.
 
     Attributes:
-        base:   Original linear module (frozen during training). Accepts any
-                linear-like ``eqx.Module`` with ``weight``, ``in_features``,
-                and ``out_features`` attributes (e.g. jNO, foundax, or eqx.nn.Linear).
+        base: Original linear module (frozen during training). Accepts any
+            linear-like ``eqx.Module`` with ``weight``, ``in_features``,
+            and ``out_features`` attributes (e.g. jNO, foundax, or eqx.nn.Linear).
         lora_A: Down-projection, shape ``(rank, in_features)``.
         lora_B: Up-projection,   shape ``(out_features, rank)``.
-        rank:   LoRA rank (static).
-        alpha:  Scaling factor (static).
+        rank: LoRA rank (static).
+        alpha: Scaling factor (static).
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -160,8 +187,19 @@ class LoRALinear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return isinstance(leaf, eqx.Module) and not isinstance(leaf, LoRAWrapper) and isinstance(leaf, LinearLike)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -181,7 +219,16 @@ class LoRALinear(LoRAWrapper):
         delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / self.rank)
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         w = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, w)
 
@@ -364,7 +411,14 @@ def apply_lora(
 
 
 def merge_lora(model: eqx.Module) -> eqx.Module:
-    """Collapse all LoRA adapters back into their base layers."""
+    """Collapse all LoRA adapters back into their base layers (each wrapper's :meth:`LoRAWrapper.merge`).
+
+    Args:
+        model: the Equinox model, possibly containing LoRA-wrapped layers.
+
+    Returns:
+        eqx.Module: the model with plain layers, computing the same outputs.
+    """
     is_lora = lambda x: isinstance(x, LoRAWrapper)
     leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=is_lora)
     return jax.tree_util.tree_unflatten(
@@ -377,6 +431,12 @@ def lora_trainable_filter(model: eqx.Module) -> object:
     """Return a filter-spec pytree that marks only LoRA adapter arrays as trainable.
 
     Works with any ``LoRAWrapper`` subclass via its ``adapter_fields`` declaration.
+
+    Args:
+        model: the Equinox model, possibly containing LoRA-wrapped layers.
+
+    Returns:
+        A pytree of booleans matching ``model``, ``True`` for adapter arrays.
     """
     adapter_ids: set[int] = set()
     for node in jax.tree_util.tree_leaves(model, is_leaf=lambda x: isinstance(x, LoRAWrapper)):
@@ -401,6 +461,12 @@ def partial_lora_trainable_filter(model: eqx.Module) -> object:
 
     Use this when the user says ``mask(M).lora()`` without a prior ``freeze()``:
     selected layers get LoRA with frozen bases; everything else stays trainable.
+
+    Args:
+        model: the Equinox model, possibly containing LoRA-wrapped layers.
+
+    Returns:
+        A pytree of booleans matching ``model``.
     """
     adapter_ids: set[int] = set()
     wrapped_base_ids: set[int] = set()
@@ -460,6 +526,14 @@ class rsLoRALinear(LoRALinear):
     Drop-in replacement for ``LoRALinear`` — identical API and parameter count.
 
     Reference: https://arxiv.org/abs/2312.03732
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -467,7 +541,16 @@ class rsLoRALinear(LoRALinear):
         delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / jnp.sqrt(self.rank))
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         w = self.base.weight + (self.alpha / jnp.sqrt(self.rank)) * (self.lora_B @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, w)
 
@@ -480,6 +563,14 @@ class LoRAFALinear(LoRALinear):
     adapter parameters at a small accuracy cost.
 
     Reference: https://arxiv.org/abs/2308.03303
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_B",)  # lora_A stays in pytree but is frozen
@@ -490,13 +581,21 @@ class DoRALinear(LoRAWrapper):
 
     Decomposes the base weight into a magnitude vector and a unit-norm
     direction matrix.  Low-rank matrices update the direction; the per-output
-    magnitude is a small additional trainable vector.
+    magnitude is a small additional trainable vector::
 
         W' = m * (W_0 + B @ A) / ||W_0 + B @ A||_row
 
     Assumes the base layer computes ``x @ weight.T (+ bias)``.
 
     Reference: https://arxiv.org/abs/2402.09353
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("magnitude", "lora_A", "lora_B")
@@ -508,8 +607,19 @@ class DoRALinear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -530,7 +640,16 @@ class DoRALinear(LoRAWrapper):
         bias = getattr(self.base, "bias", None)
         return out + bias if bias is not None else out
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
         row_norms = jnp.linalg.norm(W, axis=1, keepdims=True)
         W_dora = self.magnitude[:, None] * W / row_norms
@@ -548,6 +667,14 @@ class PiSSALinear(LoRAWrapper):
     faster convergence when fine-tuning pretrained models.
 
     Reference: https://arxiv.org/abs/2404.02948
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -558,8 +685,19 @@ class PiSSALinear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -585,7 +723,16 @@ class PiSSALinear(LoRAWrapper):
         delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / self.rank)
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         w = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, w)
 
@@ -603,6 +750,14 @@ class LoRAXSLinear(LoRAWrapper):
     rank because ``R`` has r² parameters instead of r*(in+out).
 
     Reference: https://arxiv.org/abs/2405.17604
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("R",)
@@ -614,8 +769,19 @@ class LoRAXSLinear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -635,7 +801,16 @@ class LoRAXSLinear(LoRAWrapper):
         delta = (x @ self.lora_A.T @ self.R.T) @ self.lora_B.T * (self.alpha / self.rank)
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.R @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, W)
 
@@ -658,6 +833,14 @@ class VeRALinear(LoRAWrapper):
     via constant-expression deduplication (CSE), achieving true device-level sharing.
 
     Reference: https://arxiv.org/abs/2310.11454
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("b", "d")
@@ -671,8 +854,19 @@ class VeRALinear(LoRAWrapper):
     in_features: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -698,7 +892,16 @@ class VeRALinear(LoRAWrapper):
         delta = (x @ A.T * self.d) @ B.T * self.b * (self.alpha / self.rank)
         return self.base(x) + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         A, B = self._frozen_AB()
         # delta_W = diag(b) @ B @ diag(d) @ A * (alpha / rank)
         delta_W = (self.b[:, None] * B) @ (self.d[:, None] * A) * (self.alpha / self.rank)
@@ -714,6 +917,14 @@ class MiLoRALinear(LoRAWrapper):
     directions the base model treats as noise — preserving pretrained knowledge.
 
     Reference: https://arxiv.org/abs/2405.09913
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -724,8 +935,19 @@ class MiLoRALinear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -750,7 +972,16 @@ class MiLoRALinear(LoRAWrapper):
         delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / self.rank)
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         w = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, w)
 
@@ -763,11 +994,19 @@ class IA3Linear(LoRAWrapper):
     is exactly ``out_features``.
 
     At initialisation ``scale = ones(out_features)`` so the output is
-    unchanged.  ``rank`` is stored for API compatibility but unused.
+    unchanged.  ``rank`` is stored for API compatibility but unused::
 
         y = (x @ weight.T) * scale + bias
 
     Reference: https://arxiv.org/abs/2205.05638
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("scale",)
@@ -777,8 +1016,19 @@ class IA3Linear(LoRAWrapper):
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -793,7 +1043,16 @@ class IA3Linear(LoRAWrapper):
         bias = getattr(self.base, "bias", None)
         return y + bias if bias is not None else y
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         w = self.base.weight * self.scale[:, None]
         return eqx.tree_at(lambda m: m.weight, self.base, w)
 
@@ -811,6 +1070,14 @@ class LoKrLinear(LoRAWrapper):
     the output is unchanged at init.
 
     Reference: https://arxiv.org/abs/2212.10650
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("kron_A", "kron_B")
@@ -823,8 +1090,19 @@ class LoKrLinear(LoRAWrapper):
     in_features: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -848,7 +1126,16 @@ class LoKrLinear(LoRAWrapper):
         delta = x @ self._delta_W().T * (self.alpha / self.rank)
         return y + delta
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         W = self.base.weight + (self.alpha / self.rank) * self._delta_W()
         return eqx.tree_at(lambda m: m.weight, self.base, W)
 
@@ -870,6 +1157,14 @@ class OFTLinear(LoRAWrapper):
     regularisation and no explicit scaling is applied.
 
     Reference: https://arxiv.org/abs/2306.07280
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("Q_blocks",)
@@ -881,8 +1176,19 @@ class OFTLinear(LoRAWrapper):
     n_blocks: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _linear_applies_to(leaf)
 
     def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
@@ -912,7 +1218,16 @@ class OFTLinear(LoRAWrapper):
         bias = getattr(self.base, "bias", None)
         return y + bias if bias is not None else y
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         W_new = self._R() @ self.base.weight
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)
 
@@ -941,6 +1256,14 @@ class LoRAConv(LoRAWrapper):
     ``eqx.tree_at``, which XLA fuses into a single conv kernel call.
 
     ``flat_in = in_channels // groups * prod(kernel_size)``
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -952,8 +1275,19 @@ class LoRAConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -976,7 +1310,16 @@ class LoRAConv(LoRAWrapper):
         W_new = (W_flat + delta).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -989,6 +1332,14 @@ class rsLoRAConv(LoRAConv):
     """Rank-Stabilized LoRA for conv layers.  Scales by ``alpha/sqrt(rank)``.
 
     Reference: https://arxiv.org/abs/2312.03732
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -999,7 +1350,16 @@ class rsLoRAConv(LoRAConv):
         W_new = (W_flat + delta).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -1012,6 +1372,14 @@ class LoRAFAConv(LoRAConv):
     """Frozen-A LoRA for conv layers.  Only ``lora_B`` is trained.
 
     Reference: https://arxiv.org/abs/2308.03303
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_B",)  # lora_A stays in pytree but is frozen
@@ -1024,6 +1392,14 @@ class DoRAConv(LoRAWrapper):
     as ``DoRALinear`` does on a 2-D linear weight.
 
     Reference: https://arxiv.org/abs/2402.09353
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("magnitude", "lora_A", "lora_B")
@@ -1036,8 +1412,19 @@ class DoRAConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1066,7 +1453,16 @@ class DoRAConv(LoRAWrapper):
         W_new = self._dora_weight_flat().reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         W_new = self._dora_weight_flat().reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)
 
@@ -1078,6 +1474,14 @@ class PiSSAConv(LoRAWrapper):
     Adapters start from the top-r singular components; base holds the residual.
 
     Reference: https://arxiv.org/abs/2404.02948
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -1089,8 +1493,19 @@ class PiSSAConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1119,7 +1534,16 @@ class PiSSAConv(LoRAWrapper):
         W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -1134,6 +1558,14 @@ class LoRAXSConv(LoRAWrapper):
     Only the small ``R`` (rank × rank) matrix is trained.
 
     Reference: https://arxiv.org/abs/2405.17604
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("R",)
@@ -1146,8 +1578,19 @@ class LoRAXSConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1173,7 +1616,16 @@ class LoRAXSConv(LoRAWrapper):
         W_new = (W_flat + delta).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -1189,6 +1641,14 @@ class VeRAConv(LoRAWrapper):
     Only per-channel ``b`` (out_channels,) and ``d`` (rank,) are trained.
 
     Reference: https://arxiv.org/abs/2310.11454
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("b", "d")
@@ -1201,8 +1661,19 @@ class VeRAConv(LoRAWrapper):
     seed: int = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1231,7 +1702,16 @@ class VeRAConv(LoRAWrapper):
         W_new = (W_flat + delta).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         A, B = self._frozen_AB()
@@ -1248,6 +1728,14 @@ class MiLoRAConv(LoRAWrapper):
     components; base retains the principal directions.
 
     Reference: https://arxiv.org/abs/2405.09913
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("lora_A", "lora_B")
@@ -1259,8 +1747,19 @@ class MiLoRAConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1289,7 +1788,16 @@ class MiLoRAConv(LoRAWrapper):
         W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -1304,6 +1812,14 @@ class IA3Conv(LoRAWrapper):
     the convolution.  No low-rank matrices — trainable params = ``out_channels``.
 
     Reference: https://arxiv.org/abs/2205.05638
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("scale",)
@@ -1314,8 +1830,19 @@ class IA3Conv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1332,7 +1859,16 @@ class IA3Conv(LoRAWrapper):
         W_new = self.base.weight * self.scale.reshape(scale_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         scale_shape = (self.weight_shape[0],) + (1,) * (len(self.weight_shape) - 1)
         W_new = self.base.weight * self.scale.reshape(scale_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)
@@ -1345,6 +1881,14 @@ class LoKrConv(LoRAWrapper):
     ``(out_channels, flat_in)`` and reshaped to the original weight shape.
 
     Reference: https://arxiv.org/abs/2212.10650
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("kron_A", "kron_B")
@@ -1356,8 +1900,19 @@ class LoKrConv(LoRAWrapper):
     alpha: float = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1386,7 +1941,16 @@ class LoKrConv(LoRAWrapper):
         W_new = (W_flat + self._delta_W_flat() * (self.alpha / self.rank)).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)
@@ -1402,6 +1966,14 @@ class OFTConv(LoRAWrapper):
     ``OFTLinear`` on a 2-D weight.
 
     Reference: https://arxiv.org/abs/2306.07280
+
+    Args:
+        base: the layer to adapt (kept frozen); a linear-like module with ``weight``,
+            ``in_features`` and ``out_features`` (or a conv layer for the ``*Conv`` adapters).
+        rank: the adapter rank, capped at the layer's smaller dimension.
+        alpha: the scaling factor of the update (the update is scaled by ``alpha / rank`` where
+            the method uses one).
+        key: PRNG key for the adapter's random initialisation.
     """
 
     adapter_fields = ("Q_blocks",)
@@ -1413,8 +1985,19 @@ class OFTConv(LoRAWrapper):
     n_blocks: int = eqx.field(static=True)
     weight_shape: tuple = eqx.field(static=True)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.applies_to
     @classmethod
     def applies_to(cls, leaf: Any) -> bool:
+        """Whether this adapter can wrap ``leaf``, a layer found in the model's pytree.
+
+        ``model.lora()`` tries the wrapper classes in order and uses the first that applies.
+
+        Args:
+            leaf: a module from the model pytree (e.g. a linear or conv layer).
+
+        Returns:
+            bool: ``True`` if this class can wrap it.
+        """
         return _conv_applies_to(leaf)
 
     def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
@@ -1446,7 +2029,16 @@ class OFTConv(LoRAWrapper):
         W_new = (self._R() @ W_flat).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
 
+    # docstring-from: jno.architectures.lora.LoRAWrapper.merge
     def merge(self) -> eqx.Module:
+        """Fold the trained adapter into the base layer and return that plain layer.
+
+        The merged layer computes the same output as the adapted one, with no adapter overhead; used by
+        :func:`merge_lora` before export.
+
+        Returns:
+            eqx.Module: the base layer with the adapter's update applied to its weights.
+        """
         out_ch = self.weight_shape[0]
         flat_in = _math.prod(self.weight_shape[1:])
         W_flat = self.base.weight.reshape(out_ch, flat_in)

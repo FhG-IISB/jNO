@@ -52,6 +52,11 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 
 * **Domain** — any jNO domain works (a `jno.shape`, `jno.domain.cube`, a CSG/`gmsh` constructor).
   Add `time=(t0, t1, n_steps)` to make it transient.
+* **The unknown and its test function** — `u = d.unknown(); v = u.test()`, or by shape
+  `d.unknown.vector(2, order=2)`, `d.unknown.matrix(2, 2, symmetric=True)`, with `order=`, `space=`,
+  `complex=`, `name=` as keywords. The test function is derived from the unknown, so space, shape and
+  order cannot be mismatched, and the same `d.unknown()` is what `jno.fdm` solves for. The older
+  spelling below is equivalent (bit-identical assembly) and keeps working.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
   Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`

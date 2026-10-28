@@ -185,30 +185,26 @@ def test_stats_records_the_slots():
 
 
 # --------------------------------------------------------------------------------------
-# refresh cadence on cached specs
+# reuse cadence
 # --------------------------------------------------------------------------------------
-def test_cached_refresh_int_rebuilds_on_cadence():
-    """`cached(spec, refresh=k)`: reuse within the window, rebuild on the k-th materialization."""
+def test_reuse_k_rebuilds_on_cadence():
+    """`reuse=k`: reuse within the window, rebuild on the k-th materialization."""
     import jax.numpy as jnp
 
-    from jno.precond import PrecondContext, cached, jacobi
+    from jno.precond import PrecondContext, jacobi
     from jno.utils.solver.solver_api import LinearOperator
 
     op = LinearOperator.from_matvec(lambda v: v, diag_fn=lambda: jnp.ones(4), shape=(4, 4))
     ctx = PrecondContext(op)
-    c = cached(jacobi(), refresh=2)
+    c = jacobi(reuse=2)
     a1, a2, a3, a4, a5 = (c.materialize(ctx) for _ in range(5))
     assert a1 is a2, "within the k-window the applier must be reused"
     assert a3 is not a2, "the k-th materialization must rebuild"
     assert a3 is a4 and a5 is not a4
 
 
-def test_cached_refresh_rejects_nonsense():
-    from jno.precond import cached, jacobi
+def test_reuse_rejects_nonsense():
+    from jno.precond import jacobi
 
-    c = cached(jacobi(), refresh="often")
-    from jno.precond import PrecondContext
-    from jno.utils.solver.solver_api import LinearOperator
-
-    with pytest.raises(TypeError, match="expected bool, int, or callable"):
-        c.materialize(PrecondContext(LinearOperator.from_matvec(lambda v: v, shape=(2, 2))))
+    with pytest.raises(ValueError, match="reuse="):
+        jacobi(reuse="often")

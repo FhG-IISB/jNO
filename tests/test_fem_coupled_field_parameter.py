@@ -1,14 +1,11 @@
 """A nodal FEM field parameter k(x) on a coupled (multi-field) problem (Phase 7 of the compose work).
 
 Previously ``jno.fem (native)`` rejected a ``jno.np.parameter(phi)`` coefficient *field* on any
-multi-field problem (single-field only). It now associates the field parameter with the field whose
-test function appears in the term(s) referencing it (e.g. ``k(x)·(grad p . grad q)`` -> the ``p`` field),
-so its nodal values gather/interpolate on **that** field's FE space. A field parameter *shared* across
-several fields' terms is allowed when those fields share ONE FE space (same element order -> identical
-nodes, so k interpolates the same on any of them) — a material property common to coupled equations;
-only fields of DIFFERING order (no shared node set) are rejected. (Coupled-steady-parametric is blocked
-upstream regardless, so this exercises the coupled *transient* native path, which threads runtime
-parameters per step.)
+multi-field problem (single-field only). A field parameter carries P1 (mesh-vertex) values, so it now
+gathers and interpolates on its own P1 space, whichever fields' terms mention it: on a second field, on
+two same-order fields, and on fields of differing order (which warns that the coefficient is resolved
+more coarsely than a P2 field). This exercises the coupled *transient* native path, which threads
+runtime parameters per step.
 
 Correctness mirrors the single-field nodal-parameter test: a *linear* nodal field must assemble the
 same spatial operator as the equivalent coordinate-function coefficient (P1 interpolation of a linear
@@ -125,9 +122,12 @@ def test_field_parameter_spanning_two_same_order_fields_matches_coordinate_coeff
     assert diff < 1e-9, f"shared field-parameter operator != coordinate-coeff operator on free DOFs: {diff:.2e}"
 
 
-def test_field_parameter_spanning_different_order_fields_raises():
-    """A field parameter shared by fields of DIFFERENT order (P1 + P2) has no common node set to
-    interpolate on -> a clear NotImplementedError (rather than a silently-wrong gather)."""
+def test_field_parameter_spanning_different_order_fields_builds_and_warns():
+    """A field parameter shared by fields of DIFFERENT order (P1 + P2) used to be refused: it was
+    interpolated on one referencing field's space, and two orders share no node set. It now gathers and
+    interpolates on its OWN P1 space, so there is nothing to choose between and the form builds; the
+    P2 field only gets a warning that the coefficient is resolved more coarsely than it. (Its values
+    against the inline coefficient are checked in test_fem_parametric_coupled.py.)"""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.02, 4))
     u, v = d.fem_symbols(names=("u", "v"))  # P1
     p, q = d.fem_symbols(names=("p", "q"), order=2)  # P2
@@ -146,5 +146,6 @@ def test_field_parameter_spanning_different_order_fields_raises():
         u(ci[0], ci[1]) - 0.0,
         p(ci[0], ci[1]) - 0.0,
     ]
-    with pytest.raises(NotImplementedError, match="same element order|differing orders|one FE space"):
-        jno.fem(cons)
+    with pytest.warns(UserWarning, match="carry P1"):
+        fem = jno.fem(cons)
+    assert fem.is_transient

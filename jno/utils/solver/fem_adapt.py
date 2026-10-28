@@ -139,42 +139,31 @@ def remesh_with_mmg(
 ):
     """Locally remesh ``domain`` to a per-vertex target edge size.
 
-    Parameters
-    ----------
-    domain
-        A meshed 2D (triangle) or 3D (tetrahedron) ``jno`` domain.
-    vertex_size
-        Either ``(n_vertices,)`` isotropic target edge lengths (smaller = finer), or an
-        ``(n_vertices, 3)`` **anisotropic** metric tensor ``(m11, m12, m22)`` per vertex
-        (e.g. from :func:`hessian_metric`), which additionally sets the *direction* of
-        refinement -- stretched triangles aligned to a directional feature.
-    copy
-        If ``True`` (default) apply the new mesh to a shallow copy and return it,
-        leaving ``domain`` untouched.  If ``False`` remesh ``domain`` **in place**
-        (used by the adaptive driver, so constraints bound to ``domain`` re-assemble
-        on the refined mesh).
-    hmin, hmax
-        Hard clamps on the produced edge length.  Default to half the smallest and
-        twice the largest requested size, so the requested field is never itself
-        clamped away (a too-large ``hmin`` would silently cap the refinement).
-    hgrad
-        Maximum ratio between adjacent edge lengths (size gradation).
-    hausd
-        Hausdorff boundary-approximation tolerance (only relevant for curved
-        boundaries; polygonal boundaries stay exact regardless).
+    Args:
+        domain: A meshed 2D (triangle) or 3D (tetrahedron) ``jno`` domain.
+        vertex_size: Either ``(n_vertices,)`` isotropic target edge lengths (smaller = finer), or an
+            ``(n_vertices, 3)`` **anisotropic** metric tensor ``(m11, m12, m22)`` per vertex (e.g. from
+            :func:`hessian_metric`), which additionally sets the *direction* of refinement -- stretched
+            triangles aligned to a directional feature.
+        copy: If ``True`` (default) apply the new mesh to a shallow copy and return it, leaving
+            ``domain`` untouched.  If ``False`` remesh ``domain`` **in place** (used by the adaptive
+            driver, so constraints bound to ``domain`` re-assemble on the refined mesh).
+        hmin, hmax: Hard clamps on the produced edge length.  Default to half the smallest and twice the
+            largest requested size, so the requested field is never itself clamped away (a too-large
+            ``hmin`` would silently cap the refinement).
+        hgrad: Maximum ratio between adjacent edge lengths (size gradation).
+        hausd: Hausdorff boundary-approximation tolerance (only relevant for curved boundaries;
+            polygonal boundaries stay exact regardless).
 
-    Returns
-    -------
-    domain
-        The remeshed domain (a shallow copy if ``copy``, else ``domain`` itself).
-        Spatial tag predicates (``domain.tag(...)``) are preserved, so ``jno.fem``
-        boundary conditions bound to those tags resolve geometrically on the new nodes.
+    Returns:
+        domain: The remeshed domain (a shallow copy if ``copy``, else ``domain`` itself). Spatial tag
+            predicates (``domain.tag(...)``) are preserved, so ``jno.fem`` boundary conditions bound to
+            those tags resolve geometrically on the new nodes.
 
-    Notes
-    -----
-    Polygonal corners (including a reentrant corner) are pinned as *required* so the
-    domain geometry is preserved exactly; boundary edges are left splittable so the
-    boundary can still be refined along its straight segments.
+    Note:
+        Polygonal corners (including a reentrant corner) are pinned as *required* so the
+        domain geometry is preserved exactly; boundary edges are left splittable so the
+        boundary can still be refined along its straight segments.
     """
     return _mmg_remeshed(domain, vertex_size, hmin=hmin, hmax=hmax, hgrad=hgrad, hausd=hausd, verbose=verbose).apply(copy)
 
@@ -672,11 +661,8 @@ def _capture_geometric_boundary_tags(domain: Any) -> None:
             continue
 
         def _on_region(*coords, _r=region):
-            import jax
-            import jax.numpy as jnp
-
             pts = np.stack([np.asarray(c, dtype=float).reshape(-1) for c in coords], axis=-1)
-            return np.asarray(jax.vmap(_r.contains)(jnp.asarray(pts)))
+            return _r.contains_points(pts)
 
         preds[name] = _on_region
 
@@ -1235,35 +1221,29 @@ def transfer_solution(
     gradients flow through ``values`` (a field parameter carried across a remesh in an inverse loop
     stays differentiable).
 
-    Parameters
-    ----------
-    source_domain, target_domain
-        Meshed 2-D/3-D ``jno`` domains (``.mesh.points`` + triangle/tetra ``cells_dict``).
-    values
-        Nodal field on ``source_domain``'s **vertices**: leading axis ``n_src == n_source_vertices``.
-    fill
-        How to treat target vertices that fall outside the source mesh (numerically, or genuinely
-        non-overlapping domains): ``"nearest"`` (default) projects onto the nearest source simplex;
-        ``"error"`` raises, naming the count; a float substitutes that constant there. A remesh of the
-        same domain preserves the boundary, so outside points are rare and ``"nearest"`` is safe;
-        ``"error"`` is the strict check for a genuinely mismatched target.
-    tol
-        Barycentric inside-tolerance (a point on a shared face/edge belongs to every incident cell,
-        which all agree on the value).
-    k
-        Candidate cells tested per query point (nearest centroids). Raise for strongly anisotropic
-        meshes where the containing cell's centroid may not be among the ``k`` nearest.
+    Args:
+        source_domain, target_domain: Meshed 2-D/3-D ``jno`` domains (``.mesh.points`` + triangle/tetra
+            ``cells_dict``).
+        values: Nodal field on ``source_domain``'s **vertices**: leading axis ``n_src ==
+            n_source_vertices``.
+        fill: How to treat target vertices that fall outside the source mesh (numerically, or genuinely
+            non-overlapping domains): ``"nearest"`` (default) projects onto the nearest source simplex;
+            ``"error"`` raises, naming the count; a float substitutes that constant there. A remesh of
+            the same domain preserves the boundary, so outside points are rare and ``"nearest"`` is
+            safe; ``"error"`` is the strict check for a genuinely mismatched target.
+        tol: Barycentric inside-tolerance (a point on a shared face/edge belongs to every incident cell,
+            which all agree on the value).
+        k: Candidate cells tested per query point (nearest centroids). Raise for strongly anisotropic
+            meshes where the containing cell's centroid may not be among the ``k`` nearest.
 
-    Returns
-    -------
-    The field on ``target_domain``'s vertices, shape ``(n_target_vertices, ...)`` and the dtype of
-    ``values`` (complex is preserved).
+    Returns:
+        The field on ``target_domain``'s vertices, shape ``(n_target_vertices, ...)`` and the dtype of
+        ``values`` (complex is preserved).
 
-    Notes
-    -----
-    A shape/nodes mismatch (``values`` not aligned with the source vertices) or a dimension mismatch
-    raises rather than silently mis-transferring. Reference: barycentric interpolation over a
-    simplicial complex; KD-tree candidate location is the standard scattered-mesh interpolation route.
+    Note:
+        A shape/nodes mismatch (``values`` not aligned with the source vertices) or a dimension mismatch
+        raises rather than silently mis-transferring. Reference: barycentric interpolation over a
+        simplicial complex; KD-tree candidate location is the standard scattered-mesh interpolation route.
     """
     import jax.numpy as jnp
 
@@ -1502,26 +1482,20 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     ``g*`` by area-weighted averaging of the incident element gradients at each
     vertex; the elementwise gap ``|g* - grad u_h|`` is the error indicator.
 
-    Parameters
-    ----------
-    domain
-        A meshed domain whose P1 gradient geometry is read via
-        :func:`jno._fem._fe_element_gradient_data`.
-    u_vertex
-        ``(n_vertices,)`` nodal values of a SCALAR field, or ``(n_vertices, vec)`` for a VECTOR field
-        (one column per component). Values may be complex (Helmholtz).
+    Args:
+        domain: A meshed domain whose P1 gradient geometry is read via
+            :func:`jno._fem._fe_element_gradient_data`.
+        u_vertex: ``(n_vertices,)`` nodal values of a SCALAR field, or ``(n_vertices, vec)`` for a
+            VECTOR field (one column per component). Values may be complex (Helmholtz).
 
-    Returns
-    -------
-    (eta, global_estimate)
-        ``eta`` is ``(n_cells,)`` non-negative indicators; ``global_estimate`` is
-        ``sqrt(sum eta**2)``, an estimate of the global energy-norm error.
-
-    For a vector field the ZZ energy-norm error generalises to the **sum over components** of the
-    per-component recovered-gradient gaps (the Frobenius norm of the recovered gradient-*tensor* gap), so
-    one scalar indicator per cell still drives refinement.
-
-    Reference: Zienkiewicz & Zhu (1987), IJNME 24, 337-357.
+    Returns:
+        (eta, global_estimate): ``eta`` is ``(n_cells,)`` non-negative indicators; ``global_estimate``
+            is ``sqrt(sum eta**2)``, an estimate of the global energy-norm error.
+        For a vector field the ZZ energy-norm error generalises to the **sum over components** of the
+        per-component recovered-gradient gaps (the Frobenius norm of the recovered gradient-*tensor*
+            gap), so
+        one scalar indicator per cell still drives refinement.
+        Reference: Zienkiewicz & Zhu (1987), IJNME 24, 337-357.
     """
     u = np.asarray(u_vertex)
     comps = [u[:, c] for c in range(u.shape[1])] if (u.ndim == 2 and u.shape[1] > 1) else [u.reshape(-1)]
@@ -2862,30 +2836,28 @@ def harmonic_extension(
     expansion, translation, or shear) extends to exactly that affine field in the interior (an affine
     field is harmonic), so those motions are reproduced to machine precision.
 
-    Parameters
-    ----------
-    domain
-        A meshed 2-D/3-D simplicial ``jno`` domain.
-    boundary_displacement
-        ``(n_vert, dim)`` array; **only its prescribed rows are read** (as Dirichlet data).  The remaining
-        rows are ignored and overwritten by the harmonic solve -- build a full-length array and set the
-        prescribed rows to the desired motion (e.g. an interface velocity times ``dt``).
-    prescribed
-        Boolean ``(n_vert,)`` mask of the vertices whose displacement is *given*.  Defaults to the
-        geometric boundary, which is the ALE case.  Pass it when the motion is stated on an arbitrary
-        region -- a geometry term ``coord.d(t) - v`` may name an interior region or a ``where=`` predicate
-        just as well as a boundary, and then *those* vertices are the Dirichlet data and everything else
-        (including the outer boundary) relaxes around them.
+    Args:
+        domain: A meshed 2-D/3-D simplicial ``jno`` domain.
+        boundary_displacement: ``(n_vert, dim)`` array; **only its prescribed rows are read** (as
+            Dirichlet data).  The remaining rows are ignored and overwritten by the harmonic solve --
+            build a full-length array and set the prescribed rows to the desired motion (e.g. an
+            interface velocity times ``dt``).
+        prescribed: Boolean ``(n_vert,)`` mask of the vertices whose displacement is *given*.  Defaults
+            to the geometric boundary, which is the ALE case.  Pass it when the motion is stated on an
+            arbitrary region -- a geometry term ``coord.d(t) - v`` may name an interior region or a
+            ``where=`` predicate just as well as a boundary, and then *those* vertices are the Dirichlet
+            data and everything else (including the outer boundary) relaxes around them.
 
-    Returns
-    -------
-    ``(n_vert, dim)`` full displacement (given boundary rows, harmonically-extended interior); pass it
-    straight to :func:`move_mesh`.  Host/NumPy + a SciPy sparse solve -- a structural mesh step, outside
-    the differentiable trace.
-
-    Reference: harmonic / Laplacian mesh motion, the simplest ALE mesh-update operator; e.g. Johnson &
-    Tezduyar, *Mesh update strategies in parallel FE computations of flows with moving boundaries*,
-    Comput. Methods Appl. Mech. Engrg. 119 (1994) 73-94 (§3).
+    Returns:
+        ``(n_vert, dim)`` full displacement (given boundary rows, harmonically-extended interior); pass
+            it
+        straight to :func:`move_mesh`.  Host/NumPy + a SciPy sparse solve -- a structural mesh step,
+            outside
+        the differentiable trace.
+        Reference: harmonic / Laplacian mesh motion, the simplest ALE mesh-update operator; e.g. Johnson
+            &
+        Tezduyar, *Mesh update strategies in parallel FE computations of flows with moving boundaries*,
+        Comput. Methods Appl. Mech. Engrg. 119 (1994) 73-94 (§3).
     """
     import jax.numpy as jnp
 
@@ -2923,7 +2895,7 @@ def harmonic_extension(
 
 
 def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check: bool = True) -> Any:
-    r"""Move the mesh vertices by a per-vertex ``displacement`` (an ALE mesh motion), **keeping the
+    """Move the mesh vertices by a per-vertex ``displacement`` (an ALE mesh motion), **keeping the
     connectivity**.  Returns the deformed domain (ready for ``jno.fem``); its boundary changes shape.
 
     Because the topology is unchanged, a nodal solution field stays attached to its (now-moved) vertices
@@ -2931,30 +2903,25 @@ def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check
     the *smooth* part of a free-boundary march; once the accumulated motion distorts the mesh too much
     (``check`` trips, or element quality drops), ``remesh_with_mmg`` + ``transfer_solution`` instead.
 
-    Parameters
-    ----------
-    domain
-        A meshed 2-D/3-D simplicial ``jno`` domain.
-    displacement
-        ``(n_vert, dim)`` per-vertex displacement -- typically :func:`harmonic_extension` of a boundary
-        motion, so the interior follows smoothly.
-    copy
-        Return a moved copy (``True``, default) or mutate ``domain`` in place (``False``).
-    check
-        If ``True`` (default), raise if the motion **inverts or collapses** any element (a tangled mesh
-        would silently give a wrong solve -- house rule: fail loud).  Pass ``False`` only if you validate
-        element quality yourself.
+    Args:
+        domain: A meshed 2-D/3-D simplicial ``jno`` domain.
+        displacement: ``(n_vert, dim)`` per-vertex displacement -- typically :func:`harmonic_extension`
+            of a boundary motion, so the interior follows smoothly.
+        copy: Return a moved copy (``True``, default) or mutate ``domain`` in place (``False``).
+        check: If ``True`` (default), raise if the motion **inverts or collapses** any element (a
+            tangled mesh would silently give a wrong solve -- house rule: fail loud).  Pass ``False``
+            only if you validate element quality yourself.
 
-    Returns
-    -------
-    The deformed domain.
-
-    Scope / limitations (fail-loud, each a later extension):
-    - **Connectivity-preserving** only -- large boundary motion eventually tangles; the recovery is an
-      outer remesh + transfer, not this call (:func:`run_mesh_motion` does that under ``adapt=``).
-    - **Boundary sub-tags re-derive from the domain's spatial predicates on the moved coordinates.** A
-      predicate pinned to a fixed location (e.g. ``x == 1``) will *not* follow an edge that moved past it;
-      the moving surface should be tagged by a predicate that tracks it, or driven through the outer loop.
+    Returns:
+        The deformed domain.
+        Scope / limitations (fail-loud, each a later extension)
+        - **Connectivity-preserving** only -- large boundary motion eventually tangles; the recovery is
+            an: outer remesh + transfer, not this call (:func:`run_mesh_motion` does that under
+            ``adapt=``).
+        - **Boundary sub-tags re-derive from the domain's spatial predicates on the moved coordinates.**
+            A: predicate pinned to a fixed location (e.g. ``x == 1``) will *not* follow an edge that
+            moved past it; the moving surface should be tagged by a predicate that tracks it, or driven
+            through the outer loop.
     """
     cells, bfacets, dim = _mesh_boundary_facets(domain)
     pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
@@ -2985,52 +2952,67 @@ def move_mesh(domain: Any, displacement: np.ndarray, *, copy: bool = True, check
 class AdaptSpec:
     """Controls for the adaptive-FEM loop (``FEM.solve(adapt=...)``).
 
-    Attributes
-    ----------
-    theta
-        Dörfler bulk-marking fraction (0..1).
-    max_iters
-        Maximum number of refine-solve rounds.
-    refine_factor
-        Local edge-size reduction applied to marked cells each round.
-    tol
-        Stop early once the global error estimate falls below this (optional).
-    max_dofs
-        The DOF budget (optional): every unknown of the assembled system (``fem.dofs``), so a vector
-        field counts each component, a Taylor-Hood P2/P1 pair about nine per vertex in 2-D, and a complex
-        field its real and imaginary halves. Held within ``_DOF_BUDGET_TOL`` (20 %): the mesher cannot hit
-        a count exactly, so each remesh is counted before it is applied and redone with a corrected
-        target if it misses, and one that cannot be brought under ``1.2 * max_dofs`` raises. Steady: the
-        loop stops once a mesh reaches the budget, and no round grows past it. Transient: the constant
-        size every remesh holds (default: the starting DOF count).
-    eps
-        Relative-change convergence tolerance: stop once the round's figure of merit
-        stops changing by more than ``eps`` between successive rounds (optional). The
-        figure of merit is the ZZ estimate for the forward driver
-        (:func:`run_adaptive_solve`) and the recovered parameter for the inverse driver
-        (:func:`run_adaptive_inverse`). A **plateau detector** ("the answer has stopped
-        moving as I refine"), not a certified error bound -- the lever for more accuracy
-        is the ``max_dofs`` / ``max_iters`` budget. Requires two consecutive rounds under
-        ``eps`` (patience) so a single flat step does not stop the loop prematurely.
-    anisotropic
-        If ``True``, refine the forward loop with an :func:`hessian_metric` (stretched
-        elements aligned to the solution's curvature) grown by ``refine_factor``× vertices
-        per round, instead of isotropic ZZ + Dörfler marking. Far fewer DOFs for directional
-        features (layers, fronts); 2D and 3D scalar. ``hmin`` / ``hmax`` bound the edge sizes.
-        Metric-based DOF control is approximate, so ``max_dofs`` is held within 20 % (see there).
-    hmin, hmax
-        Edge-size window for the anisotropic metric (defaults derive from the mesh).
-    every
-        **Transient only** (``FEM.solve(adapt=...)`` on a ``u.t`` problem): remesh every ``every``
-        time steps, carrying the state across each remesh (:func:`transfer_solution`). Between remeshes
-        the march is the ordinary differentiable stepper; smaller = the mesh tracks a fast feature more
-        tightly, larger = cheaper. Ignored by the steady loop.
-    metric_field
-        **Transient multifield only**: the index of the coupled field whose curvature drives the
-        anisotropic metric (which feature the mesh tracks) — first-appearance order in the ``jno.fem``
-        constraints. Default 0. A vector and/or higher-order (P2) metric field is reduced to a scalar
-        **per-vertex magnitude** for the (scalar) ZZ / Hessian estimator. (Refining on *all* fields at
-        once — metric intersection — is a later refinement.)
+    Attributes:
+        theta: Dörfler bulk-marking fraction (0..1).
+        max_iters: Maximum number of refine-solve rounds.
+        refine_factor: Local edge-size reduction applied to marked cells each round.
+        tol: Stop early once the global error estimate falls below this (optional).
+        max_dofs: The DOF budget (optional): every unknown of the assembled system (``fem.dofs``), so a
+            vector field counts each component, a Taylor-Hood P2/P1 pair about nine per vertex in 2-D,
+            and a complex field its real and imaginary halves. Held within ``_DOF_BUDGET_TOL`` (20 %):
+            the mesher cannot hit a count exactly, so each remesh is counted before it is applied and
+            redone with a corrected target if it misses, and one that cannot be brought under ``1.2 *
+            max_dofs`` raises. Steady: the loop stops once a mesh reaches the budget, and no round grows
+            past it. Transient: the constant size every remesh holds (default: the starting DOF count).
+        eps: Relative-change convergence tolerance: stop once the round's figure of merit stops changing
+            by more than ``eps`` between successive rounds (optional). The figure of merit is the ZZ
+            estimate for the forward driver (:func:`run_adaptive_solve`) and the recovered parameter for
+            the inverse driver (:func:`run_adaptive_inverse`). A **plateau detector** ("the answer has
+            stopped moving as I refine"), not a certified error bound -- the lever for more accuracy is
+            the ``max_dofs`` / ``max_iters`` budget. Requires two consecutive rounds under ``eps``
+            (patience) so a single flat step does not stop the loop prematurely.
+        anisotropic: If ``True``, refine the forward loop with an :func:`hessian_metric` (stretched
+            elements aligned to the solution's curvature) grown by ``refine_factor``× vertices per
+            round, instead of isotropic ZZ + Dörfler marking. Far fewer DOFs for directional features
+            (layers, fronts); 2D and 3D scalar. ``hmin`` / ``hmax`` bound the edge sizes. Metric-based
+            DOF control is approximate, so ``max_dofs`` is held within 20 % (see there).
+        hmin, hmax: Edge-size window for the anisotropic metric (defaults derive from the mesh).
+        every: **Transient only** (``FEM.solve(adapt=...)`` on a ``u.t`` problem): remesh every
+            ``every`` time steps, carrying the state across each remesh (:func:`transfer_solution`).
+            Between remeshes the march is the ordinary differentiable stepper; smaller = the mesh tracks
+            a fast feature more tightly, larger = cheaper. Ignored by the steady loop.
+        metric_field: **Transient multifield only**: the index of the coupled field whose curvature
+            drives the anisotropic metric (which feature the mesh tracks) — first-appearance order in
+            the ``jno.fem`` constraints. Default 0. A vector and/or higher-order (P2) metric field is
+            reduced to a scalar **per-vertex magnitude** for the (scalar) ZZ / Hessian estimator.
+            (Refining on *all* fields at once — metric intersection — is a later refinement.)
+
+    Attributes:
+        theta: Dörfler bulk-marking fraction (h-adaptivity).
+        max_iters: maximum refine-solve (or relocation) rounds.
+        refine_factor: local edge-size reduction of marked cells.
+        tol: stop once the global error estimate falls below this.
+        max_dofs: DOF budget.
+        eps: stop once the round's figure of merit moves less than this.
+        anisotropic: Hessian-metric refinement instead of isotropic ZZ + Dörfler.
+        hmin: smallest allowed edge length.
+        hmax: largest allowed edge length.
+        every: transient only, adapt every this many steps.
+        alpha: moving meshes only, re-triangulation threshold.
+        metric_field: transient multi-field only, the field driving the metric.
+        criterion: a traced expression marking cells to refine or enrich.
+        split: split marked quadrilaterals/hexahedra with hanging nodes (``jno.solve.refine``).
+        enrich: p-adaptivity on a fixed mesh (``jno.solve.enrich``).
+        relocate: r-adaptivity, moving vertices (``jno.solve.relocate``).
+        quality_floor: relocation, minimum ``|det J|`` a step may leave.
+        lr: relocation by descent, base step.
+        ma_relax: relocation by Monge–Ampère, relaxation steps.
+        ma_dt: relocation by Monge–Ampère, pseudo-time step.
+        escalate_growth: DOF growth per escalation round.
+        escalate: fall back to h-refinement when relocation leaves the error above this.
+        relocate_method: ``"descent"`` or ``"monge_ampere"``.
+        remesh_spec: the h-refinement spec used by ``escalate``.
+        objective: what relocation equidistributes (``"equidistribution"`` or an expression).
     """
 
     theta: float = 0.5
@@ -3181,6 +3163,13 @@ class AdaptSpec:
         The criterion is checked after every descent round and must be a **mesh-geometry** condition
         (it is evaluated on the moved vertices, with no solve). Takes the same arguments as
         :func:`jno.solve.remesh`.
+
+        Args:
+            **kwargs: the :func:`jno.solve.remesh` options (``criterion=``, ``theta=``, ``max_iters=``,
+                ``refine_factor=``, ``hmin=``, ``hmax=``, ...).
+
+        Returns:
+            AdaptSpec: a copy that interleaves the remeshing.
         """
         import copy as _copy
 
@@ -3194,8 +3183,8 @@ class AdaptSpec:
     """Relocation only: which mesh functional
     to descend. ``"equidistribution"`` (default) is :func:`_equidistribution_jax`, the scale-free
     equidistribution defect of an arclength monitor; ``"huang"`` is :func:`_huang_ea_jax`, Huang's
-    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the FE
-    Dirichlet energy.
+    equidistribution+alignment functional with the same (isotropic) monitor; ``"energy"`` is the form's
+    Ritz functional ``a(u,u) - 2 l(u)`` (:func:`_ritz_weak_terms`), the energy-norm error up to a constant.
 
     It may instead be a **weak-form expression**, assembled exactly as ``criterion=`` is (same test
     symbol and region recovery) and summed to a scalar. The three strings are mesh-QUALITY functionals
@@ -3678,6 +3667,57 @@ def _walk_trials(constraint):
 
     go(getattr(constraint, "expr", constraint))
     return seen
+
+
+def _ritz_weak_terms(fem: Any, mode: str, vals0: dict) -> list:
+    """The weak terms whose Ritz functional ``objective="energy"`` descends -- validated, or a named refusal.
+
+    For a linear, symmetric, single-field form ``a(u, v) = l(v)`` the Ritz functional
+    ``J(v) = 1/2 a(v, v) - l(v)`` is minimised by ``u`` (Ciarlet, *The Finite Element Method for Elliptic
+    Problems*, 1978, §1.1), and Galerkin orthogonality ``a(u - u_h, v_h) = 0`` turns that into
+    ``J(u_h) - J(u) = 1/2 ||u - u_h||_E^2`` -- so lowering ``J(u_h)`` over meshes lowers the energy-norm
+    error. The objective is ``2 J(u_h) = u . (R(u_h) + R(0))`` with ``R`` the free
+    residual of the form's own weak terms -- with no load it is ``a(u_h, u_h)``, the Dirichlet energy this
+    objective used to descend unconditionally (#114: with a source, ``J(u_h) = -1/2 a(u_h, u_h)``, and
+    descending ``a(u_h, u_h)`` walked AWAY from the solution -- the true error rose 6x on an L-shape).
+
+    Refused by name where no minimum exists: a nonlinear or transient form (no Ritz functional), a
+    complex one (no real energy to minimise), several fields (typically a saddle point, where ``J`` has no
+    minimum), and a non-symmetric operator (advection; detected with one bilinear-symmetry probe)."""
+    import jax.numpy as jnp
+
+    from ...trace import TestFunction
+    from .solver_helper import contains_node_type
+
+    def _refuse(why):
+        raise NotImplementedError(
+            f"relocate(objective='energy') descends the Ritz functional 1/2 a(u,u) - l(u), which is the "
+            f"energy-norm error only for a LINEAR, SYMMETRIC, single-field steady form; {why}. Use the default "
+            "objective ('equidistribution'), 'huang', or a weak-form expression objective."
+        )
+
+    if mode != "linear":
+        _refuse(f"this form is {mode!r}")
+    if getattr(fem, "_complex_n", None) is not None or getattr(fem, "is_complex", False):
+        _refuse("this form is complex")
+    off = getattr(fem, "offsets", None)
+    if off is not None and len(off) > 2:
+        _refuse(f"this form has {len(off) - 1} fields (a coupled form is typically a saddle point, with no minimum)")
+    terms = [
+        t for t in (getattr(fem, "_constraints", None) or []) if contains_node_type(getattr(t, "expr", t), TestFunction)
+    ]
+    if not terms:
+        _refuse("no weak term carrying a test function was found")
+    # Symmetry: a(x, y) == a(y, x) for two probe vectors, with a(x, y) = x . (R(y) - R(0)).
+    n = int(fem.dofs)
+    rng = np.random.default_rng(0)
+    x, y = (jnp.asarray(rng.standard_normal(n)) for _ in range(2))
+    r0 = jnp.asarray(fem.eval(terms, jnp.zeros(n), args=vals0)).reshape(-1)
+    ax_y = float(jnp.vdot(x, jnp.asarray(fem.eval(terms, y, args=vals0)).reshape(-1) - r0))
+    ay_x = float(jnp.vdot(y, jnp.asarray(fem.eval(terms, x, args=vals0)).reshape(-1) - r0))
+    if abs(ax_y - ay_x) > 1e-8 * max(abs(ax_y), abs(ay_x), 1e-300):
+        _refuse(f"its operator is not symmetric (a(x,y) = {ax_y:.6e} vs a(y,x) = {ay_x:.6e} on a probe pair)")
+    return terms
 
 
 def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
@@ -4576,6 +4616,13 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         _obj_weak, _ = _criterion_weak_terms(fem, _obj_expr, _fidx)
     if spec.relocate_method not in ("descent", "monge_ampere"):
         raise ValueError(f"AdaptSpec.relocate_method must be 'descent' or 'monge_ampere'; got {spec.relocate_method!r}.")
+    # `objective="energy"` descends the RITZ functional of the form's own weak terms (#114), checked here
+    # once -- before any descent -- for the conditions under which it has a minimum at all.
+    _ritz_terms = (
+        _ritz_weak_terms(fem, mode, {sp["name"]: jnp.asarray(pts0[sp["ids"], sp["axis"]]) for sp in coord_specs})
+        if spec.objective == "energy"
+        else None
+    )
 
     def _block_defect(u, pts, bounds):
         """Mesh functional summed over every solution block — the mirror of :func:`_block_energy`, so a
@@ -4585,13 +4632,18 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         d_ = 0.0
         for i in range(len(bounds) - 1):
             bf = _vertex_values(u[bounds[i] : bounds[i + 1]], i)
-            if spec.objective == "energy":
-                d_ = d_ + _dirichlet_energy_jax(pts, bf, cells_j, dim)
-            elif spec.objective == "huang":
+            if spec.objective == "huang":  # ("energy" never reaches here: it is the Ritz functional, `_ritz`)
                 d_ = d_ + _huang_ea_jax(pts, pts0_j, bf, cells_j, dim)
             else:
                 d_ = d_ + _equidistribution_jax(pts, bf, cells_j, dim)
         return d_
+
+    def _ritz(u, vals):
+        """``2 J(u) = a(u, u) - 2 l(u) = u . (R(u) + R(0))``, with ``R`` the form's FREE residual (no essential
+        elimination) assembled on the moved geometry -- differentiable in the vertices through ``args``."""
+        r_u = jnp.asarray(fem.eval(_ritz_terms, u, args=vals)).reshape(-1)
+        r_0 = jnp.asarray(fem.eval(_ritz_terms, jnp.zeros_like(u), args=vals)).reshape(-1)
+        return jnp.vdot(u, r_u + r_0)
 
     def _objective(vals):
         """What relocation descends -- :attr:`AdaptSpec.objective`. The FE energy is *also* computed and
@@ -4599,7 +4651,9 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
         u = _solve_at(vals)
         pts = _scatter(vals)
         bounds = list(fem.offsets) if fem.offsets is not None else [0, int(u.shape[0])]
-        if _obj_expr is not None:
+        if _ritz_terms is not None:
+            obj = _ritz(u, vals)
+        elif _obj_expr is not None:
             # `fem.eval` gives the term tested against every basis function, `int g phi_i`. Summing over
             # i is `int g (sum_i phi_i)` = `int g` exactly, because a Lagrange basis is a partition of
             # unity -- so this is the integral of the objective, not a mesh-dependent proxy for it.
@@ -4646,7 +4700,8 @@ def run_adaptive_relocate(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **
             bf = blk.reshape(n_verts, veci) if veci > 1 else blk[:n_verts]
             m = _arclength_monitor_jax(bf, sg_j, meas_j, wsum_j, cells_j2, n_local, dim)
             disp = _monge_ampere_displacement(m, ops, cells, dim, n_relax=spec.ma_relax, dt=spec.ma_dt)
-            return disp, _block_defect(u, pts, bounds), _block_energy(u, pts, bounds)
+            obj = _ritz(u, vals) if _ritz_terms is not None else _block_defect(u, pts, bounds)
+            return disp, obj, _block_energy(u, pts, bounds)
 
         # `max_iters` MOVES need `max_iters + 1` evaluations, so each history entry's ``objective`` is the
         # objective OF its own ``points`` rather than of the mesh one round earlier.
@@ -4915,6 +4970,12 @@ class AdaptiveTrajectory:
     ``meshes[i]`` (a ``(points, cells)`` pair; ``points`` ``(n_i, dim)``, ``cells`` ``(m_i, dim+1)`` —
     the same mesh object is shared between remeshes). Call :meth:`resample` to project every frame onto
     one reference mesh and get a uniform array for post-processing / plotting.
+
+    Attributes:
+        times: the frame times.
+        states: one solution per frame.
+        meshes: one mesh per frame.
+        layouts: per-frame field layout (offsets, orders, cells); ``None`` for a scalar P1 field.
     """
 
     times: np.ndarray
@@ -4936,7 +4997,19 @@ class AdaptiveTrajectory:
         (scalar) / ``(n_save, n_ref, vec_i)`` (vector). The transfer is basis-aware (P1/P2, per component)
         via each frame's recorded per-field layout; a legacy scalar-P1 trajectory (no layouts — e.g. a
         moving-boundary run) uses the plain barycentric transfer of :func:`transfer_solution`. Frames are
-        loss-free; this adds one interpolation per frame on demand."""
+        loss-free; this adds one interpolation per frame on demand.
+
+        Args:
+            domain: the target domain.
+            field: for a vector/mixed system, the field index to return.
+            fill: what target vertices outside a frame's mesh get: ``"nearest"`` (the nearest source
+                simplex), a float, or ``"error"`` to refuse.
+            tol: tolerance of the point location.
+            k: candidate cells searched per point.
+
+        Returns:
+            The resampled states (shapes above).
+        """
         import jax.numpy as jnp
 
         dim = int(domain.dimension)
@@ -5143,7 +5216,7 @@ def run_adaptive_transient(
     if values is not None:
         from ...trace import check_runtime_values
 
-        check_runtime_values(_pnames, values)
+        check_runtime_values(dict(getattr(fem._op, "runtime_parameter_exprs", None) or {}), values)
         step_args = {n: jnp.asarray(v) for n, v in values.items()}
     if solve_fn is not None:
         raise NotImplementedError(
@@ -7167,42 +7240,32 @@ def run_adaptive_inverse(
     Python loop; each inner ``crux.solve`` is a fully differentiable inverse solve on the
     (currently frozen) mesh, so gradients reach the parameters unchanged.
 
-    Parameters
-    ----------
-    domain
-        The mesh to adapt.  Mutated in place (``domain.refine``) between rounds.
-    build_inverse
-        ``build_inverse(domain) -> (crux, state_op)``.  Rebuilds the inverse problem on the
-        current mesh: ``crux`` is a :func:`jno.core` whose ``.solve(n)`` optimizes the shared
-        ``jno.np`` parameters, and ``state_op`` is the FEM solve op whose value at the
-        optimized parameters is the recovered nodal state (this drives the ZZ estimator).
-        The parameters must be **shared** ``jno.np`` objects created once by the caller and
-        closed over here, so their optimized value carries (warm-starts) into the next round.
-        Scalar / low-dimensional parameters only: a *field* parameter tied to mesh vertices
-        changes shape on remesh and would need solution transfer (not supported here).
-    spec
-        :class:`AdaptSpec` controlling marking (``theta``), the round budget (``max_iters``),
-        the local refinement (``refine_factor``), and optional ``tol`` / ``max_dofs`` stops.
-    n_opt
-        Optimizer steps (``crux.solve(n_opt)``) per round.
-    readout
-        Optional ``readout(crux) -> Any`` called with the just-solved ``crux`` to snapshot
-        the recovered parameter value(s) (e.g. ``crux.eval([kappa])``); stored under
-        ``"params"`` in the returned history.  Optimized values live in the ``crux``
-        instance (they are *not* written back to the ``jno.np`` object), so read them here.
-        To warm-start the next round, reseed inside ``build_inverse`` via
-        ``param.initialize(...)`` from the value snapshotted here.
+    Args:
+        domain: The mesh to adapt.  Mutated in place (``domain.refine``) between rounds.
+        build_inverse: ``build_inverse(domain) -> (crux, state_op)``.  Rebuilds the inverse problem on
+            the current mesh: ``crux`` is a :func:`jno.core` whose ``.solve(n)`` optimizes the shared
+            ``jno.np`` parameters, and ``state_op`` is the FEM solve op whose value at the optimized
+            parameters is the recovered nodal state (this drives the ZZ estimator). The parameters must
+            be **shared** ``jno.np`` objects created once by the caller and closed over here, so their
+            optimized value carries (warm-starts) into the next round. Scalar / low-dimensional
+            parameters only: a *field* parameter tied to mesh vertices changes shape on remesh and would
+            need solution transfer (not supported here).
+        spec: :class:`AdaptSpec` controlling marking (``theta``), the round budget (``max_iters``), the
+            local refinement (``refine_factor``), and optional ``tol`` / ``max_dofs`` stops.
+        n_opt: Optimizer steps (``crux.solve(n_opt)``) per round.
+        readout: Optional ``readout(crux) -> Any`` called with the just-solved ``crux`` to snapshot the
+            recovered parameter value(s) (e.g. ``crux.eval([kappa])``); stored under ``"params"`` in the
+            returned history.  Optimized values live in the ``crux`` instance (they are *not* written
+            back to the ``jno.np`` object), so read them here. To warm-start the next round, reseed
+            inside ``build_inverse`` via ``param.initialize(...)`` from the value snapshotted here.
+        The loop stops on whichever of ``spec``'s criteria fires first, including ``eps`` --
+        convergence of the recovered parameter: once ``readout`` returns numeric value(s) whose
+        relative change ``||Δθ|| / ||θ||`` stays below ``eps`` for two consecutive rounds, the
+        design is mesh-converged and the loop ends. Setting ``eps`` requires ``readout`` to
+        return the parameter value(s) (array-like), not just a label.
 
-    The loop stops on whichever of ``spec``'s criteria fires first, including ``eps`` --
-    convergence of the recovered parameter: once ``readout`` returns numeric value(s) whose
-    relative change ``||Δθ|| / ||θ||`` stays below ``eps`` for two consecutive rounds, the
-    design is mesh-converged and the loop ends. Setting ``eps`` requires ``readout`` to
-    return the parameter value(s) (array-like), not just a label.
-
-    Returns
-    -------
-    list of dict
-        One record per round: ``{n_dofs, estimate, n_marked[, params]}``.
+    Returns:
+        list of dict: One record per round: ``{n_dofs, estimate, n_marked[, params]}``.
     """
     if spec.eps is not None and readout is None:
         raise ValueError("AdaptSpec.eps needs `readout` to return the parameter value(s) to measure convergence.")

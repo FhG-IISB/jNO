@@ -132,11 +132,51 @@ def _residual_check(A, b, u, who):
 def _bicgstab_jacobi(A, b, tol, maxiter):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
-    from .utils.solver.linear import jacobi, sparse_matvec
-
     # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
     # every call and XLA does not hoist that out of the loop -- 1.5x per iteration at 1M dofs.
-    return jax.scipy.sparse.linalg.bicgstab(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))[0]
+    # `bicgstab_counted` is jax.scipy's loop keeping the iteration count it discards (fem.stats, #104).
+    from .utils.solver.krylov import bicgstab_counted
+    from .utils.solver.linear import jacobi, sparse_matvec
+
+    x, k, broke = bicgstab_counted(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    return x, k, broke
+
+
+def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side):
+    """:func:`_bicgstab_jacobi` with its iteration count recorded for ``fem.stats``; returns ``x``."""
+    from .utils.solver.solver_api import record_iterations
+
+    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter)
+    record_iterations(k, who, side=side, broke=broke)
+    return x
+
+
+def _summarise_linear_iterations(records):
+    """``fem.stats["linear_iterations"]``: the Krylov iteration counts of a solve's linear solves (#104).
+
+    ``None`` when no counted linear solve ran (a direct factorisation, a deferred node not yet evaluated).
+    Otherwise ``solves`` (how many), ``iterations`` (each forward solve's count, in the order they finished --
+    for a Newton driver, one per Newton step), ``total``, ``max``, and ``transpose`` (the adjoint solves'
+    counts, when a gradient ran any). Solves whose count is unavailable are listed under ``uncounted``."""
+    if not records:
+        return None
+    fwd = [r for r in records if r["side"] == "forward" and isinstance(r["iterations"], int)]
+    rev = [r for r in records if r["side"] == "transpose" and isinstance(r["iterations"], int)]
+    out = {
+        "solves": len(records),
+        "iterations": [r["iterations"] for r in fwd],
+        "total": sum(r["iterations"] for r in fwd),
+        "max": max((r["iterations"] for r in fwd), default=None),
+        "by": sorted({r["who"] for r in records}),
+    }
+    if rev:
+        out["transpose"] = [r["iterations"] for r in rev]
+    other = [r for r in records if not isinstance(r["iterations"], int)]
+    if other:
+        out["uncounted"] = other
+    if any(r.get("breakdown") for r in records):
+        out["breakdown"] = True
+    return out
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
@@ -215,8 +255,12 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
     mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
-    fwd = lambda _mv, rhs: residual_gate(mv, rhs, _bicgstab_jacobi(A, rhs, tol, maxiter), who, side="forward")
-    rev = lambda _mv, rhs: residual_gate(mvT, rhs, _bicgstab_jacobi(AT, rhs, tol, maxiter), who, side="transpose")
+    fwd = lambda _mv, rhs: residual_gate(
+        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward"), who, side="forward"
+    )  # noqa: E501
+    rev = lambda _mv, rhs: residual_gate(
+        mvT, rhs, _counted_bicgstab_jacobi(AT, rhs, tol, maxiter, who, "transpose"), who, side="transpose"
+    )  # noqa: E501
     return jax.lax.custom_linear_solve(mv, b, fwd, transpose_solve=rev)
 
 
@@ -370,6 +414,57 @@ def _bare(obj: Any):
     return obj.expr if _is_view(obj) else obj
 
 
+def _unknown_symbol_of(node: Any) -> Any:
+    """The trial symbol a ``domain.unknown()`` field stands for in a weak form, or ``None``.
+
+    ``domain.unknown()`` is a valued nodal field (``jno.fdm`` solves for its values); the model it wraps
+    records the ``TrialFunction`` it was built from. Read from the instance dict on purpose: a plain
+    ``jno.np.parameter`` coefficient has no such entry and stays a coefficient."""
+    if isinstance(node, ModelCall):
+        return getattr(node.model, "__dict__", {}).get("_unknown_symbol")
+    return None
+
+
+def _lower_unknowns(obj: Any) -> Any:
+    """Replace every ``domain.unknown()`` field in a term (or a list of terms) by its trial symbol.
+
+    One object serves FEM and FDM: ``jno.fdm`` consumes the unknown's values, ``jno.fem`` its symbol.
+    The substitution happens once, at the door, so every classification site downstream sees an ordinary
+    ``TrialFunction`` -- exactly what ``fem_symbols`` would have produced. A view's bound coordinates (the
+    region of ``u(xb, yb) - g``) are carried over to the rewritten term."""
+    from .trace import substitute
+
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_lower_unknowns(o) for o in obj)
+    sym = _unknown_symbol_of(_bare(obj))
+    if sym is not None:
+        return sym
+    bare = _bare(obj)
+    if not isinstance(bare, Placeholder):
+        return obj
+    from .trace import Jacobian, TemporalDerivative
+
+    nodes = list(_walk(bare))
+    mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    if not mapping:
+        return obj
+    for n in nodes:
+        # A nodal field's `.t` is the strong-form TemporalDerivative (a cross-step difference for jno.fdm);
+        # the weak-form time derivative of a trial is a Jacobian in the time coordinate, which is what the
+        # fem_symbols view builds and what the transient classifier looks for.
+        if isinstance(n, TemporalDerivative) and any(_unknown_symbol_of(m) is not None for m in _walk(n.target)):
+            mapping[n] = Jacobian(_lower_unknowns(n.target), [n.time_var])
+    out = substitute(bare, mapping)
+    if _is_view(obj):
+        cv = getattr(obj, "_coord_vars", None)
+        if cv and "_coord_vars" not in getattr(out, "__dict__", {}):
+            out._coord_vars = dict(cv)
+        tie = getattr(obj, "_periodic_tie", None)  # `u(A) - u(B)`: the view is where the two regions survive
+        if tie is not None:
+            out._periodic_tie = tie
+    return out
+
+
 def _walk(node: Any):
     """Yield every node in a Placeholder tree (deduplicated by id)."""
     from .utils.solver.solver_helper import iter_placeholder_children
@@ -384,6 +479,27 @@ def _walk(node: Any):
         yield n
         for child in iter_placeholder_children(n):
             stack.append(child)
+
+
+def _attach_watch(constraints) -> list:
+    """``[(domain, prop, version, live)]``: the attached properties these terms read through ``d.<prop>``,
+    with the version each had when the terms were assembled. ``live`` is False for a property whose
+    value is an expression the terms captured (``d.<prop>`` marks it with ``_attached_snapshot``)."""
+    from .trace import AttachedLiteral
+
+    found: dict = {}
+    for c in constraints if isinstance(constraints, (list, tuple)) else [constraints]:
+        for n in _walk(getattr(c, "_expr", c)):
+            snap = getattr(n, "_attached_snapshot", None)
+            if isinstance(n, AttachedLiteral):
+                key = (id(n._domain), n.prop)
+                found[key] = (n._domain, found.get(key, (None, True))[1])
+            if snap is not None:
+                found[(id(snap[0]), snap[1])] = (snap[0], False)
+    return [
+        (dom, prop, (dom.__dict__.get("_attach_versions") or {}).get(prop, 0), live)
+        for (_i, prop), (dom, live) in found.items()
+    ]
 
 
 def _spatial_coord_vars(constraint: Any) -> List[Variable]:
@@ -418,6 +534,104 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _split_point_terms(constraints):
+    """Take the POINT loads out of a term list: ``(point_terms, rest)``.
+
+    A test function called with point coordinates, ``v(px, py, pz)`` (see ``trace.PointEval``), is a
+    point load. Each term is split additively; a piece holding a point evaluation must be
+    ``coefficient * v(points)`` with a point-free coefficient (numbers, arrays, ``jno.np.parameter``s
+    and arithmetic of those), and becomes ``(coefficient, PointEval)``. The other pieces of the same
+    term are kept, as one term, for the usual classification. Anything else raises by name: a point
+    evaluation is never dropped or integrated as if it were a region."""
+    from .trace import BinaryOp, Literal, PointEval, TestFunction, _is_point_coord
+
+    def pieces(e, sign=1.0):
+        if isinstance(e, BinaryOp) and e.op in ("+", "-"):
+            return pieces(e.left, sign) + pieces(e.right, sign if e.op == "+" else -sign)
+        return [(sign, e)]
+
+    def factors(e):
+        if isinstance(e, BinaryOp) and e.op == "*":
+            return factors(e.left) + factors(e.right)
+        if isinstance(e, BinaryOp) and e.op == "/":
+            return factors(e.left) + [("inv", e.right)]
+        return [e]
+
+    point_terms, rest = [], []
+    for c in constraints:
+        if not _contains(c, PointEval):
+            rest.append(c)
+            continue
+        keep = None
+        for sign, piece in pieces(_bare(c)):
+            if not _contains(piece, PointEval):
+                term = piece if sign > 0 else Literal(-1.0) * piece
+                keep = term if keep is None else keep + term
+                continue
+            fs = factors(piece)
+            pe = [f for f in fs if isinstance(f, PointEval)]
+            others = [f for f in fs if not isinstance(f, PointEval)]
+            trial = [f for f in pe if not isinstance(f.of, TestFunction)]
+            if trial:
+                raise NotImplementedError(
+                    f"jno.fem: {trial[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            if len(pe) != 1 or any(isinstance(f, tuple) and isinstance(f[1], PointEval) for f in others):
+                raise ValueError(
+                    f"jno.fem: a point term must be `coefficient * v(px, py, pz)` with ONE point evaluation of the "
+                    f"test function as a factor; got {piece!r}."
+                )
+            if not isinstance(pe[0].of, TestFunction):
+                raise NotImplementedError(
+                    f"jno.fem: {pe[0]!r} -- a TRIAL field at points inside a weak form (a point constraint or "
+                    "coupling) is not supported yet. Point LOADS are: `c * v(px, py, pz)` with the test function."
+                )
+            coef = Literal(sign)
+            for f in others:
+                inv = isinstance(f, tuple)
+                g = f[1] if inv else f
+                if not _is_point_coord(g):
+                    raise ValueError(
+                        f"jno.fem: the coefficient of a point load may only hold numbers, arrays and "
+                        f"`jno.np.parameter`s (and arithmetic of those); {g!r} is not one. A coefficient that "
+                        "depends on the solution or on position is not a point load."
+                    )
+                coef = coef / g if inv else coef * g
+            point_terms.append((coef, pe[0]))
+        if keep is not None:
+            rest.append(keep)
+    return point_terms, rest
+
+
+def _point_value(e, args):
+    """The value of a point-free expression (numbers, arrays, parameters, arithmetic) given ``args``."""
+    import jax as _jax
+
+    from .trace import BinaryOp, Constant, Literal, ModelCall
+
+    if isinstance(e, (int, float, np.ndarray, np.number)) or isinstance(e, _jax.Array):
+        return jnp.asarray(e)
+    if isinstance(e, (Literal, Constant)):
+        return jnp.asarray(e.value)
+    if isinstance(e, ModelCall):
+        name = getattr(e.model, "_parameter_name", None)
+        if args and name in args:
+            return jnp.asarray(args[name])
+        if getattr(e.model, "_frozen", False) and getattr(e.model, "_weight_tree", None) is not None:
+            return jnp.asarray(e.model._weight_tree)  # a .freeze()d (known) value
+        raise ValueError(
+            f"jno.fem: the point term uses parameter {name!r}, which has no value here: pass it to `fem.solve({name}=...)`."
+        )
+    if isinstance(e, BinaryOp):
+        a, b = _point_value(e.left, args), _point_value(e.right, args)
+        ops = {"+": jnp.add, "-": jnp.subtract, "*": jnp.multiply, "/": jnp.divide, "**": jnp.power}
+        if e.op not in ops:
+            raise ValueError(f"jno.fem: operator {e.op!r} in a point term is not supported.")
+        return ops[e.op](a, b)
+    raise ValueError(f"jno.fem: {e!r} is not a number, array or parameter.")
+
+
 def _reject_source_terms(fem_obj: Any, where: str) -> None:
     """Fail loud if the weak form carries a **load** — a term with a test function but no trial.
 
@@ -435,6 +649,11 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
     from .utils.solver.weak_form import _split_additive_terms
 
     dom = getattr(fem_obj, "domain", None)
+    if getattr(fem_obj, "_point_loads", 0):
+        raise ValueError(
+            f"{where}: the weak form carries point loads (`c * v(px, py, pz)`). An eigenproblem K x = λ M x "
+            "is homogeneous -- a load is not part of the pencil and would be silently ignored. Drop them."
+        )
     for c, cl in zip(getattr(fem_obj, "_constraints", None) or [], fem_obj.classification or []):
         if not (isinstance(cl, str) and (cl.startswith("volume") or cl.startswith("surface"))):
             continue
@@ -446,6 +665,65 @@ def _reject_source_terms(fem_obj: Any, where: str) -> None:
                     f"load vector is not part of the pencil, so it would be silently ignored and you "
                     f"would get the spectrum of the *undriven* problem. Drop the source term."
                 )
+
+
+def _eigs_periodic(fem_obj: Any):
+    """The periodic reduction **in the space this fem's operator actually lives in**.
+
+    A complex form -- and a Bloch tie makes one, since ``u(A) - c*u(B)`` with ``c != 1`` (e.g. the Bloch
+    factor ``exp(-1j*k*a)``, of modulus 1) is a complex relation -- is solved on the fused real-equivalent ``2n`` block over ``[Re; Im]``, whose
+    reduction is the realified ``B(P)`` on ``_periodic_2n``, not the ``n``-space complex ``P``.
+    Reaching for ``_periodic`` there would apply an ``(n, n_red)`` map to a ``2n`` vector."""
+    if getattr(fem_obj, "_complex_n", None) is not None:
+        return getattr(fem_obj, "_periodic_2n", None)
+    return getattr(fem_obj, "_periodic", None)
+
+
+def _fuse_mass_like(K_complex_n: int, mass_fem: Any, M: Any) -> Any:
+    """Put ``M`` in the same real-equivalent ``[[M_r, -M_i], [M_i, M_r]]`` layout ``K`` uses.
+
+    ``K x = lambda M x`` only makes sense when both sides are in the same space. ``K`` comes from a
+    complex (e.g. Bloch-tied) form and is ``2n x 2n``; the mass form is assembled as its own
+    ``jno.fem(list(mass))``, which carries neither the tie nor the complex literal, so it stays
+    ``n x n`` and the pencil shapes disagree -- the concrete failure being
+    ``dot_general requires contracting dimensions to have the same shape, got (n,) and (2n,)``.
+    A mass form that is complex in its own right is already fused by the same route and passes
+    through untouched."""
+    if getattr(mass_fem, "_complex_n", None) is not None:
+        return M
+    Mr = _to_bcoo(M)
+    return _complex_block_bcoo(Mr, _bcoo_empty(K_complex_n, K_complex_n, Mr.data.dtype), K_complex_n)
+
+
+def _expand_complex_guess(X0: Any, n_half: int) -> Any:
+    """A complex ``n``-space eigenvector guess, back into the real-equivalent ``2n`` layout.
+
+    The inverse of :func:`_thin_real_equivalent_pairs`, and needed for the same reason: ``eigs``
+    hands back complex modes on the ``n``-space, so feeding them straight back as ``X0`` (the
+    natural thing to do in a band sweep, where the previous k-point's modes are an excellent guess)
+    would present an ``n``-row guess to a ``2n`` solve. Each complex mode contributes BOTH of its
+    real-equivalent partners, ``[Re; Im]`` and ``[-Im; Re]`` -- which is exactly the pair the
+    ``2k``-mode solve is looking for."""
+    W = jnp.asarray(X0)
+    W = W[:, None] if W.ndim == 1 else W
+    re, im = jnp.real(W), jnp.imag(W)
+    return jnp.concatenate([jnp.concatenate([re, im], axis=0), jnp.concatenate([-im, re], axis=0)], axis=1)
+
+
+def _thin_real_equivalent_pairs(lam: Any, X: Any, n_half: int):
+    """Read a real-equivalent ``2n`` spectrum back as the complex one it represents.
+
+    ``[[A_r, -A_i], [A_i, A_r]]`` carries every complex eigenpair **twice** -- ``x = [Re; Im]`` and
+    its ``i``-multiple ``[-Im; Re]`` share an eigenvalue -- so the solve asks for ``2k`` and keeps
+    every second mode of the sorted spectrum. A genuinely degenerate complex mode appears four
+    times and is correctly thinned to two. The vectors come back complex on the ``n``-space, which
+    is what a band structure wants."""
+    lam = jnp.asarray(lam)
+    order = jnp.argsort(jnp.real(lam))
+    keep = order[::2]
+    Xa = jnp.asarray(X)
+    Xc = _complex_recombine(n_half)(Xa.T).T if Xa.ndim == 2 else _complex_recombine(n_half)(Xa)
+    return lam[keep], (Xc[:, keep] if Xc.ndim == 2 else Xc)
 
 
 def _eigs_constraint_maps(fem_obj: Any, n_full: int):
@@ -466,7 +744,7 @@ def _eigs_constraint_maps(fem_obj: Any, n_full: int):
     than matrices so the reduced pencil ``PᵀKP`` is never assembled and the LOBPCG path stays
     matrix-free. ``(None, None, n_full)`` when the form is unconstrained.
     """
-    per = getattr(fem_obj, "_periodic", None)
+    per = _eigs_periodic(fem_obj)
     pairs = getattr(getattr(fem_obj, "domain", None), "_fem_native_dirichlet_pairs", None) or []
     if pairs and any(abs(float(val)) > 1e-12 for _d, val in pairs):
         raise ValueError(
@@ -634,6 +912,9 @@ def _saddle_block_positions(fem_obj: "FEM", domain: Any, volume_terms: List[Any]
         for n in _walk(_bare(c)):
             if isinstance(n, TrialFunction):
                 names.setdefault(getattr(n, "field_key", None), getattr(n, "name", None))
+    # A constant tied to a field (`u(region) - U`) or pinned (`U - g`) has a diagonal after all: the tie sums
+    # the tied DOFs' rows into its row, the pin is a unit row.
+    occupied |= {(k, k) for k in getattr(fem_obj, "_constant_closed_keys", ())}
     out = []
     for i, k in enumerate(keys):
         if (k, k) in occupied:
@@ -879,15 +1160,18 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
     if pts is None or offs is None or cells_all is None:
         return []  # a route that does not publish per-field DOF coordinates; nothing to check against
 
-    from .utils.solver.fem_utils import _cell_region_mask, _value_shape_num_components
+    from .utils.solver.fem_utils import _cell_region_mask
 
     _dp, _tv = _prescribed_dofs(domain)
     pinned = {int(d) for d, _g in _dp} | {int(d) for d in _tv}
+    _const_blocks = list(getattr(fem_obj, "_block_constant", None) or [])
     out: List[Tuple[int, List[Any], int]] = []
     for i, key in enumerate(field_keys):
         spec = by_key.get(key)
         if spec is None or any(r is None for _sp, r in spec) or i >= len(cells_all) or i >= len(pts):
             continue
+        if i < len(_const_blocks) and _const_blocks[i]:
+            continue  # a constant's one DOF is reached by any term on any region -- its rows are integrals
         pts_i, cells_i = np.asarray(pts[i]), np.asarray(cells_all[i])
         reached = np.zeros(len(pts_i), dtype=bool)
         try:
@@ -906,7 +1190,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
                     reached |= np.asarray(bm, dtype=bool)
         except LookupError:
             continue  # unresolvable region: stay quiet rather than report a DOF as dead on a guess
-        vec = int(_value_shape_num_components(fem_obj._field_value_shape(i)))
+        vec = int(fem_obj._field_vec(i))
         base = int(offs[i])
         dead = [base + int(nd) * vec + c for nd in np.flatnonzero(~reached) for c in range(vec)]
         dead = [dd for dd in dead if dd not in pinned]
@@ -966,6 +1250,10 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
             tag = tag[6:]
         return _normalize_quad_tag(tag, _bregions)
 
+    def _is_across(tag) -> bool:
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
+        return isinstance(tag, str) and tag.startswith("across_")
+
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
         # pool ("fem_gauss" / "gauss_<tag>"); recover its original region from `_jno_region_tag` so a
@@ -978,7 +1266,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
     tags = {
         _region_of(_effective_tag(v))
         for v in _spatial_coord_vars(constraint)
-        if isinstance(_effective_tag(v), str) and not _effective_tag(v).startswith("__")
+        if isinstance(_effective_tag(v), str)
+        and not _effective_tag(v).startswith("__")
+        and not _is_across(_effective_tag(v))
     }
     # The t=t0 slice is its own support; an IC residual lives here. A *velocity* IC `u.t(initial)-v0`
     # carries its region only on the temporal variable (the `.t` derivative drops the spatial bind),
@@ -1125,7 +1415,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -1312,6 +1602,307 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     return f"solve: {mode} · {_lin()}"
 
 
+def _field_num_components(constraint: Any) -> int:
+    """Number of components of the trial field a constraint names (``1`` for a scalar)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return int(np.prod(vs)) if vs else 1
+
+
+def _is_constant_trial(node: Any) -> bool:
+    """A constant unknown's trial symbol (``domain.unknown(..., constant=True)``)."""
+    return isinstance(node, TrialFunction) and bool(node.__dict__.get("_is_constant", False))
+
+
+def _constant_side(node: Any) -> Optional[Tuple[Any, Optional[int]]]:
+    """``(constant trial, component or None)`` if ``node`` is a bare constant ``U`` or one entry ``U[k]``."""
+    node = _bare(node)
+    if _is_constant_trial(node):
+        return node, None
+    if getattr(node, "_name", None) == "getitem" and len(getattr(node, "args", None) or []) == 1:
+        tgt = _bare(node.args[0])
+        if _is_constant_trial(tgt):
+            from .utils.solver.fem_utils import _flat_component_index
+
+            ints = [k for k in node.getitem_key if isinstance(k, int)]
+            return tgt, _flat_component_index(tgt, ints)
+    return None
+
+
+def _constant_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Optional[int], Any, Optional[int]]]:
+    """Recognise a tie of a field to a constant, ``u(region) - U`` or ``u(region)[i] - U`` (also ``U[k]``).
+
+    Returns ``(field_key, region, comp, constant_trial, constant_comp)``, or ``None`` for anything else.
+    The tie makes every DOF of ``u`` (component ``i``) on the region the SAME unknown as ``U``: it is
+    eliminated exactly, ``u = P ũ`` with the tied rows summed into U's row -- no penalty, and the reaction
+    the tie carries is the virtual work of the constrained DOFs, as it is for a periodic tie."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or _contains(bare, TestFunction):
+        return None
+    left, right = bare.left, bare.right
+    for field_side, const_side in ((left, right), (right, left)):
+        cs = _constant_side(const_side)
+        if cs is None:
+            continue
+        trials = [n for n in _walk(_bare(field_side)) if isinstance(n, TrialFunction)]
+        if not trials or any(_is_constant_trial(t) for t in trials):
+            return None
+        comp = _component_index_of(_bare(field_side))
+        if not (isinstance(_bare(field_side), TrialFunction) or comp is not None):
+            raise ValueError(
+                "jno.fem: a tie to a constant must be `u(region) - U` or `u(region)[i] - U` -- affine in the "
+                f"field, with the constant alone on the other side. Got: {field_side!r}."
+            )
+        U, ucomp = cs
+        field = trials[0]
+        n_field = _field_num_components(constraint) if comp is None else 1
+        n_const = U.num_components if ucomp is None else 1
+        if comp is None and ucomp is None and tuple(field.value_shape) != tuple(U.value_shape):
+            raise ValueError(
+                f"jno.fem: `u(region) - U` ties every component, so u and U need the same value shape; got "
+                f"{tuple(field.value_shape)} and {tuple(U.value_shape)}. Tie one component, `u(region)[i] - U`."
+            )
+        if n_field != n_const and not (comp is None and ucomp is None):
+            raise ValueError(
+                f"jno.fem: the tie `u(region){'' if comp is None else f'[{comp}]'} - U{'' if ucomp is None else f'[{ucomp}]'}` "
+                f"pairs {n_field} field component(s) with {n_const} constant value(s)."
+            )
+        support, region = _region_and_support(constraint, domain)  # U carries no coordinates
+        if support not in ("boundary", "volume") or region == "volume":
+            raise ValueError(
+                "jno.fem: a tie to a constant names a region of the field -- bind the field to a boundary or a "
+                f"named sub-region, `u(xb, yb) - U`; got support {support!r}, region {region!r}."
+            )
+        return getattr(field, "field_key", field.op_id), region, comp, U, ucomp
+    return None
+
+
+def _constant_pin_spec(constraint: Any) -> Optional[Tuple[Any, Optional[int], Any]]:
+    """``U - value`` (or ``U[k] - value``): an essential value for a constant unknown. ``(trial, comp, value)``."""
+    bare = _bare(constraint)
+    if _contains(bare, TestFunction):
+        return None
+    trials = [n for n in _walk(bare) if isinstance(n, TrialFunction)]
+    if trials and all(_is_constant_trial(t) for t in trials) and getattr(bare, "op", "-") not in ("-", None):
+        raise ValueError(
+            "jno.fem: an essential value of a constant unknown is written `U - g` (or `U[k] - g`); got "
+            f"{bare!r}. A test-free term in constants alone has no other meaning."
+        )
+    if getattr(bare, "op", None) != "-":
+        return None
+    for const_side, value in ((bare.left, bare.right), (bare.right, bare.left)):
+        cs = _constant_side(const_side)
+        if cs is None:
+            continue
+        if _contains(value, TrialFunction):
+            return None
+        if any(isinstance(n, Variable) for n in _walk(_bare(value))):
+            raise ValueError(
+                "jno.fem: the value of a constant unknown, `U - g`, must not depend on position -- U is one "
+                "number over the whole domain."
+            )
+        return cs[0], cs[1], value
+    return None
+
+
+def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: bool) -> None:
+    """A constant unknown is wired on the native 2-D/3-D Lagrange assembler only -- the same scope as a
+    symmetric field, and for the same reason: that assembler is the one that knows its one-node layout."""
+    if not any(_is_constant_trial(n) for c in constraints for n in _walk(_bare(c))):
+        return
+    where = None
+    if getattr(domain, "dimension", None) not in (2, 3):
+        where = f"a {getattr(domain, 'dimension', '?')}-D domain"
+    elif is_vpinn:
+        where = "a VPINN (network trial)"
+    elif _trial_spaces(constraints) - {"Lagrange"}:
+        where = "a form mixing in a non-nodal element family"
+    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+        where = "a complex form"
+    if where is not None:
+        raise NotImplementedError(
+            f"jno.fem: a constant unknown (constant=True) is supported on the native 2-D/3-D Lagrange assembler "
+            f"only, not on {where}."
+        )
+
+
+def _build_constant_tie_reduction(
+    fem_obj: Any, ties: List[Any], prescribed: List[int], slip: Optional[dict] = None
+) -> dict:
+    """The prolongation ``u = P ũ`` that makes each tied DOF the constant's DOF.
+
+    One global selection over the whole (multi-field) vector -- a tie crosses field blocks, which the
+    per-field periodic layout cannot express -- in the single-block periodic format, so the whole
+    reduce / solve / prolong / restrict path is reused. A tied DOF that is also prescribed by a Dirichlet
+    condition keeps its own row (the prescribed value wins), exactly as on a periodic face.
+
+    With ``slip`` (a slip reduction from :func:`_build_slip_reduction`) the result is the composition
+    ``P_slip · P_tie``; see :func:`_compose_slip_and_constant_ties`."""
+    import jax.experimental.sparse as jsparse
+
+    n = int(fem_obj.dofs)
+    keys = list(getattr(fem_obj, "_block_field_keys", None) or [])
+    offs = list(fem_obj.offsets)
+    pres = {int(d) for d in prescribed}
+    main_of: Dict[int, int] = {}
+    for fk, region, comp, U, ucomp in ties:
+        if fk not in keys or U.field_key not in keys:
+            raise ValueError("jno.fem internal: a tie names a field that is not part of the assembled system.")
+        fi, ui = keys.index(fk), keys.index(U.field_key)
+        comps = [comp] if comp is not None else list(range(fem_obj._field_vec(fi)))
+        for j, c in enumerate(comps):
+            uc = ucomp if ucomp is not None else (0 if comp is not None else j)
+            main = int(offs[ui]) + int(uc)
+            for d in np.asarray(fem_obj.region_dofs(region, field=fi, component=c)).reshape(-1):
+                d = int(d)
+                if d in pres:
+                    continue
+                if d in main_of and main_of[d] != main:
+                    raise ValueError(
+                        f"jno.fem: DOF {d} is tied to two different constants (regions overlap). A value cannot "
+                        "equal two independent unknowns; tie it once."
+                    )
+                main_of[d] = main
+    if not main_of:
+        raise ValueError(
+            "jno.fem: a tie `u(region) - U` matched no free DOF -- the region is empty on this field's nodes, "
+            "or every node on it is already prescribed by a Dirichlet condition."
+        )
+    if slip is not None:
+        return _compose_slip_and_constant_ties(slip, main_of, n)
+    sec = np.zeros(n, dtype=bool)
+    sec[list(main_of)] = True
+    kept = np.flatnonzero(~sec)
+    col = -np.ones(n, dtype=np.int64)
+    col[kept] = np.arange(kept.size)
+    rows = np.arange(n)
+    cols = col.copy()
+    for d, m in main_of.items():
+        cols[d] = col[m]
+    P = jsparse.BCOO((jnp.ones(n), jnp.asarray(np.stack([rows, cols], axis=1), dtype=jnp.int32)), shape=(n, int(kept.size)))
+    return {"P": P, "kept_nodes": kept, "vec": 1, "is_selection": True, "coupling": "constant_tie"}
+
+
+def _compose_slip_and_constant_ties(slip: dict, main_of: Dict[int, int], n: int) -> dict:
+    """``u = P_slip P_tie ũ``: the slip elimination first, then the tie on the slip-reduced vector.
+
+    The tie is a selection on DOFs the slip leaves alone, so it is restated in the slip-reduced numbering
+    and the two prolongations multiply. That needs every tied DOF and every constant to pass through the
+    slip untouched: its row of ``P_slip`` is one unit entry, alone in its column. A node on both the slip
+    surface and a tied region would have its normal component eliminated twice -- by the slip, in terms of
+    its tangential components, and by the tie, to the constant -- so the composition is refused there
+    rather than silently picking one.
+
+    The composed ``P`` is weighted (the slip rows), so it takes the general, non-selection reduction path,
+    exactly as a slip alone does."""
+    import jax.experimental.sparse as jsparse
+    import scipy.sparse as sp
+
+    if "slip_runtime" in slip:
+        raise NotImplementedError(
+            "jno.fem: a tie to a constant together with a slip surface that moves with runtime (trainable) "
+            "coordinates is not supported -- the moving slip prolongation is rebuilt per solve, and the tie "
+            "would have to be recomposed with it. Keep the slip surface's vertices out of the trainable region."
+        )
+    if "blocks" in slip:
+        Ps_b = slip["P_blockdiag"]
+        off_f = np.asarray(slip["off_full"], dtype=np.int64)
+        kept_s = np.concatenate([off_f[i] + np.asarray(b["kept"], dtype=np.int64) for i, b in enumerate(slip["blocks"])])
+    else:
+        Ps_b = slip["P"]
+        kept_s = np.asarray(slip["kept_nodes"], dtype=np.int64)
+    idx = np.asarray(Ps_b.indices)
+    Ps = sp.coo_matrix((np.asarray(Ps_b.data, dtype=float), (idx[:, 0], idx[:, 1])), shape=Ps_b.shape).tocsr()
+    Ps.sum_duplicates()
+    Ps.eliminate_zeros()  # a structural zero (an axis-aligned wall's off-axis weight) is not a coupling
+    n_s = int(Ps.shape[1])
+    row_nnz = np.diff(Ps.indptr)
+    col_nnz = np.bincount(Ps.indices, minlength=n_s)
+
+    def _col(d: int, what: str) -> int:
+        s, e = Ps.indptr[d], Ps.indptr[d + 1]
+        j = int(Ps.indices[s]) if e - s == 1 else -1
+        if j < 0 or Ps.data[s] != 1.0 or col_nnz[j] != 1:
+            raise NotImplementedError(
+                f"jno.fem: {what} (DOF {d}) sits on a slip surface `n·u = 0`. A node that is both slipping and "
+                "tied to a constant would be eliminated twice, and composing the two constraints on one node is "
+                "not implemented. Keep the tied region off the slip surface (or drop the slip on those nodes)."
+            )
+        return j
+
+    if int(Ps.shape[0]) != n or row_nnz.size != n:
+        raise ValueError("jno.fem internal: the slip prolongation does not span the assembled system.")
+    main_s = {_col(d, "a DOF tied to a constant"): _col(m, "a constant unknown") for d, m in main_of.items()}
+    sec = np.zeros(n_s, dtype=bool)
+    sec[list(main_s)] = True
+    kept_t = np.flatnonzero(~sec)
+    col = -np.ones(n_s, dtype=np.int64)
+    col[kept_t] = np.arange(kept_t.size)
+    cols = col.copy()
+    for d, m in main_s.items():
+        cols[d] = col[m]
+    Pt = sp.csr_matrix((np.ones(n_s), (np.arange(n_s), cols)), shape=(n_s, int(kept_t.size)))
+    Pc = (Ps @ Pt).tocoo()
+    P = jsparse.BCOO(
+        (jnp.asarray(Pc.data, dtype=jnp.float64), jnp.asarray(np.stack([Pc.row, Pc.col], axis=1), dtype=jnp.int32)),
+        shape=(n, int(kept_t.size)),
+    )
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": kept_s[kept_t],
+        "n_full": n,
+        "n_red": int(kept_t.size),
+        "vec": 1,
+        "is_selection": False,
+        "is_bloch": False,
+        "coupling": "constant_tie",
+        "with_slip": True,
+    }
+
+
+def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_ties: List[Any], is_vpinn: bool) -> None:
+    """A ``symmetric=True`` matrix field is wired on the native 2-D/3-D Lagrange assembler only.
+
+    Its storage (``n(n+1)/2`` values per node) is read by that assembler, its Dirichlet path and its block
+    layout. The other routes size a field from ``value_shape`` alone and would lay out ``n*n`` values, so they
+    are refused here rather than left to fail with a shape error -- or, worse, to succeed on a wrong layout."""
+    syms = [
+        n
+        for c in constraints
+        for n in _walk(_bare(c))
+        if isinstance(n, (TrialFunction, TestFunction)) and n.__dict__.get("symmetric", False)
+    ]
+    if not syms:
+        return
+    where = None
+    if getattr(domain, "dimension", None) not in (2, 3):
+        where = f"a {getattr(domain, 'dimension', '?')}-D domain"
+    elif is_vpinn:
+        where = "a VPINN (network trial)"
+    elif periodic_ties:
+        where = "a form with periodic ties"
+    elif _trial_spaces(constraints) - {"Lagrange"}:
+        where = "a form mixing in a non-nodal element family"
+    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+        where = "a complex form"
+    if where is not None:
+        raise NotImplementedError(
+            f"jno.fem: a symmetric=True matrix field is supported on the native 2-D/3-D Lagrange assembler only, "
+            f"not on {where}. Declare the field without symmetric=True (full n x n storage) there."
+        )
+
+
+def _component_key(comp: int, constraint: Any) -> Any:
+    """The key a per-component Dirichlet value is stored under: ``"x"/"y"/"z"`` for a vector of up to three
+    components (the historical spelling every consumer reads), the flat integer index otherwise -- a matrix
+    entry or a vector's fourth component has no axis name, and naming entry ``(0, 1)`` of a matrix "y" would
+    mislabel it. Every consumer accepts both (``_normalize_dirichlet_value``)."""
+    trials = [n for n in _walk(_bare(constraint)) if isinstance(n, TrialFunction)]
+    vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+    return _COMPONENT_NAMES[comp] if len(vs) <= 1 and comp in _COMPONENT_NAMES else int(comp)
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -1323,6 +1914,20 @@ def _component_index_of(node: Any) -> Optional[int]:
         args = getattr(node, "args", None) or []
         if len(args) == 1 and _contains(args[0], TrialFunction):
             ints = [k for k in node.getitem_key if isinstance(k, int)]
+            trials = [n for n in _walk(args[0]) if isinstance(n, TrialFunction)]
+            vs = tuple(getattr(trials[0], "value_shape", ()) or ()) if trials else ()
+            if len(vs) >= 2:
+                # A matrix field: one index per axis, flattened row-major -- `S(region)[i, j]` is component
+                # `i * m + j` of the node-major layout. A row `S(region)[i]` is not one component.
+                if len(ints) != len(vs) or any(isinstance(k, slice) for k in node.getitem_key):
+                    raise ValueError(
+                        f"jno.fem: a Dirichlet condition on one entry of a field with value_shape={vs} names "
+                        f"every index, e.g. `S(region)[0, 1] - g`; got the key {node.getitem_key!r}. Pin the "
+                        "whole tensor with `S(region) - G`, or one entry at a time."
+                    )
+                from .utils.solver.fem_utils import _flat_component_index
+
+                return _flat_component_index(trials[0], ints)
             if len(ints) == 1:
                 return ints[0]
     return None
@@ -1364,7 +1969,46 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
     )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None) -> Any:
+#: set by the evaluation sites that hand ``_eval_value_node_at`` the MOVED node positions of a moving
+#: mesh (coordinate parameters); everywhere else a position-dependent value on a moving mesh is refused
+_FOLLOWS_MOVING_MESH = __import__("contextvars").ContextVar("jno_follows_moving_mesh", default=False)
+
+
+def _follows_moving_mesh():
+    """Context: the points handed to ``_eval_value_node_at`` inside are where the mesh is NOW."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def cm():
+        tok = _FOLLOWS_MOVING_MESH.set(True)
+        try:
+            yield
+        finally:
+            _FOLLOWS_MOVING_MESH.reset(tok)
+
+    return cm()
+
+
+def _refuse_stale_position(variables, where="a condition's value"):
+    """A position-dependent value on a mesh that coordinate parameters move, evaluated at the reference
+    node positions by a path that does not follow the motion, would answer for the old shape -- raise."""
+    if _FOLLOWS_MOVING_MESH.get():
+        return
+    for v in variables:
+        if getattr(v, "axis", "spatial") != "spatial":
+            continue
+        dom = getattr(v, "_domain", None)
+        if dom is not None and getattr(dom, "__dict__", {}).get("_trainable_coords"):
+            raise NotImplementedError(
+                f"jno.fem: {where} depends on position (it reads {getattr(v, 'tag', '?')!r}) on a mesh that "
+                "coordinate parameters move (`x.trainable()` or a parametric shape), and this path "
+                "evaluates it at the REFERENCE node positions -- it would not follow the design. Supported: "
+                "an essential (Dirichlet) value and an initial condition on a P1 field. Write this one "
+                "without the coordinates, or build the shape with numbers."
+            )
+
+
+def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -1379,10 +2023,17 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     ``t`` is the time a **temporal** Variable reads (an initial condition passes the start time). A time
     Variable has its own tag, so without ``t`` it would be handed the spatial points and read the x column;
     a value that mentions time with no ``t`` given therefore raises instead.
+
+    ``pointwise=True`` evaluates the expression one point at a time (vmapped), so the result is
+    ``(n_points, *value_shape)`` flattened. A batch evaluation hands every coordinate in as an ``(n, 1)``
+    column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
+    with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
+    a constant. A matrix-valued condition therefore needs this.
     """
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
         raise ValueError(
@@ -1415,6 +2066,16 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
                 elif (nn := _neural_coefficient_name(nd)) in params:  # trainable network: its live module
                     mod = params[nn]
             table[m.layer_id] = mod
+    if pointwise:
+
+        def _at(p):
+            ctx = {tag: p[None, :] for tag in tags}
+            for tag in temporal:
+                ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
+
+        vals = jax.vmap(_at)(pts)
+        return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
@@ -1833,16 +2494,19 @@ def _rotation_bc_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, 
 # the FEM container
 # ---------------------------------------------------------------------------
 class FEM:
-    """Assembled FEM artefacts produced by :func:`fem` (no solve).
+    """Assembled FEM artefacts produced by :func:`fem` (no solve yet).
 
-    Attributes
-    ----------
-    domain, mesh, problem:
-        the owning jNO domain, its meshio mesh, and the assembled problem object.
-    dofs:
-        total number of degrees of freedom.
-    classification:
-        human-readable summary of how each residual was bucketed.
+    Attributes:
+        domain, mesh, problem: the owning jNO domain, its meshio mesh, and the assembled problem object.
+        dofs: total number of degrees of freedom.
+        classification: human-readable summary of how each residual was bucketed.
+
+    Args:
+        domain: the domain the problem lives on.
+        op: the assembled operator (linear system, residual operator or time block).
+        classification: how each residual was bucketed.
+        mode: the route fixed at build: ``"linear"``, ``"nonlinear"``, ``"transient"`` or ``"complex"``.
+        offsets: start offset of each field block in the DOF vector (multi-field problems).
     """
 
     def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str, offsets: Any = None):
@@ -1851,6 +2515,15 @@ class FEM:
         self._op = op
         self._mode = mode
         self.classification = classification
+        # A problem heated by a jno.peec network's `em.loss` is coupled to it: the network learns which
+        # problem its loss heats, so `em.solve()` and `self.solve()` converge the pair, once, together.
+        from .utils.solver.electrothermal import peec_source_of
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            _em._heat = self
+        if hasattr(domain, "_register_solver"):
+            domain._register_solver(self)  # a `domain.rebuild` rebuilds this problem with the domain
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
@@ -1889,6 +2562,7 @@ class FEM:
 
     @property
     def is_transient(self) -> bool:
+        """Whether the problem marches in time (a ``u.t`` / ``u.tt`` term was found)."""
         return self._mode == "transient"
 
     @property
@@ -1902,6 +2576,7 @@ class FEM:
 
     @property
     def is_linear(self) -> bool:
+        """Whether the form is linear in the unknowns (for a transient problem: its spatial operator)."""
         if self._mode == "transient":
             return bool(self._op.is_linear())
         return self._mode == "linear"
@@ -1932,6 +2607,7 @@ class FEM:
         fem.operator`` keeps unpacking cleanly and silently binds ``op_i`` to the LOAD VECTOR. It
         does not raise; it just means something else. That is what broke ``jno.rcwa`` and made a
         test report a missing imaginary part that was there all along."""
+        self._refresh_attachments()
         return self._op
 
     @property
@@ -1982,8 +2658,8 @@ class FEM:
         ``None`` before any solve. Afterwards a dict with ``mode``, ``dofs``, ``wall_s`` (dispatch
         time of the solve call — JAX is async; block on the result for compute time), the ``linear``
         and ``precond`` slot reprs, ``nonlinear`` (driver name, final residual norm against its
-        bound, step count where the driver runs its loop eagerly — ``newton_direct`` reports steps,
-        the traced-loop drivers report ``None``), and ``amgx_cache`` (AmgX solver-cache occupancy)
+        bound, step count — every driver reports it: ``newton_direct`` from its forward loop, ``newton_krylov`` and
+        ``staggered`` as an auxiliary output of their ``custom_root``), and ``amgx_cache`` (AmgX solver-cache occupancy)
         when jaxamg served the solve. Populated on eager paths; a solve wrapped whole in
         ``jit``/``vmap``/``grad`` records the slots but no residuals — the same concrete-only
         self-disabling as the convergence guards.
@@ -2039,6 +2715,7 @@ class FEM:
         :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
         if isinstance(field, int):
             return field
+        field = _lower_unknowns(field)  # a `domain.unknown()` field resolves through its trial symbol
         # the native assembler records the keys in assembly (= offsets) order — snapshotted onto
         # this FEM at finalize time (the domain attribute is overwritten by any later assembly on
         # the same domain, e.g. an auxiliary jno.precond.form); the constraint-walk order is only
@@ -2120,14 +2797,261 @@ class FEM:
             u = u - mask * (_weighted(load, u) / total)
         return u
 
-    def solve(self, *args, **kwargs):
-        """Timed wrapper around the solve. See :meth:`_solve_inner` for the full signature."""
+    def _rebuild(self):
+        """Assemble this problem again from its term list, in place, on a domain that has just been
+        rebuilt (`domain.rebuild`): every trace node holding this object then solves the new one."""
+        if self._constraints is None:
+            return  # an internal sub-problem; the problem that owns it is rebuilt instead
+        import jno
+
+        cur = jno.fem(self._constraints, **self._fem_kwargs)
+        self.__dict__.update(cur.__dict__)
+        from .utils.solver.electrothermal import peec_source_of
+
+        em = peec_source_of(self)
+        if em is not None:
+            if em.__dict__.get("_heat") is cur:
+                em._heat = self  # the rebuild's throw-away object registered itself as the heated problem
+            et = em.__dict__.get("_coupling")
+            if et is not None:
+                et._result = None
+
+    # docstring-from: jno._fem.FEM._solve_inner
+    def solve(
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        checkpoint=None,
+        contact=None,
+        continuation=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        tau=None,
+        basis=None,
+        shard=None,
+        profile=False,
+        **kwargs,
+    ) -> Any:
+        """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
+        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
+        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
+        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
+        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
+        refinement step is non-differentiable (discrete remeshing); gradients are exact on
+        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
+        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
+        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
+        and needs no cross-mesh transfer.
+
+        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
+        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
+        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
+        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
+        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
+        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
+        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
+
+        Delegates to :meth:`FemLinearSystem.solve` (steady linear),
+        :meth:`FemResidualOperator.solve` (steady nonlinear), or
+        :meth:`SemidiscreteTimeBlock.solve` (transient). The result is a jNO field: compare it
+        to data and train any ``jno.np.parameter`` in the weak form through
+        ``crux.solve``::
+
+            alpha = jno.np.parameter((1,), name="alpha")
+            fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
+            crux.solve(n)                      # recovers alpha
+
+        ``solve_fn`` is **your** solver (jNO writes none):
+
+        * steady linear: ``(A, b) -> u``. The **default** is a matrix-free **Jacobi-preconditioned**
+          BiCGStab on the BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``),
+          GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
+          non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
+          **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
+          dependency, robust on CPU), or bring your own. It receives the operator **exactly as
+          assembled** — the BCOO, never a densified copy — so a sparse solver of your choosing
+          (scipy SuperLU, PETSc, anything taking triplets) can be dropped straight in. jNO does not
+          pick the representation for you: densifying is ``O(n^2)`` on an ``O(nnz)`` operator (20.5
+          GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
+          would reach for your own solver. A **dense** solver must densify itself:
+          ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default :func:`jno.solve.newton`: Newton on
+          the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where
+          there is no assembled tangent; implicit-diff, no optimistix; pass ``u0=`` for the guess);
+        * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
+          ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
+          the sample times, default the domain's time grid). For a custom integrator build it
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
+          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
+          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
+
+        Enable x64 — the assembly is float64.
+
+        For a **complex** steady linear problem (complex coefficients in the weak form),
+        ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
+        ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
+        to choose the real block solver.
+
+        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
+        override — passing both is an error). The solver space factorises into four orthogonal
+        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
+        own with the same contract, see those modules), and every ``None`` keeps today's
+        default::
+
+            fem.solve(
+                x0        = None,                   # warm start (initial guess / iterate)
+                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
+                linear    = jno.solve.gmres(),      # inner linear solve
+                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
+            )
+
+        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
+        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
+        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
+        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
+        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
+        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
+        diagonal) does not. On a **transient** problem the slots configure the *per-step*
+        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
+        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
+        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
+        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
+        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
+        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
+        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
+
+        ``basis=U`` solves in the span of an ``(n_dofs, k)`` **Galerkin basis** instead of the full space:
+        the reduced system ``UᵀA U x = Uᵀb`` is ``k×k``, and the answer is lifted back to ``u = U x`` so
+        nothing downstream changes. This is the reduced-order-model (POD) entry — build ``U`` from a few
+        full solves with :func:`jno.solve.svd`, then every later solve in the family costs ``k`` unknowns::
+
+            snapshots = jnp.stack([build(p).solve() for p in sweep])   # (n_snapshots, n_dofs)
+            _, s, Vt  = jno.solve.svd(snapshots, k=10)
+            u = build(p_new).solve(basis=Vt.T)                         # 10 unknowns, full field back
+
+        Unlike every other way of solving here, this returns an **approximation**, so the relative residual
+        of the FULL system at the lifted solution is measured (one matvec) and a basis that does not span
+        the solution fails loud rather than returning a plausible wrong field — the measured value stays on
+        ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
+        work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
+        operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
+        Steady and **first-order transient** (linear and nonlinear); a transient block is reduced once at
+        solve time and the marcher steps in the reduced space, returning the trajectory at full width —
+        certified there by the projection error of the initial state rather than a residual. Refused,
+        each with its own reason: second-order-in-time, complex, and periodic-tied problems. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
+        reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
+        step (no hyper-reduction).
+
+        ``shard=`` controls multi-device execution of the default steady-linear solve. The default
+        (``None``) is **automatic**: the operator's nonzero axis is partitioned across every visible
+        device and one ``all-reduce`` combines the partial scatter-adds. That is a placement decision,
+        not a different algorithm — the answer moves only by reduction order (~1e-14) — and it is on by
+        default because the alternative on a multi-device box is idle silicon. On a single-device host
+        it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
+        ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
+        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
+        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
+        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
+        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
+        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
+
+        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
+        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
+        Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
+        work to time.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
+        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
+        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
+        accepted.
+
+        Args:
+            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
+            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
+            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
+                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
+                every=200))``.
+            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
+                deformed configuration until it settles; required when a gap lists several candidate surfaces.
+            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
+                solve warm-started from the last (``"all"`` as first argument returns the whole family).
+            x0: warm start for the iterative solve.
+            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
+            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
+            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
+            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
+                optionally ``.adaptive()``).
+            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
+                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
+            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
+            shard: multi-device execution (see above).
+            profile: run inside a JAX trace and report the time (see above).
+            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
+                make a parametric form concrete for this solve.
+
+        Returns:
+            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
+            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
+            mesh).
+        """
+        self._refresh_attachments()
         import time as _time
 
+        from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
+
+        # Forward only what was given: the defaults are `_solve_inner`'s own, and the coupled path below has
+        # to tell an argument the caller passed from one left at its default.
+        slots = dict(
+            adapt=adapt,
+            checkpoint=checkpoint,
+            contact=contact,
+            continuation=continuation,
+            x0=x0,
+            nonlinear=nonlinear,
+            linear=linear,
+            precond=precond,
+            time=time,
+            tau=tau,
+            basis=basis,
+            shard=shard,
+        )
+        given = {k: v for k, v in slots.items() if v is not None}
+        if profile:
+            given["profile"] = profile
+        args = () if solve_fn is None else (solve_fn,)
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            extra = sorted((set(kwargs) - {"tol", "max_iter"}) | set(given))
+            if args or extra:
+                raise ValueError(
+                    "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
+                    f"coupled fixed point, which takes only tol= and max_iter= (got {extra or 'positional args'}). "
+                    "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            out = coupled(_em, self).solve(**kwargs)
+            return jnp.asarray(out.field) if isinstance(out, ElectroThermalSolution) else out
+
         from .utils.logger import get_logger
+        from .utils.solver import newton_krylov as _nk
 
         _t0 = _time.perf_counter()
-        out = self._solve_inner(*args, **kwargs)
+        # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
+        # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
+        prev_linear = _nk._LINEAR_FORM[0]
+        _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
+        try:
+            out = self._solve_inner(*args, **given, **kwargs)
+        finally:
+            _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
         return out
 
@@ -2345,6 +3269,40 @@ class FEM:
         count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
+        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
+        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
+        accepted.
+
+        Args:
+            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
+            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
+            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
+                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
+                every=200))``.
+            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
+                deformed configuration until it settles; required when a gap lists several candidate surfaces.
+            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
+                solve warm-started from the last (``"all"`` as first argument returns the whole family).
+            x0: warm start for the iterative solve.
+            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
+            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
+            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
+            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
+                optionally ``.adaptive()``).
+            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
+                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
+            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
+            shard: multi-device execution (see above).
+            profile: run inside a JAX trace and report the time (see above).
+            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
+                make a parametric form concrete for this solve.
+
+        Returns:
+            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
+            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
+            mesh).
         """
         # ONE site, in the public entry: the mode-specific paths below return at different points
         # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
@@ -2425,6 +3383,7 @@ class FEM:
                 # ... and with its FEM, so orchestration (the tune `sequence` axis) can find the operator
                 # behind a constraint without a side channel. Lazy nodes only: a concrete array needs none.
                 result._fem_ref = self
+                result._linear_spec = linear  # the solver it was asked to use: forms share a factorisation only on one spec
             return result
 
         def _run_with_stats():
@@ -2433,9 +3392,10 @@ class FEM:
 
             from .utils.solver.history_march import LAST_MARCH_STATS
             from .utils.solver.newton_krylov import LAST_NEWTON_STATS
-            from .utils.solver.solver_api import clear_gate_failures, raise_if_gate_failed
+            from .utils.solver.solver_api import LAST_LINEAR_STATS, clear_gate_failures, raise_if_gate_failed
 
             LAST_NEWTON_STATS.clear()
+            LAST_LINEAR_STATS.clear()
             LAST_MARCH_STATS.clear()
             clear_gate_failures()  # so this solve cannot be blamed for an earlier one's failure
             t0 = _time.perf_counter()
@@ -2468,10 +3428,27 @@ class FEM:
                     # to the failing step, which is what the user needs next to that error.
                     self._stats["error"] = f"{type(error).__name__}: {str(error).splitlines()[0][:200]}"
 
+            # Krylov iteration counts (fem.stats["linear_iterations"]) are recorded for an eager, steady,
+            # non-adaptive solve only: a march's compiled step makes no host call, and a deferred node is
+            # evaluated later, outside this solve. The switch is jit-keyed (see `solver_api.iterations_recorded`).
+            from .utils.solver.solver_api import iterations_recorded
+
+            _steady = (
+                self._mode in ("linear", "nonlinear", "complex")
+                and adapt is None
+                and tau is None
+                and not getattr(self._op, "history_specs", None)
+                and not getattr(self._op, "surface_history_specs", None)
+                and not getattr(self, "_geometry", None)
+            )
             try:
-                result = _run()
+                with iterations_recorded(_steady):
+                    result = _run()
             except Exception as exc:
-                _record(exc)
+                named = self._name_factorization_failure(exc)
+                _record(named or exc)
+                if named is not None:
+                    raise named from exc
                 raise
             _record()
             if "jaxamg" in _sys.modules:  # AmgX solver-cache summary, only if jaxamg is in play
@@ -2489,7 +3466,16 @@ class FEM:
             # CONCRETE result -- under an outer jit/grad/vmap the solve returns a tracer, nothing has
             # run, and there is nothing to drain (the limitation is documented in docs/solvers.md).
             if not any(isinstance(v, jax.core.Tracer) for v in jax.tree_util.tree_leaves(result)):
-                jax.block_until_ready(result)
+                try:
+                    jax.block_until_ready(result)  # an asynchronous failure surfaces here
+                except Exception as exc:
+                    named = self._name_factorization_failure(exc)
+                    if named is None:
+                        raise
+                    _record(named)
+                    raise named from exc
+                # The counts arrive through the solves' callbacks, so they are complete only now.
+                self._stats["linear_iterations"] = _summarise_linear_iterations(LAST_LINEAR_STATS)
                 raise_if_gate_failed()
             return result
 
@@ -2498,12 +3484,6 @@ class FEM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run_with_stats, label=f"fem profile · {self.dofs} DOFs · {self._mode}", warm=(adapt is None))
-
-    # `solve` is a thin timing/logging wrapper, so its own signature is `(*args, **kwargs)` -- which
-    # erased every solver slot from `help(fem.solve)`, IDE completion and `inspect.signature` (a test
-    # asserting `shard=` is accepted failed on exactly that). Point both at the real one.
-    solve.__wrapped__ = _solve_inner
-    solve.__doc__ = _solve_inner.__doc__
 
     #: relative residual of the FULL system above which a ``basis=`` solve is refused. Not a tuning
     #: knob: at this size the basis does not span the solution at all (a modelling error), rather than
@@ -2755,6 +3735,29 @@ class FEM:
                 checkpoint=checkpoint,
                 **kwargs,
             )
+        if checkpoint is not None:
+            # `checkpoint=` writes a MARCH down as it runs. The moving-mesh driver above consumes it; below,
+            # the transient stepper and the load-path march do. Everything else used to accept it and drop
+            # it -- a run returned its answer and left the directory empty, which is exactly the run a
+            # checkpoint exists to save. Refuse those up front.
+            _marches = (
+                self._mode == "transient"
+                or getattr(self._op, "history_specs", None)
+                or getattr(self._op, "surface_history_specs", None)
+            )
+            if adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=..., checkpoint=...): checkpointing an adaptive march is wired for the "
+                    "MOVING-MESH driver (a geometry term `coord.d(t) - velocity` with adapt=jno.solve.remesh(...)). "
+                    "A fixed-mesh adapt= rebuilds the problem between segments and does not write itself down. "
+                    "Drop one of the two."
+                )
+            if not _marches:
+                raise ValueError(
+                    f"fem.solve(checkpoint=): this is a {self._mode!r} solve, so there is no march to write down. "
+                    "checkpoint= applies to a transient (`u.t`) march, a load-path march (`.i(k)` with "
+                    "`domain(tau=...)`), or a moving mesh."
+                )
         if adapt is not None:
             # A load-path march is dispatched BELOW this branch, so an `adapt=` on a form carrying step
             # history used to return here with a single STEADY solve -- shape (n_dofs,) where the caller
@@ -2903,6 +3906,10 @@ class FEM:
         # it root-finds the min-map instead of the bare residual. Done here, once, so the same wrapper
         # serves the plain steady solve and every step of the history march below, and composes with any
         # `nonlinear=` slot the caller picked. ----
+        # Whether a parametric solve's verdict may RAISE (see `_record_values_verdict`): only for jNO's own
+        # drivers, whose tolerances the verdict knows. A user `solve_fn=` carries its own tolerances, and a
+        # box-constrained solve root-finds the min-map, not the residual the verdict re-evaluates.
+        _jno_driver = (solve_fn is None or from_slots) and not getattr(self, "_bound_specs", None)
         if getattr(self, "_bound_specs", None):
             solve_fn = self._bounded_solve_fn(solve_fn)
 
@@ -2929,7 +3936,12 @@ class FEM:
             from .utils.solver.history_march import run_history_march
 
             return run_history_march(
-                self, solve_fn if from_slots else solve_fn, path=tau, contact=contact, values=kwargs.get("values")
+                self,
+                solve_fn if from_slots else solve_fn,
+                path=tau,
+                contact=contact,
+                values=kwargs.get("values"),
+                checkpoint=checkpoint,
             )
         if tau is not None:
             raise ValueError(
@@ -3055,7 +4067,11 @@ class FEM:
             from .trace import FunctionCall
 
             _rc = _complex_recombine(self._complex_n)
-            return FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node = FunctionCall(lambda *v, _f=_node.fn: _rc(_f(*v)), _node.args, name="fem_complex_solve")
+            node._per_evaluation = True
+            node._solve_fls, node._solve_recombine = self._op, _rc  # for a shared factorisation (trace_evaluator)
+            node._solve_fn = getattr(_node, "_solve_fn", None)
+            return node
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
@@ -3119,44 +4135,83 @@ class FEM:
 
             _out = self._op.solve(solve_fn=_reduced, **kwargs)
             if kwargs.get("values"):
-                self._record_values_verdict(_out, kwargs, nonlinear)  # see that method: jit hides the guard
+                # see that method: jit hides the guard
+                self._record_values_verdict(_out, kwargs, nonlinear, judge=_jno_driver)
             # A SLIP reduction returns the array, matching the non-reduced steady-nonlinear branch below:
             # it is a boundary condition, not a training construct, and leaving it lazy meant
             # `np.asarray(fem.solve(...))` silently produced a 0-d OBJECT array that only blew up later
             # inside the next residual call. A PERIODIC tie deliberately stays lazy — its `FunctionCall`
             # is what flows into `crux` for an inverse problem, and evaluating it here breaks that
-            # (measured: test_periodic_nonlinear_reaction_diffusion).
-            if periodic.get("coupling") == "slip" and not getattr(self._op, "is_parametric", False):
+            # (measured: test_periodic_nonlinear_reaction_diffusion). A tie to a CONSTANT is a boundary
+            # condition like a slip, and returned lazily it ran only when the caller evaluated it -- after
+            # `fem.stats` had been recorded, so stats["nonlinear"] was None and the convergence verdict lost.
+            if periodic.get("coupling") in ("slip", "constant_tie") and not getattr(self._op, "is_parametric", False):
                 return _out.fn()
             return _out
         if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
             # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
             # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
-            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond is None):
+            from .utils.solver.solver_api import precond_compiles
+
+            if solve_fn is None or (getattr(solve_fn, "cache_key", None) is not None and precond_compiles(precond)):
                 # jNO's own solvers (the default, or one composed from the slots) have a value identity, so
                 # the solve is compiled once and reused: evaluated lazily, every call re-staged the Newton
                 # `while_loop` and `custom_root` and ran each residual op by op -- measured 2.3 s per warm
-                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%.
+                # solve of an 87k-DOF 3-D problem, of which the GPU was busy for 26%. The composed solver's
+                # cache_key names the preconditioner's built state too (`compose_solver`).
                 return self._op.solve(solve_fn, values={}, **kwargs)
             # A user `solve_fn=` has no identity to cache on (a fresh lambda per call would recompile every
             # time) and may do things that need concrete values, so it keeps running eagerly. So does a
-            # `precond=`: it can hold state built from concrete values (a hierarchy, a Picard-lagged form
-            # refreshed from the entry iterate) that a cached compiled solve would silently keep stale.
+            # `precond=` holding state built from concrete values (a hierarchy rebuilt per solve, a
+            # Picard-lagged form refreshed from the entry iterate) that a cached compiled solve would keep
+            # stale -- see `precond_compiles`. A kept (`reuse=True`) one runs here once, to build.
             return self._op.solve(solve_fn, **kwargs).fn()
         if self._mode == "transient" and self.is_complex and not self._op.runtime_parameter_exprs:
             # Non-parametric COMPLEX transient: return the concrete complex trajectory eagerly, exactly as
             # the steady linear / nonlinear branches above do — and as the complex transient did before its
             # Re/Im legs were fused into one block. (A *real* transient stays lazy; that asymmetry predates
             # the fusion and is a separate call to make, not something a refactor should change silently.)
-            return self._op.solve(solve_fn, **kwargs).fn()
+            return self._op.solve(solve_fn, checkpoint=checkpoint, **kwargs).fn()
+        if self._mode == "transient":
+            kwargs = {**kwargs, "checkpoint": checkpoint}
         out = self._op.solve(solve_fn, **kwargs)
         if kwargs.get("values") and self._mode == "nonlinear":
-            self._record_values_verdict(out, kwargs, nonlinear)
+            self._record_values_verdict(out, kwargs, nonlinear, judge=_jno_driver)
         return out
 
-    def _record_values_verdict(self, out, kwargs, nonlinear):
-        """Judge a ``fem.solve(param=value)`` solve and write it to :attr:`stats`.
+    def _name_factorization_failure(self, exc):
+        """A named ``RuntimeError`` for a host SuperLU factorization that failed inside this solve, else None.
+
+        On the CPU the sparse-direct solve (``jno.solve.lu()``, ``newton(direct=True)``) is JAX's
+        ``spsolve``, whose callback runs scipy's SuperLU. A singular or structurally rank-deficient
+        operator makes SuperLU abort ("failed to factorize matrix at line ... dpanel_bmod.c"), which
+        reaches the caller wrapped in a JAX callback error that names neither the matrix nor the cause.
+        Called only on the failure path, so a successful solve pays nothing for it.
+        """
+        from .utils.solver.linear import (
+            SUPERLU_SINGULAR_PHRASE,
+            superlu_failure_detail,
+            superlu_singular_message,
+        )
+
+        text = str(exc)
+        if SUPERLU_SINGULAR_PHRASE in text:  # `lu(backend="host")` already named it, with the exact size
+            line = next(ln for ln in reversed(text.splitlines()) if SUPERLU_SINGULAR_PHRASE in ln)
+            return RuntimeError(line.split("RuntimeError:", 1)[-1].strip())
+        detail = superlu_failure_detail(text)
+        if detail is None:
+            return None
+        n = int(self.dofs)
+        per = getattr(self, "_periodic", None)
+        if per is not None:
+            from .utils.solver.fem_utils import _periodic_blocks
+
+            n = int(_periodic_blocks(per)[2][-1])  # the REDUCED system is the one factorized
+        return RuntimeError(superlu_singular_message((n, n), detail, known_size=False))
+
+    def _record_values_verdict(self, out, kwargs, nonlinear, *, judge=True):
+        """Judge a ``fem.solve(param=value)`` solve, write it to :attr:`stats`, and raise if it stalled.
 
         That solve is jitted -- which is how it avoids re-staging for every value -- and the driver's
         own convergence check self-disables under a trace, so without this it returns with NO verdict
@@ -3164,6 +4219,12 @@ class FEM:
         the residual the solver actually worked on: the REDUCED one on a reduced system, because the
         full residual of a constrained problem keeps the constraint's reaction, which is physical and
         stays O(1) however well converged the solve is.
+
+        A failed verdict RAISES, exactly as the driver's own check does on an eager solve. It used to be
+        recorded only (``fem.stats["nonlinear"]["converged"] = False``), so a stalled Newton -- a 3-D
+        rolling model warm-started from a different problem, residual 1e-1 against a 1e-10 tolerance --
+        came back as an ordinary-looking field. ``judge=False`` (a user ``solve_fn=`` or a box-constrained
+        solve, whose tolerances or residual the verdict does not know) records without raising.
         """
         from .utils.solver.slip_runtime import bind_periodic
         from .utils.solver.solver_api import record_nonlinear_verdict
@@ -3189,7 +4250,106 @@ class FEM:
             u = restrict_state_periodic(per, u)
             if u0.shape[0] != u.shape[0]:
                 u0 = restrict_state_periodic(per, u0)
-        record_nonlinear_verdict(res_at, u, u0, nonlinear, getattr(nonlinear, "name", None) or "newton")
+        who = getattr(nonlinear, "name", None) or "newton"
+        r_end, bound, ok = record_nonlinear_verdict(res_at, u, u0, nonlinear, who)
+        if ok is False and judge:
+            cfg = getattr(nonlinear, "config", None) or {}
+            traits = getattr(nonlinear, "traits", None) or {}
+            rtol, atol = float(traits.get("rtol", 1e-8)), float(traits.get("atol", 1e-8))
+            cap = f" in max_steps={cfg['max_steps']}" if "max_steps" in cfg else ""
+            raise RuntimeError(
+                f"fem.solve({', '.join(f'{k}=...' for k in vals)}): {who} did not converge{cap}: residual norm "
+                f"{r_end:.3e} against the tolerance atol + rtol*||r(u0)|| = {bound:.3e} (atol={atol:g}, "
+                f"rtol={rtol:g}){' on the reduced system' if per is not None else ''}. The last iterate is "
+                "NOT a root -- raise max_steps, loosen atol/rtol, globalize the iteration "
+                "(jno.solve.newton(line_search=True) or damping<1), or start from a better x0 (a nearby "
+                "solved parameter value, e.g. fem.solve(continuation=...))."
+            )
+
+    def _operator_key(self):
+        """A structural key of this form's operator (load summands left out; cached), for sharing one
+        factorisation between forms that differ only in their load -- see `utils/solver/operator_key.py`.
+        ``None`` where the solve does not take the assembled operator as it is (a periodic reduction)."""
+        if getattr(self, "_op_key_cache", None) is not None:
+            return self._op_key_cache[0]
+        key = None
+        if self._mode == "linear" and (self._periodic_2n if self._complex_n is not None else self._periodic) is None:
+            from .utils.solver.operator_key import operator_key
+
+            try:
+                key = operator_key(
+                    self.domain,
+                    list(self._constraints or []),
+                    extra=(self._mode, self._complex_n, repr(sorted((self._fem_kwargs or {}).items()))),
+                )
+            except Exception:  # noqa: BLE001 -- a form the key cannot describe is simply never shared
+                key = None
+        self._op_key_cache = (key,)
+        return key
+
+    def _linear_solver_context(self):
+        """What a direct solver may know about the steady linear operator beyond its values (cached):
+        ``pattern`` -- its COO indices as a concrete array, from one COMPILED evaluation (the same program a
+        traced solve runs, so the same entry order), which lets a factorisation be planned while the values
+        are still tracers; ``complex_n`` -- the half size when the operator is a fused complex block;
+        ``owner`` -- this FEM (factor slots are per form). ``None`` where the solve does not hand over the
+        assembled operator unchanged (a periodic reduction re-forms it per call)."""
+        if getattr(self, "_solver_ctx", None) is not None:
+            return self._solver_ctx
+        if self._mode != "linear" or (self._periodic_2n if self._complex_n is not None else self._periodic) is not None:
+            return None
+        op = self._op
+        if isinstance(op, FemLinearSystem):
+            if op.operator_fn is not None:
+                names = list(op.runtime_parameter_exprs)
+                shapes = []
+                known = (op.metadata or {}).get("runtime_value_shapes") or {}
+                for n_ in names:
+                    if n_ in known:  # the assembler recorded it (coordinates, a field frozen to another solve)
+                        shapes.append(np.zeros(known[n_]))
+                        continue
+                    mod = getattr(getattr(op.runtime_parameter_exprs[n_], "model", None), "module", None)
+                    val = getattr(mod, "value", None)
+                    if val is None:
+                        return None  # a parameter whose shape is not known here: no planned pattern
+                    shapes.append(np.zeros(np.shape(val), np.asarray(val).dtype))
+                # The pattern of the COMPILED evaluation: it is what a traced solve sees (an eager evaluation
+                # can differ, e.g. 336 entries fewer on a 3-D N1E form). Run on a worker thread, whose JAX
+                # trace state is its own, so the result is concrete even when first asked from inside a
+                # trace (`ensure_compile_time_eval` would run the jit op by op: the EAGER pattern).
+                import concurrent.futures
+
+                _pat = lambda: np.asarray(jax.jit(lambda *v: op.evaluate(dict(zip(names, v)))[0].indices)(*shapes))  # noqa: E731
+                with concurrent.futures.ThreadPoolExecutor(1) as _ex:
+                    idx = _ex.submit(_pat).result()
+            else:
+                idx = getattr(op.A, "indices", None)
+        else:
+            idx = getattr(op[0], "indices", None)
+        if idx is None:
+            return None
+        if isinstance(idx, jax.core.Tracer):
+            return None
+        self._solver_ctx = {
+            "pattern": np.asarray(idx),
+            "complex_n": self._complex_n,
+            "owner": self,
+            "symmetric": self._symmetric_operator(),
+        }
+        return self._solver_ctx
+
+    def _symmetric_operator(self):
+        """Is this real linear form's operator provably symmetric (see ``operator_key.symmetric_operator``)?
+        A direct cuDSS solve then factors it LDL^T inside the compiled program instead of LU through a host
+        callback. ``False`` for a complex form (its own path decides) and wherever it cannot be shown."""
+        if self._complex_n is not None or self._mode != "linear":
+            return False
+        from .utils.solver.operator_key import symmetric_operator
+
+        try:
+            return bool(symmetric_operator(self.domain, list(self._constraints or [])))
+        except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
+            return False
 
     def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
@@ -3231,13 +4391,13 @@ class FEM:
                 compose_transient_step_solvers,
             )
 
-            # `cached(spec, refresh=k)` asks for a rebuild every k steps. A setup that cannot run under a
+            # `reuse=k` asks for a rebuild every k steps. A setup that cannot run under a
             # trace can only be rebuilt between scans, so the march is chunked at that cadence instead of
             # running as one scan; without it nothing changes.
             _cadence = None if precond is None else _refresh_cadence(precond)
             if _cadence is not None and time is not None:
                 raise NotImplementedError(
-                    f"fem.solve(precond=jno.precond.cached(..., refresh={_cadence})) asks for a rebuild every "
+                    f"fem.solve(precond=jno.precond.<spec>(reuse={_cadence})) asks for a rebuild every "
                     f"{_cadence} steps, but a jno.solve.theta(...)/exponential(...) scheme integrates the march "
                     "itself and is not chunked here, so the setup would silently never refresh. Drop the "
                     "cadence, or use the default scheme."
@@ -3360,6 +4520,7 @@ class FEM:
         tol=None,
         maxiter=None,
         X0=None,
+        contour=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -3382,10 +4543,35 @@ class FEM:
 
             lam, X = K.eigs(mass=[ui * vi], k=6, precond=jno.precond.amg())
             lam, X = K.eigs(mass=[ui * vi], k=4, sigma=60.0)   # the 4 modes nearest λ = 60
+
+        ``contour=jno.solve.contour(centre=, radius=, ...)`` returns **every** eigenvalue inside a circle
+        instead of a count (Beyn contour integration), differentiable through the eigenvectors; it refuses
+        ``which``/``sigma``/``precond``/``X0``. A Bloch tie ``u(A) - c*u(B)`` among the terms (a band
+        structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
+        ``n``-space, and a complex ``X0`` warm-starts the next k-point.
         """
+        self._refresh_attachments()
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
         _reject_source_terms(self, "FEM.eigs")
+        if contour is not None:
+            bad = [
+                nm
+                for nm, val in (
+                    ("which", None if which == "smallest" else which),
+                    ("sigma", sigma),
+                    ("precond", precond),
+                    ("X0", X0),
+                )
+                if val is not None
+            ]
+            if bad:
+                raise ValueError(
+                    f"fem.eigs(contour=...) names a REGION of the complex plane, so it does not take "
+                    f"{', '.join(bad)} — those target the k eigenvalues at one end of the spectrum, "
+                    f"which is a different question. Drop them, or drop contour=."
+                )
+            return self._eigs_contour(mass, contour, tol=tol, maxiter=maxiter)
         from . import solve as _solve
         from .utils.solver.solver_api import LinearOperator
 
@@ -3409,7 +4595,12 @@ class FEM:
         # would silently be the identity.
         _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
         _dir_dofs = sorted({int(dof) for dof, _v in _pairs})
-        M = fem(list(mass)).operator[0]  # mass matrix on the same FE space
+        _mass_fem = fem(list(mass))
+        M = _mass_fem.operator[0]  # mass matrix on the same FE space
+        # A complex / Bloch-tied K lives on the fused real-equivalent 2n block; lift M into it.
+        _cn = self._complex_n
+        if _cn is not None:
+            M = _fuse_mass_like(_cn, _mass_fem, M)
         # RESTORE the stash the (Dirichlet-free) mass assembly just cleared: without this, a SECOND
         # eigs() on the same fem finds no constraints, skips the elimination, and silently returns the
         # row-replaced spurious spectrum — eigs would not be idempotent (measured: the repeat call gave
@@ -3418,13 +4609,22 @@ class FEM:
 
         # A warm start (the previous sweep point's eigenvectors) arrives in the FULL DOF space the
         # caller sees; the constrained solve runs in the reduced one, so restrict its columns.
+        if X0 is not None and _cn is not None and int(jnp.shape(jnp.asarray(X0))[0]) == _cn:
+            X0 = _expand_complex_guess(X0, _cn)  # complex n-space guess -> real-equivalent 2n
         if X0 is not None and restrict is not None:
             _W = jnp.asarray(X0)
             _W = _W[:, None] if _W.ndim == 1 else _W
             X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
-        solver = _solve.eigs(k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0)
+        # the real-equivalent block doubles every complex mode, so ask for 2k and thin afterwards
+        _k_solve = 2 * k if _cn is not None else k
+        _finish = (
+            (lambda lam, X: _thin_real_equivalent_pairs(lam, X, _cn)) if _cn is not None else (lambda lam, X: (lam, X))
+        )
+        solver = _solve.eigs(
+            k=_k_solve, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0
+        )
         if restrict is None:
-            return solver(K, M)
+            return _finish(*solver(K, M))
 
         if sigma is not None:
             # Shift-invert factorizes K − σM, so the constrained pencil must be ASSEMBLED in the
@@ -3436,7 +4636,8 @@ class FEM:
             from .utils.solver.fem_utils import reduce_matrix, reduce_matrix_periodic
 
             if _kind == "periodic":
-                K_red, M_red = reduce_matrix_periodic(self._periodic, K), reduce_matrix_periodic(self._periodic, M)
+                _per = _eigs_periodic(self)
+                K_red, M_red = reduce_matrix_periodic(_per, K), reduce_matrix_periodic(_per, M)
             else:  # dirichlet: the free-DOF selection P as a BCOO, reduced by the sparse remap
                 free = jnp.asarray(sorted(set(range(n_full)) - set(_dir_dofs)), dtype=jnp.int32)
                 P = jsparse.BCOO(
@@ -3445,7 +4646,7 @@ class FEM:
                 )
                 K_red, M_red = reduce_matrix(P, K, is_selection=True), reduce_matrix(P, M, is_selection=True)
             lam, Xr = solver(K_red, M_red)
-            return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
+            return _finish(lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr))
 
         # Reduced pencil (PᵀKP) x̂ = λ (PᵀMP) x̂ as MATVECS — never assembled, so this composes with the
         # matrix-free LOBPCG path and never densifies a big operator just to drop some rows.
@@ -3465,7 +4666,7 @@ class FEM:
             if _kind == "dirichlet":
                 _free = jnp.asarray(sorted(set(range(n_full)) - {int(dof) for dof, _v in _pairs}), dtype=jnp.int32)
                 return lambda: matrix_diagonal(A_raw)[_free]
-            return lambda: matrix_diagonal(reduce_matrix_periodic(self._periodic, A_raw))
+            return lambda: matrix_diagonal(reduce_matrix_periodic(_eigs_periodic(self), A_raw))
 
         def red(op, A_raw):
             mv = lambda v: restrict(op.mv(prolong(v)))  # noqa: E731
@@ -3479,7 +4680,74 @@ class FEM:
             )
 
         lam, Xr = solver(red(Kop, K), red(Mop, M))
-        return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)  # modes back on the full mesh
+        return _finish(lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr))  # modes back on the full mesh
+
+    def _eigs_contour(self, mass, spec, *, tol=None, maxiter=None):
+        """Beyn contour integration on this fem's pencil; see :func:`jno.solve.contour`.
+
+        A complex form (which a Bloch tie makes, since ``u(A) - c*u(B)`` with ``c != 1`` is a
+        complex relation) is solved on the **complex n-space pencil built from the Re/Im legs**, not
+        on the fused real-equivalent ``2n`` block the other paths use. That is not a detail: the
+        realified block carries every eigenvalue TWICE, and Beyn resolves each artificial pair as two
+        nearby simple values. Measured on a Bloch-tied photonic-crystal cell, the realified route
+        gave 1.2e-03 relative where the complex one gives 1.0e-05, at half the system size.
+        """
+        from .utils.solver.eigen import contour_geneigh
+        from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic
+        from .utils.solver.solver_api import LinearOperator
+
+        _pairs = list(getattr(self.domain, "_fem_native_dirichlet_pairs", None) or [])
+        _dir = sorted({int(dof) for dof, _v in _pairs})
+        mass_fem = fem(list(mass))
+        M_raw = mass_fem.operator[0]
+        self.domain._fem_native_dirichlet_pairs = _pairs  # the mass assembly clears the stash
+
+        cn = self._complex_n
+        if cn is not None:
+            (A_r, _br), (A_i, _bi) = self._complex_legs
+            K_raw = _complex_operator(A_r, A_i)  # the n-space complex operator
+        else:
+            K_raw = self.operator[0]
+        Kop, Mop = LinearOperator(K_raw), LinearOperator(M_raw)
+        n_full = int(Kop.shape[0])
+
+        per = self._periodic
+        if per is not None:
+            restrict = lambda w: jnp.asarray(reduce_vector_periodic(per, w, conj=True))  # noqa: E731
+            prolong = lambda v: jnp.asarray(prolong_periodic(per, v))  # noqa: E731
+            n_red = int(jnp.shape(restrict(jnp.zeros(n_full, dtype=jnp.complex128)))[0])
+        elif _dir:
+            free = jnp.asarray(sorted(set(range(n_full)) - set(_dir)), dtype=jnp.int32)
+            restrict = lambda w: w[free]  # noqa: E731
+            prolong = lambda v: jnp.zeros(n_full, v.dtype).at[free].set(v)  # noqa: E731
+            n_red = int(free.shape[0])
+        else:
+            restrict = prolong = None
+            n_red = n_full
+
+        if restrict is None:
+            Kr, Mr = Kop, Mop
+        else:
+            red = lambda op: LinearOperator.from_matvec(  # noqa: E731
+                lambda v: restrict(op.mv(prolong(v))), shape=(n_red, n_red)
+            )
+            Kr, Mr = red(Kop), red(Mop)
+
+        lam, Xr = contour_geneigh(
+            Kr,
+            Mr,
+            centre=spec.centre,
+            radius=spec.radius,
+            points=spec.points,
+            probes=spec.probes,
+            rank=spec.rank,
+            tol=spec.tol if tol is None else float(tol),
+            maxiter=spec.maxiter if maxiter is None else int(maxiter),
+            seed=spec.seed,
+        )
+        if restrict is None:
+            return lam, Xr
+        return lam, jax.vmap(prolong, in_axes=1, out_axes=1)(Xr)
 
     # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
     def _dd_region(self):
@@ -3503,6 +4771,33 @@ class FEM:
         """The shapely geometry of :attr:`region`, or ``None`` — used by ``jno.core([...])`` coupling."""
         return self._dd_region()[1]
 
+    def _refresh_attachments(self):
+        """Re-assemble if a property these terms read was re-attached since the last assembly.
+
+        ``d.<prop>`` reads plain values from the domain when the terms are lowered, so rebuilding from the
+        stored terms picks up the new value; the mesh and anything built on it (an enclosure's view
+        factors) are not touched. A property whose value is an expression was captured when the term was
+        written and cannot be re-read: that refuses instead of solving with the old value."""
+        watch = self.__dict__.get("_attach_watch")
+        if not watch:
+            return
+        changed = [(p, live) for dom, p, v, live in watch if (dom.__dict__.get("_attach_versions") or {}).get(p, 0) != v]
+        if not changed:
+            return
+        frozen = sorted({p for p, live in changed if not live})
+        if frozen:
+            raise ValueError(
+                f"jno.fem: {frozen[0]!r} was re-attached after this fem was built, but its value is an "
+                f"expression, which the terms captured when they were written, so the new value cannot reach "
+                f"this fem. Build a new one after the attach: jno.fem([...])."
+            )
+        new = fem(self._constraints, **self.__dict__.get("_rebuild_kwargs", self._fem_kwargs))
+        self.__dict__.update(new.__dict__)
+        from .utils.logger import get_logger
+
+        names = ", ".join(repr(p) for p in sorted({p for p, _ in changed}))
+        get_logger().info(f"jno.fem: re-assembled, since domain.attach changed {names} after the last assembly.")
+
     def _as_whole_mesh(self):
         """Rebuild this region-tagged FEM with WHOLE-MESH assembly (no ``RegionMask``) while keeping its
         region label. A region-local matrix can't reconcile an overlapping-Schwarz band (its artificial
@@ -3512,11 +4807,18 @@ class FEM:
             return self
         return fem(self._constraints, _dd_overlap=True, **(getattr(self, "_fem_kwargs", None) or {}))
 
-    def pinned_solver(self, node_ids, *, nonlinear=None):
+    def pinned_solver(self, node_ids):
         """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
         ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
         (fixed) matrix is prefactored once; each iteration only re-solves against a new right-hand side.
-        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky)."""
+        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky).
+
+        Args:
+            node_ids: the DOFs to pin.
+
+        Returns:
+            Callable: ``f(values) -> field``.
+        """
         import numpy as _np
         import scipy.linalg as _sla
 
@@ -3558,6 +4860,7 @@ class FEM:
 
         The linear branch never densifies — ``A`` stays the assembled BCOO, so this is ``O(nnz)``.
         """
+        self._refresh_attachments()
         if self._mode == "linear":
 
             def _linear_residual(u, args=None):
@@ -3618,11 +4921,17 @@ class FEM:
 
         The region is read off the expression's coordinate Variables exactly as for a weak term, so a
         boundary integrand is spelled by binding the field to that region's coordinates; a term naming two
-        regions is refused, because an integral has one measure. Narrower in scope than the weak path: the
-        whole volume and tagged boundary regions only, and steady native-Lagrange problems only. Where it
-        is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
+        regions is refused, because an integral has one measure. Narrower in scope than the weak path: steady
+        problems only -- on a native-Lagrange form the whole volume and tagged boundary regions, on a
+        non-nodal form the whole volume (below). Where it is unavailable, ``sum(fem.eval(F * phi, u))`` is the same integral — a Lagrange basis is a
         partition of unity.
+
+        On a **non-nodal** form (N1E / N2E / RT / DG, alone or mixed with Lagrange) the test-free integrand is
+        integrated over the whole volume, real or complex, with coefficient fields of any space — e.g. the
+        current through an impressed field ``E`` of an eddy-current form,
+        ``I = (sigma * inner(E - 1j*w*A, E)).integrate(fem)``. Boundary integrands are not wired there.
         """
+        self._refresh_attachments()
         return self._eval_at(term, u, 0.0, args=args)
 
     def _eval_at(self, term, u, t_eval, *, args=None):
@@ -3633,7 +4942,7 @@ class FEM:
         """
         from .utils.solver.solver_helper import contains_node_type
 
-        terms = list(term) if isinstance(term, (list, tuple)) else [term]
+        terms = _lower_unknowns(list(term) if isinstance(term, (list, tuple)) else [term])
         bares = [getattr(t, "expr", t) for t in terms]
         weak = [contains_node_type(b, TestFunction) for b in bares]
         if any(weak) and not all(weak):
@@ -3703,6 +5012,7 @@ class FEM:
         from .trace import FunctionCall
         from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
+        expr = _lower_unknowns(expr)  # a `domain.unknown()` field is the trial here, not a coefficient
         bare = getattr(expr, "expr", expr)
         op = getattr(self, "operator", None)
         declared = dict(getattr(op, "runtime_parameter_exprs", None) or {})
@@ -3727,7 +5037,12 @@ class FEM:
         def _run(u, *vals):
             return jnp.asarray(fn(jnp.asarray(u).reshape(-1), 0.0, dict(zip(names, vals)))).reshape(())
 
-        return FunctionCall(_run, [sol, *params], name="fem_integral")
+        from .utils.solver.parametric_helpers import mark_global_scalar
+
+        node = FunctionCall(_run, [sol, *params], name="fem_integral")
+        node._per_evaluation = True  # a scalar of the parameters: evaluated once per evaluation
+        # one number per solve: usable as another FEM's coefficient, read once rather than per point
+        return mark_global_scalar(node, f"__fem_integral_{id(expr)}")
 
     def _functional_solution(self, solver=None):
         """The one solve every functional over this system shares.
@@ -3754,7 +5069,15 @@ class FEM:
                 )
             return sol
         self._functional_solver = solver
-        self._functional_sol = sol = self.solve() if solver is None else self.solve(solver)
+        from .utils.solver.solver_api import LinearSolver
+
+        if solver is None:
+            sol = self.solve()
+        elif isinstance(solver, LinearSolver):  # a `jno.solve.*` spec fills the linear slot, with this FEM as context
+            sol = self.solve(linear=solver)
+        else:
+            sol = self.solve(solver)
+        self._functional_sol = sol
         return sol
 
     def _functional_fn(self, terms, bares):
@@ -3766,11 +5089,10 @@ class FEM:
         factory = getattr(self, "_term_functional_factory", None)
         if factory is None:
             raise NotImplementedError(
-                "fem.eval: a test-free integrand is integrated only through the native Lagrange assembler "
-                "on a STEADY problem, which is the only route that publishes the functional. Not wired "
-                "for: transient, complex, 1-D, non-nodal (Argyris/Morley/edge) elements, and the VPINN "
-                "path. Assemble the equivalent weak term `F * phi` and sum it instead — a Lagrange basis "
-                "is a partition of unity, so that is the same integral."
+                "fem.eval: a test-free integrand is integrated on STEADY problems of the native Lagrange "
+                "and the non-nodal assemblers, which publish the functional. Not wired for: transient, "
+                "1-D, and the VPINN path. On a Lagrange form, assemble the equivalent weak term `F * phi` "
+                "and sum it instead — a Lagrange basis is a partition of unity, so that is the same integral."
             )
         vol, surf = [], {}
         for t, bare in zip(terms, bares):
@@ -3801,7 +5123,6 @@ class FEM:
         ``component`` picks one component of a vector field (``None`` = all of them). Returns a plain
         ``numpy`` int array, so it indexes a solution or a residual directly.
         """
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         idx = field if isinstance(field, int) else self.block_index(field)
         pts = self.field_points
@@ -3819,7 +5140,7 @@ class FEM:
                 "finer than the mesh, or a region on a different field's nodes, is the usual cause."
             )
         offs = self.offsets
-        vec = int(_value_shape_num_components(self._field_value_shape(idx)))
+        vec = int(self._field_vec(idx))
         base = int(offs[idx]) if offs is not None else 0
         comps = range(vec) if component is None else [int(component)]
         return np.concatenate([base + nodes * vec + c for c in comps])
@@ -3853,6 +5174,14 @@ class FEM:
         Refused by name rather than guessed: a **transient trajectory** ``(n_steps, n_dofs)`` — pass one
         step, ``fem.export(traj[k], ...)`` — and a **complex** solution, where taking a part silently is
         exactly the kind of quiet choice that hides a wrong answer; pass ``sol.real`` / ``sol.imag``.
+
+        Args:
+            solution: one solution vector (a single step of a trajectory).
+            save_path: the output path; a multi-field problem inserts the field name before the extension.
+            file_format: a ``meshio`` format name; ``None`` infers it from the extension.
+
+        Returns:
+            list: the paths written.
         """
         import os
 
@@ -3884,7 +5213,6 @@ class FEM:
                 f"fem.export: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} "
                 "DOFs. Pass the solve's own output, not a slice of it."
             )
-        from .utils.solver.fem_utils import _value_shape_num_components
 
         names = _field_names(self._constraints or [])
         # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
@@ -3905,7 +5233,7 @@ class FEM:
                     f"fem.export: no meshio cell type for a {dim}-D element with {int(cells_i.shape[1])} "
                     "nodes. Export the mesh with `d.export_vtk()` and the field separately."
                 )
-            vec = int(_value_shape_num_components(self._field_value_shape(i)))
+            vec = int(self._field_vec(i))
             block = arr[int(offs[i]) : int(offs[i + 1])].reshape(-1, vec)
             nm = names.get(keys[i], f"field{i}") if i < len(keys) else f"field{i}"
             out = save_path if n_fields == 1 else f"{root}.{nm}{ext}"
@@ -3916,6 +5244,15 @@ class FEM:
             )
             written.append(out)
         return written
+
+    def _field_vec(self, idx):
+        """Values stored per node in block ``idx`` (``n(n+1)/2`` for a symmetric ``n x n`` field)."""
+        from .utils.solver.fem_utils import _value_shape_num_components
+
+        vecs = getattr(self, "_block_vecs", None)
+        if vecs and idx < len(vecs):
+            return int(vecs[idx])
+        return int(_value_shape_num_components(self._field_value_shape(idx)))
 
     def _field_value_shape(self, idx):
         """The ``value_shape`` of block ``idx`` — from the assembler's own field list."""
@@ -4157,6 +5494,7 @@ class FEM:
         """Jacobian callable for a custom solver, returning a dense ``(n_dofs, n_dofs)`` JAX
         array — ``jacobian(u)`` (steady nonlinear) or ``jacobian(u, t)`` (transient). Use
         ``fem.operator`` for the raw sparse (BCOO) form on large problems."""
+        self._refresh_attachments()
         if self._mode == "nonlinear":
             j = self._op.jacobian
             return lambda u: _as_dense(j(u))
@@ -4199,18 +5537,22 @@ class FEM:
 
     @property
     def t0(self):
+        """Start time of a transient problem (``None`` if steady)."""
         return self._time_block().t0 if self.is_transient else None
 
     @property
     def t1(self):
+        """End time of a transient problem (``None`` if steady)."""
         return self._time_block().t1 if self.is_transient else None
 
     @property
     def dt(self):
+        """Time step of a transient problem (``None`` if steady)."""
         return self._time_block().dt if self.is_transient else None
 
     @property
     def dofs(self) -> Optional[int]:
+        """Total number of degrees of freedom (``None`` when not yet known)."""
         if self._mode == "linear" and self._b is not None:
             return int(jnp.asarray(self._b).reshape(-1).shape[0])
         if self._mode == "nonlinear":
@@ -4598,6 +5940,11 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
     from .utils.solver.fem_utils import build_periodic_prolongation_n1e
 
     topo = domain._fem_nonnodal_topology
+    _fm = topo.get("field_dofmaps")
+    if _fm is not None and not all(sp == "N1E" and dm is not None and dm.degree == 1 for sp, dm in _fm):
+        # degree k, N2E / RT, or a MIXED system (N1E x Lagrange): one prolongation per field from its
+        # own entity map. The edge-only builder below would size every block by the edge count.
+        return _build_periodic_reduction_entities(domain, ties, offsets)
     n_edges = int(topo["n_edges"])
     vpts = np.asarray(topo["vertex_points"])
     ev = np.asarray(topo["edge_vertices"])
@@ -4628,6 +5975,68 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         "n_full": off_full[-1],
         "n_red": off_red[-1],
         "is_bloch": red["is_bloch"],
+    }
+
+
+def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
+    """Periodic (Floquet/Bloch) reduction for non-nodal fields of ANY degree -- N1E/N2E/RT of degree k
+    and the Lagrange / DG / P0 fields mixed with them -- one prolongation per FIELD from its own entity
+    DOF map (:func:`fem_dofmap.periodic_prolongation`: tie by interpolation, so orientation and phase
+    need no per-family rules). A field without facet DOFs (P0 / DG) is untouched by a tie."""
+    import jax.experimental.sparse as jsparse
+
+    from .utils.solver.fem_dofmap import build_dofmap, periodic_prolongation
+
+    topo = domain._fem_nonnodal_topology
+    vpts = np.asarray(topo["vertex_points"])
+    cells = np.asarray(topo["cells"])
+    n_verts = int(vpts.shape[0])
+    field_maps = topo.get("field_dofmaps") or []
+    masks = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
+        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
+        # ties along periodic edges would then miss their partners).
+        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+        if m is None:
+            f = _face_nodes(domain, vpts, None, tag)
+            m = np.zeros(n_verts, dtype=bool)
+            if f is not None:
+                m[np.asarray(f, dtype=int).reshape(-1)] = True
+        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
+        if not m.any():
+            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
+        masks[tag] = m
+    spec = [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
+    n_fields = len(offsets) - 1
+    blocks, off_full, off_red = [], [0], [0]
+    is_bloch = False
+    for i in range(n_fields):
+        n_i = int(offsets[i + 1] - offsets[i])
+        space, dm = field_maps[i] if i < len(field_maps) else ("?", None)
+        if dm is None and space == "Lagrange":
+            dm = build_dofmap(cells, "Lagrange", 1, n_verts=n_verts)
+        if dm is None or space in ("P0", "DG"):
+            if space not in ("P0", "DG"):
+                raise NotImplementedError(f"jno.fem periodic: no DOF map for the {space} field {i}.")
+            idx = np.arange(n_i)
+            P = jsparse.BCOO((jnp.ones(n_i), jnp.asarray(np.stack([idx, idx], axis=1))), shape=(n_i, n_i))
+            kept, bl = idx, False
+        else:
+            P, kept, bl = periodic_prolongation(dm, vpts, cells, spec)
+        if int(P.shape[0]) != n_i:
+            raise RuntimeError(f"jno.fem periodic: field {i} has {n_i} DOFs but its map has {int(P.shape[0])}.")
+        is_bloch = is_bloch or bl
+        blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
+        off_full.append(off_full[-1] + n_i)
+        off_red.append(off_red[-1] + int(P.shape[1]))
+    return {
+        "blocks": blocks,
+        "off_full": off_full,
+        "off_red": off_red,
+        "n_full": off_full[-1],
+        "n_red": off_red[-1],
+        "is_bloch": is_bloch,
     }
 
 
@@ -5172,9 +6581,11 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     A_i_fn, b_i_fn = _parts(op_i)
     n = int(jnp.shape(b_r_fn(None))[0])
     rpe: dict = {}
+    shapes: dict = {}  # runtime inputs without a parameter model (coordinates, coupled solutions): their shapes
     for leg in (op_r, op_i):
         if isinstance(leg, _FLS):
             rpe.update(getattr(leg, "runtime_parameter_exprs", None) or {})
+            shapes.update((getattr(leg, "metadata", None) or {}).get("runtime_value_shapes") or {})
 
     blk = lambda a: _complex_block_bcoo(A_r_fn(a), A_i_fn(a), n)  # noqa: E731
     rhs = lambda a: jnp.concatenate([b_r_fn(a), b_i_fn(a)])  # noqa: E731
@@ -5185,7 +6596,7 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
             operator_fn=blk,
             rhs_fn=rhs,
             runtime_parameter_exprs=rpe,
-            metadata={"complex": True},
+            metadata={"complex": True, **({"runtime_value_shapes": shapes} if shapes else {})},
         )
     else:
         fused = (blk(None), rhs(None))
@@ -5708,7 +7119,12 @@ def _check_bounds_under_reduction(fem_obj: Any, periodic: Any, kind: str) -> Non
     lo, hi = fem_obj._resolve_bounds(jnp.zeros((int(fem_obj.dofs),)))
     for side, full in (("lower", np.asarray(lo)), ("upper", np.asarray(hi))):
         kept = np.asarray(restrict_state_periodic(periodic, jnp.asarray(full)))
-        bad = np.flatnonzero(~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12))
+        disagree = ~np.isclose(full, kept[main], rtol=1e-12, atol=1e-12)
+        if periodic.get("coupling") == "constant_tie":
+            # A DOF tied to a constant with no bound of its own takes the constant's: u_s = U, so U's box
+            # bounds it exactly. Only a bound declared on BOTH sides can conflict.
+            disagree &= np.isfinite(full)
+        bad = np.flatnonzero(disagree)
         if bad.size:
             d = int(bad[0])
             raise ValueError(
@@ -6107,32 +7523,77 @@ def _refuse_point_indexing(constraints: Any) -> None:
                 )
 
 
+#: Domains whose `_fem_tied_constants` hand-over was set by the build in progress; `fem()` clears them on
+#: exit so a build that raised before assembling cannot leak a constant into a later, unrelated assembly.
+_TIED_CONSTANT_DOMAINS: List[Any] = []
+
+
+# docstring-from: jno._fem._fem_impl
 def fem(
     constraints: Any,
     *,
-    quad_degree: int = 2,
+    quad_degree: int | None = None,
     chunk: Any = None,
     _dd_overlap: bool = False,
 ) -> FEM:
-    """Assemble a flat list of traced residuals into an :class:`FEM` — see :func:`_fem_impl`.
+    """Assemble a flat list of traced residuals into an :class:`FEM`: the finite-element front door.
 
-    This thin wrapper exists only to scope ``chunk=`` over the assembly. The element-chunk policy has
-    to be in force while the assembler builds its closures (it is captured there, not read when they
-    later run), and threading a parameter through ten ``assemble_fem_native`` call sites to say the
-    same thing would be churn for no gain.
+    The term list is the whole problem: weak terms (those containing a test function), essential
+    conditions ``u(region) - g``, initial conditions, ties and pins. Linear or nonlinear, steady or
+    transient is read off the terms, not configured::
+
+        u = d.unknown(); v = u.test()
+        grad = lambda w: jno.np.jacobian(w, [x, y])
+        fem = jno.fem([jno.np.inner(grad(u), grad(v)) - f * v,   # -Δu = f, weak form
+                       u(xb, yb) - 0.0])                          # u = 0 on the boundary
+        sol = fem.solve()                                         # differentiable
+
+    Args:
+        constraints: A residual expression or list of them. Weak terms (containing the test function)
+            and essential conditions (``u(region) - g``) are auto-classified.
+        quad_degree: Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what
+            integrates its mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is
+            used as written, also below that: a form with only gradients of a P1 field is exact at
+            degree 0, at a quarter of the points in 3-D. A degree below the default is reported once
+            with what it integrates inexactly. The element type is derived from the domain's dimension
+            and the trial's ``order``.
+        chunk: Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
+            device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
+            positive int pins the cell count. A single ``vmap`` over every cell materialises the whole
+            batched intermediate at once, and on a 3-D mesh that intermediate — not the assembled
+            operator — is what sets the memory ceiling. Chunking capped the peak of a 3-D nonlinear
+            solve at 509 MiB where it had been 2324 MiB, for roughly 15% more assembly time. The default
+            needs no tuning: a chunk may use ~0.15% of device memory, so the same problem that must be
+            split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB one. Pin it
+            when you know better than the heuristic: a very large per-cell block, an unusual device, or
+            to reproduce the unchunked behaviour exactly. This lives on ``jno.fem`` rather than on
+            ``fem.solve`` because it is an assembly-time decision: the steady-linear operator is built
+            here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
+            non-nodal) is an error rather than a silent no-op.
+
+    Returns:
+        FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """
+    # This wrapper only scopes `chunk=` over the assembly: the element-chunk policy has to be in force while
+    # the assembler builds its closures (it is captured there, not read when they later run), and threading a
+    # parameter through every `assemble_fem_native` call site to say the same thing would be churn.
     from .utils.solver import fem_utils as _fn  # the chunk policy's home; both assemblers read it
 
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
+    prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
     _fn._CHUNK_CONSUMED[0] = False
+    _fn._QUAD_EXPLICIT[0] = quad_degree is not None
+    _fn._QUAD_REPORTED.clear()
     try:
         with _host_assembly_scope():
             out = _fem_impl(
-                constraints,
+                _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
+        out._attach_watch = _attach_watch(constraints)
+        out._rebuild_kwargs = {"quad_degree": quad_degree, "chunk": chunk, "_dd_overlap": _dd_overlap}
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
             # loops and none of them chunk, so an explicit request there would quietly do nothing.
@@ -6144,6 +7605,11 @@ def fem(
         return out
     finally:
         _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
+        _fn._QUAD_EXPLICIT[0] = prev_quad
+        _fn._QUAD_REPORTED.clear()
+        _fn._QUAD_REPORTED.update(prev_reported)
+        while _TIED_CONSTANT_DOMAINS:
+            _TIED_CONSTANT_DOMAINS.pop().__dict__.pop("_fem_tied_constants", None)
 
 
 def _is_volume_region(domain, name: str) -> bool:
@@ -6170,37 +7636,46 @@ def _is_volume_region(domain, name: str) -> bool:
 def _fem_impl(
     constraints: Any,
     *,
-    quad_degree: int = 2,
+    quad_degree: int | None = None,
     _dd_overlap: bool = False,
 ) -> FEM:
-    """Assemble a flat list of traced residuals into an :class:`FEM`.
+    """Assemble a flat list of traced residuals into an :class:`FEM`: the finite-element front door.
 
-    Parameters
-    ----------
-    constraints:
-        A residual expression or list of them. Weak terms (containing the test
-        function) and essential conditions (``u(region) - g``) are auto-classified.
-    quad_degree:
-        Quadrature degree (forwarded to the quadrature setup). The element type is
-        derived from the domain's dimension and the trial's ``order``.
-    chunk:
-        Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
-        device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
-        positive int pins the cell count.
+    The term list is the whole problem: weak terms (those containing a test function), essential
+    conditions ``u(region) - g``, initial conditions, ties and pins. Linear or nonlinear, steady or
+    transient is read off the terms, not configured::
 
-        A single ``vmap`` over every cell materialises the whole batched intermediate at once, and on
-        a 3-D mesh that intermediate — not the assembled operator — is what sets the memory ceiling.
-        Chunking capped the peak of a 3-D nonlinear solve at 509 MiB where it had been 2324 MiB, for
-        roughly 15% more assembly time.
+        u = d.unknown(); v = u.test()
+        grad = lambda w: jno.np.jacobian(w, [x, y])
+        fem = jno.fem([jno.np.inner(grad(u), grad(v)) - f * v,   # -Δu = f, weak form
+                       u(xb, yb) - 0.0])                          # u = 0 on the boundary
+        sol = fem.solve()                                         # differentiable
 
-        The default needs no tuning: a chunk may use ~0.15% of device memory, so the same problem
-        that must be split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB
-        one. Pin it when you know better than the heuristic: a very large per-cell block, an unusual
-        device, or to reproduce the unchunked behaviour exactly.
+    Args:
+        constraints: A residual expression or list of them. Weak terms (containing the test function)
+            and essential conditions (``u(region) - g``) are auto-classified.
+        quad_degree: Quadrature degree. Omitted (the default), it is ``2 x order`` of the field -- what
+            integrates its mass term exactly (6 for a Hermite beam, 12 for Argyris, ...). Given, it is
+            used as written, also below that: a form with only gradients of a P1 field is exact at
+            degree 0, at a quarter of the points in 3-D. A degree below the default is reported once
+            with what it integrates inexactly. The element type is derived from the domain's dimension
+            and the trial's ``order``.
+        chunk: Cells per chunk in the element assembly loop. ``None`` (the default) sizes it from the
+            device — see below; ``False`` runs one ``vmap`` over every cell (the old behaviour); a
+            positive int pins the cell count. A single ``vmap`` over every cell materialises the whole
+            batched intermediate at once, and on a 3-D mesh that intermediate — not the assembled
+            operator — is what sets the memory ceiling. Chunking capped the peak of a 3-D nonlinear
+            solve at 509 MiB where it had been 2324 MiB, for roughly 15% more assembly time. The default
+            needs no tuning: a chunk may use ~0.15% of device memory, so the same problem that must be
+            split on an 8 GB card runs unsplit — and therefore at full speed — on an 80 GB one. Pin it
+            when you know better than the heuristic: a very large per-cell block, an unusual device, or
+            to reproduce the unchunked behaviour exactly. This lives on ``jno.fem`` rather than on
+            ``fem.solve`` because it is an assembly-time decision: the steady-linear operator is built
+            here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
+            non-nodal) is an error rather than a silent no-op.
 
-        This lives on ``jno.fem`` rather than on ``fem.solve`` because it is an assembly-time
-        decision: the steady-linear operator is built here, before any solve. Setting it on a problem
-        whose assembler has no element loop (1-D, non-nodal) is an error rather than a silent no-op.
+    Returns:
+        FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """
     from .utils.solver.fem_route import neumann
     from .utils.solver.weak_form import (
@@ -6222,7 +7697,11 @@ def _fem_impl(
     # so re-tracing them picks up the refined mesh automatically.
     _orig_constraints = list(constraints)
     _refuse_point_indexing(constraints)
-    _orig_fem_kwargs = {"quad_degree": quad_degree}
+    _orig_fem_kwargs = {"quad_degree": quad_degree}  # as GIVEN: a rebuild must keep "not given" (None)
+    from .utils.solver.fem_utils import quad_floor
+
+    if quad_degree is None:
+        quad_degree = 2  # raised per field below to what its mass term needs (`quad_floor`)
 
     # Gauge pins (`p.pin()`) remove a field's constant null space. Each lowers to a single-node
     # Dirichlet `p(node) - value`. A GaugePin is a bare marker, not a walkable expression, so it must
@@ -6276,7 +7755,7 @@ def _fem_impl(
     # backed) domain once with gmsh setPeriodic on the tied face pairs. No `periodic=` arg — driven purely
     # by the periodic conditions the user already authored. (Nodal fields tie by interpolation and need no
     # re-mesh, so this is gated on N1E.)
-    if "N1E" in _trial_spaces(constraints) and hasattr(domain, "_remesh_periodic"):
+    if _trial_spaces(constraints) & {"N1E", "N2E", "RT"} and hasattr(domain, "_remesh_periodic"):
         _pairs = [(s[0], s[1]) for c in constraints if (s := _periodic_tie_spec(c, domain)) is not None]
         if _pairs:
             domain._remesh_periodic(_pairs)
@@ -6290,6 +7769,32 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
+    # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
+    # off before classification -- neither names a region the classifier could read.
+    const_ties: List[Any] = []
+    const_pins: List[Any] = []
+    _rest: List[Any] = []
+    for c in constraints:
+        spec = _constant_tie_spec(c, domain)
+        if spec is not None:
+            const_ties.append(spec)
+            continue
+        pin = _constant_pin_spec(c)
+        if pin is not None:
+            const_pins.append(pin)
+            continue
+        _rest.append(c)
+    constraints = _rest
+    # A constant that appears ONLY in a tie or a pin has no weak term to be found in; the assembler takes it
+    # from here (read once, by the next native assembly -- see `assemble_fem_native`).
+    domain._fem_tied_constants = [t[3] for t in const_ties] + [p[0] for p in const_pins]
+    _TIED_CONSTANT_DOMAINS.append(domain)  # `fem()` clears the hand-over however this build ends
+    if const_ties and periodic_ties:
+        raise NotImplementedError(
+            "jno.fem: a tie to a constant (`u(region) - U`) together with a periodic tie composes two "
+            "prolongations; that composition is not implemented."
+        )
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
     # Gauge pins lower to a one-node Dirichlet at a vertex off every tied face (see `_lower_gauge_pin`).
@@ -6382,6 +7887,8 @@ def _fem_impl(
     _weak_has_real_trial = any(_contains(c, TestFunction) and _contains(c, TrialFunction) for c in constraints)
     is_vpinn = _has_network and not _weak_has_real_trial
     has_neural_coeff = _has_network and not is_vpinn
+    _check_symmetric_field_scope(domain, constraints, periodic_ties, is_vpinn)
+    _check_constant_field_scope(domain, constraints, is_vpinn)
 
     if has_neural_coeff:
         # A network in a trial-only (essential) constraint is a trainable *essential value*, NOT an
@@ -6459,6 +7966,7 @@ def _fem_impl(
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
+        fem_obj._constant_closed_keys = {t[3].field_key for t in const_ties} | {pn[0].field_key for pn in const_pins}
         fem_obj._fem_kwargs = _orig_fem_kwargs
         fem_obj._geometry = list(_geometry)  # `coord.d(t) - v` terms: the mesh-motion driver reads these
         fem_obj._mesh_velocity = _mesh_velocity_node  # `coord.d(t)` in a weak form; the driver feeds it
@@ -6472,6 +7980,8 @@ def _fem_impl(
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
+        fem_obj._block_vecs = list(getattr(domain, "_fem_native_field_vecs", None) or ())
+        fem_obj._block_constant = list(getattr(domain, "_fem_native_field_constant", None) or ())
         # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
         # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
@@ -6523,8 +8033,8 @@ def _fem_impl(
             # reduction and reaches `reduce_matrix_periodic` / `B(P)` with no branch of its own.
             from .utils.solver.fem_refine import hanging_prolongation
 
-            if periodic_ties or slip_bcs:
-                _other = "a periodic or tied interface" if periodic_ties else "a slip condition `n·u = 0`"
+            if periodic_ties or slip_bcs or const_ties:
+                _other = "a periodic or tied interface" if (periodic_ties or const_ties) else "a slip condition `n·u = 0`"
                 raise NotImplementedError(
                     f"jno.fem: a locally refined (hanging-node) mesh combined with {_other} composes two "
                     "prolongations, and their order changes the answer. Refine away from those faces, or "
@@ -6565,6 +8075,31 @@ def _fem_impl(
             fem_obj._periodic = _hp
             _check_bounds_under_reduction(fem_obj, _hp, "hanging-node constraint")
             return _fuse_complex_steady(fem_obj)
+        if const_ties:
+            if fem_obj._mode not in ("linear", "nonlinear"):
+                raise NotImplementedError(
+                    f"jno.fem: a tie to a constant (`u(region) - U`) is wired on steady linear and nonlinear "
+                    f"forms; this one assembled as {fem_obj._mode!r}."
+                )
+            _dpairs_c, _tvdofs_c = _prescribed_dofs(domain)
+            _slip_c = None
+            if slip_bcs:
+                # The constant scope is the native assembler, which stashed its cells (see the slip branch below).
+                _slip_c = _build_slip_reduction(
+                    domain,
+                    slip_bcs,
+                    fem_obj,
+                    getattr(domain, "_fem_native_assembly_cells", None),
+                    int(getattr(domain, "_fem_native_assembly_order", 1)),
+                )
+            periodic = _build_constant_tie_reduction(
+                fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c, slip=_slip_c
+            )
+            periodic = _annotate_reduced_dirichlet(periodic, _dpairs_c, _tvdofs_c)
+            fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
+            fem_obj._periodic = periodic
+            _check_bounds_under_reduction(fem_obj, periodic, "tie to a constant")
+            return _fuse_complex_steady(fem_obj)
         if not periodic_ties and not slip_bcs:
             return _fuse_complex_steady(fem_obj)
         if slip_bcs and periodic_ties:
@@ -6597,7 +8132,7 @@ def _fem_impl(
             # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
             # prolong / restrict path below is reused with no new branch.
             periodic = _build_slip_reduction(domain, slip_bcs, fem_obj, cells, ele_order)
-        elif _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
+        elif _nonnodal_topo is not None and _nonnodal_topo.get("family") in ("N1E", "N2E", "RT"):
             # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
             periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
         elif _nonnodal_topo is not None:
@@ -6762,6 +8297,10 @@ def _fem_impl(
     # Variables in place, so classifying up front prevents one constraint's retag from
     # leaking into another's region detection — e.g. two surface terms on the same
     # region (a Neumann load + a Robin term) that share the bound boundary coordinates.
+    # Point loads (a test function called at point coordinates) are not region terms: they are taken
+    # out here, before classification, and assembled by the native path through the shape functions
+    # of the elements that hold the points.
+    point_terms, constraints = _split_point_terms(list(constraints))
     classified = [
         (c, _contains(c, TestFunction), _contains(c, TrialFunction), *_region_and_support(c, domain)) for c in constraints
     ]
@@ -6823,9 +8362,11 @@ def _fem_impl(
                 dirichlet_values[region] = value
                 classification.append(f"dirichlet@{region}")
             else:  # one component (roller/symmetry): u(region)[i] - g
-                if comp not in _COMPONENT_NAMES:
+                _n_comp = _field_num_components(c)
+                if not 0 <= comp < _n_comp:
                     raise ValueError(
-                        f"jno.fem: Dirichlet component index {comp} out of range (vector components are 0..2)."
+                        f"jno.fem: Dirichlet component index {comp} is out of range for a field with "
+                        f"{_n_comp} component(s)."
                     )
                 if dirichlet_style.get(style_key) == "all":
                     raise ValueError(
@@ -6835,9 +8376,10 @@ def _fem_impl(
                 dirichlet_style[style_key] = "per_component"
                 current = dirichlet_values.get(region)
                 current = dict(current) if isinstance(current, dict) else {}
-                current[_COMPONENT_NAMES[comp]] = value
+                _key = _component_key(comp, c)
+                current[_key] = value
                 dirichlet_values[region] = current
-                classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
+                classification.append(f"dirichlet@{region}[{_key}]")
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
@@ -6849,6 +8391,26 @@ def _fem_impl(
     classification.extend(f"slip@{spec[1]}" for spec in slip_bcs)
 
     _check_movable_bc_nodes(domain, dirichlet_raw, boundary_terms)
+    for U, ucomp, value_node in const_pins:
+        # One DOF: the native assembler resolves any region of a constant field to its single node.
+        _vn = _bare(value_node)
+        dirichlet_raw.append((U.field_key, "__constant__", ucomp, _value_from_node(_vn), _vn))
+        classification.append(f"dirichlet@{U.name}" + ("" if ucomp is None else f"[{ucomp}]"))
+    classification.extend(f"tie@{region}->{U.name}" for _fk, region, _c, U, _uc in const_ties)
+    _plan = getattr(domain, "_shape_plan", None)
+    if _plan is not None and getattr(_plan, "_node", None) is not None:
+        from .geometry import parametric as _par
+
+        _wires = _par.unfollowed(_plan) if _par.has_params(_plan._node) else []
+        if _wires:
+            raise NotImplementedError(
+                f"jno.fem: the line region(s) {_wires} have `jno.np.parameter`s in their vertices or "
+                "radius. The mesh follows a design by stretching along x, y and z between face planes, "
+                "which does not move a tube along its own path, so this FEM would integrate over the "
+                "wire at its reference position whatever the design. Keep the parametric wire out of "
+                "the meshed domain (a jno.peec line on its own, its heat as point loads), or give it "
+                "numbers."
+            )
 
     if is_vpinn and multifield:
         # Single-field is a real boundary, not a guard: the network-trial lowering wraps ONE primary
@@ -6966,6 +8528,21 @@ def _fem_impl(
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     _nonnodal_families = _trial_spaces(constraints) - _NATIVE_SPACES
+    # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
+    # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
+    # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    _reads_across = any(
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        for c in constraints
+        for n in _walk(_bare(c))
+    )
+    if _reads_across and not _nonnodal_families:
+        _nonnodal_families = {"Lagrange (across)"}
+    # A term on a body's faces INSIDE the mesh (`d.tag(..., region=body)`) likewise: the nodal assemblers
+    # walk boundary facets only, so such a term -- a load in particular -- would be dropped without a word.
+    _iface = set(getattr(domain, "_interior_face_tags", ()) or ())
+    if _iface and not _nonnodal_families and any(r in _iface for r in boundary_terms):
+        _nonnodal_families = {"Lagrange (interior faces)"}
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
@@ -7138,6 +8715,12 @@ def _fem_impl(
     if getattr(domain, "dimension", None) == 1 and not is_vpinn:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
+        if getattr(domain, "_trainable_coords", None):
+            raise NotImplementedError(
+                "jno.fem: the 1-D assembler does not read coordinate parameters (`x.trainable()`), so it "
+                "would solve the reference mesh whatever the design. Moving a 1-D mesh is not supported yet."
+            )
+
         _order_1d = _infer_order(constraints)
         # ---- complex 1D: the same real-equivalent split the 2D/3D and non-nodal paths use ----
         # Every other `_is_complex_form` dispatch sits BELOW this branch, so before this a `1j` on a
@@ -7183,7 +8766,7 @@ def _fem_impl(
                     "Re u = g with Im u = 0 but not a prescribed Im u. Use a real essential value and carry "
                     "the complex part in the operator or the source."
                 )
-            _cx_quad = max(quad_degree, 2 * _order_1d)
+            _cx_quad = quad_floor(quad_degree, 2 * _order_1d, f"a P{_order_1d} mass term")
             _cx_legs = [
                 assemble_fem_1d(
                     domain,
@@ -7226,7 +8809,11 @@ def _fem_impl(
                 # 2D/3D path); too few Gauss points would under-integrate the mass silently. The
                 # Hermite beam's stiffness ∫w''v'' is degree 2 in xi but its mass ∫wv is degree 6, so
                 # it needs the same rule a P3 Lagrange field would.
-                quad_degree=max(quad_degree, 6 if _hermite_1d else 2 * _order_1d),
+                quad_degree=quad_floor(
+                    quad_degree,
+                    6 if _hermite_1d else 2 * _order_1d,
+                    "a Hermite beam's mass term" if _hermite_1d else f"a P{_order_1d} mass term",
+                ),
                 order=_order_1d,
                 space="Hermite" if _hermite_1d else "Lagrange",
                 rotation_bcs=rotation_bcs,
@@ -7239,7 +8826,7 @@ def _fem_impl(
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs_1d))
 
     order = _infer_order(constraints)
-    quad_degree = max(quad_degree, 2 * order)
+    quad_degree = quad_floor(quad_degree, 2 * order, f"a P{order} mass term")
 
     # ---- coupled / mixed multi-field -> block (multi-variable) assembly ----
     if multifield:
@@ -7260,7 +8847,9 @@ def _fem_impl(
     # ---- single field: element defaults to the field order (P1->TRI3/TET4,
     # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
     element_type = _element_for(domain.dimension, order)
-    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
+    quad_degree = quad_floor(
+        quad_degree, 2 * order, f"a P{order} mass term"
+    )  # factory uses 2*degree+1; bump to the field's order
 
     # ---- build IR with explicit regions, then detect transient vs steady. This is done so the
     # native path can route from the IR alone: split each weak constraint into additive sub-terms
@@ -7318,6 +8907,30 @@ def _fem_impl(
     # by `kron(P_node, I_vec)`, which `_finalize` already asks for with `vec or 1`. Only the TRANSIENT
     # route pre-builds its reduction in its own branch, so it still falls through here.
     _native_periodic_ok = not periodic_ties or not is_transient
+    if point_terms:
+        # v1 of point loads: the steady, real, native Lagrange path. Anywhere else they are refused
+        # rather than dropped -- the other routes have no place to put them.
+        why = (
+            "a transient form"
+            if is_transient
+            else "a complex form"
+            if _is_complex_form(domain, ir)
+            else "a network-coefficient (VPINN) form"
+            if is_vpinn
+            else "periodic ties"
+            if periodic_ties
+            else "an evolving state"
+            if _evolution
+            else None
+            if _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+            else "this mesh/element"
+        )
+        if why is not None:
+            raise NotImplementedError(
+                f"jno.fem: point loads (`c * v(px, py, pz)`) are supported on steady, real Lagrange problems; "
+                f"this one has {why}."
+            )
+        domain._fem_point_terms = point_terms  # read (and cleared) by assemble_fem_native
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
@@ -7343,7 +8956,11 @@ def _fem_impl(
             evolution=_evolution,
             bounded=bool(_bounds),
         )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+        if point_terms:
+            classification.append(f"point x{len(point_terms)}")
+        _fem_obj = FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
+        _fem_obj._point_loads = len(point_terms)
+        return _finalize(_fem_obj)
 
     # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
     # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
@@ -7786,7 +9403,6 @@ def _assemble_multifield(
     the native assembler, which allocates each state's per-quadrature-point buffer and builds the
     readout — both indexed by cell, so the coupled case needs nothing extra here. The march is the
     *pseudo-time* path, so it is rejected below for a real (``u.t``) transient and for a complex form."""
-    from .trace import history_variables as _history_variables
     from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
@@ -7801,14 +9417,6 @@ def _assemble_multifield(
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
     evolution = dict(evolution or {})
-    # Does this form carry step history? Scanned exactly as the assembler scans it — the weak terms plus
-    # every evolution formula, since a state can be read only inside its own update.
-    _carries_history = bool(_history_variables(weak_bares + [su.formula for su in evolution.values()]))
-    # Will this form assemble as a RESIDUAL operator rather than a matrix/rhs pair? Either trigger does
-    # it: a nonlinearity in the unknown, or step history. That is the question the runtime-parameter gate
-    # below actually needs answered — a residual operator re-evaluates at the runtime args and is
-    # entirely field-agnostic, while the coupled linear assembly has no parametric route.
-    _residual_path = _carries_history or any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -7857,7 +9465,8 @@ def _assemble_multifield(
         else:
             current = region_values.get(region)
             current = dict(current) if isinstance(current, dict) else {}
-            current[_COMPONENT_NAMES[comp]] = value
+            _rank = len(tuple(fields[fidx].get("value_shape", ()) or ()))
+            current[_COMPONENT_NAMES[comp] if _rank <= 1 and comp in _COMPONENT_NAMES else int(comp)] = value
             region_values[region] = current
     domain._fem_dirichlet_by_field = by_field
 
@@ -7871,15 +9480,13 @@ def _assemble_multifield(
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
-        # A runtime parameter is excluded because the coupled *linear* assembly has no parametric route --
-        # not because the parameter itself is a problem. A form on the RESIDUAL path never takes that
-        # route: it assembles as a ``FemResidualOperator`` that re-evaluates at the runtime ``args`` each
-        # call, which is entirely field-agnostic (the coupled *transient* branch below already allows a
-        # parameter for exactly this reason). So gate on WHICH BRANCH the form will take. This is what
-        # makes a coupled load-path march — and a coupled nonlinear inverse problem, the shape a
-        # staggered solve identifies material parameters with — differentiable in a material parameter,
-        # as the single-field paths already were.
-        and (not any(_contains_runtime_parameter(b) for b in weak_bares) or _residual_path)
+        # A runtime parameter needs no gate here. Whichever branch the form takes, the assembler
+        # re-evaluates at the runtime ``args``: the RESIDUAL path through a ``FemResidualOperator``,
+        # and the LINEAR path through a ``FemLinearSystem`` whose ``operator_fn``/``rhs_fn`` close
+        # over ``_assemble_at(args)`` (fem_native). Both are built from the same residual/jacobian
+        # closures and are entirely field-agnostic, so the coupled case was never the obstacle --
+        # this gate was. It excluded a parametric coupled LINEAR form on the stated grounds that the
+        # coupled linear assembly had no parametric route; it has one, and had one.
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
@@ -7901,8 +9508,8 @@ def _assemble_multifield(
         # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
         # differentiable solve in an inverse problem -- assembles natively too. It needs the same
         # 2D/3D-Lagrange-real gate as the non-parametric case, just WITHOUT the runtime-parameter
-        # exclusion baked into ``_native_ok``. (A nodal FIELD parameter ``k(x)`` in a multi-field form
-        # is still rejected -- by ``assemble_fem_native`` itself, with a clear single-field-only error.)
+        # exclusion baked into ``_native_ok``. A nodal FIELD parameter ``k(x)`` interpolates on its own P1
+        # space whatever field's terms mention it.
         _native_transient_ok = (
             getattr(domain, "dimension", None) in (2, 3)
             and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
@@ -7925,6 +9532,21 @@ def _assemble_multifield(
             f"(got dimension={getattr(domain, 'dimension', None)}, "
             f"spaces={sorted({str(f.get('space', 'Lagrange')) for f in fields})}, "
             f"complex={_is_complex_form(domain, ir)})."
+        )
+
+    # A runtime parameter in an ESSENTIAL VALUE on a coupled form. The native Dirichlet path looks the
+    # parameter's nodal array up with the CONSTRAINED field's node ids. In a single-field problem those
+    # index the same space, so it is correct there; in a coupled one the design field (say P1) and the
+    # constrained field (say P2 velocity) do not share a numbering, so the lookup either raises an
+    # IndexError from inside assembly or -- when the two node counts happen to coincide -- silently
+    # reads the wrong nodes and imposes a plausible wrong boundary value. Refuse by name instead.
+    if len(fields) > 1 and any(_contains_runtime_parameter(vnode) for *_rest, vnode in dirichlet_raw if vnode is not None):
+        raise NotImplementedError(
+            "jno.fem: a runtime/trainable parameter in an ESSENTIAL VALUE is not supported on a coupled "
+            "(multi-field) form -- the boundary lookup indexes the parameter's nodal array with the "
+            "constrained field's node ids, and the two fields do not share a numbering, so the imposed "
+            "value would be read from the wrong nodes. A parameter in the OPERATOR or the LOAD of a "
+            "coupled form is supported; recover a boundary parameter on a single-field form instead."
         )
 
     if _native_ok:
@@ -7951,14 +9573,6 @@ def _assemble_multifield(
     # through the ± block structure — coupled Helmholtz systems in their natural spelling. ----
     _cx_coupled = _is_complex_form(domain, ir)
     _par_coupled = any(_contains_runtime_parameter(b) for b in weak_bares)
-    _par_names = sorted(
-        {
-            str(getattr(n.model, "_parameter_name", None) or "a trainable network")
-            for b in weak_bares
-            for n in _walk(b)
-            if type(n).__name__ == "ModelCall"
-        }
-    )
     if evolution and _cx_coupled:
         raise NotImplementedError(
             "jno.fem: `state.evolves(...)` cannot combine with a complex coupled form — complex forms "
@@ -7983,17 +9597,27 @@ def _assemble_multifield(
         )
         return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs)
 
-    # A coupled steady form `_native_ok` excluded -- a runtime parameter on the coupled LINEAR assembly,
-    # which has no parametric route. The native coupled assembler covers linear and nonlinear real forms
-    # (incl. complex=True), the linear complex split above, and a parametric form that carries step
-    # history (which assembles as a residual operator, not a matrix pair); reject the rest explicitly
-    # rather than mis-assemble.
+    # A coupled steady form the native assembler cannot take. It covers linear and nonlinear real forms
+    # (incl. complex=True), the linear complex split above, forms carrying step history, and -- since
+    # the gate above stopped excluding them -- parametric forms on either the residual or the
+    # parametric-linear route. Reject the rest explicitly rather than mis-assemble.
+    #
+    # The reason is read off `_native_ok`'s own conditions rather than asserted. The previous message
+    # blamed a missing parametric route on the coupled linear assembly; that route existed the whole
+    # time, so the message sent people to work around a limitation they did not have.
+    _why = []
+    if getattr(domain, "dimension", None) not in (2, 3):
+        _why.append(f"the domain is {getattr(domain, 'dimension', None)}-D (native covers 2-D and 3-D)")
+    _spaces = sorted({str(f.get("space", "Lagrange")) for f in fields} - {"Lagrange"})
+    if _spaces:
+        _why.append(f"a coupled form on non-Lagrange space(s): {', '.join(_spaces)}")
+    if _is_complex_form(domain, ir):
+        _why.append("a complex form that the real-equivalent split above did not take")
     raise NotImplementedError(
-        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a runtime "
-        f"parameter ({', '.join(_par_names) or 'unnamed'}) and is linear with no step history, so it would take the coupled "
-        "linear assembly, which has no parametric route. Recover the parameter on a single-field "
-        "reduced form, on a coupled NONLINEAR form or a load-path march (`domain(tau=...)` + `.i(k)`) "
-        "-- both assemble as a residual operator -- or through a coupled first-order transient."
+        "jno.fem: this coupled (multi-field) steady form is not supported natively -- "
+        + ("; ".join(_why) if _why else "the native assembler declined it")
+        + ". Recover the parameter on a single-field reduced form, on a coupled NONLINEAR form or a "
+        "load-path march (`domain(tau=...)` + `.i(k)`), or through a coupled first-order transient."
     )
 
 
@@ -8133,6 +9757,8 @@ def _assemble_second_order_time(
 ):
     r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
 
+    Assembled once, on the reference mesh: a moving mesh (coordinate parameters) is refused below.
+
     A second-order semidiscrete system :math:`M_2 \ddot u + C \dot u + K u = F` is rewritten with
     the velocity :math:`v = \dot u` as the first-order block
     :math:`M_\text{aug}\,\dot y + A_\text{aug}\,y = c_\text{aug}` in :math:`y = [u; v]`::
@@ -8172,6 +9798,12 @@ def _assemble_second_order_time(
     first-order system); runtime parameters on a *coupled* form (the parametric coupled steady
     assembly underneath does not exist yet).
     """
+    if getattr(domain, "_trainable_coords", None):
+        raise NotImplementedError(
+            "jno.fem: a second-order-in-time form (`u.tt`) is assembled once, on the reference mesh, so "
+            "coordinate parameters (`x.trainable()`, a parametric shape) would not move it -- it would solve "
+            "the old shape whatever the design. Not supported yet; a first-order (`u.t`) or steady form is."
+        )
     from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
     from .utils.solver.fem_utils import bcoo_set_dirichlet_rows, bcoo_zero_rows
@@ -8206,21 +9838,27 @@ def _assemble_second_order_time(
             "recover the parameter through the operator or load instead."
         )
     if multifield and has_param:
-        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group,
-        # and the parametric coupled steady assembly does not exist — letting it run would surface a
-        # confusing "coupled steady form" error from inside a u_tt build.
+        # The parametric branch re-forms M₂/C/K per step through the STEADY assembly of each group.
+        # That assembly IS parametric now — a coupled linear form takes the FemLinearSystem route — but
+        # the u_tt block does not thread the runtime args through its per-step re-forming, so the
+        # parameter would freeze at its initial value without saying so. Refuse until that is wired.
         raise NotImplementedError(
             "jno.fem: runtime/trainable parameters on a COUPLED second-order-in-time form are not "
-            "supported yet — the parametric coupled steady assembly underneath is not wired. A "
-            "single-field parametric u_tt works, and a coupled FIRST-order parametric transient works "
-            "(write each second-order field with an explicit velocity field)."
+            "supported yet — the u_tt block re-forms M₂/C/K per step without threading the runtime "
+            "args, so the parameter would silently freeze at its initial value. A single-field "
+            "parametric u_tt works, and a coupled FIRST-order parametric transient works (write each "
+            "second-order field with an explicit velocity field)."
         )
 
     # Wave / elastodynamics frequencies of soft modes are not resolvable in float32 (silent error).
     _warn_second_order_float32()
 
     # ---- quadrature setup (the native assembler owns the FE state; no problem object) ----
-    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
+    from .utils.solver.fem_utils import quad_floor
+
+    quad_degree = quad_floor(
+        quad_degree, 2 * order, f"a P{order} mass term"
+    )  # factory uses 2*degree+1; bump to the field's order
 
     # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
     def _strip(coeff, times):

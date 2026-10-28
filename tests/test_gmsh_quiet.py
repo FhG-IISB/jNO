@@ -32,9 +32,9 @@ def test_a_gmsh_warning_during_a_build_reaches_the_jno_log(monkeypatch):
     monkeypatch.setattr("jno.utils.logger.get_logger", lambda *a, **k: Log())
     real = emit._emit_node
 
-    def noisy(node, occ, split_full=False):
+    def noisy(*args, **kwargs):
         gmsh.logger.write("a planted warning", level="warning")
-        return real(node, occ, split_full)
+        return real(*args, **kwargs)
 
     monkeypatch.setattr(emit, "_emit_node", noisy)
     mesh, dim, _ = emit.build(jno.shape.rect(0, 0, 1, 1, size=0.5))

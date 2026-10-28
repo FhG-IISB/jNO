@@ -29,20 +29,29 @@ path is unaffected.
 | `d.tag(name, pred)` over a geometry face | the predicate filters point sampling only; facets still map through the geometry, so naming a DIFFERENT face splits the region | warns |
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
-| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient | raises |
+| Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient; on a coupled (multi-field) form only on a first-order transient, not steady or on the τ load path (the parameter's nodes and the constrained field's do not share a numbering) | raises |
 | Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
 | Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
 | `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
-| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` needs `adapt=`; runtime connectivity is affine-simplex only | raises |
+| `symmetric=True` matrix fields | native 2-D/3-D Lagrange only — not 1-D, VPINN, periodic ties, complex, or mixed with a non-nodal family; a time-varying whole-tensor Dirichlet value is not mapped to the stored values (write it per entry); an asymmetric whole-tensor value is refused | raises |
+| Constant unknowns (`constant=True`) | native 2-D/3-D Lagrange only; a tie `u(region) - U` on steady linear/nonlinear forms only, and not together with a periodic tie, a moving slip surface, a node that both slips and is tied in the same component, or a hanging-node mesh; `U - g` takes a value that does not depend on position; `jno.fdm` has no constants | raises |
+| `d.unknown(...)` in `jno.fdm` | a real P1 nodal unknown with full storage; `order=2`, a non-nodal `space=`, `complex=True`, `symmetric=True` or `constant=True` make it FEM-only | raises |
+| Adapting a moving mesh | `relocate` fails on two separate bodies (use `alpha`); `enrich()` (p) is not wired; `checkpoint=` on a moving mesh needs `adapt=`, and a checkpointed march cannot be differentiated; runtime connectivity is affine-simplex only | raises |
 | Interpolation covers (`space="cover"`) | first order, simplices only; the layout is padded so memory scales by `1+dim` even where enrichment is off; `jno.solve.enrich` is steady-only; a `u.gap` contact search may not read a cover field | raises |
-| FEM functionals (`fem.eval(F, u)` with a test-free `F`, `expr.integrate(fem)`) | steady, native Lagrange; the whole volume or a tagged boundary region — not a sub-region; not transient, complex, 1-D, non-nodal or VPINN (use `sum(fem.eval(F * phi, u))` there) | raises |
+| FEM functionals (`fem.eval(F, u)` with a test-free `F`, `expr.integrate(fem)`) | steady forms. Native Lagrange: the whole volume or a tagged boundary region — not a sub-region. Non-nodal (N1E / N2E / RT / DG, mixed with Lagrange), real or complex: the whole volume only. Not transient, 1-D or VPINN | raises |
 | VPINN (network trial) | **steady only**, single field (scalar or vector), no periodic ties; a boundary coefficient must carry a coordinate | raises |
-| `dom.cell_size` / `dom.cell_metric` | native 2-D/3-D **volume** terms only — a 1-D form or a non-nodal family packs no element Jacobian | raises |
+| `dom.cell_size` / `dom.cell_metric` | 2-D/3-D **volume** terms (native Lagrange and non-nodal forms) and `expr.integrate(d)` — a 1-D form packs no element Jacobian | raises |
 | Element order on RT / N1E / P0 / Hermite / Argyris / Morley | each family has one intrinsic order | raises |
-| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** | NaN, not a silent zero |
+| Coefficient fields on an element space (`e.bind(...).freeze(values)` or `jno.np.parameter(e)` with `e` an N1E / N2E / RT / DG / P_k symbol) | **volume** terms of the non-nodal assembler (a form with such an unknown): value and gradient (`.curl`, `.d(x)`) of a frozen field, value of a parameter. Not in boundary terms, not on the nodal Lagrange or 1-D assembler (P0 / P1 fields only there) | raises |
+| Integrals over a domain (`expr.integrate(d)`) of known fields, incl. solutions frozen with `u.freeze(fem.solve())` | the whole volume, simplex meshes; follows trainable coordinates, and `d.cell_size` / `d.cell_metric` resolve per cell (mesh quality as an integral); the integrand may hold no unknown | raises |
+| A field frozen to a solve (`u.freeze(fem1.solve())`) as a coefficient of another form (one-way coupling) | non-nodal forms (an N1E / N2E / RT / DG / P_k unknown), volume terms, evaluated through `jno.core` (the coupled solve is a runtime input); not the nodal Lagrange assembler, a boundary term, or an eager `fem.solve()` without the value | raises |
+| `eigs` on a non-symmetric pencil | eigenvalues differentiate, **eigenvectors do not** (`contour=` differentiates through the modes) | NaN, not a silent zero |
+| `eigs`: a Bloch/periodic tie **plus** a Dirichlet pin | the two constraint maps do not compose in the eigen path — so a *slab* (periodic in-plane, PEC or PML above and below) cannot be solved yet; a tie alone and a pin alone are both fine | raises |
+| `eigs` eigenvector gradients at an **exact degeneracy** | NaN at a repeated eigenvalue, where only *subspace-invariant* functionals have a derivative at all. `contour=` differentiates through the modes and is the way round it | NaN, not a silent zero |
+| `eigs` on a **runtime-parametric** form | a design parameter reaches the eigensolve only through `fem.operator.evaluate`, not through `fem.eigs` itself | raises |
 | **Curved-boundary geometry** | straight-sided **by default**; `shape.curved()` is the fix | **silent** |
 | **Axisymmetric vector forms** | the `2πr` measure is wrong for vectors | **silent** |
 
@@ -59,7 +68,8 @@ path is unaffected.
     still refuses:
 
     - a field with **no** `u_tt` term — its velocity rows would be singular;
-    - **runtime parameters** — the parametric coupled steady assembly underneath is not wired;
+    - **runtime parameters** — the `u_tt` block re-forms `M₂`/`C`/`K` per step without threading the
+      runtime args, so the parameter would freeze at its initial value;
     - periodic ties.
 
     Time-varying Dirichlet is refused on nonlinear `u_tt` forms (a first-order nonlinear transient
@@ -103,8 +113,16 @@ path is unaffected.
     any other parameter — `∂b/∂g` flows through the symmetric elimination (linear), and `∂/∂g`
     through the solve's / each step's `custom_root` (nonlinear / transient).
 
-    Refused loudly: a value that is **both** parametric and t/τ-dependent (`u(top) - g*tau`). Train
-    the amplitude through a Neumann / body term instead. A parametric wall **beside** a τ-ramped one
+    On a **coupled** (multi-field) form a parametric essential value is refused, steady or on the τ load
+    path: the boundary lookup reads the parameter's nodal array with the constrained field's node ids, and
+    two fields do not share a numbering. A parameter in the operator or the load of a coupled form is fine;
+    recover a boundary parameter on a single-field form.
+
+    A value that is **both** parametric and t/τ-dependent is held at each step's t/τ WITH the runtime
+    parameters, on a first-order transient and on a τ load-path march (`u(top)[1] - g*tau`,
+    displacement control with a trainable grip). Refused loudly on a second-order (`u.tt`) form, whose
+    block evaluates the value and its rate without them: train that amplitude through a Neumann / body
+    term instead. A parametric wall **beside** a τ-ramped one
     (`u(left) - g` with `u(right) - delta*tau`) is fine on the load path: both are held at every step.
     A t/τ-dependent essential value needs steps to be held at: on a steady form that reads no step
     history (`.i(k)`), and so does not march its `domain(tau=...)` grid, it is refused, with or without
@@ -275,6 +293,12 @@ path is unaffected.
     spectrum it actually has — the case that matters for stability problems (resistive MHD growth
     rates, drift waves, anything with a mean flow), where the sign of the growth rate *is* the
     physics. Neither path ever returns the spectrum of `½(K+Kᵀ)` as though it were the answer.
+
+    Every pair ARPACK returns is checked against the pencil (relative residual against `1e-6`; a converged
+    pair sits near `1e-14`). A set that fails **raises** `RuntimeError` naming the worst residual: ARPACK's
+    generalized solve without a shift assumes a symmetric `M`, and a one-sided coupling block (dispersive
+    auxiliary fields, poroelastic or piezoelectric modes) breaks that and yields plausible values that are
+    not eigenvalues. The way out is the exact dense path on a small problem, `sigma=`, or a symmetric `M`.
 
     The routing probe is a randomized bilinear test and is concrete-only, so **under `jit` the
     symmetric path is assumed**.

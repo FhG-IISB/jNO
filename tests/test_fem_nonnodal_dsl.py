@@ -631,13 +631,13 @@ def test_n1e_parametric_transient_operator_fn_is_sparse_and_differentiable():
 
 @pytest.mark.parametrize(
     "space, value_shape",
-    [("N1E", (2,)), ("RT", (2,)), ("Morley", ()), ("Argyris", ()), ("Hermite", ())],
+    [("Morley", ()), ("Argyris", ()), ("Hermite", ())],
 )
 def test_nonnodal_order_is_intrinsic_and_a_request_fails_loud(space, value_shape):
-    """``order=`` is a nodal-Lagrange knob. Every non-nodal family's order is fixed by the element
-    definition and was never plumbed, so ``space="N1E", order=2`` silently returned the SAME
-    lowest-order space (measured: an identical 179-DOF operator) — the worst failure shape for a wave
-    problem, where the user is explicitly paying for accuracy. It must refuse by name."""
+    """The C0/C1 plate families' order is fixed by the element definition. An ignored ``order=`` once
+    silently returned the SAME lowest-order space (measured: an identical 179-DOF operator), so a
+    request for another order must refuse by name. (N1E / N2E / RT honour ``order=`` -- see
+    ``test_fem_nedelec_general.py``.)"""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
     u, v = d.fem_symbols(space=space, value_shape=value_shape, order=2)
     xi, yi, *_ = d.variable("interior", split=True)

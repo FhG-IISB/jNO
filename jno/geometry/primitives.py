@@ -69,9 +69,31 @@ class Rect:
     dim: ClassVar[int] = 2
 
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         return (2, occ.addRectangle(self.x0, self.y0, 0.0, self.x1 - self.x0, self.y1 - self.y0))
 
     def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         if abs(x - self.x0) < tol:
             return "left"
         if abs(x - self.x1) < tol:
@@ -83,12 +105,24 @@ class Rect:
         return None
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``."""
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         x, y = pts[:, 0], pts[:, 1]
         return (x >= self.x0 - tol) & (x <= self.x1 + tol) & (y >= self.y0 - tol) & (y <= self.y1 + tol)
 
     def bounds(self):
-        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive)."""
+        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive).
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         return (self.x0, self.y0, 0.0), (self.x1, self.y1, 0.0)
 
     def boundary_measure(self) -> float:
@@ -96,7 +130,15 @@ class Rect:
         return 2.0 * ((self.x1 - self.x0) + (self.y1 - self.y0))
 
     def sample_boundary(self, n: int, rng):
-        """``(points (n,3), normals (n,3))`` drawn uniformly by arclength, exactly on the edges."""
+        """``(points (n,3), normals (n,3))`` drawn uniformly by arclength, exactly on the edges.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         w, h = self.x1 - self.x0, self.y1 - self.y0
         # edge order matches `classify`: bottom, right, top, left
         lengths = np.array([w, h, w, h], dtype=float)
@@ -118,20 +160,56 @@ class Disk:
     r: float
     dim: ClassVar[int] = 2
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         return (2, occ.addDisk(self.cx, self.cy, 0.0, self.r, self.r))
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         if abs(math.hypot(x - self.cx, y - self.cy) - self.r) < tol:
             return "arc"
         return None
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``."""
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥2) lie inside, inclusive within ``tol``.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         return (pts[:, 0] - self.cx) ** 2 + (pts[:, 1] - self.cy) ** 2 <= (self.r + tol) ** 2
 
     def bounds(self):
-        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive)."""
+        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive).
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         return (self.cx - self.r, self.cy - self.r, 0.0), (self.cx + self.r, self.cy + self.r, 0.0)
 
     def boundary_measure(self) -> float:
@@ -139,7 +217,15 @@ class Disk:
         return 2.0 * math.pi * self.r
 
     def sample_boundary(self, n: int, rng):
-        """``(points, normals)`` exactly on the circle: uniform in angle, normal = radial."""
+        """``(points, normals)`` exactly on the circle: uniform in angle, normal = radial.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         th = rng.uniform(0.0, 2.0 * math.pi, size=n)
         nrm = np.stack([np.cos(th), np.sin(th)], axis=1)
         return _to3(np.array([self.cx, self.cy]) + self.r * nrm), _to3(nrm)
@@ -147,7 +233,16 @@ class Disk:
 
 @dataclass(frozen=True)
 class Box:
-    """Axis-aligned box; faces ``left/right/front/back/bottom/top``."""
+    """Axis-aligned box; faces ``left/right/front/back/bottom/top``.
+
+    Attributes:
+        x0: lower x face.
+        y0: lower y face.
+        z0: lower z face.
+        x1: upper x face.
+        y1: upper y face.
+        z1: upper z face.
+    """
 
     x0: float
     y0: float
@@ -157,13 +252,37 @@ class Box:
     z1: float
     dim: ClassVar[int] = 3
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         return (
             3,
             occ.addBox(self.x0, self.y0, self.z0, self.x1 - self.x0, self.y1 - self.y0, self.z1 - self.z0),
         )
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         if abs(x - self.x0) < tol:
             return "left"
         if abs(x - self.x1) < tol:
@@ -179,7 +298,15 @@ class Box:
         return None
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``."""
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
         return (
             (x >= self.x0 - tol)
@@ -191,7 +318,11 @@ class Box:
         )
 
     def bounds(self):
-        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors."""
+        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         return (self.x0, self.y0, self.z0), (self.x1, self.y1, self.z1)
 
     def _extent(self):
@@ -203,7 +334,15 @@ class Box:
         return 2.0 * (w * d + w * h + d * h)
 
     def sample_boundary(self, n: int, rng):
-        """``(points, normals)`` uniform by area over the six faces, exactly on each plane."""
+        """``(points, normals)`` uniform by area over the six faces, exactly on each plane.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         w, d, h = self._extent()
         lo = np.array([self.x0, self.y0, self.z0])
         # face order matches `classify`: left, right, front, back, bottom, top
@@ -223,19 +362,47 @@ class Box:
 
 @dataclass(frozen=True)
 class Polygon:
-    """Arbitrary 2-D polygon from ordered vertices; edges auto-named ``e0, e1, ...``."""
+    """Arbitrary 2-D polygon from ordered vertices; edges auto-named ``e0, e1, ...``.
+
+    Attributes:
+        points: the vertices ``((x, y), ...)`` in order.
+    """
 
     points: Tuple[Tuple[float, float], ...]
     dim: ClassVar[int] = 2
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         tags = [occ.addPoint(px, py, 0.0) for px, py in self.points]
         n = len(tags)
         lines = [occ.addLine(tags[i], tags[(i + 1) % n]) for i in range(n)]
         loop = occ.addCurveLoop(lines)
         return (2, occ.addPlaneSurface([loop]))
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         pts = self.points
         n = len(pts)
         for i in range(n):
@@ -255,7 +422,15 @@ class Polygon:
 
     def contains(self, pts, tol: float = TOL):
         """Boolean mask (N,) — inside test by the even-odd crossing rule (ray-cast). Edge-exact points
-        are ambiguous (the crossing rule is exclusive on edges); ``tol`` is unused here."""
+        are ambiguous (the crossing rule is exclusive on edges); ``tol`` is unused here.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         import jax as _jax
 
         xp = jnp if isinstance(pts, (_jax.core.Tracer, _jax.Array)) else np
@@ -273,7 +448,11 @@ class Polygon:
         return inside
 
     def bounds(self):
-        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive)."""
+        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors (z is 0 for a 2-D primitive).
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         p = np.asarray(self.points, dtype=float)
         return (p[:, 0].min(), p[:, 1].min(), 0.0), (p[:, 0].max(), p[:, 1].max(), 0.0)
 
@@ -295,13 +474,220 @@ class Polygon:
         return float(self._edges()[2].sum())
 
     def sample_boundary(self, n: int, rng):
-        """``(points, normals)`` uniform by arclength over the edge loop, exactly on each edge."""
+        """``(points, normals)`` uniform by arclength over the edge loop, exactly on each edge.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         a, b, lengths, nrm = self._edges()
         keep = lengths > 0.0
         a, b, lengths, nrm = a[keep], b[keep], lengths[keep], nrm[keep]
         e = rng.choice(len(lengths), size=n, p=lengths / lengths.sum())
         t = rng.uniform(0.0, 1.0, size=n)[:, None]
         return _to3(a[e] + t * (b[e] - a[e])), _to3(nrm[e])
+
+
+@dataclass(frozen=True)
+class Line:
+    """Tube of radius ``r`` swept along a polyline — a 1-D conductor that is also a solid.
+
+    Written for integral-equation methods, where a bond wire, a filament or a vortex line is the
+    natural element and meshing it is beside the point. But it is a genuine solid, so a mesher can
+    consume it too: one primitive, two consumers.
+
+    The reason it is a primitive rather than ``disk.sweep(path)`` is :meth:`contains`. A swept solid
+    has no closed-form membership (``_NO_ANALYTIC_MEMBERSHIP``), so it cannot be a named region
+    carrying its own ``size=`` — per-region mesh sizing needs a containment test and dies without
+    one. A tube's membership is exactly "distance to the polyline <= r", which is closed form.
+
+    Built as overlapping capsules — a cylinder per segment plus a sphere at each interior joint — so
+    the union is smooth at the corners rather than leaving a wedge notch on the outside of a bend.
+
+    Faces: lateral ``side``, and the two end caps ``start`` / ``end``.
+
+    Attributes:
+        points: the polyline vertices ``((x, y, z), ...)``.
+        r: the tube radius.
+    """
+
+    points: Tuple[Tuple[float, float, float], ...]
+    r: float
+    dim: ClassVar[int] = 3
+
+    def _pts(self):
+        return np.asarray(self.points, dtype=float).reshape(-1, 3)
+
+    def _simplified(self):
+        """Drop points that lie on the straight line through their neighbours.
+
+        Two collinear cylinders overlap with COINCIDENT lateral surfaces, which is the one case a
+        boolean kernel handles worst. Merging the run first means every joint has a real angle and
+        the pieces always cross transversally.
+        """
+        P = self._pts()
+        keep = [P[0]]
+        for q, nxt in zip(P[1:-1], P[2:]):
+            u = q - keep[-1]
+            v = nxt - q
+            nu, nv = np.linalg.norm(u), np.linalg.norm(v)
+            if nu <= TOL or nv <= TOL:
+                continue
+            if float(np.dot(u / nu, v / nv)) < 1.0 - 1e-9:  # a genuine bend
+                keep.append(q)
+        keep.append(P[-1])
+        return np.asarray(keep)
+
+    def build(self, occ):
+        """A cylinder per segment, with a SPHERE at each interior joint.
+
+        That is exactly the solid :meth:`contains` describes -- every point within ``r`` of the
+        polyline -- and the two must agree, because the build is what gets meshed while the
+        membership test is what assigns material to the cells.
+
+        Collinear runs are merged first (:meth:`_simplified`), because two collinear cylinders
+        overlap with coincident lateral surfaces, which a boolean kernel handles badly.
+
+        A thin solid embedded in a COARSE host fails to mesh whatever the construction -- that is a
+        property of the host's size, and a plain ``Shape.cylinder`` fails identically. Measured on a
+        wire of radius ``r`` bridging two boxes, the host size has to be within about ``2.5 r``:
+
+            host 10 r  fails      host 5 r  fails      host 2.5 r  meshes      host 1.25 r  meshes
+
+        That is finer than the mitred construction needed (which reached ``5 r``), and it is the price
+        of the build agreeing with :meth:`contains`. A sphere sits TANGENT to the tube, which is the
+        contact a boolean kernel likes least; a mitre crosses at an angle and meshes more easily, but
+        describes a different solid. See
+        ``tests/test_shape_line.py::test_a_coarse_host_cannot_mesh_around_a_thin_inclusion`` and
+        ``::test_the_built_solid_and_the_membership_test_agree_at_a_bend``.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the fused solid.
+        """
+        P = self._simplified()
+        seg = P[1:] - P[:-1]
+        L = np.linalg.norm(seg, axis=1)
+        if not np.any(L > TOL):
+            raise ValueError("shape.line: every segment is shorter than the tolerance; nothing to build.")
+        u = seg / np.maximum(L, 1e-300)[:, None]
+        parts = [(3, occ.addCylinder(*P[k], *(u[k] * L[k]), self.r)) for k in range(len(seg))]
+        # A SPHERE at each interior joint, which is the solid `contains` describes. Mitring the
+        # cylinders instead fills the outer notch of a bend, and that notch reaches r/cos(theta/2)
+        # from the vertex -- outside `distance <= r`. The two then disagree about a thin wedge above
+        # every convex bend, and a cell whose centroid lands in it belongs to no region at all: on a
+        # bond wire arcing over two traces, 17 cells of 7,423 were claimed by nothing, took no
+        # material, and sat at 0 K in the thermal solve while the mesh around them was perfectly
+        # connected. A build and a membership test for the same primitive have to agree.
+        parts += [(3, occ.addSphere(*P[j], self.r)) for j in range(1, len(P) - 1)]
+        if len(parts) == 1:
+            return parts[0]
+        # One fuse of everything, not a pairwise chain: chaining leaves an internal seam face per
+        # step for a later `fragment` to trip over.
+        out = occ.fuse([parts[0]], parts[1:])[0]
+        return out[0] if isinstance(out, list) else out
+
+    def _distance(self, pts):
+        """Distance from each point to the polyline (segment-wise, exact)."""
+        P = self._pts()
+        x = np.asarray(pts)[:, :3]
+        a, b = P[:-1], P[1:]
+        d = b - a
+        L2 = np.maximum((d * d).sum(1), 1e-300)
+        w = x[:, None, :] - a[None, :, :]
+        t = np.clip((w * d[None, :, :]).sum(2) / L2[None, :], 0.0, 1.0)
+        proj = a[None, :, :] + t[:, :, None] * d[None, :, :]
+        return np.linalg.norm(x[:, None, :] - proj, axis=2).min(1)
+
+    # docstring-from: jno.geometry.primitives.Rect.classify
+    def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
+        P = self._pts()
+        q = np.array([x, y, z], dtype=float)
+        for name, end, nxt in (("start", P[0], P[1]), ("end", P[-1], P[-2])):
+            u = end - nxt
+            u = u / max(float(np.linalg.norm(u)), 1e-300)
+            t = float((q - end) @ u)
+            if abs(t) < tol and float(np.linalg.norm((q - end) - t * u)) < self.r + tol:
+                return name
+        if abs(float(self._distance(q[None, :])[0]) - self.r) < tol:
+            return "side"
+        return None
+
+    def contains(self, pts, tol: float = TOL):
+        """Boolean mask ``(N,)`` — within ``r`` of the polyline. Closed form, which is the point.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
+        return self._distance(pts) <= self.r + tol
+
+    def bounds(self):
+        """Axis-aligned bounding box of this primitive.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
+        P = self._pts()
+        return tuple(P.min(0) - self.r), tuple(P.max(0) + self.r)
+
+    def boundary_measure(self) -> float:
+        """Lateral area plus the two caps. The capsule joints overlap, so this is an upper bound and
+        is used only to weight boundary sampling."""
+        P = self._pts()
+        L = float(np.linalg.norm(P[1:] - P[:-1], axis=1).sum())
+        return 2.0 * math.pi * self.r * L + 2.0 * math.pi * self.r**2
+
+    def sample_boundary(self, n: int, rng):
+        """``(points, normals)`` on the lateral surface, weighted by segment length.
+
+        The caps are omitted: for a tube long against its radius they are a vanishing share of the
+        area, and the joints already overlap, so a uniform lateral sample is the honest one.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
+        P = self._pts()
+        a, b = P[:-1], P[1:]
+        seg = b - a
+        L = np.linalg.norm(seg, axis=1)
+        which = rng.choice(len(L), size=n, p=L / L.sum())
+        t = rng.random(n)[:, None]
+        u = seg[which] / L[which][:, None]
+        seed = np.zeros((n, 3))
+        seed[np.arange(n), np.argmin(np.abs(u), axis=1)] = 1.0
+        e1 = np.cross(u, seed)
+        e1 /= np.linalg.norm(e1, axis=1)[:, None]
+        e2 = np.cross(u, e1)
+        th = rng.random(n)[:, None] * 2.0 * math.pi
+        nrm = np.cos(th) * e1 + np.sin(th) * e2  # radial: the outward normal of a tube
+        return a[which] + t * seg[which] + self.r * nrm, nrm
 
 
 @dataclass(frozen=True)
@@ -320,10 +706,34 @@ class Cylinder:
     r: float
     dim: ClassVar[int] = 3
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         return (3, occ.addCylinder(self.x, self.y, self.z, self.dx, self.dy, self.dz, self.r))
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         alen = math.sqrt(self.dx**2 + self.dy**2 + self.dz**2)
         ux, uy, uz = self.dx / alen, self.dy / alen, self.dz / alen
         wx, wy, wz = x - self.x, y - self.y, z - self.z
@@ -338,7 +748,15 @@ class Cylinder:
         return None
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — inside the axial extent [0, |axis|] and within radius ``r`` (± ``tol``)."""
+        """Boolean mask (N,) — inside the axial extent [0, |axis|] and within radius ``r`` (± ``tol``).
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         axis = np.array([self.dx, self.dy, self.dz])
         alen = float(np.linalg.norm(axis))
         u = axis / alen
@@ -361,7 +779,11 @@ class Cylinder:
         return base, u, alen, e1, np.cross(u, e1)
 
     def bounds(self):
-        """Exact AABB: the caps' centres widened by the disc's projected radius on each axis."""
+        """Exact AABB: the caps' centres widened by the disc's projected radius on each axis.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         base, u, alen, _, _ = self._frame()
         tip = base + alen * u
         pad = self.r * np.sqrt(np.maximum(1.0 - u**2, 0.0))  # radius of the disc projected per axis
@@ -375,7 +797,15 @@ class Cylinder:
         return 2.0 * math.pi * self.r * alen + 2.0 * math.pi * self.r**2
 
     def sample_boundary(self, n: int, rng):
-        """``(points, normals)`` uniform by area over the side and the two caps."""
+        """``(points, normals)`` uniform by area over the side and the two caps.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         base, u, alen, e1, e2 = self._frame()
         side, cap = 2.0 * math.pi * self.r * alen, math.pi * self.r**2
         areas = np.array([side, cap, cap])  # side, bottom, top
@@ -401,21 +831,57 @@ class Sphere:
     r: float
     dim: ClassVar[int] = 3
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         return (3, occ.addSphere(self.cx, self.cy, self.cz, self.r))
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         if abs(math.sqrt((x - self.cx) ** 2 + (y - self.cy) ** 2 + (z - self.cz) ** 2) - self.r) < tol:
             return "surface"
         return None
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``."""
+        """Boolean mask (N,) — which rows of ``pts`` (N, ≥3) lie inside, inclusive within ``tol``.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         c = np.array([self.cx, self.cy, self.cz])
         return np.sum((pts[:, :3] - c) ** 2, axis=1) <= (self.r + tol) ** 2
 
     def bounds(self):
-        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors."""
+        """Axis-aligned bounding box ``(lo, hi)``, both 3-vectors.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         c, r = np.array([self.cx, self.cy, self.cz]), self.r
         return tuple(c - r), tuple(c + r)
 
@@ -424,7 +890,15 @@ class Sphere:
         return 4.0 * math.pi * self.r**2
 
     def sample_boundary(self, n: int, rng):
-        """``(points, normals)`` uniform on the sphere (normalised Gaussians — Marsaglia 1972)."""
+        """``(points, normals)`` uniform on the sphere (normalised Gaussians — Marsaglia 1972).
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         g = rng.normal(size=(n, 3))
         nrm = g / np.linalg.norm(g, axis=1, keepdims=True)
         return np.array([self.cx, self.cy, self.cz]) + self.r * nrm, nrm
@@ -529,7 +1003,16 @@ class Curve:
     def _end(self):
         return self.segments[-1][1]
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         p0 = occ.addPoint(*self.start)
         prev = p0
         curves = []
@@ -546,7 +1029,22 @@ class Curve:
         # already in the model (chained through shared points) and get meshed by generate(1).
         return curves[0]
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         s, e = self.start, self._end()
         if math.dist((x, y, z), s) < tol:
             return "left"
@@ -577,7 +1075,11 @@ class Curve:
 
     def bounds(self):
         """AABB. An arc contributes its **full circle's** box, which is a superset of the arc's
-        own extent -- never a subset, so a rejection proposal built on it stays valid."""
+        own extent -- never a subset, so a rejection proposal built on it stays valid.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         lo = np.full(3, np.inf)
         hi = np.full(3, -np.inf)
         for kind, payload, _ in self._pieces():
@@ -597,7 +1099,15 @@ class Curve:
         return all(abs(lo[i]) < tol and abs(hi[i]) < tol for i in range(k, 3))
 
     def contains(self, pts, tol: float = TOL):
-        """Boolean mask (N,) — which points lie **on** the 1-D manifold (it has no volume)."""
+        """Boolean mask (N,) — which points lie **on** the 1-D manifold (it has no volume).
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         pts = np.asarray(pts, dtype=float)
         if pts.ndim == 1:
             pts = pts[None, :]
@@ -634,6 +1144,13 @@ class Curve:
 
         A 1-D domain has no volume to reject into, so this parametrises rather than rejects --
         which also makes it exact, with every point lying on the curve to machine precision.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator``.
+
+        Returns:
+            The points, ``(n, 3)``.
         """
         pieces = self._pieces()
         w = np.array([L for _, _, L in pieces], dtype=float)
@@ -659,7 +1176,15 @@ class Curve:
 
     def sample_boundary(self, n: int, rng):
         """``(points, normals)`` over the two ends; the normal is the outward unit tangent (-1/+1
-        for the usual straight interval)."""
+        for the usual straight interval).
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
+        """
         pieces = self._pieces()
 
         def tangent(kind, payload, at_start):
@@ -698,7 +1223,16 @@ class Contour:
             segs.append(("line", self.start, None))  # auto-close
         return segs
 
+    # docstring-from: jno.geometry.primitives.Rect.build
     def build(self, occ):
+        """Instantiate this primitive in an OpenCASCADE model.
+
+        Args:
+            occ: the gmsh OCC kernel handle (``gmsh.model.occ``).
+
+        Returns:
+            tuple: the ``(dim, tag)`` dimtag of the created entity.
+        """
         p_start = occ.addPoint(self.start[0], self.start[1], 0.0)
         prev = p_start
         curves = []
@@ -716,7 +1250,22 @@ class Contour:
         loop = occ.addCurveLoop(curves)
         return (2, occ.addPlaneSurface([loop]))
 
+    # docstring-from: jno.geometry.primitives.Rect.classify
     def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        """Name the sub-boundary of this primitive a boundary point lies on.
+
+        Used after boolean operations to recover named boundaries: a point on any boundary entity of the
+        built model is tested against this primitive's analytic edges/faces.
+
+        Args:
+            x: the point's x coordinate.
+            y: the point's y coordinate.
+            z: the point's z coordinate (0 for 2-D).
+            tol: distance within which the point counts as on a sub-boundary.
+
+        Returns:
+            str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
+        """
         prev = self.start
         for i, seg in enumerate(self._effective()):
             end = seg[1]
@@ -748,7 +1297,11 @@ class Contour:
         return out
 
     def bounds(self):
-        """AABB; an arc contributes its full circle's box, a superset of the arc's own extent."""
+        """AABB; an arc contributes its full circle's box, a superset of the arc's own extent.
+
+        Returns:
+            tuple: ``(lo, hi)``, two 3-vectors.
+        """
         lo = np.full(3, np.inf)
         hi = np.full(3, -np.inf)
         for kind, payload, _, _ in self._pieces():
@@ -764,7 +1317,15 @@ class Contour:
 
     def contains(self, pts, tol: float = TOL):
         """Boolean mask (N,) by even-odd ray casting along +x, with arcs crossed **analytically**
-        (circle-line roots restricted to the arc's angular span) rather than polygonised."""
+        (circle-line roots restricted to the arc's angular span) rather than polygonised.
+
+        Args:
+            pts: the points, ``(N, d)`` with ``d >= 2`` (``>= 3`` for a 3-D primitive).
+            tol: inclusion tolerance.
+
+        Returns:
+            A boolean mask, ``(N,)``.
+        """
         p = _to3(pts)
         x, y = p[:, 0], p[:, 1]
         crossings = np.zeros(len(p), dtype=np.int64)
@@ -799,6 +1360,13 @@ class Contour:
 
         Orientation is settled by probing ``contains`` a hair either side rather than by trusting a
         winding convention, so it holds for arcs and for either traversal direction.
+
+        Args:
+            n: number of points.
+            rng: a NumPy ``Generator`` (``np.random.default_rng(seed)``).
+
+        Returns:
+            tuple: ``(points, normals)``, each ``(n, 3)``.
         """
         pieces = self._pieces()
         w = np.array([L for _, _, L, _ in pieces], dtype=float)

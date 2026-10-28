@@ -1,3 +1,4 @@
+import builtins
 import warnings
 from pathlib import Path
 from typing import List, Union
@@ -125,8 +126,7 @@ def tracker(op: Placeholder, interval: int = 1, reduce=None) -> Tracker:
 
 
 def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
-    """
-    Create a ConstantNamespace from a dict or file.
+    """Create a ConstantNamespace from a dict or file.
 
     Args:
         tag: Name for this constant group
@@ -135,7 +135,8 @@ def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
     Returns:
         ConstantNamespace with attribute access to constants
 
-    Examples:
+    Example::
+
         # From dict with nested parameters
         C = constant("C", {
             "k": 1.0,
@@ -169,84 +170,416 @@ def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
 
 
 def function(fn, args: list = [], name: str = "", reduces_axis: int = None):
+    """Wrap a pure JAX function of traced arguments as a node (the general escape hatch).
+
+    Example::
+
+        r = jno.np.function(lambda a, b: jnp.where(a > b, a, 0.0), [u, v], name="clip")
+
+    Args:
+        fn: the pure function, called with the evaluated ``args``.
+        args: its arguments (traced expressions, arrays or numbers).
+        name: display name in printing and ``jno.info``.
+        reduces_axis: set when ``fn`` reduces its input (a mean, a sum, ...), so the weak-form mark of
+            the input does not pass to the result.
+
+    Returns:
+        FunctionCall: the node.
+    """
     return FunctionCall(fn, args, name, reduces_axis)
 
 
 def choice(options, name: str | None = None, default: int = 0) -> Choice:
     """Create a tunable categorical choice over traced expressions.
 
-    Example:
+    The tuner switches between the options; otherwise ``default`` is used.
+
+    Example::
+
         u = jnn.choice([net(inp) * x * (1 - x), net(inp)], name="bc_form")
+
+    Args:
+        options: the candidate expressions (constants are wrapped as literals).
+        name: name under which the tuner reports the choice.
+        default: index of the option used until another is selected.
+
+    Returns:
+        Choice: the choice node.
     """
     return Choice(options=options, name=name, default=default)
 
 
 # ============================================================================
-# Factory for simple unary wrappers
+# Element-wise wrappers
 # ============================================================================
 
 
-def _unary(jnp_fn):
-    """Create a unary wrapper for Placeholder args (auto-unwraps typed views)."""
-
-    def wrapper(x):
-        return _attach_coords(FunctionCall(jnp_fn, [_u(x)]), [x])
-
-    wrapper.__name__ = jnp_fn.__name__
-    wrapper.__doc__ = jnp_fn.__doc__
-    return wrapper
+def _unary_call(jnp_fn, x) -> FunctionCall:
+    """``jnp_fn(x)`` as a traced node; typed views are unwrapped and ``x``'s coordinates carried over."""
+    return _attach_coords(FunctionCall(jnp_fn, [_u(x)]), [x])
 
 
-def _binary(jnp_fn):
-    """Create a binary wrapper for Placeholder args (auto-unwraps typed views)."""
-
-    def wrapper(x, y):
-        return _attach_coords(FunctionCall(jnp_fn, [_u(x), _u(y)]), [x, y])
-
-    wrapper.__name__ = jnp_fn.__name__
-    wrapper.__doc__ = jnp_fn.__doc__
-    return wrapper
+def _binary_call(jnp_fn, x, y) -> FunctionCall:
+    """``jnp_fn(x, y)`` as a traced node; typed views are unwrapped and coordinates carried over."""
+    return _attach_coords(FunctionCall(jnp_fn, [_u(x), _u(y)]), [x, y])
 
 
 # Trigonometric
-sin = _unary(jnp.sin)
-cos = _unary(jnp.cos)
-tan = _unary(jnp.tan)
-arcsin = _unary(jnp.arcsin)
-arccos = _unary(jnp.arccos)
-arctan = _unary(jnp.arctan)
-arctan2 = _binary(jnp.arctan2)
+def sin(x) -> FunctionCall:
+    """Element-wise sine, ``jnp.sin``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sin, x)
+
+
+def cos(x) -> FunctionCall:
+    """Element-wise cosine, ``jnp.cos``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cos, x)
+
+
+def tan(x) -> FunctionCall:
+    """Element-wise tangent, ``jnp.tan``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.tan, x)
+
+
+def arcsin(x) -> FunctionCall:
+    """Element-wise inverse sine, ``jnp.arcsin``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arcsin, x)
+
+
+def arccos(x) -> FunctionCall:
+    """Element-wise inverse cosine, ``jnp.arccos``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arccos, x)
+
+
+def arctan(x) -> FunctionCall:
+    """Element-wise inverse tangent, ``jnp.arctan``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arctan, x)
+
+
+def arctan2(x, y) -> FunctionCall:
+    """Element-wise four-quadrant inverse tangent ``arctan(x / y)`` with the sign of both arguments, ``jnp.arctan2``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.arctan2, x, y)
+
+
 atan2 = arctan2
 
+
 # Hyperbolic
-sinh = _unary(jnp.sinh)
-cosh = _unary(jnp.cosh)
-tanh = _unary(jnp.tanh)
-arcsinh = _unary(jnp.arcsinh)
-arccosh = _unary(jnp.arccosh)
-arctanh = _unary(jnp.arctanh)
+def sinh(x) -> FunctionCall:
+    """Element-wise hyperbolic sine, ``jnp.sinh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sinh, x)
+
+
+def cosh(x) -> FunctionCall:
+    """Element-wise hyperbolic cosine, ``jnp.cosh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cosh, x)
+
+
+def tanh(x) -> FunctionCall:
+    """Element-wise hyperbolic tangent, ``jnp.tanh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.tanh, x)
+
+
+def arcsinh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic sine, ``jnp.arcsinh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arcsinh, x)
+
+
+def arccosh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic cosine, ``jnp.arccosh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arccosh, x)
+
+
+def arctanh(x) -> FunctionCall:
+    """Element-wise inverse hyperbolic tangent, ``jnp.arctanh``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.arctanh, x)
+
 
 # Exponential / logarithmic
-exp = _unary(jnp.exp)
-exp2 = _unary(jnp.exp2)
-expm1 = _unary(jnp.expm1)
-log = _unary(jnp.log)
-log2 = _unary(jnp.log2)
-log10 = _unary(jnp.log10)
-log1p = _unary(jnp.log1p)
+def exp(x) -> FunctionCall:
+    """Element-wise exponential ``e**x``, ``jnp.exp``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.exp, x)
+
+
+def exp2(x) -> FunctionCall:
+    """Element-wise base-2 exponential ``2**x``, ``jnp.exp2``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.exp2, x)
+
+
+def expm1(x) -> FunctionCall:
+    """Element-wise ``exp(x) - 1``, accurate for small ``x``, ``jnp.expm1``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.expm1, x)
+
+
+def log(x) -> FunctionCall:
+    """Element-wise natural logarithm, ``jnp.log``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log, x)
+
+
+def log2(x) -> FunctionCall:
+    """Element-wise base-2 logarithm, ``jnp.log2``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log2, x)
+
+
+def log10(x) -> FunctionCall:
+    """Element-wise base-10 logarithm, ``jnp.log10``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log10, x)
+
+
+def log1p(x) -> FunctionCall:
+    """Element-wise ``log(1 + x)``, accurate for small ``x``, ``jnp.log1p``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.log1p, x)
+
 
 # Power / root
-sqrt = _unary(jnp.sqrt)
-cbrt = _unary(jnp.cbrt)
-square = _unary(jnp.square)
-power = _binary(jnp.power)
+def sqrt(x) -> FunctionCall:
+    """Element-wise square root, ``jnp.sqrt``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sqrt, x)
+
+
+def cbrt(x) -> FunctionCall:
+    """Element-wise cube root, ``jnp.cbrt``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.cbrt, x)
+
+
+def square(x) -> FunctionCall:
+    """Element-wise square ``x**2``, ``jnp.square``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.square, x)
+
+
+def power(x, y) -> FunctionCall:
+    """Element-wise power ``x**y``, ``jnp.power``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.power, x, y)
+
 
 # Rounding / absolute
-abs = _unary(jnp.abs)
-floor = _unary(jnp.floor)
-ceil = _unary(jnp.ceil)
-round = _unary(jnp.round)
-sign = _unary(jnp.sign)
+def abs(x) -> FunctionCall:
+    """Element-wise absolute value, ``jnp.abs``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.abs, x)
+
+
+def floor(x) -> FunctionCall:
+    """Element-wise floor (round down), ``jnp.floor``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.floor, x)
+
+
+def ceil(x) -> FunctionCall:
+    """Element-wise ceiling (round up), ``jnp.ceil``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.ceil, x)
+
+
+def round(x) -> FunctionCall:
+    """Element-wise rounding to the nearest integer, ``jnp.round``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.round, x)
+
+
+def sign(x) -> FunctionCall:
+    """Element-wise sign (-1, 0 or 1), ``jnp.sign``, as a traced node.
+
+    Args:
+        x: a traced expression, view, array or number.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _unary_call(jnp.sign, x)
 
 
 # ============================================================================
@@ -256,16 +589,12 @@ sign = _unary(jnp.sign)
 
 @jax.tree_util.register_pytree_node_class
 class ViewFactorOp:
-    """
-    Linear boundary radiation operator.
+    """Linear boundary radiation operator: a view-factor matrix ``F`` usable in traced expressions.
 
-    Supports:
-        F @ x
-        x @ F
+    Supports ``F @ x`` and ``x @ F`` with arrays or traced expressions, and a radiosity solve.
 
-    Works with:
-        • jnp.ndarray
-        • Placeholder
+    Args:
+        F: the view-factor matrix, an array or a traced expression ``(n, n)``.
     """
 
     def __init__(self, F: Union["Placeholder", jnp.ndarray]):
@@ -287,12 +616,30 @@ class ViewFactorOp:
     # Apply operator explicitly
     # -----------------------
     def apply(self, x):
+        """``F @ x``.
+
+        Args:
+            x: the vector (array or traced expression).
+
+        Returns:
+            The product.
+        """
         return self @ x
 
     # -----------------------
     # Solve (I - αF)x = rhs
     # -----------------------
     def solve(self, rhs, alpha):
+        """Solve the radiosity system ``(I - alpha F) q = rhs``.
+
+        Args:
+            rhs: the right-hand side vector.
+            alpha: the scalar factor (e.g. ``1 - emissivity`` for grey-body radiosity).
+
+        Returns:
+            The solution ``q``, traced when any input is traced.
+        """
+
         def solve_fn(A, b, a):
             eye_mat = jnp.eye(A.shape[0])
             return jnp.linalg.solve(eye_mat - a * A, b)
@@ -303,15 +650,32 @@ class ViewFactorOp:
     # PyTree support for JAX
     # -----------------------
     def tree_flatten(self):
+        """Pytree flattening: the children ``(F,)`` and no auxiliary data."""
         return (self.F,), None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
+        """Pytree unflattening: rebuild the operator from its children.
+
+        Args:
+            aux: unused auxiliary data.
+            children: ``(F,)``.
+
+        Returns:
+            ViewFactorOp: the rebuilt operator.
+        """
         return cls(*children)
 
 
 def view_factor(F: Union["Placeholder", jnp.ndarray]) -> ViewFactorOp:
-    """Create a view factor operator."""
+    """Create a view-factor operator, :class:`ViewFactorOp`.
+
+    Args:
+        F: the view-factor matrix, an array or traced expression.
+
+    Returns:
+        ViewFactorOp: the operator.
+    """
     return ViewFactorOp(F)
 
 
@@ -335,7 +699,16 @@ def _align_temporal(items):
 
 
 def concat(items, axis: int = -1) -> FunctionCall:
-    """Concatenate placeholders along an axis (always axis=-1 at eval time)."""
+    """Concatenate traced expressions along the last axis.
+
+    Args:
+        items: the expressions (views, Placeholders or arrays).
+        axis: accepted for NumPy compatibility; concatenation is always along the last axis at
+            evaluation time.
+
+    Returns:
+        FunctionCall: the concatenation.
+    """
     items = _align_temporal(items)
 
     def _fn(*args):
@@ -361,8 +734,12 @@ def concat(items, axis: int = -1) -> FunctionCall:
         if all(a.shape[:-1] == ref for a in expanded[1:]):
             return jnp.concatenate(expanded, axis=-1)
 
-        # Fallback: align ranks and only broadcast singleton dimensions.
-        max_ndim = max(a.ndim for a in expanded)
+        # Fallback: align ranks and only broadcast singleton dimensions. This is where a bare number
+        # meets a per-point operand (``vector(1.0, x)``): the number is (1,), the coordinate (N, 1).
+        # ``builtins.max``, not ``max``: this module rebinds ``max`` to the trace reduction
+        # ``jno.np.max``, which here built a trace node into the reshape shape -- and JAX's formatter
+        # for that invalid shape then iterated the node forever (``__getitem__`` never ends).
+        max_ndim = builtins.max(a.ndim for a in expanded)
         aligned = []
         for a in expanded:
             if a.ndim < max_ndim:
@@ -391,8 +768,18 @@ def concat(items, axis: int = -1) -> FunctionCall:
     return FunctionCall(_fn, [_u(i) for i in items], name="concat")
 
 
+# docstring-from: jno.jnp_ops.concat
 def concatenate(items, axis: int = -1) -> FunctionCall:
-    """Alias for concat."""
+    """Concatenate traced expressions along the last axis.
+
+    Args:
+        items: the expressions (views, Placeholders or arrays).
+        axis: accepted for NumPy compatibility; concatenation is always along the last axis at
+            evaluation time.
+
+    Returns:
+        FunctionCall: the concatenation.
+    """
     return concat(items, axis=axis)
 
 
@@ -405,6 +792,8 @@ def vector(*components):
         n    = jno.np.vector(nx, ny)          # 2-D normal as VectorView
         flux = jno.np.vector(jx, jy, jz)      # 3-D current density
         prob = jno.np.vector(x * p, y * p)    # OU drift flux
+        e1   = jno.np.vector(1.0, 0.0, 0.0)    # a constant vector
+        g    = jno.np.vector(1.0, 0.0, x)      # numbers broadcast over the points like `1.0 + 0.0*x`
     """
     from .trace.views import VectorView
 
@@ -412,24 +801,56 @@ def vector(*components):
 
 
 def stack(items, axis: int = 0) -> FunctionCall:
-    """Stack placeholders along a new axis."""
+    """Stack traced expressions along a new axis.
+
+    Args:
+        items: the expressions (views, Placeholders or arrays).
+        axis: position of the new axis; ``-1`` concatenates along the last axis (as :func:`concat`).
+
+    Returns:
+        FunctionCall: the stacked node.
+    """
     if axis == -1:
         return concat(items, axis=-1)
     return FunctionCall(lambda *args: jnp.stack(args, axis=axis), [_u(i) for i in items], name="stack")
 
 
 def reshape(x, shape: tuple) -> FunctionCall:
-    """Reshape a placeholder to a new shape."""
+    """Reshape a traced expression.
+
+    Args:
+        x: a traced expression, view or array.
+        shape: the new shape.
+
+    Returns:
+        FunctionCall: the reshaped node.
+    """
     return FunctionCall(lambda a: jnp.reshape(a, shape), [_u(x)])
 
 
 def squeeze(x, axis: int = None) -> FunctionCall:
-    """Remove single-dimensional entries."""
+    """Remove axes of length one.
+
+    Args:
+        x: a traced expression, view or array.
+        axis: the axis (or axes) to remove; ``None`` removes every length-one axis.
+
+    Returns:
+        FunctionCall: the squeezed node.
+    """
     return FunctionCall(lambda a: jnp.squeeze(a, axis=axis), [_u(x)])
 
 
 def expand_dims(x, axis: int) -> FunctionCall:
-    """Expand array dimensions."""
+    """Insert an axis of length one.
+
+    Args:
+        x: a traced expression, view or array.
+        axis: where the new axis goes.
+
+    Returns:
+        FunctionCall: the expanded node.
+    """
     return FunctionCall(lambda a: jnp.expand_dims(a, axis=axis), [_u(x)])
 
 
@@ -450,7 +871,7 @@ def transpose(x, axes: tuple = None) -> FunctionCall:
     Pass ``axes`` explicitly to get the raw ``jnp.transpose`` behaviour for a genuine axis permutation.
 
     Args:
-        x:    tensor-valued expression, ``(..., n, n)``.
+        x: tensor-valued expression, ``(..., n, n)``.
         axes: explicit permutation. Omit it for the tensor transpose.
     """
     if axes is not None:
@@ -462,13 +883,18 @@ def transpose(x, axes: tuple = None) -> FunctionCall:
 
 
 def trace(x) -> FunctionCall:
-    """
-    Trace of a matrix/tensor over the last two axes.
+    """Trace of a matrix/tensor over the last two axes.
 
-    Examples
-    --------
-    trace(A)              -> scalar trace for (..., n, n)
-    trace(symgrad(u))     -> volumetric strain
+    Example::
+
+        trace(A)              -> scalar trace for (..., n, n)
+        trace(symgrad(u))     -> volumetric strain
+
+    Args:
+        x: a second-order tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the trace per point.
     """
     return _attach_coords(
         FunctionCall(
@@ -481,10 +907,13 @@ def trace(x) -> FunctionCall:
 
 
 def sym(x) -> FunctionCall:
-    """
-    Symmetric part of a second-order tensor over the last two axes.
+    """Symmetric part of a second-order tensor over the last two axes, ``sym(A) = (A + Aᵀ)/2``.
 
-    sym(A) = 0.5 * (A + A^T)
+    Args:
+        x: a second-order tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the symmetric part.
     """
     return _attach_coords(
         FunctionCall(
@@ -497,10 +926,13 @@ def sym(x) -> FunctionCall:
 
 
 def antisym(x) -> FunctionCall:
-    """
-    Skew-symmetric part of a second-order tensor over the last two axes.
+    """Skew-symmetric part of a second-order tensor over the last two axes, ``antisym(A) = (A - Aᵀ)/2``.
 
-    antisym(A) = 0.5 * (A - A^T)
+    Args:
+        x: a second-order tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the skew-symmetric part.
     """
     return _attach_coords(
         FunctionCall(
@@ -513,18 +945,17 @@ def antisym(x) -> FunctionCall:
 
 
 def identity(n: int) -> FunctionCall:
-    """
-    Symbolic identity matrix helper — an ``(n, n)`` identity carried with a **leading singleton axis**,
+    """Symbolic identity matrix helper — an ``(n, n)`` identity carried with a **leading singleton axis**,
     ``(1, n, n)``, so it broadcasts as a *constant tensor* over the batch axis a kernel prepends (the
     quadrature axis in an FE weak form; the points axis in a collocation residual). A bare ``(n, n)``
     would be mis-read by the elementwise-broadcast alignment as if its first axis were the quadrature
     axis; the leading singleton makes ``I`` compose correctly inside any tensor formula.
 
-    Example
-    -------
-    I = jnn.identity(3)
-    sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps          # tensor stress in a weak form
-    F     = I + jnn.grad(u, [x, y, z])                          # deformation gradient (finite strain)
+    Example::
+
+        I = jnn.identity(3)
+        sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps          # tensor stress in a weak form
+        F     = I + jnn.grad(u, [x, y, z])                          # deformation gradient (finite strain)
     """
     return FunctionCall(
         lambda: jnp.eye(n)[None],  # (1, n, n): constant over the leading (quadrature / points) axis
@@ -538,23 +969,27 @@ def symgrad(
     variables: List[Variable],
     scheme: str = "automatic_differentiation",
 ) -> FunctionCall:
-    """
-    Symmetric gradient of a vector/tensor-valued field.
+    """Symmetric gradient of a vector/tensor-valued field.
 
-    For a vector field u in R^dim:
-        grad(u)    -> (..., n_comp, dim)
-        symgrad(u) -> 0.5 * (grad(u) + grad(u)^T)
+    For a vector field ``u`` in R^dim: ``grad(u)`` is ``(..., n_comp, dim)`` and
+    ``symgrad(u) = (grad(u) + grad(u)ᵀ)/2``. In small-strain elasticity::
 
-    In small-strain elasticity:
-        eps(u) = symgrad(u, [x, y])   # 2D
-        eps(u) = symgrad(u, [x, y, z])# 3D
+        eps = symgrad(u, [x, y])       # 2-D
+        eps = symgrad(u, [x, y, z])    # 3-D
 
-    Notes
-    -----
-    This assumes the Jacobian convention used by jno:
-        jacobian(u, [x, y]) has trailing shape (..., value_shape, dim)
-    so the last axis is the derivative direction and the second-last block
-    corresponds to field components.
+    This uses jNO's Jacobian convention, ``jacobian(u, [x, y])`` with trailing shape
+    ``(..., value_shape, dim)``: the last axis is the derivative direction.
+
+    Args:
+        target: the vector field.
+        variables: the coordinate Variables, one per dimension.
+        scheme: how the derivatives are computed: ``"automatic_differentiation"`` (default, the global
+            mode set via :func:`jno.setup`; ``":forward"`` / ``":reverse"`` and, for second order,
+            ``":fwd-over-rev"`` style suffixes select the nesting) or ``"finite_difference"`` (optional
+            sub-schemes ``":lsq"``, ``":uniform"``, ``":inverse_distance"``, ``":cotangent"``).
+
+    Returns:
+        FunctionCall: the symmetric gradient, ``(..., dim, dim)``.
     """
     G = jacobian(_u(target), variables, scheme=scheme)
     return FunctionCall(
@@ -584,9 +1019,15 @@ def inv(x) -> FunctionCall:
 
     Broadcasts over any leading (quadrature/batch) axes.
 
-    Example
-    -------
-    Fe = jnn.matmul(F, jnn.inv(Fp))       # elastic part of F = Fe · Fp
+    Example::
+
+        Fe = jnn.matmul(F, jnn.inv(Fp))       # elastic part of F = Fe · Fp
+
+    Args:
+        x: a second-order tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the inverse.
     """
     return _attach_coords(FunctionCall(jnp.linalg.inv, [_u(x)], name="inv"), [x])
 
@@ -594,9 +1035,15 @@ def inv(x) -> FunctionCall:
 def det(x) -> FunctionCall:
     """Determinant over the last two axes → scalar (per leading index).
 
-    Example
-    -------
-    J = jnn.det(F)                        # volumetric part of the deformation
+    Example::
+
+        J = jnn.det(F)                        # volumetric part of the deformation
+
+    Args:
+        x: a second-order tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the determinant per point.
     """
     return _attach_coords(FunctionCall(jnp.linalg.det, [_u(x)], name="det"), [x])
 
@@ -694,6 +1141,12 @@ def eigvalsh(x) -> FunctionCall:
     only — eigenvectors are not returned, as they are ill-defined at repeated
     eigenvalues; for a spectral matrix function use :func:`logm`/:func:`expm`/
     :func:`sqrtm`, which stay differentiable there.)
+
+    Args:
+        x: a symmetric tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the eigenvalues, ascending, ``(..., n)``.
     """
     return _attach_coords(FunctionCall(lambda a: jnp.linalg.eigh(a)[0], [_u(x)], name="eigvalsh"), [x])
 
@@ -706,9 +1159,15 @@ def logm(x) -> FunctionCall:
     so a log-strain return map is differentiable through equal principal
     stretches. Distinct from the element-wise scalar :func:`log`.
 
-    Example
-    -------
-    E = 0.5 * jnn.logm(jnn.matmul(F.T, F))   # Hencky (logarithmic) strain
+    Example::
+
+        E = 0.5 * jnn.logm(jnn.matmul(F.T, F))   # Hencky (logarithmic) strain
+
+    Args:
+        x: a symmetric positive-definite tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the matrix logarithm.
     """
     from .trace.views import _spectral_matrix_function
 
@@ -722,9 +1181,15 @@ def expm(x) -> FunctionCall:
     Gradient stable at repeated eigenvalues; the inverse of :func:`logm` on SPD
     inputs. Distinct from the element-wise scalar :func:`exp`.
 
-    Example
-    -------
-    Fp = jnn.matmul(jnn.expm(dgamma * N), Fp_prev)   # exponential map of plastic flow
+    Example::
+
+        Fp = jnn.matmul(jnn.expm(dgamma * N), Fp_prev)   # exponential map of plastic flow
+
+    Args:
+        x: a symmetric tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the matrix exponential.
     """
     from .trace.views import _spectral_matrix_function
 
@@ -738,6 +1203,12 @@ def sqrtm(x) -> FunctionCall:
     Gradient stable at repeated eigenvalues. E.g. the right stretch
     ``U = sqrtm(FᵀF)`` of a polar decomposition. Distinct from the element-wise
     scalar :func:`sqrt`.
+
+    Args:
+        x: a symmetric positive-semidefinite tensor expression, ``(..., n, n)``.
+
+    Returns:
+        FunctionCall: the principal square root.
     """
     from .trace.views import _spectral_matrix_function
 
@@ -835,36 +1306,152 @@ def _resolve_axes(shape, axis):
     return _resolve_axis(shape, _u(axis)) if isinstance(_u(axis), Variable) else axis
 
 
-def _reduction(jnp_fn, name):
-    """Create a reduction wrapper for Placeholder args (auto-unwraps typed views)."""
+def _reduction_call(jnp_fn, name, x, axis, keepdims) -> FunctionCall:
+    """``jnp_fn(x, axis=axis, keepdims=keepdims)`` as a traced reduction node (typed views unwrapped)."""
 
-    def wrapper(x, axis=None, keepdims=False):
-        # `axis` may be a coordinate Variable (or a tuple containing them). It is resolved to an
-        # integer HERE, inside the closure, because that is the first point where the array — and
-        # therefore its shape — actually exists; a trace expression carries no shape. `reduces_axis`
-        # keeps the UNRESOLVED value: it is what the user wrote.
-        def _fn(a, _axis=axis, _keepdims=keepdims):
-            return jnp_fn(a, axis=_resolve_axes(a.shape, _axis), keepdims=_keepdims)
+    # `axis` may be a coordinate Variable (or a tuple containing them). It is resolved to an
+    # integer HERE, inside the closure, because that is the first point where the array — and
+    # therefore its shape — actually exists; a trace expression carries no shape. `reduces_axis`
+    # keeps the UNRESOLVED value: it is what the user wrote.
+    def _fn(a, _axis=axis, _keepdims=keepdims):
+        return jnp_fn(a, axis=_resolve_axes(a.shape, _axis), keepdims=_keepdims)
 
-        return FunctionCall(_fn, [_u(x)], name=name, reduces_axis=axis)
-
-    wrapper.__name__ = name
-    wrapper.__doc__ = jnp_fn.__doc__
-    return wrapper
+    return FunctionCall(_fn, [_u(x)], name=name, reduces_axis=axis)
 
 
-sum = _reduction(jnp.sum, "sum")
-mean = _reduction(jnp.mean, "mean")
-median = _reduction(jnp.median, "median")
-std = _reduction(jnp.std, "std")
-var = _reduction(jnp.var, "var")
-min = _reduction(jnp.min, "min")
-max = _reduction(jnp.max, "max")
-prod = _reduction(jnp.prod, "prod")
+def sum(x, axis=None, keepdims=False) -> FunctionCall:
+    """Sum of a traced expression, ``jnp.sum``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.sum, "sum", x, axis, keepdims)
+
+
+def mean(x, axis=None, keepdims=False) -> FunctionCall:
+    """Arithmetic mean of a traced expression, ``jnp.mean``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.mean, "mean", x, axis, keepdims)
+
+
+def median(x, axis=None, keepdims=False) -> FunctionCall:
+    """Median of a traced expression, ``jnp.median``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.median, "median", x, axis, keepdims)
+
+
+def std(x, axis=None, keepdims=False) -> FunctionCall:
+    """Standard deviation of a traced expression, ``jnp.std``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.std, "std", x, axis, keepdims)
+
+
+def var(x, axis=None, keepdims=False) -> FunctionCall:
+    """Variance of a traced expression, ``jnp.var``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.var, "var", x, axis, keepdims)
+
+
+def min(x, axis=None, keepdims=False) -> FunctionCall:
+    """Minimum of a traced expression, ``jnp.min``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.min, "min", x, axis, keepdims)
+
+
+def max(x, axis=None, keepdims=False) -> FunctionCall:
+    """Maximum of a traced expression, ``jnp.max``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.max, "max", x, axis, keepdims)
+
+
+def prod(x, axis=None, keepdims=False) -> FunctionCall:
+    """Product of a traced expression, ``jnp.prod``, over all or some axes.
+
+    Args:
+        x: a traced expression, view, array or number.
+        axis: ``None`` reduces over every axis; an int or tuple of ints picks axes; a coordinate
+            ``Variable`` (or a tuple containing them) picks the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the reduced node.
+    """
+    return _reduction_call(jnp.prod, "prod", x, axis, keepdims)
 
 
 def norm(x, ord=None, axis=None, keepdims=False) -> FunctionCall:
-    """Vector/matrix norm. ``axis`` also accepts a coordinate ``Variable`` (see :func:`mean`)."""
+    """Vector or matrix norm, ``jnp.linalg.norm``, as a traced node.
+
+    Args:
+        x: a traced expression, view or array.
+        ord: the norm order, as for ``jnp.linalg.norm`` (``None`` is the 2-norm / Frobenius norm).
+        axis: ``None``, an int or tuple of ints, or a coordinate ``Variable`` (or tuple containing
+            them) for the axis that coordinate runs along.
+        keepdims: keep the reduced axes with size 1.
+
+    Returns:
+        FunctionCall: the norm.
+    """
 
     def _fn(a, _axis=axis):
         return jnp.linalg.norm(a, ord=ord, axis=_resolve_axes(a.shape, _axis), keepdims=keepdims)
@@ -877,8 +1464,30 @@ def norm(x, ord=None, axis=None, keepdims=False) -> FunctionCall:
 # ============================================================================
 
 
-maximum = _binary(jnp.maximum)
-minimum = _binary(jnp.minimum)
+def maximum(x, y) -> FunctionCall:
+    """Element-wise maximum of the two arguments, ``jnp.maximum``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.maximum, x, y)
+
+
+def minimum(x, y) -> FunctionCall:
+    """Element-wise minimum of the two arguments, ``jnp.minimum``, as a traced node.
+
+    Args:
+        x: the first argument: a traced expression, view, array or number.
+        y: the second argument; broadcast against ``x``.
+
+    Returns:
+        FunctionCall: the result, broadcast to the arguments' shape.
+    """
+    return _binary_call(jnp.minimum, x, y)
 
 
 def where(condition, x, y) -> FunctionCall:
@@ -891,9 +1500,167 @@ def where(condition, x, y) -> FunctionCall:
 # ============================================================================
 
 
-dot = _binary(jnp.dot)
-matmul = _binary(jnp.matmul)
-cross = _binary(jnp.cross)
+def _small_matmul(a, b):
+    from .utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports this module's users
+
+    return small_matmul(a, b)
+
+
+_small_matmul.__name__ = "matmul"
+_small_matmul.__doc__ = jnp.matmul.__doc__
+
+#: FunctionCall names whose result has the rank of their first operand.
+_RANK_PRESERVING = {"transpose", "sym", "antisym", "inv", "matmul", "dot"}
+
+
+def _value_rank(x):
+    """Tensor rank of ``x`` per point (its TRAILING axes), or ``None`` when the trace does not say.
+
+    Read from the trace, never from a runtime shape: inside a kernel ``(4, 3)`` may be four 3-vectors or
+    one 4x3 matrix. Known: a field's ``value_shape``, a ``grad`` over several coordinates (one more than its
+    target), a typed view, a constant (its ``ndim``; ``identity`` is a matrix), elementwise arithmetic (the
+    larger rank), ``transpose``/``sym``/``inv`` (unchanged), ``trace``/``det`` (two fewer) and ``dot``/``matmul``
+    of known ranks. Anything else -- an opaque ``function``, a single-coordinate derivative -- is ``None``."""
+    from .trace import BinaryOp, Literal
+    from .trace.views import MatrixView, ScalarView, VectorView
+
+    if isinstance(x, VectorView):
+        return 1
+    if isinstance(x, MatrixView):
+        return 2
+    if isinstance(x, ScalarView):
+        return 0
+    if not isinstance(x, Placeholder):
+        return jnp.ndim(x)
+    if isinstance(x, Literal):
+        return jnp.ndim(x.value)
+    if isinstance(x, Jacobian):
+        r = _value_rank(x.target)
+        return r + 1 if r is not None and len(x.variables) > 1 else None
+    if isinstance(x, BinaryOp):
+        if x.op not in ("+", "-", "*", "/"):
+            return None
+        ra, rb = _value_rank(x.left), _value_rank(x.right)
+        return None if ra is None or rb is None else builtins.max(ra, rb)
+    if isinstance(x, FunctionCall):
+        name = getattr(x, "_name", "")
+        if name == "identity":
+            return 2
+        if name == "dot" and getattr(x, "_value_rank", None) is not None:
+            return x._value_rank
+        if name in _RANK_PRESERVING and x.args:
+            return _value_rank(x.args[0])
+        if name in ("trace", "det") and x.args:
+            r = _value_rank(x.args[0])
+            return r - 2 if r is not None and r >= 2 else None
+        return None
+    shape = getattr(x, "value_shape", None)  # trial / test functions, state fields
+    return len(shape) if shape is not None else None
+
+
+def _per_point_dot(a, b, ra: int, rb: int):
+    """``dot`` of one point's rank-``ra`` and rank-``rb`` tensors (``<= 2``), over the trailing axes, with
+    the leading batch axes aligned like :func:`inner` aligns them: a test function's extra local-basis
+    axis is matched by a singleton inserted after the other operand's batch axes."""
+    a, b = jnp.asarray(a), jnp.asarray(b)
+    if ra == 0 or rb == 0:
+        return a * b
+    pa, pb = a.ndim - ra, b.ndim - rb
+    if pa < pb:
+        a = jnp.reshape(a, a.shape[:pa] + (1,) * (pb - pa) + a.shape[pa:])
+    elif pb < pa:
+        b = jnp.reshape(b, b.shape[:pb] + (1,) * (pa - pb) + b.shape[pb:])
+    if ra == 1 and rb == 1:
+        return jnp.sum(a * b, axis=-1)
+    from .utils.solver.small_linalg import small_matmul  # lazy: see _small_matmul
+
+    if ra == 2 and rb == 1:
+        return small_matmul(a, b[..., None])[..., 0]
+    if ra == 1 and rb == 2:
+        return small_matmul(a[..., None, :], b)[..., 0, :]
+    return small_matmul(a, b)
+
+
+def dot(x, y):
+    """Dot product of per-point tensors: vector·vector (a scalar), matrix·vector, vector·matrix,
+    matrix·matrix, or a scaling when one side is a scalar -- NumPy's ``dot`` for each point.
+
+    In a weak form every operand carries leading batch axes (quadrature points, a test function's basis
+    axis) and the tensor sits in the trailing ones, the convention of ``transpose`` and ``trace``. Which
+    product is meant depends on each operand's tensor rank, which a shape alone cannot tell, so it is read
+    from the trace (see :func:`_value_rank`). An operand whose rank the trace does not carry, or a tensor of
+    rank above 2, raises: write ``inner(a, b)`` (vectors, any contraction count), ``matmul(a, b)`` /
+    ``a @ b`` (matrices) or ``einsum`` instead. Two plain arrays (no trace, no batch axes) are ``jnp.dot``.
+
+    Args:
+        x: the first operand (scalar, vector or matrix per point).
+        y: the second operand.
+
+    Returns:
+        FunctionCall: the product.
+
+    Raises:
+        ValueError: if an operand's tensor rank is unknown or above 2.
+    """
+    if not any(isinstance(v, (Placeholder,) + _view_types()) for v in (x, y)):
+        return FunctionCall(jnp.dot, [x, y], name="dot")
+    ra, rb = _value_rank(x), _value_rank(y)
+    if ra is None or rb is None or ra > 2 or rb > 2:
+        which = " and ".join(
+            f"{n} (rank {'unknown' if r is None else r})"
+            for n, r in (("the first operand", ra), ("the second operand", rb))
+            if r is None or r > 2
+        )
+        raise ValueError(
+            f"jno.np.dot: cannot tell which product is meant -- {which}. dot picks vector·vector, "
+            "matrix·vector or matrix·matrix from each operand's tensor rank, read from the trace (a field's "
+            "value_shape, grad over several coordinates, a view, a constant), and this operand does not carry "
+            "one. Write the product explicitly: inner(a, b) for vectors, matmul(a, b) or a @ b for matrices, "
+            "or einsum('...ij,...j->...i', A, v)."
+        )
+    call = _attach_coords(
+        FunctionCall(lambda a, b, _ra=ra, _rb=rb: _per_point_dot(a, b, _ra, _rb), [_u(x), _u(y)], name="dot"),
+        [x, y],
+    )
+    call._value_rank = builtins.max(ra, rb) if 0 in (ra, rb) else ra + rb - 2  # a scaling keeps the rank
+    return call
+
+
+def _view_types():
+    from .trace.views import _VIEW_TYPES
+
+    return _VIEW_TYPES
+
+
+def matmul(x, y) -> FunctionCall:
+    """Matrix product over the last two axes, per point (``jnp.matmul`` semantics), as a traced node.
+
+    A small per-point product (``M·N·K`` up to 8x8x8) is computed as a broadcast multiply and a sum
+    rather than a ``dot_general``, which a GPU would run as a padded batched GEMM once the points are
+    batched (see :func:`jno.utils.solver.small_linalg.small_matmul`). The values are the same up to
+    summation order.
+
+    Args:
+        x: the left matrix (or batch of matrices), ``(..., M, K)``.
+        y: the right matrix, ``(..., K, N)``.
+
+    Returns:
+        FunctionCall: the product, ``(..., M, N)``.
+    """
+    return _binary_call(_small_matmul, x, y)
+
+
+def cross(x, y) -> FunctionCall:
+    """Cross product of 3-vectors along the last axis, ``jnp.cross``, as a traced node.
+
+    Args:
+        x: the first vector field, ``(..., 3)``.
+        y: the second vector field, ``(..., 3)``.
+
+    Returns:
+        FunctionCall: the cross product, ``(..., 3)``.
+    """
+    return _binary_call(jnp.cross, x, y)
 
 
 # ============================================================================
@@ -908,21 +1675,25 @@ def _broadcasts(s1, s2) -> bool:
 
 
 def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
-    """
-    Generalized inner product / contraction over the last ``n_contract`` axes.
+    """Generalized inner product: a contraction over the last ``n_contract`` axes.
 
-    This is intentionally shape-friendly for weak forms. It pads the lower-rank
-    operand with singleton axes *before* the contracted trailing axes so common
-    patterns like
+    Shape-friendly for weak forms: the lower-rank operand is padded with singleton axes *before* the
+    contracted trailing axes, so ``inner(grad_u, grad_phi)`` works both pointwise and in FEM mode,
+    where ``grad_phi`` carries an extra basis-function axis.
 
-        inner(grad_u, grad_phi)
+    Example::
 
-    work both in pointwise mode and FEM mode, where ``grad_phi`` usually carries
-    an extra local basis-function axis.
+        inner(a, b)               # vector inner product over the last axis
+        inner(A, B, n_contract=2) # Frobenius product A : B
 
-    Examples:
-        inner(a, b)               -> vector inner product over last axis
-        inner(A, B, n_contract=2) -> Frobenius product
+    Args:
+        x: the first operand.
+        y: the second operand.
+        n_contract: how many trailing axes to contract (1 for vectors, 2 for ``A : B``).
+        keepdims: keep the contracted axes with size 1.
+
+    Returns:
+        FunctionCall: the contraction.
     """
 
     def _fn(a, b, _n=n_contract, _keep=keepdims):
@@ -966,11 +1737,16 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
 
 
 def double_dot(x, y) -> FunctionCall:
-    """
-    Double contraction / Frobenius product.
+    """Double contraction (Frobenius product) ``A : B = Σ_ij A_ij B_ij`` over the last two axes.
 
-    Equivalent to:
-        inner(x, y, n_contract=2)
+    The same as ``inner(x, y, n_contract=2)``.
+
+    Args:
+        x: the first tensor, ``(..., n, m)``.
+        y: the second tensor, ``(..., n, m)``.
+
+    Returns:
+        FunctionCall: the contraction per point.
     """
     return inner(x, y, n_contract=2)
 
@@ -987,7 +1763,15 @@ def einsum(subscripts: str, *operands) -> FunctionCall:
     A contraction of small per-point tensors (``M·N·K`` at most 8x8x8 per pairwise step) is evaluated as a
     broadcast multiply and a sum instead of a ``dot_general``, which a GPU runs as a padded batched GEMM
     once the points are batched (see :func:`jno.utils.solver.small_linalg.small_einsum`); larger ones are
-    plain ``jnp.einsum``. Same values up to summation order."""
+    plain ``jnp.einsum``. Same values up to summation order.
+
+    Args:
+        subscripts: the ``jnp.einsum`` subscript string, e.g. ``"...ij,...j->...i"``.
+        *operands: the operands (traced expressions or arrays).
+
+    Returns:
+        FunctionCall: the contraction.
+    """
     return _attach_coords(
         FunctionCall(
             lambda *args, _subs=subscripts: _small_einsum(_subs, *args),
@@ -998,14 +1782,28 @@ def einsum(subscripts: str, *operands) -> FunctionCall:
     )
 
 
+# docstring-from: jno.jnp_ops.divergence
 def div(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
-    """Alias for divergence."""
+    """Compute the divergence of a vector field.
+
+    div(F) = ∂F₁/∂x₁ + ∂F₂/∂x₂ + ...
+
+    Args:
+        vector_field: List of expressions [F₁, F₂, ...]
+        variables: Corresponding variables [x₁, x₂, ...]
+
+    Returns:
+        Divergence as a sum of gradients
+
+    Example::
+
+        div_F = pnp.divergence([Fx, Fy], [x, y])
+    """
     return divergence(vector_field, variables)
 
 
 def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Jacobian:
-    """
-    Compute the gradient of target with respect to variable.
+    """Compute the gradient of target with respect to variable.
 
     Implemented as a single-variable Jacobian.
 
@@ -1022,7 +1820,8 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     Returns:
         Jacobian placeholder representing ∂target/∂variable
 
-    Example:
+    Example::
+
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
     """
     _guard(target, scheme)
@@ -1038,8 +1837,7 @@ def laplacian(
     variables: List[Variable] = None,
     scheme: str = "automatic_differentiation",
 ) -> Hessian:
-    """
-    Compute the Laplacian of target with respect to variables.
+    """Compute the Laplacian of target with respect to variables.
 
     Implemented as a Hessian with trace=True (sum of diagonal second derivatives):
     ∇²u = ∂²u/∂x² + ∂²u/∂y² + ...
@@ -1056,7 +1854,8 @@ def laplacian(
     Returns:
         Hessian placeholder with trace=True
 
-    Example:
+    Example::
+
         lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
     """
     _guard(target, scheme)
@@ -1070,12 +1869,33 @@ def laplacian(
     return Hessian(_u(target), variables, scheme, trace=True)
 
 
+# docstring-from: jno.jnp_ops.laplacian
 def laplace(
     target: Placeholder,
     variables: List[Variable],
     scheme: str = "automatic_differentiation",
 ) -> Hessian:
-    """Alias for laplacian."""
+    """Compute the Laplacian of target with respect to variables.
+
+    Implemented as a Hessian with trace=True (sum of diagonal second derivatives):
+    ∇²u = ∂²u/∂x² + ∂²u/∂y² + ...
+
+    Prefer the method-style shorthand::
+
+        lap_u = u.laplacian(x, y)   # ∂²u/∂x² + ∂²u/∂y²
+
+    Args:
+        target: Expression to differentiate
+        variables: List of variables to differentiate with respect to
+        scheme: 'automatic_differentiation' (default) or 'finite_difference'
+
+    Returns:
+        Hessian placeholder with trace=True
+
+    Example::
+
+        lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
+    """
     _guard(target, scheme)
     return Hessian(_u(target), variables, scheme, trace=True)
 
@@ -1085,21 +1905,22 @@ def hessian(
     variables: List[Variable],
     scheme: str = "automatic_differentiation",
 ) -> Hessian:
-    """
-    Compute the Hessian matrix of target with respect to variables.
+    """Hessian matrix of ``target`` with respect to ``variables``, ``H[i,j] = ∂²u/∂xᵢ∂xⱼ``.
 
-    The Hessian is the matrix of second derivatives:
-    H[i,j] = ∂²u/∂xᵢ∂xⱼ
+    Example::
+
+        H = jno.np.hessian(u, [x, y])   # 2x2 Hessian per point
 
     Args:
-        target: Expression to differentiate
-        variables: List of variables
+        target: the expression to differentiate.
+        variables: the coordinate Variables.
+        scheme: how the derivatives are computed: ``"automatic_differentiation"`` (default, the global
+            mode set via :func:`jno.setup`; ``":forward"`` / ``":reverse"`` and, for second order,
+            ``":fwd-over-rev"`` style suffixes select the nesting) or ``"finite_difference"`` (optional
+            sub-schemes ``":lsq"``, ``":uniform"``, ``":inverse_distance"``, ``":cotangent"``).
 
     Returns:
-        Hessian placeholder representing the full Hessian matrix
-
-    Example:
-        H = pnp.hessian(u(x, y), [x, y])  # 2x2 Hessian matrix
+        Hessian: the Hessian node.
     """
     _guard(target, scheme)
     return Hessian(_u(target), variables, scheme)
@@ -1110,29 +1931,31 @@ def jacobian(
     variables: List[Variable],
     scheme: str = "automatic_differentiation",
 ) -> Jacobian:
-    """
-    Compute the Jacobian matrix of target with respect to variables.
+    """Jacobian of ``target`` with respect to ``variables``, ``J[i] = ∂u/∂xᵢ``.
 
-    The Jacobian is the matrix of first derivatives:
-    J[i] = \u2202u/\u2202x\u1d62
+    For a vector field the result is ``(..., n_comp, n_vars)``.
+
+    Example::
+
+        J = jno.np.jacobian(u, [x, y])   # gradient (scalar u) or Jacobian (vector u)
 
     Args:
-        target: Expression to differentiate
-        variables: List of variables
+        target: the expression to differentiate.
+        variables: the coordinate Variables.
+        scheme: how the derivatives are computed: ``"automatic_differentiation"`` (default, the global
+            mode set via :func:`jno.setup`; ``":forward"`` / ``":reverse"`` and, for second order,
+            ``":fwd-over-rev"`` style suffixes select the nesting) or ``"finite_difference"`` (optional
+            sub-schemes ``":lsq"``, ``":uniform"``, ``":inverse_distance"``, ``":cotangent"``).
 
     Returns:
-        Jacobian placeholder representing the full Jacobian matrix
-
-    Example:
-        J = pnp.jacobian(u(x, y), [x, y])  # 2-element Jacobian vector
+        Jacobian: the Jacobian node.
     """
     _guard(target, scheme)
     return Jacobian(_u(target), variables, scheme)
 
 
 def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
-    """
-    Compute the divergence of a vector field.
+    """Compute the divergence of a vector field.
 
     div(F) = ∂F₁/∂x₁ + ∂F₂/∂x₂ + ...
 
@@ -1143,7 +1966,8 @@ def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Pl
     Returns:
         Divergence as a sum of gradients
 
-    Example:
+    Example::
+
         div_F = pnp.divergence([Fx, Fy], [x, y])
     """
     if len(vector_field) != len(variables):
@@ -1183,19 +2007,20 @@ def curl_3d(
     y: Variable,
     z: Variable,
 ) -> Placeholder:
-    """
-    Compute the 3D curl (vector).
+    """Curl of a 3-D vector field given by components::
 
-    curl(F) = [ ∂Fz/∂y - ∂Fy/∂z,
-                ∂Fx/∂z - ∂Fz/∂x,
-                ∂Fy/∂x - ∂Fx/∂y ]
+        curl(F) = (∂Fz/∂y - ∂Fy/∂z,  ∂Fx/∂z - ∂Fz/∂x,  ∂Fy/∂x - ∂Fx/∂y)
 
     Args:
-        Fx, Fy, Fz: Components of the vector field F(x, y, z)
-        x, y, z:    Spatial variables
+        Fx: the x component of ``F(x, y, z)``.
+        Fy: the y component.
+        Fz: the z component.
+        x: the x Variable.
+        y: the y Variable.
+        z: the z Variable.
 
     Returns:
-        A 3-component Placeholder representing the curl vector
+        A 3-component expression, the curl vector.
     """
     Fx, Fy, Fz = _u(Fx), _u(Fy), _u(Fz)
     _guard(Fx)
@@ -1234,12 +2059,26 @@ def integrate(expr: Placeholder, *, quadrature: "str | int" = "nodal") -> "Integ
 
 
 def test(name: str = "phi") -> TestFunction:
-    """Create a generic variational test function symbol."""
+    """Create a generic variational test function symbol.
+
+    Args:
+        name: the symbol name.
+
+    Returns:
+        TestFunction: the symbol. Prefer ``u.test()`` on an unknown.
+    """
     return TestFunction(name=name)
 
 
 def trial(name: str = "u") -> TrialFunction:
-    """Create a generic variational unknown symbol."""
+    """Create a generic variational unknown symbol.
+
+    Args:
+        name: the symbol name.
+
+    Returns:
+        TrialFunction: the symbol. Prefer ``d.unknown()``.
+    """
     return TrialFunction(name=name)
 
 
@@ -1266,38 +2105,430 @@ from jax.numpy import (  # noqa: F401, E402
 )
 
 
-def _create_linalg_wrapper():
-    """Factory function to create the linalg wrapper class."""
-
-    class _linalg:
-        """Wrapper for jax.numpy.linalg that always returns FunctionCall nodes."""
-
-        pass
-
-    for name in dir(jnp.linalg):
-        if name.startswith("_"):
-            continue
-
-        original = getattr(jnp.linalg, name)
-
-        if callable(original):
-
-            def make_method(func, func_name):
-                def method(*args, **kwargs):
-                    return FunctionCall(
-                        func,
-                        list(args),
-                        name=func_name,
-                        kwargs=kwargs if kwargs else None,
-                    )
-
-                method.__doc__ = func.__doc__
-                method.__name__ = func_name
-                return staticmethod(method)
-
-            setattr(_linalg, name, make_method(original, name))
-
-    return _linalg
+def _linalg_call(name, args, kwargs) -> FunctionCall:
+    """``jnp.linalg.<name>(*args, **kwargs)`` as a traced node."""
+    return FunctionCall(getattr(jnp.linalg, name), list(args), name=name, kwargs=kwargs or None)
 
 
-linalg = _create_linalg_wrapper()
+class _linalg:
+    """``jno.np.linalg``: every ``jax.numpy.linalg`` function, returning a traced node.
+
+    Each function takes the arguments of its ``jax.numpy.linalg`` namesake; traced expressions among
+    them are evaluated first, so ``jno.np.linalg.solve(A, b)`` builds a node that solves per point::
+
+        x = jno.np.linalg.solve(A, b)
+
+    For differentiable matrix functions of symmetric tensors at repeated eigenvalues prefer
+    :func:`logm`, :func:`expm`, :func:`sqrtm` and :func:`eigvalsh` in ``jno.np``.
+    """
+
+    @staticmethod
+    def cholesky(*args, **kwargs) -> FunctionCall:
+        """Cholesky factor of a Hermitian positive-definite matrix: ``jnp.linalg.cholesky`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.cholesky``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.cholesky(*args, **kwargs)``.
+        """
+        return _linalg_call("cholesky", args, kwargs)
+
+    @staticmethod
+    def cond(*args, **kwargs) -> FunctionCall:
+        """Condition number of a matrix: ``jnp.linalg.cond`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.cond``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.cond(*args, **kwargs)``.
+        """
+        return _linalg_call("cond", args, kwargs)
+
+    @staticmethod
+    def cross(*args, **kwargs) -> FunctionCall:
+        """Cross product of 3-vectors: ``jnp.linalg.cross`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.cross``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.cross(*args, **kwargs)``.
+        """
+        return _linalg_call("cross", args, kwargs)
+
+    @staticmethod
+    def det(*args, **kwargs) -> FunctionCall:
+        """Determinant: ``jnp.linalg.det`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.det``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.det(*args, **kwargs)``.
+        """
+        return _linalg_call("det", args, kwargs)
+
+    @staticmethod
+    def diagonal(*args, **kwargs) -> FunctionCall:
+        """Diagonal of a matrix (batched): ``jnp.linalg.diagonal`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.diagonal``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.diagonal(*args, **kwargs)``.
+        """
+        return _linalg_call("diagonal", args, kwargs)
+
+    @staticmethod
+    def eig(*args, **kwargs) -> FunctionCall:
+        """Eigenvalues and eigenvectors of a general matrix: ``jnp.linalg.eig`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.eig``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.eig(*args, **kwargs)``.
+        """
+        return _linalg_call("eig", args, kwargs)
+
+    @staticmethod
+    def eigh(*args, **kwargs) -> FunctionCall:
+        """Eigenvalues and eigenvectors of a Hermitian/symmetric matrix: ``jnp.linalg.eigh`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.eigh``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.eigh(*args, **kwargs)``.
+        """
+        return _linalg_call("eigh", args, kwargs)
+
+    @staticmethod
+    def eigvals(*args, **kwargs) -> FunctionCall:
+        """Eigenvalues of a general matrix: ``jnp.linalg.eigvals`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.eigvals``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.eigvals(*args, **kwargs)``.
+        """
+        return _linalg_call("eigvals", args, kwargs)
+
+    @staticmethod
+    def eigvalsh(*args, **kwargs) -> FunctionCall:
+        """Eigenvalues of a Hermitian/symmetric matrix: ``jnp.linalg.eigvalsh`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.eigvalsh``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.eigvalsh(*args, **kwargs)``.
+        """
+        return _linalg_call("eigvalsh", args, kwargs)
+
+    @staticmethod
+    def inv(*args, **kwargs) -> FunctionCall:
+        """Matrix inverse: ``jnp.linalg.inv`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.inv``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.inv(*args, **kwargs)``.
+        """
+        return _linalg_call("inv", args, kwargs)
+
+    @staticmethod
+    def lstsq(*args, **kwargs) -> FunctionCall:
+        """Least-squares solution of ``a x = b``: ``jnp.linalg.lstsq`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.lstsq``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.lstsq(*args, **kwargs)``.
+        """
+        return _linalg_call("lstsq", args, kwargs)
+
+    @staticmethod
+    def matmul(*args, **kwargs) -> FunctionCall:
+        """Matrix product: ``jnp.linalg.matmul`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.matmul``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.matmul(*args, **kwargs)``.
+        """
+        return _linalg_call("matmul", args, kwargs)
+
+    @staticmethod
+    def matrix_norm(*args, **kwargs) -> FunctionCall:
+        """Matrix norm: ``jnp.linalg.matrix_norm`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.matrix_norm``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.matrix_norm(*args, **kwargs)``.
+        """
+        return _linalg_call("matrix_norm", args, kwargs)
+
+    @staticmethod
+    def matrix_power(*args, **kwargs) -> FunctionCall:
+        """Integer power of a square matrix: ``jnp.linalg.matrix_power`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.matrix_power``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.matrix_power(*args, **kwargs)``.
+        """
+        return _linalg_call("matrix_power", args, kwargs)
+
+    @staticmethod
+    def matrix_rank(*args, **kwargs) -> FunctionCall:
+        """Rank of a matrix: ``jnp.linalg.matrix_rank`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.matrix_rank``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.matrix_rank(*args, **kwargs)``.
+        """
+        return _linalg_call("matrix_rank", args, kwargs)
+
+    @staticmethod
+    def matrix_transpose(*args, **kwargs) -> FunctionCall:
+        """Transpose of the last two axes: ``jnp.linalg.matrix_transpose`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.matrix_transpose``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.matrix_transpose(*args, **kwargs)``.
+        """
+        return _linalg_call("matrix_transpose", args, kwargs)
+
+    @staticmethod
+    def multi_dot(*args, **kwargs) -> FunctionCall:
+        """Chained matrix product in the cheapest order: ``jnp.linalg.multi_dot`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.multi_dot``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.multi_dot(*args, **kwargs)``.
+        """
+        return _linalg_call("multi_dot", args, kwargs)
+
+    @staticmethod
+    def norm(*args, **kwargs) -> FunctionCall:
+        """Vector or matrix norm: ``jnp.linalg.norm`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.norm``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.norm(*args, **kwargs)``.
+        """
+        return _linalg_call("norm", args, kwargs)
+
+    @staticmethod
+    def outer(*args, **kwargs) -> FunctionCall:
+        """Outer product of two vectors: ``jnp.linalg.outer`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.outer``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.outer(*args, **kwargs)``.
+        """
+        return _linalg_call("outer", args, kwargs)
+
+    @staticmethod
+    def pinv(*args, **kwargs) -> FunctionCall:
+        """Moore–Penrose pseudo-inverse: ``jnp.linalg.pinv`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.pinv``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.pinv(*args, **kwargs)``.
+        """
+        return _linalg_call("pinv", args, kwargs)
+
+    @staticmethod
+    def qr(*args, **kwargs) -> FunctionCall:
+        """QR decomposition: ``jnp.linalg.qr`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.qr``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.qr(*args, **kwargs)``.
+        """
+        return _linalg_call("qr", args, kwargs)
+
+    @staticmethod
+    def slogdet(*args, **kwargs) -> FunctionCall:
+        """Sign and log-absolute-value of the determinant: ``jnp.linalg.slogdet`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.slogdet``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.slogdet(*args, **kwargs)``.
+        """
+        return _linalg_call("slogdet", args, kwargs)
+
+    @staticmethod
+    def solve(*args, **kwargs) -> FunctionCall:
+        """Solution of the linear system ``a x = b``: ``jnp.linalg.solve`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.solve``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.solve(*args, **kwargs)``.
+        """
+        return _linalg_call("solve", args, kwargs)
+
+    @staticmethod
+    def svd(*args, **kwargs) -> FunctionCall:
+        """Singular value decomposition: ``jnp.linalg.svd`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.svd``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.svd(*args, **kwargs)``.
+        """
+        return _linalg_call("svd", args, kwargs)
+
+    @staticmethod
+    def svdvals(*args, **kwargs) -> FunctionCall:
+        """Singular values: ``jnp.linalg.svdvals`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.svdvals``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.svdvals(*args, **kwargs)``.
+        """
+        return _linalg_call("svdvals", args, kwargs)
+
+    @staticmethod
+    def tensordot(*args, **kwargs) -> FunctionCall:
+        """Tensor contraction over given axes: ``jnp.linalg.tensordot`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.tensordot``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.tensordot(*args, **kwargs)``.
+        """
+        return _linalg_call("tensordot", args, kwargs)
+
+    @staticmethod
+    def tensorinv(*args, **kwargs) -> FunctionCall:
+        """Inverse of a tensor (reshaped as a matrix): ``jnp.linalg.tensorinv`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.tensorinv``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.tensorinv(*args, **kwargs)``.
+        """
+        return _linalg_call("tensorinv", args, kwargs)
+
+    @staticmethod
+    def tensorsolve(*args, **kwargs) -> FunctionCall:
+        """Solution of a tensor equation ``a x = b``: ``jnp.linalg.tensorsolve`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.tensorsolve``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.tensorsolve(*args, **kwargs)``.
+        """
+        return _linalg_call("tensorsolve", args, kwargs)
+
+    @staticmethod
+    def trace(*args, **kwargs) -> FunctionCall:
+        """Trace of a matrix: ``jnp.linalg.trace`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.trace``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.trace(*args, **kwargs)``.
+        """
+        return _linalg_call("trace", args, kwargs)
+
+    @staticmethod
+    def vecdot(*args, **kwargs) -> FunctionCall:
+        """Vector dot product along an axis: ``jnp.linalg.vecdot`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.vecdot``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.vecdot(*args, **kwargs)``.
+        """
+        return _linalg_call("vecdot", args, kwargs)
+
+    @staticmethod
+    def vector_norm(*args, **kwargs) -> FunctionCall:
+        """Vector norm: ``jnp.linalg.vector_norm`` as a traced node.
+
+        Args:
+            *args: the positional arguments of ``jax.numpy.linalg.vector_norm``; traced expressions are evaluated first.
+            **kwargs: its keyword arguments, passed unchanged.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.linalg.vector_norm(*args, **kwargs)``.
+        """
+        return _linalg_call("vector_norm", args, kwargs)
+
+
+# A function JAX adds later is still reachable, without a hover text of its own.
+for _name in dir(jnp.linalg):
+    if not _name.startswith("_") and callable(getattr(jnp.linalg, _name)) and not hasattr(_linalg, _name):
+        setattr(_linalg, _name, staticmethod(lambda *a, _n=_name, **k: _linalg_call(_n, a, k)))
+
+linalg = _linalg

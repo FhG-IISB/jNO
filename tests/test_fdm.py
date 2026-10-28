@@ -2067,9 +2067,19 @@ def test_theta_step_imposes_the_boundary_at_the_new_time(theta):
     assert np.abs(traj[1:, on_boundary]).max() < 1e-12
 
 
-def test_nonlinear_crank_nicolson_assembled_tangent():
+def _exact_newton_steps(monkeypatch):
+    """Solve every Newton step to the inner tolerance: two marches compared at roundoff (a wrong tangent was
+    3.3e-11 off) would otherwise differ by the inexact Newton's own tolerance (its forcing stops each step
+    early, and the root is then only as good as the outer 1e-8)."""
+    from jno.utils.solver import newton_krylov as nk
+
+    monkeypatch.setattr(nk, "_FORCING", [False])
+
+
+def test_nonlinear_crank_nicolson_assembled_tangent(monkeypatch):
     """With a solver slot a nonlinear march uses the assembled step tangent M/Δt + θ·J. It dropped the θ,
     so Crank–Nicolson's Newton converged on a wrong tangent: 3.3e-11 off the matrix-free march, now 4e-17."""
+    _exact_newton_steps(monkeypatch)
 
     def solve(**slots):
         d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.2, 21))
@@ -2190,7 +2200,9 @@ def test_gradient_through_a_nonlinear_solve_with_any_linear_slot(linear):
         S = jno.np.sin(np.pi * x) * jno.np.sin(np.pi * y)
         f = 2 * np.pi**2 * S - 2.0 * jno.np.exp(S + 0.5 * x * y)
         terms = [-(ui.xx + ui.yy) - 2.0 * jno.np.exp(ui) - f, u(xb, yb) - g * xb * yb]
-        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(**slots)).reshape(-1) ** 2)
+        # far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance; the central difference divides that by 2e-5
+        tight = jno.solve.newton(rtol=1e-12, atol=1e-12)
+        return jnp.mean(jnp.asarray(jno.fdm(terms).solve(nonlinear=tight, **slots)).reshape(-1) ** 2)
 
     fd = (float(solve(0.5 + 1e-5)) - float(solve(0.5 - 1e-5))) / 2e-5
     got = float(jax.grad(lambda g: solve(g, linear=getattr(jno.solve, linear)()))(0.5))
@@ -2287,8 +2299,9 @@ def test_coupled_march_with_an_algebraic_field():
     assert np.abs(traj[-1] - exact).max() / np.abs(exact).max() < 3e-3
 
 
-def test_coupled_nonlinear_march():
+def test_coupled_nonlinear_march(monkeypatch):
     """A Gray–Scott reaction–diffusion pair: the matrix-free Newton march and the lu slot agree."""
+    _exact_newton_steps(monkeypatch)
     d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).structured(), time=(0.0, 0.5, 26))
     x, y, t = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)

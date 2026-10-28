@@ -320,6 +320,9 @@ def _param_context(volume_terms, boundary_terms):
         _collect_runtime_parameter_exprs(bare, exprs)
     tags: Tuple[str, ...] = tuple(sorted(exprs))
     fields = frozenset(n for n, e in exprs.items() if _is_fem_field_parameter(e))
+    from .parametric_helpers import refuse_space_field_parameters
+
+    refuse_space_field_parameters(exprs, "1-D")
     slots = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=tags)
     return tags, fields, slots, neural_operator_exprs(exprs, slots)
 
@@ -763,6 +766,42 @@ def dirichlet_projection(dirichlet_pairs: List[Tuple[int, float]]):
         return u_flat.at[dofs].set(vals.astype(u_flat.dtype))
 
     return dofs, vals, project
+
+
+def dirichlet_lift_start(residual_free, jacobian_free, project, dofs):
+    """The starting step for Newton on a Dirichlet-eliminated residual: ``u0 -> (res, jac, gap)``.
+
+    The eliminated residual evaluates the free one at ``P(u)``, so Newton from a ``u0`` that violates the
+    prescribed values starts at ``P(u0)``: the boundary DOFs jump to ``g`` while their neighbours stay where
+    they were. For a large prescribed displacement on a finite-strain material that inverts the cells next
+    to the boundary (``ln J`` -> NaN) before the first step. Row-replacement codes do not have this
+    problem: their first step is the linearisation at ``u0`` itself, which carries the boundary increment
+    ``g - u0`` into the interior through the coupling block.
+
+    This builds that step without giving up the symmetric elimination: the affine model
+    ``R_hat(v) = R_free(u0) + J_free(u0) (v - u0)``, eliminated the same way (evaluated at ``P(u)``, tangent
+    ``M J(u0) M + (I - M)``). Being affine, one step of any Newton driver solves it exactly; its root is the
+    linearised response to the boundary increment, which then starts the real solve. ``gap`` is
+    ``max |P(u0) - u0|``: zero when the start already satisfies the prescribed values (a diagnostic; the
+    caller decides statically whether to take the step).
+
+    ``residual_free(u)``, ``jacobian_free(u)`` (an assembled BCOO) and ``project(u)`` take the state alone
+    (close over any runtime args); ``dofs`` are the constrained DOFs."""
+    from .fem_utils import bcoo_eliminate_dirichlet
+
+    def start(u0):
+        u0 = jnp.asarray(u0)
+        target = project(u0)
+        r0, lin = jax.linearize(residual_free, u0)
+        j0 = bcoo_eliminate_dirichlet(jacobian_free(u0), dofs)
+
+        def res(u):
+            u = jnp.asarray(u)
+            return (r0 + lin(project(u) - u0)).at[dofs].set(u[dofs] - target[dofs])
+
+        return res, (lambda u: j0), jnp.max(jnp.abs(target - u0))
+
+    return start
 
 
 def _apply_dirichlet_projected(residual_free, dirichlet_pairs: List[Tuple[int, float]]):

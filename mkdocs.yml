@@ -137,6 +137,7 @@ nav:
       - Limits & build time: fem/limitations.md
     - Finite Difference Method: fdm.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
+    - Partial-Element Equivalent Circuits: peec.md
     - Solvers & preconditioners: solvers.md
     - Domain decomposition: domain-decomposition.md
     - Inverse Problems: inverse-problems.md
@@ -186,6 +187,7 @@ nav:
       - "Droplet Merger (Cahn–Hilliard–Navier–Stokes)": tutorials/08-fem-and-varpinns/droplet-merge-chns-2d.md
       - "Droplet Coalescence (sharp-interface ALE)": tutorials/08-fem-and-varpinns/droplet-coalescence-ale-2d.md
       - "Stokes 3D (Duct Past a Sphere)": tutorials/08-fem-and-varpinns/stokes-3d-duct-sphere.md
+      - "Channel at a Prescribed Flow Rate (constant unknowns)": tutorials/08-fem-and-varpinns/channel-flow-rate.md
       - "LES Subgrid Models (3-D)": tutorials/08-fem-and-varpinns/les-subgrid-3d.md
       - "Laser Melt Pool (thermo-mechanical)": tutorials/08-fem-and-varpinns/melt-pool-laser.md
       - "Thermal Barrier Coating (tied, two meshes)": tutorials/08-fem-and-varpinns/tied-coating-multiscale.md
@@ -209,6 +211,13 @@ nav:
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
     - RCWA:
       - "Binary Grating — diffraction orders": tutorials/12-rcwa/binary-grating-orders.md
+    - PEEC:
+      - "Two-Wire Loop — R and L with nothing meshed": tutorials/13-peec/two-wire-loop.md
+      - "Busbar Pair — skin and proximity effect": tutorials/13-peec/busbar-frequency.md
+      - "Cored Transformer — open secondary and core loss": tutorials/13-peec/cored-transformer.md
+      - "Inverse Corrosion — recovering a parameter": tutorials/13-peec/inverse-corrosion.md
+    - Generative:
+      - "Flow Matching — eight-mode ring": tutorials/13-generative/flow-matching-ring.md
   - Reference:
     - API Reference: API.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md

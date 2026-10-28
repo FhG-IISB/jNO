@@ -1,4 +1,6 @@
-"""`jno.precond.cached(spec)` — memoise any preconditioner's setup across solves (backend-agnostic)."""
+"""``reuse=`` -- keep any preconditioner's setup across solves (backend-agnostic). A spec built by a
+``jno.precond`` constructor takes ``reuse=`` directly; a user-written spec goes through the same wrapper,
+``jno.precond._reusing(spec, reuse)``."""
 
 import jax
 import jax.experimental.sparse as jsparse
@@ -6,7 +8,7 @@ import jax.numpy as jnp
 import pytest
 
 import jno
-from jno.precond import _Spec  # base that grants the fluent .cached() (user specs can inherit it too)
+from jno.precond import _reusing, _Spec  # _Spec: the base a user-written spec inherits
 from jno.utils.solver.solver_api import (
     LinearOperator,
     PrecondApplier,
@@ -44,9 +46,9 @@ class _Counting(_Spec):
         return PrecondApplier(lambda v: inv * v)
 
 
-def test_cached_builds_once_and_reuses_applier():
+def test_reuse_builds_once_and_reuses_applier():
     inner = _Counting()
-    c = jno.precond.cached(inner)
+    c = _reusing(inner, True)
     op, _ = _op()
     m1 = materialize_precond(c, PrecondContext(op, None))
     m2 = materialize_precond(c, PrecondContext(op, None))
@@ -54,32 +56,15 @@ def test_cached_builds_once_and_reuses_applier():
     assert m1 is m2  # same applier object reused
 
 
-def test_cached_frozen_reuses_even_when_operator_changes():
+def test_reuse_true_keeps_it_even_when_operator_changes():
     inner = _Counting()
-    c = jno.precond.cached(inner)  # refresh=False (frozen)
+    c = _reusing(inner, True)  # frozen
     materialize_precond(c, PrecondContext(_op(6)[0], None))
     materialize_precond(c, PrecondContext(_op(8)[0], None))  # different operator, still reuses
     assert inner.n == 1
 
 
-def test_cached_refresh_rebuilds_on_structure_change():
-    inner = _Counting()
-    c = jno.precond.cached(inner, refresh=True)
-    materialize_precond(c, PrecondContext(_op(6)[0], None))
-    materialize_precond(c, PrecondContext(_op(8)[0], None))  # shape/nnz changed → rebuild
-    assert inner.n == 2
-
-
-def test_cached_custom_key():
-    inner = _Counting()
-    c = jno.precond.cached(inner, refresh=lambda ctx: ctx.A.shape[0])  # key on size
-    materialize_precond(c, PrecondContext(_op(6)[0], None))
-    materialize_precond(c, PrecondContext(_op(6)[0], None))  # same size → reuse
-    materialize_precond(c, PrecondContext(_op(8)[0], None))  # new size → rebuild
-    assert inner.n == 2
-
-
-def test_cached_matches_uncached_solve():
+def test_a_kept_preconditioner_matches_a_rebuilt_one():
     """The cached preconditioner produces the same converged solution as the bare one.
 
     (Calling a solver directly takes a materialised applier as ``M``; ``fem.solve(precond=...)``
@@ -90,42 +75,14 @@ def test_cached_matches_uncached_solve():
     x_ref = jnp.linalg.solve(dense, b)
     solve = jno.solve.cg(tol=1e-12)
     x_bare = solve(op, b, M=materialize_precond(jno.precond.jacobi(), ctx))
-    x_cached = solve(op, b, M=materialize_precond(jno.precond.cached(jno.precond.jacobi()), ctx))
+    x_cached = solve(op, b, M=materialize_precond(jno.precond.jacobi(reuse=True), ctx))
     assert jnp.max(jnp.abs(x_cached - x_ref)) < 1e-8
     assert jnp.max(jnp.abs(x_cached - x_bare)) < 1e-10
 
 
-def test_fluent_cached_on_every_spec():
-    """Every jno.precond.* spec has a fluent .cached() equivalent to cached(spec)."""
-    for spec in (jno.precond.jacobi(), jno.precond.amg(), jno.precond.form([]), jno.precond.chebyshev()):
-        wrapped = spec.cached()
-        assert type(wrapped).__name__ == "_Cached" and wrapped.spec is spec
-
-
-def test_fluent_cached_builds_once():
-    inner = _Counting()
-    c = inner.cached()  # fluent form
-    materialize_precond(c, PrecondContext(_op()[0], None))
-    materialize_precond(c, PrecondContext(_op()[0], None))
-    assert inner.n == 1
-
-
-def test_fluent_cached_passes_refresh():
-    inner = _Counting()
-    c = inner.cached(refresh=True)
-    materialize_precond(c, PrecondContext(_op(6)[0], None))
-    materialize_precond(c, PrecondContext(_op(8)[0], None))
-    assert inner.n == 2  # refresh=True rebuilt on the structure change
-
-
-def test_cached_is_idempotent():
-    c = jno.precond.amg().cached()
-    assert c.cached() is c  # .cached() on an already-cached spec is a no-op
-
-
-def test_amg_no_longer_self_caches_but_cached_does(monkeypatch):
+def test_amg_rebuilds_per_solve_unless_reuse_is_set(monkeypatch):
     """Unification: `jno.precond.amg()` rebuilds the hierarchy each solve (no silent cross-solve
-    cache); `.cached()` is the explicit build-once mechanism. Verified without pyamg by counting the
+    cache); `reuse=True` is the explicit build-once mechanism. Verified without pyamg by counting the
     (monkeypatched) hierarchy build."""
     import jno.utils.solver.amg as amgmod
 
@@ -140,13 +97,13 @@ def test_amg_no_longer_self_caches_but_cached_does(monkeypatch):
     assert len(builds) == 2  # rebuilt each solve — no implicit self-cache
 
     builds.clear()
-    wrapped = jno.precond.amg().cached()
+    wrapped = jno.precond.amg(reuse=True)
     materialize_precond(wrapped, ctx)
     materialize_precond(wrapped, ctx)
-    assert len(builds) == 1  # .cached() builds once, reuses
+    assert len(builds) == 1  # reuse=True builds once, reuses
 
 
-def test_cached_forwards_prepare_hook():
+def test_reuse_forwards_prepare_hook():
     class _WithPrepare:
         def __init__(self):
             self.prepared = False
@@ -158,26 +115,26 @@ def test_cached_forwards_prepare_hook():
             return PrecondApplier(lambda v: v)
 
     inner = _WithPrepare()
-    prepare_precond(jno.precond.cached(inner), fem=object())  # prepare_precond no-ops on fem=None
+    prepare_precond(_reusing(inner, True), fem=object())  # prepare_precond no-ops on fem=None
     assert inner.prepared  # the eager build hook is forwarded to the wrapped spec
 
 
 def test_frozen_cache_reaches_the_compiled_path_once_built():
-    """`.cached()` is the recipe for many-iteration work -- a transient run or a Newton loop, where
+    """`reuse=True` is the recipe for many-iteration work -- a transient run or a Newton loop, where
     one preconditioner serves every step. It inherited `traceable = False`, so it stayed on the eager
     path on exactly the workloads with the most preconditioner applications to dispatch.
 
     A frozen cache that has already built does no setup at all -- `materialize` hands back the stored
     applier -- so it can be materialised inside a trace. The first solve still runs eager (it has to,
-    to build); every solve after it can compile. `refresh=` variants are excluded because they key on
-    the operator and may rebuild through the inner spec, which for amg/ams/form is host-side work.
+    to build); every solve after it can compile. A cadence (`reuse=k`) is excluded: it rebuilds through the
+    inner spec, which for amg/ams/form is host-side work.
     """
     from jno.utils.solver.solver_api import PrecondContext, _compilable, materialize_precond
 
     op, _ = _op()
     lin = jno.solve.cg(tol=1e-10)
 
-    spec = jno.precond.jacobi().cached()
+    spec = jno.precond.jacobi(reuse=True)
     assert spec.traceable is False, "an unbuilt cache has nothing stored yet"
     assert spec.key is None
     assert not _compilable(lin, spec)
@@ -187,15 +144,14 @@ def test_frozen_cache_reaches_the_compiled_path_once_built():
     assert spec.key is not None
     assert _compilable(lin, spec), "a built frozen cache must be able to compile -- that is the point"
 
-    # refresh= keys on the operator and may rebuild host-side, so it must never claim traceability
-    for refresh in (True, lambda ctx: 1):
-        r = jno.precond.jacobi().cached(refresh=refresh)
-        materialize_precond(r, PrecondContext(op, None))
-        assert r.traceable is False, f"cached(refresh={refresh!r}) must stay eager"
-        assert not _compilable(lin, r)
+    # a cadence rebuilds through the inner spec (host-side for amg/ams/form), so it never claims traceability
+    r = jno.precond.jacobi(reuse=2)
+    materialize_precond(r, PrecondContext(op, None))
+    assert r.traceable is False, "reuse=2 must stay eager"
+    assert not _compilable(lin, r)
 
 
-def test_compiled_cached_precond_gives_the_same_answer():
+def test_compiled_kept_precond_gives_the_same_answer():
     """Compiling the solve around a frozen cache must not change what it returns."""
     import numpy as np
     from shapely.geometry import box
@@ -209,7 +165,7 @@ def test_compiled_cached_precond_gives_the_same_answer():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
 
     ref = np.asarray(fem.solve(linear=jno.solve.lu()))
-    spec = jno.precond.jacobi().cached()
+    spec = jno.precond.jacobi(reuse=True)
     lin = jno.solve.cg(tol=1e-12, maxiter=5000)
     first = np.asarray(fem.solve(linear=lin, precond=spec))  # eager: builds the cache
     second = np.asarray(fem.solve(linear=lin, precond=spec))  # compiled: reuses it
@@ -221,7 +177,7 @@ def test_compiled_cached_precond_gives_the_same_answer():
 # --- the wrapper must not hide what it wraps -------------------------------------------------
 
 
-def test_cached_forwards_complex_native():
+def test_reuse_forwards_complex_native():
     """``complex_native`` selects HOW a complex system is solved, so a wrapper that hides it changes
     the answer rather than the speed.
 
@@ -229,29 +185,29 @@ def test_cached_forwards_complex_native():
     problem falls through to the fused real-equivalent ``2n`` block, where two things break at once:
     ``fem.blocks`` describes the ``n`` layout so every slice covers the wrong half, and AMS is handed
     the skew-dominated block its own docs record diverging to 1e+20 on. ``_Cached`` defined only its
-    own behaviour, so ``ams().cached()`` reported ``False`` and silently took that path -- making
-    ``.cached()`` and complex-native mutually exclusive, which is precisely backwards, since a
+    own behaviour, so a kept ``ams()`` reported ``False`` and silently took that path -- making
+    ``reuse=`` and complex-native mutually exclusive, which is precisely backwards, since a
     complex block preconditioner is the one whose setup most wants reusing.
     """
     assert jno.precond.ams().complex_native is True
-    assert getattr(jno.precond.ams().cached(), "complex_native", False) is True
+    assert getattr(jno.precond.ams(reuse=True), "complex_native", False) is True
 
 
-def test_cached_forwards_complex_ok():
+def test_reuse_forwards_complex_ok():
     """``complex_ok`` says a spec can be applied to a complex operator WITHOUT reformulation. AMS
     reads it to decide whether its auxiliary blocks get split, so hiding it makes AMS silently revert
     to the real-equivalent form that AMG is documented to diverge on."""
     assert jno.precond.amg().complex_ok is True
-    assert getattr(jno.precond.amg().cached(), "complex_ok", False) is True
+    assert getattr(jno.precond.amg(reuse=True), "complex_ok", False) is True
 
 
-def test_a_block_composition_sees_through_the_cache():
+def test_a_block_composition_sees_through_reuse():
     """The case that matters: the flag has to survive BOTH wrappers, since a block composition
     inherits it from its children."""
-    tri = jno.precond.triangular(("u", jno.precond.ams().cached()), ("p", jno.precond.jacobi()))
+    tri = jno.precond.triangular(("u", jno.precond.ams(reuse=True)), ("p", jno.precond.jacobi()))
     assert tri.complex_native, "triangular lost complex_native through the cached child"
 
 
-def test_caching_a_plain_spec_still_reports_no_complex_support():
+def test_keeping_a_plain_spec_still_reports_no_complex_support():
     """Forwarding must report what the inner spec actually is, not assert capability."""
-    assert not getattr(jno.precond.jacobi().cached(), "complex_native", False)
+    assert not getattr(jno.precond.jacobi(reuse=True), "complex_native", False)

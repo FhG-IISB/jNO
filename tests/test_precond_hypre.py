@@ -80,3 +80,40 @@ def test_missing_fem_for_ams_is_explained():
     op = LinearOperator(jsp.BCOO((dat, idx), shape=(2, 2)))
     with pytest.raises(TypeError, match="edge topology"):
         _Hypre("ams", {}).materialize(PrecondContext(op, None))
+
+
+def test_hypre_ams_sigma_zero_machinery_is_reachable_and_exact():
+    """``interior_nodes`` / ``zero_beta`` reach hypre's semidefinite (sigma = 0) AMS. On a curl-curl block
+    with mass only in a conductor (x < 0.5) and a near-zero gauge elsewhere, the preconditioned solve
+    reproduces the direct one on the functional the source reads; a wrong-length mask is refused."""
+    d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.25).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    ci = d.variable("interior", split=True)
+    x, y, z = ci[0], ci[1], ci[2]
+    A_, V_ = u.bind(x=x, y=y, z=z), v.bind(x=x, y=y, z=z)
+    sig = 0.5 * (1.0 + jno.np.tanh((0.5 - x) / 0.02))  # ~1 in the conductor, ~0 outside
+    f = vec(sig, 0.0 * x, 0.0 * x)  # source confined to the conductor: compatible with the kernel outside
+    fem = jno.fem(
+        [
+            inner(u.vector.curl(x, y, z), v.vector.curl(x, y, z)) + (sig + 1e-8) * inner(A_, V_) - inner(f, V_),
+            u.vector.cross(d.variable("boundary", normals=True)),
+        ]
+    )
+    ref = np.asarray(jno.np.asarray(fem.solve(linear=jno.solve.lu()))).reshape(-1)
+    P = np.asarray(d.mesh.points)
+    interior = (P[:, 0] > 0.6).astype(float)  # vertices = columns of G at degree 1
+    got = np.asarray(
+        jno.np.asarray(
+            fem.solve(
+                linear=jno.solve.fgmres(tol=1e-10, restart=60, maxiter=600),
+                precond=jno.precond.hypre(kind="ams", interior_nodes=interior, zero_beta=True),
+            )
+        )
+    ).reshape(-1)
+    b = -np.asarray(fem.b).reshape(-1)
+    assert abs(b @ got - b @ ref) <= 1e-6 * abs(b @ ref)
+    with pytest.raises(ValueError, match="interior_nodes"):
+        fem.solve(
+            linear=jno.solve.fgmres(tol=1e-8, maxiter=10),
+            precond=jno.precond.hypre(kind="ams", interior_nodes=interior[:-1], zero_beta=True),
+        )

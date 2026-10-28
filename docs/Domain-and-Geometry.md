@@ -48,7 +48,7 @@ a - b     # cut         a | b     # fuse         a & b     # intersect
 
 | Transform | Meaning |
 |---|---|
-| `.extrude(h)` | sweep a 2-D shape straight up into 3-D |
+| `.extrude(h)` | sweep a 2-D shape straight up into 3-D (thinner than the mesh size: one structured layer, no slivers) |
 | `.revolve(axis_point, axis_dir, angle=2π)` | rotate a 2-D profile about an axis (x- or y-axis through the origin); a partial angle gives a wedge/half-donut |
 | `.sweep(path)` | sweep a 2-D profile along a smooth `Path` (bent pipe) |
 | `.array(n, step=v)` / `.array(n, about=(pt, dir), angle=2π)` | `n` fused copies — linear or polar |
@@ -199,6 +199,9 @@ and `inclusion` wins inside the disk because it is listed first. Use each region
 `jno.fem` term or coefficient to that material (per-region volume integration), or to sample it in a
 PINN. A multi-material shape is a top-level construct — call `.domain()` on it directly; it does not
 compose with boolean operators or transforms.
+
+To read a solution on one region afterwards, `d.mask("inclusion")` is a boolean mask over the mesh nodes
+(see [`domain.mask`](fem/geometry.md#domainmask-a-fields-values-on-one-region)).
 
 Region names that are not valid Python identifiers go through the dict form:
 `shape.regions({"Quartz.1": q1, "Quartz.2": q2})`. Dict order is priority order exactly as for

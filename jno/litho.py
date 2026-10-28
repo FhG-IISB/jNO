@@ -40,15 +40,12 @@ class Threshold:
     constant-threshold model: Poonawala & Milanfar, *IEEE Trans. Image Process.* **16**, 774 (2007); PEB
     diffusion after Mack, *Fundamental Principles of Optical Lithography* (2007).
 
-    Parameters
-    ----------
-    threshold:
-        Dose-to-clear fraction on the aerial-intensity scale (an open frame images to ≈ 1). Raising it
-        shrinks a bright feature -- the knob that sets printed CD.
-    diffusion:
-        PEB acid-diffusion length (same length unit as the geometry; ``0`` = no bake).
-    steepness:
-        Development contrast -- the sigmoid sharpness (larger → a harder threshold / steeper resist).
+    Args:
+        threshold: Dose-to-clear fraction on the aerial-intensity scale (an open frame images to ≈ 1).
+            Raising it shrinks a bright feature -- the knob that sets printed CD.
+        diffusion: PEB acid-diffusion length (same length unit as the geometry; ``0`` = no bake).
+        steepness: Development contrast -- the sigmoid sharpness (larger → a harder threshold / steeper
+            resist).
     """
 
     def __init__(self, threshold=0.3, diffusion=0.0, steepness=50.0):
@@ -90,38 +87,35 @@ class CAResist:
     it is a **drop-in resist** for ``exposure.develop(...)`` -- the rigorous counterpart of :class:`Threshold`.
     It is heavier (a nonlinear multifield transient solve), for verification rather than the fast design loop.
 
-    Parameters
-    ----------
-    n, t_peb, steps:
-        Film-mesh resolution per side, bake time, and number of (backward-Euler) time steps.
-    source_chunk:
-        Accumulate the bulk image's Abbe sum this many source points at a time (``None`` = all at once).
-        Bounds peak memory when a ``film`` is given; see :meth:`jno.rcwa._Exposure.bulk`.
-    mesh_size:
-        PEB mesh element size (same length unit as the period). ``None`` = ``min(Px, Py, thickness)/4``,
-        which resolves the film thickness but *not* in-plane features of a wider clip -- set it to a
-        fraction of your smallest feature when the returned volume looks blocky.
-    k:
-        Rate constants ``(k1, k2, k3, k4, k5)``. ``k4`` is the bilinear acid-base neutralization (the stiff,
-        genuinely-nonlinear coupling).
-    diffusion_length:
-        Acid/base diffusion lengths ``(ρ_A, ρ_B)`` (same length unit as the mask period); ``D = ρ²/(2 t_peb)``.
-    dill_c, dose:
-        Dill exposure-rate constant and exposure dose -- the latent acid is
-        ``A(t=0) = 1 − exp(−dill_c · dose · I)`` from the aerial intensity ``I``. **Calibrate ``dill_c·dose``
-        to the exposure scale** so the acid *straddles* ``quencher`` across the pattern (roughly
-        ``dill_c·dose·median(I) ≈ −ln(1 − quencher)``): a seed that saturates (``A0 ≈ 1`` everywhere) or
-        starves (``A0 ≈ 0``) bakes to a **flat** developed field with no printed contrast.
-    quencher:
-        Uniform initial base-quencher loading ``B(t=0)``. The developed pattern forms at the contour where
-        the latent acid crosses this level (excess acid deprotects and clears; below it the resist stays).
-    tone:
-        ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"`` returns ``M``.
-    film:
-        ``None`` (default) → **2-D** PEB driven by the aerial image (matching the dos Santos 2-D model),
-        returning a ``(n, n)`` pattern. A :class:`Film` → **3-D** ``(x, y, z)`` PEB on a ``jno.shape`` box:
-        the acid is seeded from the depth-resolved standing-wave bulk image (:meth:`_Exposure.bulk`), the
-        species diffuse in x, y *and* z, and a developed ``(n, n, film.nz)`` volume is returned.
+    Args:
+        n, t_peb, steps: Film-mesh resolution per side, bake time, and number of (backward-Euler) time
+            steps.
+        source_chunk: Accumulate the bulk image's Abbe sum this many source points at a time (``None`` =
+            all at once). Bounds peak memory when a ``film`` is given; see
+            :meth:`jno.rcwa._Exposure.bulk`.
+        mesh_size: PEB mesh element size (same length unit as the period). ``None`` = ``min(Px, Py,
+            thickness)/4``, which resolves the film thickness but *not* in-plane features of a wider
+            clip -- set it to a fraction of your smallest feature when the returned volume looks blocky.
+        k: Rate constants ``(k1, k2, k3, k4, k5)``. ``k4`` is the bilinear acid-base neutralization (the
+            stiff, genuinely-nonlinear coupling).
+        diffusion_length: Acid/base diffusion lengths ``(ρ_A, ρ_B)`` (same length unit as the mask
+            period); ``D = ρ²/(2 t_peb)``.
+        dill_c, dose: Dill exposure-rate constant and exposure dose -- the latent acid is ``A(t=0) = 1 −
+            exp(−dill_c · dose · I)`` from the aerial intensity ``I``. **Calibrate ``dill_c·dose`` to
+            the exposure scale** so the acid *straddles* ``quencher`` across the pattern (roughly
+            ``dill_c·dose·median(I) ≈ −ln(1 − quencher)``): a seed that saturates (``A0 ≈ 1``
+            everywhere) or starves (``A0 ≈ 0``) bakes to a **flat** developed field with no printed
+            contrast.
+        quencher: Uniform initial base-quencher loading ``B(t=0)``. The developed pattern forms at the
+            contour where the latent acid crosses this level (excess acid deprotects and clears; below
+            it the resist stays).
+        tone: ``"positive"`` (default) returns the developed/soluble fraction ``1 − M``; ``"negative"``
+            returns ``M``.
+        film: ``None`` (default) → **2-D** PEB driven by the aerial image (matching the dos Santos 2-D
+            model), returning a ``(n, n)`` pattern. A :class:`Film` → **3-D** ``(x, y, z)`` PEB on a
+            ``jno.shape`` box: the acid is seeded from the depth-resolved standing-wave bulk image
+            (:meth:`_Exposure.bulk`), the species diffuse in x, y *and* z, and a developed ``(n, n,
+            film.nz)`` volume is returned.
     """
 
     def __init__(

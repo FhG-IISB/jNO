@@ -247,7 +247,9 @@ def test_contact_composes_with_a_load_path_march():
     The oracle is the one the frozen AL march is held to: the interface settles at ``-0.01``, half the
     platen displacement, by symmetry.
     """
-    nl = jno.solve.newton(line_search=True, rtol=1e-5, atol=3e-5)
+    # Newton well inside the rounds' settle tolerance (1e-4 relative change): its steps are inexact, so
+    # each round's solve is only as good as rtol/atol, and at 1e-5/3e-5 two rounds differed by 1.5e-4.
+    nl = jno.solve.newton(line_search=True, rtol=1e-7, atol=3e-7)
     d, fem, main = _al_contact_march()
     # the march is triggered by the form's step history, with nothing passed -- as `u.t` triggers
     # the transient stepper -- so `contact=` is the only slot this needs.
@@ -519,9 +521,10 @@ def test_a_plain_solve_after_a_searched_one_is_not_the_searched_answer():
     # The tolerance is loose enough to absorb rounding, not a leak. `cell_metric` rides in every
     # volume form's `domain_context`, and an extra entry there is not inert -- it reorders the
     # assembled arithmetic and moves the answer by ~1e-12 (the same lesson as `quad_weights`).
-    # A cache that was NOT dropped returns the searched answer, which differs by ~2e-7 here:
-    # four orders of magnitude above this bound, so the check keeps its teeth.
-    assert np.allclose(plain_first, plain_after, rtol=1e-8, atol=1e-10), (
+    # A cache that was NOT dropped returns the searched answer, which differs by ~2e-7 here. Two identical
+    # default solves agree only to the Newton contract (rtol=atol=1e-8): each step is solved to its
+    # inexact-Newton forcing term, and GPU summation order varies -- measured 1e-9 to 7e-9 apart.
+    assert np.allclose(plain_first, plain_after, rtol=0, atol=5e-8), (
         f"a plain solve changed by {np.abs(plain_first - plain_after).max():.3e} after a searched one"
     )
 

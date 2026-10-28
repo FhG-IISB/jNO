@@ -18,6 +18,12 @@ class Linear(eqx.Module):
     Maps ``(..., in_features) -> (..., out_features)`` for any number of
     leading dimensions, matching the behavior of PyTorch's ``nn.Linear``
     and Flax's ``nn.Dense``.
+
+    Args:
+        in_features: input size.
+        out_features: output size.
+        use_bias: add a learned bias.
+        key: PRNG key for the uniform ``±1/sqrt(in_features)`` initialisation.
     """
 
     weight: jax.Array

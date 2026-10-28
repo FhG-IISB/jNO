@@ -99,6 +99,27 @@ _CUDSS_CACHE_MAX = 4
 #: than a whole second factorization.
 _PARDISO_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 _PARDISO_CACHE_MAX = 4
+# The matrix TYPE each pattern was last solved as, so a lookup tries that plan first (see `_typed_lookup`).
+_CUDSS_LAST_KIND: dict = {}
+_PARDISO_LAST_KIND: dict = {}
+
+
+def _typed_lookup(cache, last_kind, skey, dhash, data):
+    """``(entry | None, data)`` for a factorization cache keyed by ``(pattern key, matrix type)``.
+
+    The type (symmetric or general) is detected from the values and baked into the symbolic analysis, so
+    each type keeps its own plan: values that switch type on one pattern (a Navier-Stokes tangent that is
+    the symmetric Stokes matrix at u = 0 and unsymmetric afterwards) reuse both plans instead of redoing the
+    analysis on every switch. The plan the pattern last used is tried first, and the type is only
+    re-detected when the values changed, so a repeated solve still costs no detection. ``data`` comes back
+    in the form the returned entry's type needs (symmetrized for a symmetric plan)."""
+    kind = last_kind.get(skey)
+    entry = cache.get((skey, kind)) if kind is not None else None
+    if entry is not None and entry["dhash"] != dhash:
+        kind_now, data = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
+        if kind_now != entry["kind"]:
+            entry = cache.get((skey, kind_now))
+    return entry, data
 
 
 def matrix_diagonal(A):
@@ -351,6 +372,54 @@ def _symmetrized_kind_and_values(values, order, orderT, pat):
 # 165k saddle whose refinement landed at 1.4e-6 -- four orders clear of the singular signature, and a
 # perfectly usable inexact-Newton step -- was rejected as SINGULAR.
 _SINGULAR_REL = 1e-4
+
+#: What to check when a direct factorization finds the operator singular -- one text for every backend.
+SINGULAR_HINTS = (
+    "Check for an unconstrained mode (a pure-Neumann problem with no gauge term, a floating region, or a "
+    "saddle system whose constraint block has an empty row), or a mixed formulation whose field spaces "
+    "are not compatible (not inf-sup stable), which leaves a whole family of modes undetermined."
+)
+
+#: What host SuperLU (scipy) says when it cannot factorize: an internal ABORT on a rank-deficient panel
+#: (``failed to factorize matrix at line ... dpanel_bmod.c``, preceded by BLAS "illegal value" lines
+#: printed from C) or, from ``splu``, ``Factor is exactly singular``.
+_SUPERLU_FAILURES = ("failed to factorize matrix", "Factor is exactly singular")
+
+#: The fixed phrase every SuperLU singular error below carries, so a caller can recognise it after JAX
+#: has wrapped it into a callback error.
+SUPERLU_SINGULAR_PHRASE = "singular / structurally rank-deficient operator"
+
+
+def superlu_singular_message(shape, detail, *, known_size=True):
+    """The named error for a host SuperLU factorization that failed: what happened, the size, the hints.
+
+    ``known_size=False`` when the size is the caller's best knowledge (the system ``fem.solve`` solves)
+    rather than the factorized matrix itself, which JAX's own ``spsolve`` callback does not report."""
+    what = (
+        f"the {shape[0]}x{shape[1]} operator"
+        if known_size
+        else f"the operator (the solved system is {shape[0]}x{shape[1]})"
+    )
+    return (
+        f"host SuperLU could not factorize {what}: a {SUPERLU_SINGULAR_PHRASE} (SuperLU said: "
+        f"{detail.strip()!r}). The sparse-direct solve has no answer to give. {SINGULAR_HINTS}"
+    )
+
+
+def superlu_failure_detail(text: str):
+    """The SuperLU failure line inside ``text`` (an exception message, possibly a JAX-wrapped callback
+    traceback), or ``None`` when ``text`` is not a SuperLU factorization failure.
+
+    Only SuperLU's OWN message counts -- a line that starts with it, after any ``RuntimeError:`` prefix.
+    A jNO error that quotes it (``jno.precond.ilu`` names the empty rows behind "Factor is exactly
+    singular") is already more specific than this one and must not be replaced by it."""
+    for line in reversed(str(text).splitlines()):
+        msg = line.split("RuntimeError:", 1)[-1].strip()
+        if msg.startswith(_SUPERLU_FAILURES):
+            return msg
+    return None
+
+
 _CLEAN_REL = 1e-8
 _REFINE_TARGET = 1e-10
 _REFINE_MAX = 50  # a backstop; the contraction test below is what decides
@@ -449,8 +518,7 @@ def _cudss_check_factorization(solver, Ag, bg, cp, shape):
             f"cuDSS factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it replaced {npivots} "
             f"pivot(s) and {why}, leaving relative residual {rel:.2e}. cuDSS reports this through "
             f"neither an exception nor a NaN, so jNO checks it -- the returned vector would have been "
-            f"finite and wrong. Check for an unconstrained mode (a pure-Neumann problem with no gauge "
-            f"term, a floating region, or a saddle system whose constraint block has an empty row)."
+            f"finite and wrong. {SINGULAR_HINTS}"
         )
     if rel > _CLEAN_REL and not _warned_perturbed:
         _warned_perturbed = True
@@ -510,19 +578,9 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
     # loop is always 1 and an eigen block always m, so this does not fragment the cache in practice.
     skey = (_h(rows, cols), shape, data.dtype.str, bool(transpose), nrhs)
     dhash = _h(data)  # the VALUES: what a numeric factorization depends on
-    entry = _CUDSS_CACHE.get(skey)
-
-    if entry is not None and entry["dhash"] != dhash:
-        # The values changed. They can change the matrix TYPE too (a Newton tangent that starts
-        # symmetric need not stay symmetric), and the type is baked into the plan -- so re-detect
-        # first and throw the plan away if it no longer applies. Only reached when the values
-        # actually differ, so a repeat solve still costs no detection.
-        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
-        if _kind_now != entry["kind"]:
-            _CUDSS_CACHE.pop(skey)["solver"].free()
-            entry = None
-        else:
-            data = _data_sym  # the refactorize below must see the same values the plan was built for
+    # The values can change the matrix TYPE (a Newton tangent that starts symmetric need not stay so), and
+    # the type is baked into the plan: one plan per type, see `_typed_lookup`.
+    entry, data = _typed_lookup(_CUDSS_CACHE, _CUDSS_LAST_KIND, skey, dhash, data)
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -541,7 +599,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         except Exception:
             solver.free()  # never cached, so nothing else will ever free it
             raise
-        _CUDSS_CACHE[skey] = entry = {
+        _CUDSS_CACHE[(skey, kind)] = entry = {
             "solver": solver,
             "Ag": Ag,
             "bg": bg,
@@ -558,7 +616,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             _, old = _CUDSS_CACHE.popitem(last=False)
             old["solver"].free()  # WITHOUT this an evicted factorization leaks device memory
     else:
-        _CUDSS_CACHE.move_to_end(skey)
+        _CUDSS_CACHE.move_to_end((skey, entry["kind"]))
         if entry["dhash"] != dhash:
             # same sparsity AND same type, new values -> refresh the CSR values IN PLACE and
             # re-factorize; the plan (the expensive half) survives. Getting this test wrong would
@@ -571,6 +629,7 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
             entry["perturbed"] = _cudss_check_factorization(entry["solver"], entry["Ag"], entry["bg"], cp, shape)
             entry["dhash"] = dhash
 
+    _CUDSS_LAST_KIND[skey] = entry["kind"]
     entry["bg"][...] = _to_device_rhs(rhs)
     entry["solver"].reset_operands(b=entry["bg"])
     x = entry["solver"].solve()
@@ -666,6 +725,166 @@ def cudss_lu_solve(A, b):
         lambda _matvec, rhs: _call(rhs, False),
         transpose_solve=lambda _matvec, rhs: _call(rhs, True),
     )
+
+
+#: cuDSS LDL^T plans (device slots) for the in-program symmetric path, keyed on (owner, pattern, kind); each
+#: entry a list, so a program that solves the same pattern twice gets a slot per solve (see `_ldl_plan`).
+_LDL_PLANS: dict = {}
+
+
+def _symmetric_pattern(rows, cols) -> bool:
+    """True if the (row, col) set of a COO pattern equals its transpose (duplicates allowed)."""
+    import numpy as np
+
+    n = int(max(rows.max(initial=0), cols.max(initial=0))) + 1
+    a = np.unique(rows.astype(np.int64) * n + cols)
+    return bool(np.array_equal(a, np.unique(cols.astype(np.int64) * n + rows)))
+
+
+def _symmetric_values(data, rows, cols, complex_n) -> bool:
+    """True if the matrix (``R + jI`` read off a fused block when ``complex_n`` is set) equals its transpose
+    to round-off. Concrete values only."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    v = np.asarray(data)
+    if complex_n is None:
+        M = sp.coo_matrix((v, (rows, cols))).tocsr()
+    else:
+        n = int(complex_n)
+        tl, bl = (rows < n) & (cols < n), (rows >= n) & (cols < n)
+        M = sp.coo_matrix(
+            (
+                np.concatenate([v[tl], 1j * v[bl]]),
+                (np.concatenate([rows[tl], rows[bl] - n]), np.concatenate([cols[tl], cols[bl]])),
+            ),
+            shape=(n, n),
+        ).tocsr()
+    scale = abs(M).max() if M.nnz else 0.0
+    return bool(M.nnz == 0 or abs(M - M.T).max() <= 1e-12 * scale)
+
+
+def _current_trace(x):
+    """The JAX trace a value belongs to (``None`` for a concrete array)."""
+    return getattr(x, "_trace", None) if isinstance(x, jax.core.Tracer) else None
+
+
+def _ldl_plan(owner, rows, cols, n, complex_values, trace):
+    """A cuDSS slot for this pattern. A slot holds ONE factorisation per program (the adjoint reuses it), so a
+    second solve of the same pattern inside the same trace gets a slot of its own instead of overwriting the
+    first one's factors between its forward and its adjoint (which would return a wrong gradient silently)."""
+    import hashlib
+    import weakref
+
+    import numpy as np
+
+    from . import cudss_sym as cs
+
+    h = hashlib.sha1(np.ascontiguousarray(rows).tobytes() + np.ascontiguousarray(cols).tobytes()).hexdigest()
+    key = (id(owner), h, int(n), bool(complex_values))
+    pool = _LDL_PLANS.setdefault(key, [])
+    for entry in pool:
+        last = entry["trace"]
+        used_here = trace is not None and last is not None and last() is trace
+        if not used_here:
+            try:
+                entry["trace"] = weakref.ref(trace) if trace is not None else None
+            except TypeError:
+                entry["trace"] = None
+            return entry["plan"]
+    with jax.ensure_compile_time_eval():  # the plan's index arrays are constants, never tracers of this trace
+        plan = cs.plan(rows, cols, n, complex_values=complex_values)
+    try:
+        ref = weakref.ref(trace) if trace is not None else None
+    except TypeError:
+        ref = None
+    pool.append({"plan": plan, "trace": ref})
+    return plan
+
+
+def release_idle_ldl() -> int:
+    """Free the factors of every EXTRA cuDSS slot of the in-program LDL^T path; returns how many.
+
+    A form keeps its first slot's factors: it is refactored in place by the next program, so its memory is
+    reused, not grown. The extra slots exist because a program solved the same form more than once (each
+    solve must keep its factors for its own adjoint); after that program their factors are dead weight, and
+    they accumulate across programs of different structure (an evaluation, a gradient, a Jacobian) until the
+    card runs out. Call between programs; jno.core does after each optimisation step and evaluation."""
+    n = 0
+    for pool in _LDL_PLANS.values():
+        for entry in pool[1:]:
+            entry["plan"].release()
+            n += 1
+    return n
+
+
+def cudss_ldl_solve(A, b, context=None):
+    """Symmetric (LDL^T) solve on cuDSS INSIDE the compiled program, or ``None`` where it does not apply.
+
+    ``A x = b`` for a BCOO ``A`` whose pattern is symmetric, factored by :mod:`cudss_sym` (XLA custom calls:
+    no host round trip, so ``jax.jit(jax.grad(...))`` runs assembly, factorisation, solve and adjoint on the
+    GPU). A fused complex system -- the real-equivalent block ``[[R, -I], [I, R]]`` jNO builds for a complex
+    form, flagged by ``context["complex_n"]`` -- is solved as the complex SYMMETRIC ``n x n`` matrix
+    ``R + jI``: half the unknowns of the block, LDL^T instead of LU.
+
+    Under a trace the pattern is not a concrete array, so it comes from ``context["pattern"]`` (the FEM's
+    operator pattern, from one compiled evaluation); a mismatch in size raises. Symmetric VALUES cannot be
+    checked under a trace: the residual of the block is (one matvec, :func:`residual_gate`), so an operator
+    that is not symmetric raises instead of returning the solution of its symmetric part. ``None`` (no GPU
+    extension, no pattern, a non-symmetric pattern) leaves the caller on its general path.
+    """
+    import numpy as np
+
+    from . import cudss_sym as cs
+    from .solver_api import residual_gate
+
+    if not cs.available():
+        return None
+    ctx = context or {}
+    if isinstance(A.indices, jax.core.Tracer):
+        pat = ctx.get("pattern")
+        if pat is None:
+            return None
+        if tuple(pat.shape) != tuple(A.indices.shape):
+            raise RuntimeError(
+                f"jno.solve.lu(backend='cudss'): the operator's pattern has {A.indices.shape[0]} entries under this "
+                f"trace and {pat.shape[0]} in the FEM's compiled pattern; refusing to factor values against the "
+                "wrong pattern."
+            )
+        idx = np.asarray(pat)
+    else:
+        idx = np.asarray(A.indices)
+    rows, cols, m = idx[:, 0], idx[:, 1], int(A.shape[0])
+    trace = _current_trace(A.data)
+    b = jnp.asarray(b)
+    b = b if b.ndim == 2 else b.reshape(-1)  # (m,) or a block (m, k): k right-hand sides on one factorisation
+    cn = ctx.get("complex_n")
+    if cn is not None and m == 2 * int(cn):
+        n = int(cn)
+        tl, bl = (rows < n) & (cols < n), (rows >= n) & (cols < n)
+        if not (_symmetric_pattern(rows[tl], cols[tl]) and (not bl.any() or _symmetric_pattern(rows[bl] - n, cols[bl]))):
+            return None
+        if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, n):
+            return None  # concrete values, not symmetric: the general LU path solves it
+        plan = _ldl_plan(ctx.get("owner"), rows % n, cols % n, n, True, trace)
+        weight = jnp.asarray(np.where(tl, 1.0 + 0j, np.where(bl, 1j, 0j)))
+        xc = cs.solve(plan, A.data * weight, b[:n] + 1j * b[n:])
+        x = jnp.concatenate([xc.real, xc.imag])
+    else:
+        if not _symmetric_pattern(rows, cols):
+            return None
+        if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, None):
+            return None
+        plan = _ldl_plan(ctx.get("owner"), rows, cols, m, False, trace)
+        x = cs.solve(plan, A.data, b)
+    x = residual_gate(lambda v: A @ v, b, x, "lu(backend='cudss') [LDL^T]", rtol=1e-6)
+    if not isinstance(x, jax.core.Tracer):
+        # An EAGER solve: nothing can come back for its factors (no adjoint, no refactorisation in place), so they
+        # are freed now. Kept, every eagerly solved form held its factors for the rest of the process -- twelve
+        # load cases of one operator held twelve factorisations (3.6 GB at 65 k complex unknowns).
+        jax.block_until_ready(x)
+        plan.release()
+    return x
 
 
 def _pardiso_available() -> bool:
@@ -766,7 +985,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     # one factorization ~70 times, and paying a sort per application made it 3x slower than scipy.
     skey = (_h(rows, cols), shape, data.dtype.str)
     dhash = _h(data)
-    entry = _PARDISO_CACHE.get(skey)
+    entry, data = _typed_lookup(_PARDISO_CACHE, _PARDISO_LAST_KIND, skey, dhash, data)
 
     def _build(values, mtype):
         A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
@@ -774,15 +993,6 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
 
     b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
-
-    if entry is not None and entry["dhash"] != dhash:
-        # values changed -> they can change the TYPE, which is baked into the analysis
-        _kind_now, _data_sym = _symmetrized_kind_and_values(data, entry["order"], entry["orderT"], entry["pat"])
-        if _kind_now != entry["kind"]:
-            _PARDISO_CACHE.pop(skey)["solver"].free_memory()
-            entry = None
-        else:
-            data = _data_sym  # the phase-22 refactorize below must see the plan's own values
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -795,7 +1005,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         solver._call_pardiso(A, b)
         solver.set_phase(22)
         solver._call_pardiso(A, b)
-        _PARDISO_CACHE[skey] = entry = {
+        _PARDISO_CACHE[(skey, kind)] = entry = {
             "solver": solver,
             "A": A,
             "dhash": dhash,
@@ -809,13 +1019,14 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             _, old = _PARDISO_CACHE.popitem(last=False)
             old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
     else:
-        _PARDISO_CACHE.move_to_end(skey)
+        _PARDISO_CACHE.move_to_end((skey, entry["kind"]))
         if entry["dhash"] != dhash:
             entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
             entry["solver"].set_phase(22)
             entry["solver"]._call_pardiso(entry["A"], b)
             entry["dhash"] = dhash
 
+    _PARDISO_LAST_KIND[skey] = entry["kind"]
     solver, A = entry["solver"], entry["A"]
     _pardiso_check_factorization(solver, A, b, _np, shape)
     solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
@@ -854,8 +1065,7 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "
             f"{perturbed} pivot(s) and the solution has relative residual {rel:.2e}. PARDISO reports "
             f"this through neither an exception nor a NaN, so jNO checks it -- the returned vector "
-            f"would have been finite and wrong. Check for an unconstrained mode (a pure-Neumann "
-            f"problem with no gauge term, a floating region, or a constraint block with an empty row)."
+            f"would have been finite and wrong. {SINGULAR_HINTS}"
         )
 
 
@@ -1038,16 +1248,27 @@ def host_lu_solve(A, b, *, reuse: bool = True):
         # unreclaimable RSS per Newton iteration. Measured on a 4-field melt pool, 13,278 DOFs, 200
         # steps: cached OOM-kills a 62 GB machine, uncached peaks at 2.08 GB, and the two answers
         # agree to ten significant figures.
+        def _splu(mat):
+            # A singular operator fails INSIDE SuperLU, with a message that names neither the matrix nor
+            # the cause; name both. Only the failure path pays anything.
+            try:
+                return _spla.splu(mat)
+            except RuntimeError as exc:
+                detail = superlu_failure_detail(str(exc))
+                if detail is None:
+                    raise
+                raise RuntimeError(superlu_singular_message(shape, detail)) from exc
+
         if not reuse:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
-            lu = _spla.splu(mat)
+            lu = _splu(mat)
             out = _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
             del lu, mat
             return out
         lu = _FACTOR_CACHE.get(key)
         if lu is None:
             mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
-            lu = _spla.splu(mat)
+            lu = _splu(mat)
             _FACTOR_CACHE[key] = lu
             if len(_FACTOR_CACHE) > _FACTOR_CACHE_MAX:
                 _FACTOR_CACHE.popitem(last=False)

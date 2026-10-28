@@ -49,17 +49,18 @@ def _test_classes():
 class TermKind:
     """Structural fingerprint of a single weak-form term.
 
-    Attributes
-    ----------
-    support: ``"volume"`` | ``"boundary"`` | ``"constraint"`` (Dirichlet/IC/periodic tie — no test fn).
-    region: variational region id, or ``None``.
-    time_order: max temporal-derivative order (0 steady, 1 first-order, 2 second-order).
-    trial_channel / test_channel: ``"none"`` (field absent) | ``"value"`` | ``"grad"`` (appears
-        under a spatial gradient). A field appearing both ways is labelled ``"grad"``
-        (conservative — correct for the ``is_local`` decision).
-    linear: linear in the unknown (negated ``_is_obviously_nonlinear_in_unknown``).
-    cell_coupled: the term contains a ``jno.np.cellwise`` per-cell projection, so its value at one
-        quadrature point depends on the whole cell. Carries no spatial gradient, yet is not pointwise.
+    Attributes:
+        support: ``"volume"`` | ``"boundary"`` | ``"constraint"`` (Dirichlet/IC/periodic tie — no test
+            fn).
+        region: variational region id, or ``None``.
+        time_order: max temporal-derivative order (0 steady, 1 first-order, 2 second-order).
+        trial_channel / test_channel: ``"none"`` (field absent) | ``"value"`` | ``"grad"`` (appears:
+            under a spatial gradient). A field appearing both ways is labelled ``"grad"`` (conservative
+            — correct for the ``is_local`` decision).
+        linear: linear in the unknown (negated ``_is_obviously_nonlinear_in_unknown``).
+        cell_coupled: the term contains a ``jno.np.cellwise`` per-cell projection, so its value at one:
+            quadrature point depends on the whole cell. Carries no spatial gradient, yet is not
+            pointwise.
     """
 
     support: str

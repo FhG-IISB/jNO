@@ -210,7 +210,8 @@ dom = 500 * jno.shape.rect(0, 0, 2, 1, size=0.05).domain()        # replicate fo
 ```
 
 `d.plot("domain.png")` renders mesh, regions and normals. Node coordinates: `d.built_mesh.points`,
-or `d.mesh_connectivity["points"]` on an FDM domain.
+or `d.mesh_connectivity["points"]` on an FDM domain. `d.mask("core")`: bool over the mesh nodes of a named
+region, `T[d.mask("core")]` for a P1 scalar solution (vector: `T.reshape(-1, n)[mask]`; P2: select on `fem.points`).
 
 ---
 
@@ -299,6 +300,10 @@ stats = crux.solve(epochs=10_000, batchsize=32, callbacks=[...], min_consecutive
 stats.plot(f"{run}/training.png")
 ```
 
+`batchsize` mini-batches the SAMPLE axis (`n * domain`); `points=N` mini-batches the collocation points /
+dataset rows (`jno.domain.from_array` has one sample, so it needs `points=`). They compose; `batchsize > B`
+raises; `points=` raises for terms that need the whole point set (finite differences, FEM).
+
 **Every non-frozen model must have an optimiser before `solve()`.**
 
 ```python
@@ -313,7 +318,13 @@ Construct with a placeholder rate of `1` when using `.scale(...)` — the schedu
 rate and is re-evaluated every step. Factories: `lrs.constant`, `lrs.exponential`, `lrs.cosine`,
 `lrs.warmup_cosine`, `lrs.piecewise_constant`, all taking `min_lr`/`max_lr`; any
 `(epoch, losses) -> scalar` callable is a schedule. `jno.optimizers` adds second-order optimisers
-absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`.
+absent from optax: `engd`, `ssbroyden`, `ssbfgs`, `soap`, `md`, and the constrained `mma` and
+`gcmma`, which handle `jno.le`/`jno.ge` entries in the `jno.core` list. With any other optimiser,
+write the constraint as `jno.le(g, b).auglag(mu=10.0, every=100)` or `(g <= b).auglag()`: an
+augmented Lagrangian, feasible only as the multiplier converges (give Adam a decaying rate). An
+equality is `jno.eq(g, b).auglag()` (never `g == b`, which tests node identity). Each constraint
+row's multiplier is logged as `λ[name]` and in `training_logs[-1]["multipliers"]`. Box bounds for
+any optax optimiser: `jno.optimizers.bounded(optax.adam(1e-2), lower=0.0, upper=1.0)`.
 
 ### What `solve()` actually returns
 
@@ -382,6 +393,12 @@ and essential boundary conditions all in the same list. There is no `dirichlet(.
 call — `jno.fem` classifies each term by the region its symbols are bound to.
 
 ### Symbols
+
+`u = d.unknown(); v = u.test()` — the unknown (the same object `jno.fdm` solves for) and its derived test
+function. By shape: `d.unknown.scalar()`, `d.unknown.vector(2, order=2)`, `d.unknown.matrix(2, 2,
+symmetric=True)` (n(n+1)/2 stored values per node, a full matrix in expressions); keywords `order=`,
+`space=`, `complex=`, `name=`. `constant=True` is ONE value over the domain: `u(xr, yr) - U` ties a field
+to it exactly, `U - g` pins it, a weak term carrying `U.test()` is an integral row. Equivalent older form:
 
 `d.fem_symbols(value_shape=(), order=1, space=None, names=("u", "phi"))`
 
@@ -493,7 +510,7 @@ Newton-Krylov diverges to NaN there.
 Preconditioners: `jacobi`, `chebyshev(degree=)`, `nystrom(rank=)` and `fsai(power=)` (**SPD only**),
 `amg(cycles=)`, `gmg()`, `ams`, `schwarz(parts=, overlap=)` (overlapping Schwarz; needs the `[metis]`
 extra), `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per-field over
-`fem.blocks`), `cached`. Every constructor but `cached` takes `float32=True`: the preconditioner is built
+`fem.blocks`); `reuse=True` / `reuse=k` on any of them keeps the setup across solves. Every constructor takes `float32=True`: the preconditioner is built
 and applied in single precision while the solve stays in double.
 
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt
@@ -673,6 +690,11 @@ Enforce positivity of the **field** with an output transform (`k = jno.fn.exp(k_
 ### Models
 
 Every model comes from **foundax**, wrapped with `jno.nn(...)`. Any Equinox module works.
+
+`net.flow(x0, time=ts)` marches a velocity network as an ODE (Heun, fixed step; `save=True` keeps the
+trajectory); `noise=jno.noise.gaussian(std=lambda t: ...)` makes it an SDE (strong order 1/2; an eager call needs `key=`).
+A symbolic `x0` (`jno.noise.gaussian(like=x1)`, the noise shaped like a data expression) puts the march
+inside a `jno.core` term list.
 
 | Family | foundax constructors |
 |---|---|

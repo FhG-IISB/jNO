@@ -87,6 +87,16 @@ trajectory), a load-path `.i(k)` march (the declared grid, an explicit `tau=<sch
 transient (`adapt=jno.solve.remesh(...)`, which refuses a parametric form given no values rather than
 marching it at the stored ones). Every runtime parameter must be named; a missing one raises.
 
+A nonlinear solve at a value **raises if it did not converge**, exactly as an eager `fem.solve()` does:
+the solve is jitted, so the driver's own check cannot fire inside it, and the verdict is made on the
+returned state afterwards — on the *reduced* residual for a slip/periodic-reduced system — against the
+`rtol`/`atol` of the `nonlinear=` spec. The error names the parameters, the residual and the tolerance.
+Up to and including 0.4.0 this verdict was only recorded (`fem.stats["nonlinear"]["converged"] = False`) and the
+unconverged iterate came back as an ordinary array; a warm start from a different problem that Newton
+could not recover from therefore looked like an answer. A user `solve_fn=` and a box-constrained form
+(`u.bounds`) are still only recorded: the verdict knows neither the user's tolerances nor the min-map
+residual a bounded solve actually drives to zero.
+
 !!! tip "`continuation=` does the same march for you, and returns the family"
     The loop above is the manual form. `jno.solve.continuation` is the driver: it marches the values,
     warm-starts each solve from the previous one, and can hand back either the endpoint or the whole
@@ -273,14 +283,24 @@ hyper-reduction).
 
 ### Field parameters `k(x)` + regularization
 
-`jno.np.parameter(phi)` is a **nodal field** on the trial space — a trainable value per node. Field
-inversion is ill-posed, so add a smoothness/structure prior with `k.regularize(...)` (`"h1seminorm"`,
+`jno.np.parameter(phi)` is a **nodal field**: a trainable value per mesh vertex, interpolated on the P1
+basis whatever field it multiplies. So it works unchanged in a coupled form of mixed orders (a P1 design
+field `k(x)` in the momentum terms of a P2 velocity and the continuity terms of a P1 pressure). When it
+appears in terms tested by a field of order 2 or higher, `jno.fem` warns that the coefficient is resolved
+more coarsely than the fields it multiplies: its detail is capped by the vertex mesh, so refine the mesh
+to resolve `k(x)` more finely (raising the other fields' order will not). Field inversion is ill-posed, so add a smoothness/structure prior with `k.regularize(...)` (`"h1seminorm"`,
 `"l2"`/`"tikhonov"`, `"tv"`, `"nonneg"`, `"bounded"`):
 
 ```python
 k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF per node
 crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
 ```
+
+In a form whose unknown is a non-nodal element (N1E / N2E / RT / DG / P_k), the parameter may live on
+any element space: `jno.np.parameter(e)` with `e` a symbol of that space, e.g. a per-cell (P0) value. The
+same holds for a frozen coefficient, including a field frozen to another form's solve
+(`u.freeze(fem1.solve())`, real or complex) — one-way coupling, in volume terms
+([limitations](limitations.md)).
 
 ### Neural coefficients — `jno.nn(net)` inside the weak form
 

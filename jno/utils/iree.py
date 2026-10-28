@@ -28,6 +28,12 @@ class IREEModel:
 
     The IREE runtime objects (context, module handle) are not picklable
     and are reconstructed transparently on unpickle via ``__setstate__``.
+
+    Args:
+        vmfb_bytes: the compiled IREE module (``.vmfb`` contents).
+        module_name: the module's name inside the flatbuffer.
+        device: the IREE runtime device, e.g. ``"local-sync"``, ``"local-task"`` or ``"cuda"``.
+        input_dtypes: the dtype each input is cast to before the call; ``None`` passes inputs as given.
     """
 
     def __init__(
@@ -124,7 +130,14 @@ class IREEModel:
         return np.asarray(self._module.main(*prepared_args))  # type: ignore[attr-defined]
 
     def infer_raw(self, *args):
-        """Run inference and return an IREE DeviceArray (no host copy)."""
+        """Run inference and return an IREE DeviceArray (no host copy).
+
+        Args:
+            *args: the inputs, as for calling the model.
+
+        Returns:
+            The IREE ``DeviceArray`` result(s).
+        """
         prepared_args = self._prepare_args(args)
         return self._module.main(*prepared_args)  # type: ignore[attr-defined]
 

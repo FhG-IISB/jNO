@@ -84,10 +84,14 @@ def _is_stencil(method) -> bool:
 
 
 class DifferentialOperators:
-    """Static collection of mesh-based FD operators (1-D, 2-D, 3-D).
+    """Static collection of mesh-based finite-difference operators (1-D, 2-D, 3-D).
 
-    All public methods are *static* — the class is used purely as a namespace.
-    See the module docstring for full method descriptions.
+    The class is a namespace: every public method is static and takes nodal values, the node
+    coordinates and the cell connectivity. These are the kernels behind ``scheme="finite_difference"``
+    on an unstructured mesh; a structured grid (``grid=``) takes the direct stencils instead. Gradient
+    methods average the per-cell gradients onto the nodes (area/volume weighted, uniform, or inverse
+    distance); Laplacians are the cotangent (P1 Laplace–Beltrami) form, a gradient of the gradient,
+    or a least-squares variant.
     """
 
     # ══════════════════════════════════════════════════════════════════
@@ -105,11 +109,11 @@ class DifferentialOperators:
 
         Args:
             u_values: Function values at mesh points, shape ``(N,)``.
-            points:   Mesh point coordinates, shape ``(N, 1)`` or ``(N,)``.
-            lines:    Line element connectivity, shape ``(M, 2)``.
-            method:   Weighting strategy — one of ``"area_weighted"``
-                      (default), ``"uniform"``, ``"inverse_distance"``,
-                      ``"least_squares"``.
+            points: Mesh point coordinates, shape ``(N, 1)`` or ``(N,)``.
+            lines: Line element connectivity, shape ``(M, 2)``.
+            method: Weighting strategy — one of ``"area_weighted"``
+                (default), ``"uniform"``, ``"inverse_distance"``,
+                ``"least_squares"``.
 
         Returns:
             ``du/dx`` at each point, shape ``(N,)``.
@@ -169,9 +173,9 @@ class DifferentialOperators:
 
         Args:
             u_values: Function values, shape ``(N,)``.
-            points:   Coordinates, shape ``(N, 1)`` or ``(N,)``.
-            lines:    Line connectivity, shape ``(M, 2)``.
-            method:   ``"gradient_of_gradient"`` (only option in 1-D).
+            points: Coordinates, shape ``(N, 1)`` or ``(N,)``.
+            lines: Line connectivity, shape ``(M, 2)``.
+            method: ``"gradient_of_gradient"`` (only option in 1-D).
 
         Returns:
             ``d²u/dx²`` at each point, shape ``(N,)``.
@@ -190,8 +194,8 @@ class DifferentialOperators:
 
         Args:
             u_values: Function values, shape ``(N,)``.
-            points:   Coordinates, shape ``(N, 1)`` or ``(N,)``.
-            lines:    Line connectivity, shape ``(M, 2)``.
+            points: Coordinates, shape ``(N, 1)`` or ``(N,)``.
+            lines: Line connectivity, shape ``(M, 2)``.
             var_dims: Optional ``[(i, vi_dim, j, vj_dim), …]``.
 
         Returns:
@@ -293,21 +297,21 @@ class DifferentialOperators:
         """Gradient on a 2-D triangular mesh.
 
         Args:
-            u_values:  Function values at mesh points, shape ``(N,)``.
-            points:    Mesh point coordinates, shape ``(N, 2)``.
+            u_values: Function values at mesh points, shape ``(N,)``.
+            points: Mesh point coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
-            dim:       Spatial dimension to differentiate (0 = x, 1 = y).
-            method:    ``"area_weighted"`` (default), ``"uniform"``,
-                       ``"inverse_distance"``, ``"least_squares"``.
-            grid:      Optional structured-grid descriptor
-                       ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
-                       ``jno.shape.rect(...).structured().domain()``, node order
-                       ``idx(i, j) = i·Ny + j``). When given, the triangulation
-                       is bypassed and the derivative is the direct central
-                       finite difference on the regular grid (2nd-order
-                       interior, 1st-order one-sided edges, via ``jnp.gradient``)
-                       — the fast path ``jno.fdm`` takes on a structured grid;
-                       ``triangles``/``method`` are then ignored.
+            dim: Spatial dimension to differentiate (0 = x, 1 = y).
+            method: ``"area_weighted"`` (default), ``"uniform"``,
+                ``"inverse_distance"``, ``"least_squares"``.
+            grid: Optional structured-grid descriptor
+                ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
+                ``jno.shape.rect(...).structured().domain()``, node order
+                ``idx(i, j) = i·Ny + j``). When given, the triangulation
+                is bypassed and the derivative is the direct central
+                finite difference on the regular grid (2nd-order
+                interior, 1st-order one-sided edges, via ``jnp.gradient``)
+                — the fast path ``jno.fdm`` takes on a structured grid;
+                ``triangles``/``method`` are then ignored.
 
         Returns:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``.
@@ -389,10 +393,10 @@ class DifferentialOperators:
         per-node Python loops.
 
         Args:
-            u_values:  Function values, shape ``(N,)``.
-            points:    Coordinates, shape ``(N, 2)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
-            dim:       0 → ``∂u/∂x``, 1 → ``∂u/∂y``.
+            dim: 0 → ``∂u/∂x``, 1 → ``∂u/∂y``.
 
         Returns:
             Gradient component at each node, shape ``(N,)``.
@@ -454,21 +458,21 @@ class DifferentialOperators:
         """Laplacian on a 2-D triangular mesh.
 
         Args:
-            u_values:  Function values, shape ``(N,)``.
-            points:    Coordinates, shape ``(N, 2)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
-            dims:      Spatial dimensions to sum over, e.g. ``(0, 1)``.
-            method:    ``"gradient_of_gradient"`` (default), ``"cotangent"``,
-                       or ``"lsq_of_gradient"``.
-            grid:      Optional structured-grid descriptor
-                       ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
-                       ``jno.shape.rect(...).structured().domain()``). When given, ``Δu``
-                       is the direct 5-point finite-difference stencil
-                       ``Σ_d (u₊ − 2u + u₋)/h_d²`` on the regular grid — the fast
-                       path ``jno.fdm`` takes on a structured mesh; the
-                       triangulation and ``method`` are then ignored. (On a
-                       uniform right-triangulation this is exactly what the
-                       ``"cotangent"`` operator computes, but assembly-free.)
+            dims: Spatial dimensions to sum over, e.g. ``(0, 1)``.
+            method: ``"gradient_of_gradient"`` (default), ``"cotangent"``,
+                or ``"lsq_of_gradient"``.
+            grid: Optional structured-grid descriptor
+                ``{"shape": (Nx, Ny), "spacing": (hx, hy), ...}`` (from
+                ``jno.shape.rect(...).structured().domain()``). When given, ``Δu``
+                is the direct 5-point finite-difference stencil
+                ``Σ_d (u₊ − 2u + u₋)/h_d²`` on the regular grid — the fast
+                path ``jno.fdm`` takes on a structured mesh; the
+                triangulation and ``method`` are then ignored. (On a
+                uniform right-triangulation this is exactly what the
+                ``"cotangent"`` operator computes, but assembly-free.)
 
         Returns:
             Laplacian, shape ``(N,)``.
@@ -523,8 +527,8 @@ class DifferentialOperators:
         for PDE discretisation on unstructured 2-D triangular meshes.
 
         Args:
-            u_values:  Function values, shape ``(N,)``.
-            points:    Coordinates, shape ``(N, 2)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
 
         Returns:
@@ -606,16 +610,18 @@ class DifferentialOperators:
         """Hessian on a 2-D triangular mesh (area-weighted FD).
 
         Args:
-            u_values:  Function values, shape ``(N,)``.
-            points:    Coordinates, shape ``(N, 2)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 2)``.
             triangles: Triangle connectivity, shape ``(M, 3)``.
-            var_dims:  List of ``(i, vi_dim, j, vj_dim)`` tuples.
-            grid:      Optional structured-grid descriptor (from
-                       ``jno.shape.rect(...).structured().domain()``). When given, the
-                       second derivatives are the direct grid stencils
-                       (``∂²/∂x²``, ``∂²/∂y²`` central; the mixed ``∂²/∂x∂y`` a
-                       nested central difference) instead of the triangulation
-                       — the fast path for e.g. ``u.d2(x)`` on a structured mesh.
+            var_dims: List of ``(i, vi_dim, j, vj_dim)`` tuples.
+            grid: Optional structured-grid descriptor (from
+                ``jno.shape.rect(...).structured().domain()``). When given, the
+                second derivatives are the direct grid stencils
+                (``∂²/∂x²``, ``∂²/∂y²`` central; the mixed ``∂²/∂x∂y`` a
+                nested central difference) instead of the triangulation
+                — the fast path for e.g. ``u.d2(x)`` on a structured mesh.
+            method: ``None`` for the default mesh stencil, or a ``jno.fd(...)`` spec; on an unstructured
+                mesh a spec with ``fit=`` uses a local polynomial least-squares fit.
 
         Returns:
             Hessian, shape ``(N, n_vars, n_vars)``.
@@ -704,12 +710,12 @@ class DifferentialOperators:
         """Gradient on a 3-D tetrahedral mesh.
 
         Args:
-            u_values:    Function values, shape ``(N,)``.
-            points:      Mesh point coordinates, shape ``(N, 3)``.
-            tetrahedra:  Tet connectivity, shape ``(M, 4)``.
-            dim:         Spatial dimension (0, 1 or 2).
-            method:      ``"area_weighted"`` (default), ``"uniform"``,
-                         ``"inverse_distance"``, ``"least_squares"``.
+            u_values: Function values, shape ``(N,)``.
+            points: Mesh point coordinates, shape ``(N, 3)``.
+            tetrahedra: Tet connectivity, shape ``(M, 4)``.
+            dim: Spatial dimension (0, 1 or 2).
+            method: ``"area_weighted"`` (default), ``"uniform"``,
+                ``"inverse_distance"``, ``"least_squares"``.
 
         Returns:
             ``∂u/∂x_dim`` at each point, shape ``(N,)``. When ``grid`` is a structured-grid descriptor
@@ -827,10 +833,10 @@ class DifferentialOperators:
         normal-equation system at each node via Cramer's rule.
 
         Args:
-            u_values:   Function values, shape ``(N,)``.
-            points:     Coordinates, shape ``(N, 3)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 3)``.
             tetrahedra: Tet connectivity, shape ``(M, 4)``.
-            dim:        0 → ``∂u/∂x``, 1 → ``∂u/∂y``, 2 → ``∂u/∂z``.
+            dim: 0 → ``∂u/∂x``, 1 → ``∂u/∂y``, 2 → ``∂u/∂z``.
 
         Returns:
             Gradient component at each node, shape ``(N,)``.
@@ -928,8 +934,8 @@ class DifferentialOperators:
         CG-compatible, and second-order for the Galerkin solution — the accurate default on tets.
 
         Args:
-            u_values:   Function values, shape ``(N,)``.
-            points:     Coordinates, shape ``(N, 3)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 3)``.
             tetrahedra: Tet connectivity, shape ``(M, 4)``.
 
         Returns:
@@ -981,12 +987,14 @@ class DifferentialOperators:
         """Laplacian on a 3-D tetrahedral mesh.
 
         Args:
-            u_values:   Function values, shape ``(N,)``.
-            points:     Coordinates, shape ``(N, 3)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 3)``.
             tetrahedra: Tet connectivity, shape ``(M, 4)``.
-            dims:       Spatial dimensions to sum over, e.g. ``(0, 1, 2)``.
-            method:     ``"cotangent"`` (P1 Laplace–Beltrami — accurate, symmetric),
-                        ``"gradient_of_gradient"``, or ``"lsq_of_gradient"``.
+            dims: Spatial dimensions to sum over, e.g. ``(0, 1, 2)``.
+            method: ``"cotangent"`` (P1 Laplace–Beltrami — accurate, symmetric),
+                ``"gradient_of_gradient"``, or ``"lsq_of_gradient"``.
+            grid: optional structured-grid descriptor (from ``jno.shape.rect(...).structured().domain()``);
+                when given, the direct grid stencils are used instead of the mesh.
 
         Returns:
             Laplacian, shape ``(N,)``.
@@ -1032,10 +1040,14 @@ class DifferentialOperators:
         """Hessian on a 3-D tetrahedral mesh (volume-weighted FD).
 
         Args:
-            u_values:   Function values, shape ``(N,)``.
-            points:     Coordinates, shape ``(N, 3)``.
+            u_values: Function values, shape ``(N,)``.
+            points: Coordinates, shape ``(N, 3)``.
             tetrahedra: Tet connectivity, shape ``(M, 4)``.
-            var_dims:   List of ``(i, vi_dim, j, vj_dim)`` tuples.
+            var_dims: List of ``(i, vi_dim, j, vj_dim)`` tuples.
+            grid: optional structured-grid descriptor (from ``jno.shape.rect(...).structured().domain()``);
+                when given, the direct grid stencils are used instead of the mesh.
+            method: ``None`` for the default mesh stencil, or a ``jno.fd(...)`` spec; on an unstructured
+                mesh a spec with ``fit=`` uses a local polynomial least-squares fit.
 
         Returns:
             Hessian, shape ``(N, n_vars, n_vars)``.

@@ -45,18 +45,39 @@ def _is_runtime_scalar_parameter(node) -> bool:
     return isinstance(node, ModelCall) and len(node.args) == 0 and bool(getattr(node.model, "_is_parameter", False))
 
 
+def _is_global_scalar(node) -> bool:
+    """A node worth ONE value per solve, computed from parameters alone -- another solver's readout
+    (a PEEC loss, an RCWA transmission) used as a coefficient. Marked by its producer with
+    ``node._jno_global = name``. An assembler resolves it like a runtime parameter: crux evaluates it
+    once and hands the value in, rather than the kernel calling it at every quadrature point."""
+    return bool(getattr(node, "_jno_global", None))
+
+
+def mark_global_scalar(node, name):
+    """Mark ``node`` (a trace node over parameters, one value per solve) as a global scalar, under
+    ``name`` -- see :func:`_is_global_scalar`. Returns ``node``."""
+    node._jno_global = str(name)
+    return node
+
+
 def _is_frozen_parameter(node) -> bool:
     """A parameter marked ``.freeze()`` — a **known**, non-trainable coefficient. It is *not* a runtime
     (trainable) unknown: the integrand evaluator resolves it as a coordinate function / constant at
     the quadrature points (see ``fem_utils._eval_frozen_coefficient``), so the system assembles
     non-parametrically. Excluded from runtime-parameter detection/collection below."""
-    return _is_runtime_scalar_parameter(node) and bool(getattr(getattr(node, "model", None), "_frozen", False))
+    model = getattr(node, "model", None)
+    if getattr(model, "_derived_expr", None) is not None:
+        # `.derives(...)` also marks the parameter untrained, but it is NOT a known coefficient:
+        # its value is recomputed every solve, so it must keep the runtime-parameter threading
+        # (and with it the per-cell / per-node gather) rather than being baked in at assembly.
+        return False
+    return _is_runtime_scalar_parameter(node) and bool(getattr(model, "_frozen", False))
 
 
 def _contains_runtime_parameter(node) -> bool:
     """Recursively detect **trainable** physical parameters in one trace subtree (frozen ones don't
     count — they are baked in as known coefficients, keeping the system non-parametric)."""
-    if _is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node):
+    if (_is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node)) or _is_global_scalar(node):
         return True
 
     return any(_contains_runtime_parameter(child) for child in (_iter_children(node) or ()))
@@ -78,6 +99,21 @@ def _fem_field_kind(node):
     if not _is_fem_field_parameter(node):
         return None
     return getattr(node.model, "_fem_field", None)
+
+
+def refuse_space_field_parameters(exprs, where: str) -> None:
+    """Raise for a field parameter on an element space (``jno.np.parameter(<N1E / RT / P_k symbol>)``)
+    reaching an assembler that only gathers P0 (per cell) and P1 (per vertex) fields: there its values
+    would be read at vertex ids, which is silently wrong."""
+    bad = sorted(n for n, e in exprs.items() if _fem_field_kind(e) == "space")
+    if bad:
+        spaces = sorted({f"{e.model._fem_space[0]}{e.model._fem_space[1]}" for n, e in exprs.items() if n in bad})
+        raise NotImplementedError(
+            f"jno.fem ({where}): the field parameter(s) {bad} live on the element space(s) {spaces}; this "
+            "assembler takes P0 (one value per cell) and P1 (one value per vertex) field parameters only. "
+            "Coefficients on any element space are evaluated by the non-nodal assembler (a form with an "
+            "N1E / N2E / RT / DG / P_k unknown), or use a P0 / P1 symbol here."
+        )
 
 
 def _contains_fem_field_parameter(node) -> bool:
@@ -186,10 +222,12 @@ class NeuralSlots:
 
     @property
     def any(self) -> bool:
+        """Whether the block has any neural coefficient (frozen or trainable)."""
         return bool(self.all_names)
 
     @property
     def any_trainable(self) -> bool:
+        """Whether any of them is trainable."""
         return bool(self.param_names)
 
 
@@ -286,6 +324,8 @@ def _multiply_factors(factors):
 
 def _parameter_name(param: ModelCall) -> str:
     """Return the stable public name used for one runtime parameter."""
+    if _is_global_scalar(param):
+        return param._jno_global
     name = getattr(param.model, "_parameter_name", None)
     if name:
         return str(name)
@@ -438,7 +478,7 @@ def _collect_runtime_parameter_exprs(node, out=None):
     if out is None:
         out = {}
 
-    if _is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node):
+    if (_is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node)) or _is_global_scalar(node):
         name = _parameter_name(node)
         previous = out.get(name)
 

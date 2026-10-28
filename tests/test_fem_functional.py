@@ -373,6 +373,29 @@ def test_an_integrand_using_a_parameter_the_form_never_declared_is_refused():
         stray.integrate(fem)
 
 
+def test_an_unknown_in_the_integrand_is_the_trial_not_a_parameter():
+    """``d.unknown()`` is a valued nodal field (``jno.fdm`` solves for its values), so it is a parameter
+    node until ``jno.fem`` lowers it onto its trial. ``.integrate(fem)`` read it before that lowering and
+    refused it as an undeclared parameter; it must give the integral the ``fem_symbols`` spelling gives."""
+    d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.25).domain()
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    grad = lambda w: jno.np.jacobian(w, [xi, yi])  # noqa: E731
+
+    def energy(u, v):
+        fem = jno.fem([jno.np.inner(grad(u), grad(v)) - 1.0 * v, u(xl, yl) - 0.0])
+        node = jno.np.inner(grad(u), grad(u)).integrate(fem)
+        return float(
+            np.asarray(jno.core([node], domain=jno.domain.from_array({"_": np.zeros((1, 1))})).eval([node])).reshape(-1)[0]
+        )
+
+    w = d.unknown()
+    u, phi = d.fem_symbols()
+    by_unknown, by_symbols = energy(w, w.test()), energy(u, phi)
+    assert by_symbols > 0.0
+    assert abs(by_unknown - by_symbols) <= 1e-10 * by_symbols, f"{by_unknown!r} vs {by_symbols!r}"
+
+
 def test_the_collocation_integral_is_untouched():
     """``.integrate()`` with no FEM is the Deep-Ritz/collocation route and must not have moved."""
     d = jno.shape.rect(0.0, 0.0, 2.0, 1.0, size=0.2).domain()

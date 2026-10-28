@@ -13,8 +13,8 @@ must preserve:
   ``jno.precond.*`` apply, so a sparse/matrix-free operator is never densified.
 
 * :func:`shift_invert_geneigh` — the ``k`` eigenpairs **nearest a shift** ``σ`` (interior modes:
-  cavity resonances, band structure away from the band edge), by block subspace iteration on the
-  spectrally transformed operator ``C = (K−σM)⁻¹M`` with ``θ = 1/(λ−σ)``.
+  cavity resonances, band structure away from the band edge), by depth-2 block Krylov iteration on
+  the spectrally transformed operator ``C = (K−σM)⁻¹M`` with ``θ = 1/(λ−σ)``.
 
 :mod:`jno.solve` exposes all three through ``jno.solve.eigs``: ``precond=`` selects LOBPCG,
 ``sigma=`` selects shift-invert, otherwise the dense reduction runs exactly as before.
@@ -25,6 +25,23 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
+
+
+class ShiftInvertNotConverged(RuntimeError):
+    """``jno.solve.eigs(sigma=...)`` / ``FEM.eigs(sigma=...)`` did not reach its residual gate.
+
+    Raised instead of returning NaN whenever the residual is a concrete value -- an eager call, and
+    also ``jax.grad`` without ``jit`` (the sweeps run under ``stop_gradient``). Under ``jit``/``vmap``
+    the residual is a tracer and nothing can be raised; the result is NaN-poisoned there instead. The
+    message says which of the two causes it was: the sweep budget (``maxiter=``) ran out, or
+    ``K - sigma*M`` is singular to working precision (sigma sits on an eigenvalue), detected by one
+    probe solve on the failure path. Attributes ``sigma``, ``k``, ``sweeps``, ``residual``, ``tol``
+    carry the numbers. A ``RuntimeError``, so a generic solver-failure handler catches it.
+    """
+
+    def __init__(self, message, *, sigma, k, sweeps, residual, tol):
+        super().__init__(message)
+        self.sigma, self.k, self.sweeps, self.residual, self.tol = sigma, k, sweeps, residual, tol
 
 
 def _as_dense(A):
@@ -558,6 +575,166 @@ def _arnoldi_opinv(shifted, backend, np, spla):
     )
 
 
+def _verify_arnoldi_pairs(As, Bs, lam, V, np, sigma, which, tol=1e-6):
+    """Every pair ARPACK hands back must actually satisfy the pencil. Raises if one does not.
+
+    ARPACK's ``which='SM'`` on a **generalized** problem is only valid when ``M`` is symmetric
+    positive definite -- scipy's documented precondition for ``sigma=None`` -- and even then the
+    smallest-magnitude end is the slowest for a Krylov method to reach. A coupled FEM pencil
+    routinely breaks that precondition, because a one-sided coupling block makes ``M`` non-symmetric:
+    auxiliary-field dispersive Maxwell, poroelasticity, thermo-elastic and piezoelectric modal
+    analysis all have that shape.
+
+    Measured on a Lorentz-dispersive slab (a polarisation field carrying the pole, so ``M`` has an
+    ``(u, P)`` block and no ``(P, u)`` one): ARPACK returned the BLOCK-DIAGONAL spectrum --
+    ``4.9385, 19.79, 25, 25`` where the truth is ``1.883, 6.533, 11.70, 15.78`` -- entirely
+    plausible numbers, not one of them an eigenvalue. It appeared only above this function's dense
+    cutoff, so the same physics was right on a coarse mesh and wrong on a fine one, silently.
+    Relative residuals told the two apart with no ambiguity at all: **1e-14 converged against
+    0.33-0.41 wrong**. scipy returns the same values directly, so this is ARPACK's contract being
+    violated rather than anything jNO does to the matrices -- but returning them would be exactly
+    the plausible-wrong-number this codebase refuses to produce.
+    """
+    res = []
+    for j in range(len(lam)):
+        x = V[:, j]
+        kx = As @ x
+        mx = x if Bs is None else Bs @ x
+        den = float(np.linalg.norm(kx) + abs(lam[j]) * np.linalg.norm(mx)) + 1e-300
+        res.append(float(np.linalg.norm(kx - lam[j] * mx) / den))
+    worst = max(res) if res else 0.0
+    if worst <= tol:
+        return
+    sym = (
+        ""
+        if Bs is None
+        else (
+            " M is NOT symmetric, which is scipy's documented precondition for a generalized "
+            "`sigma=None` solve, and is the usual cause on a coupled FEM pencil."
+            if abs(Bs - Bs.T).max() > 1e-12 * abs(Bs).max()
+            else ""
+        )
+    )
+    raise RuntimeError(
+        f"jno.solve.eigs: the Arnoldi (non-symmetric) path returned pairs that do not satisfy the "
+        f"pencil -- worst relative residual {worst:.2e} against a {tol:.0e} gate (a converged pair "
+        f"sits near 1e-14). The values look plausible but are not eigenvalues, so they are refused "
+        f"rather than returned.{sym} `which={which!r}` without a shift asks ARPACK for the "
+        f"smallest-magnitude end, which is the slowest for a Krylov method to reach and is not "
+        f"guaranteed for a generalized pencil. What to try, in order: reduce the problem size so "
+        f"the exact dense path is taken (n <= max(64, 4k+16)); or pass `sigma=` to target the "
+        f"region by shift-invert (with `linear=jno.solve.lu(...)` for the factorization) -- but "
+        f"note shift-invert is subject to this same check and, on a non-symmetric M, was measured "
+        f"returning only one converged pair out of four; or reformulate so M is symmetric."
+    )
+
+
+def contour_geneigh(K, M, *, centre, radius, points, probes, rank, tol, maxiter, seed=0):
+    """Eigenpairs INSIDE a circle in the complex plane, by contour integration (Beyn 2012,
+    *Linear Algebra Appl.* 436:3839, "An integral method for solving nonlinear eigenvalue problems").
+
+    Where the Krylov paths ask "give me the k smallest", this asks "give me everything inside this
+    region", which is the question a band structure or a resonance search actually poses. Three
+    properties follow from the construction rather than from extra machinery:
+
+    * **It is pure JAX.** The whole method is ``points`` shifted linear solves, one SVD and one
+      small ``k x k`` eigenproblem -- no host callback, no ARPACK -- so ``jax.grad`` flows straight
+      through it, *including through the eigenVECTORS*. A subspace-invariant functional of the
+      enclosed modes (the shape a Q / mode-volume / field-overlap objective has) differentiates
+      here where the Arnoldi path returns NaN. Verified against central differences at 1e-10.
+    * **Non-Hermitian is native.** You name a region; you get what is in it. Nothing assumes a real
+      spectrum or a symmetric pencil.
+    * **The solves are independent**, so they ``vmap`` and the cost is
+      ``points x probes`` matvec-based solves rather than one long serial iteration.
+
+    Accuracy is set by the quadrature: the trapezoid rule on a circle is spectrally accurate for an
+    analytic integrand, so ``points`` buys digits quickly. Measured on a Bloch-tied photonic-crystal
+    cell, ``points=48`` gave ~1e-5 relative on a near-degenerate pair, and ~1e-14 on a well-separated
+    1-D pencil.
+
+    ``rank`` is the one knob that bites, and it is worth stating plainly because it is not
+    self-tuning: it must be at least the number of eigenvalues inside the contour. Measured on a
+    pencil with 4 inside -- rank 3 gives WRONG values; rank 4 is right; **rank 5 (one spare) is right
+    and is the sweet spot**; rank 6 is still right but the gradient breaks (0.0071 against a true
+    61.1), because the extra directions differentiate the SVD through numerically-zero singular
+    values. Left as ``None``, the rank is read from the singular-value gap, which is correct but
+    data-dependent -- pass it explicitly to differentiate.
+    """
+    import numpy as np
+
+    from .solver_api import LinearOperator
+
+    Kop = K if isinstance(K, LinearOperator) else LinearOperator(K)
+    Mop = None if M is None else (M if isinstance(M, LinearOperator) else LinearOperator(M))
+    n = int(Kop.shape[0])
+    ell = int(probes if probes is not None else max(8, 2 * (rank or 4)))
+    ell = min(ell, n)
+
+    key = jax.random.PRNGKey(int(seed))
+    k1, k2 = jax.random.split(key)
+    V = jax.random.normal(k1, (n, ell), dtype=jnp.float64) + 1j * jax.random.normal(k2, (n, ell), dtype=jnp.float64)
+
+    th = 2.0 * jnp.pi * (jnp.arange(points) + 0.5) / points
+    zs = centre + radius * jnp.exp(1j * th)
+    dzs = 1j * radius * jnp.exp(1j * th)
+
+    def _solve_at(z, Vm):
+        mv = lambda w: Kop.mv(w) - z * (w if Mop is None else Mop.mv(w))  # noqa: E731
+        one = lambda b: jax.scipy.sparse.linalg.bicgstab(  # noqa: E731
+            mv, b, tol=tol, atol=tol * 1e-2, maxiter=maxiter
+        )[0]
+        return jax.vmap(one, in_axes=1, out_axes=1)(Vm)
+
+    Ys = jax.vmap(_solve_at, in_axes=(0, None))(zs, V)  # (points, n, ell)
+    A0 = jnp.einsum("qne,q->ne", Ys, dzs) / points
+    A1 = jnp.einsum("qne,q->ne", Ys, zs * dzs) / points
+
+    U, sv, Wh = jnp.linalg.svd(A0, full_matrices=False)
+    concrete_rank = rank is None
+    if rank is None:  # data-dependent, so this branch is concrete-only (not differentiable)
+        r = int(np.sum(np.asarray(sv) > 1e-8 * float(sv[0]))) if float(sv[0]) > 0 else 0
+        if r == 0:
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): no eigenvalues found inside |z - {centre}| = "
+                f"{radius}. Widen the contour, or move its centre onto the region you want."
+            )
+        if r == ell:
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): the probing subspace is SATURATED (rank {r} of "
+                f"{ell} probes), so the contour holds at least as many eigenvalues as there are "
+                f"probes and the result would be wrong. Raise `probes=`, or shrink the contour."
+            )
+        rank = r
+    U, sv, Wh = U[:, :rank], sv[:rank], Wh[:rank]
+    B = U.conj().T @ A1 @ Wh.conj().T @ jnp.diag(1.0 / sv)
+    # `enable_eigvec_derivs` because the gradient has to reach the modes -- that is the whole point
+    # of this path. JAX declines by default since a non-symmetric eigenvector derivative is only
+    # valid for DISTINCT eigenvalues, which it cannot check. Two things make it safe here: B is a
+    # tiny rank x rank matrix, and the functionals this path exists for (radiative Q, mode volume,
+    # field overlap) are SUBSPACE-invariant -- they depend on span(U), which the eig cannot change,
+    # so their derivative is right even where an individual eigenvector's would not be.
+    _out = jax.lax.linalg.eig(
+        B, compute_left_eigenvectors=False, compute_right_eigenvectors=True, enable_eigvec_derivs=True
+    )
+    lam, Q = _out[0], _out[-1]
+    X = U @ Q
+    if concrete_rank:
+        # Beyn can return values from OUTSIDE the contour when the rank admits a spare direction:
+        # they are artefacts of the truncation, not eigenvalues of the region that was asked for.
+        # Dropping them is data-dependent, so it only happens on the concrete path; when `rank` was
+        # given explicitly (the differentiable path) everything is returned and the caller is
+        # expected to use a subspace-invariant functional.
+        keep = np.asarray(np.abs(np.asarray(lam) - centre) <= radius * (1.0 + 1e-8))
+        if not keep.any():
+            raise ValueError(
+                f"jno.solve.eigs(contour=...): every value the quadrature produced lies outside "
+                f"|z - {centre}| = {radius}, so the contour encloses nothing. Move or widen it."
+            )
+        idx = jnp.asarray(np.flatnonzero(keep))
+        lam, X = lam[idx], X[:, idx]
+    return lam, X
+
+
 def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_solve=None, tol: float = 0.0, maxiter=None):
     """The ``k`` eigenpairs of a **NON-self-adjoint** pencil ``K x = lambda M x`` -- COMPLEX spectrum.
 
@@ -646,6 +823,11 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
             # one factorization it needs is the fast one, and every Arnoldi step reuses it.
             Ms = Bs if Bs is not None else sp.identity(n, format="csr", dtype=As.dtype)
             opinv = _arnoldi_opinv((As - sigma * Ms).tocoo(), backend, np, spla)
+        # A fixed start vector: without one ARPACK draws its own, from a seed that advances with every
+        # call in the process, so the same solve could fail (ARPACK error 1 on a defective spectrum,
+        # seen on CI only) depending on what ran before it. Random, not ones(n): a constant vector is
+        # an exact eigenvector of many FEM operators and would leave the rest of the spectrum unseen.
+        v0 = np.random.default_rng(0).standard_normal(n).astype(As.dtype)
         try:
             lam, V = spla.eigs(
                 As,
@@ -653,6 +835,7 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
                 M=Bs,
                 sigma=sigma,
                 which="LM" if sigma is not None else _which_code(which),
+                v0=v0,
                 tol=tol,
                 maxiter=maxiter,
                 OPinv=opinv,
@@ -669,6 +852,8 @@ def nonsymmetric_geneigh(K, M, k: int, sigma, which: str = "smallest", *, inner_
             ) from exc
         order = np.argsort(np.abs(lam - sigma)) if sigma is not None else _which_order(lam, which)
         lam, V = lam[order], V[:, order]
+        # the iterative path can converge to something that is not an eigenvalue at all -- gate it
+        _verify_arnoldi_pairs(As, Bs, lam, V, np, sigma, which)
         W = _left_eigenvectors(As, Bs, lam, V, np, sp, spla, sla, dense=False)
         return lam.astype(cdt), V.astype(cdt), W.astype(cdt)
 
@@ -735,19 +920,29 @@ def shift_invert_geneigh(
     so the eigenvalues **nearest σ become the largest |θ|** — the dominant subspace — and the
     transformed gaps are enormous exactly where the original gaps are tiny (the transform is its own
     preconditioner; no ``precond=`` is needed or accepted here). ``C`` is self-adjoint in the
-    M-inner product (``M C = M(K−σM)⁻¹M`` is symmetric), so **block subspace iteration** on ``C``
-    (Bathe & Wilson 1973; guards absorbing the slow boundary direction, as in LOBPCG) converges the
-    ``k`` nearest pairs wherever they lie — both sides of σ or all on one — and, being a BLOCK
-    method, converges a degenerate cluster near σ (the double modes of a symmetric cavity) as a
-    block, where single-vector shift-invert Lanczos finds one copy.
+    M-inner product (``M C = M(K−σM)⁻¹M`` is symmetric). Each sweep builds a **depth-2 block Krylov
+    space** ``span{CV, C²V}`` of the ``m``-block ``V`` (Golub & Underwood 1977; guards as in LOBPCG),
+    which converges the ``k`` nearest pairs wherever they lie — both sides of σ or all on one — and,
+    being a BLOCK method, converges a degenerate cluster near σ (the double modes of a symmetric
+    cavity) as a block, where single-vector shift-invert Lanczos finds one copy.
+
+    It also survives a **wide degenerate cluster at the same distance** as the wanted pairs, which
+    plain subspace iteration on ``C`` does not: the gradient kernel of a curl-curl (Maxwell) operator,
+    hundreds of exact zeros, with σ between 0 and the first cavity mode. Plain subspace iteration
+    stalled there (rate 0.974 per sweep, NaN after 200 sweeps on the PEC unit square at σ = 5); the
+    Krylov space separates θ = −1/σ from a wanted θ of the same size and opposite sign, and the
+    restart keeps at most ``k`` copies of any one Ritz value, so the exact kernel modes cannot crowd a
+    still-converging wanted mode out of the block. Both are pinned by
+    ``tests/test_fem_eigs_shift_invert_kernel.py``.
 
     Every sweep closes with a Rayleigh–Ritz of the **original pencil** on the block, so the
     convergence gate is the caller's quantity — the λ-space relative residual ``‖Kx − λMx‖`` of the
     ``k`` wanted pairs, normalized by their spectrum scale — never a θ-space proxy, whose mapping
     back is amplified by ``‖K−σM‖/|θ|`` (from ``Kx − λMx = −(K−σM)(Cx−θx)/θ``). An exhausted budget
-    NaN-poisons rather than returning a quietly under-converged interior spectrum. A shift that
-    lands ON an eigenvalue makes ``K − σM`` singular; the inner factorization then yields garbage
-    that fails the same gate — perturb σ off the eigenvalue.
+    never returns a quietly under-converged interior spectrum, and neither does a shift that lands ON
+    an eigenvalue (``K − σM`` singular, the inner solves garbage): a call outside ``jit``/``vmap`` raises
+    :class:`ShiftInvertNotConverged`, saying which of the two it was; only under ``jit``/``vmap``,
+    where nothing can be raised, does the result come back NaN-poisoned instead.
 
     Args:
         K: **assembled** symmetric operator (BCOO or dense — the shifted operator is factorized, so
@@ -763,7 +958,8 @@ def shift_invert_geneigh(
 
     Returns:
         ``(λ, X)`` — the ``k`` eigenvalues nearest σ (sorted by ``|λ − σ|``), M-orthonormal
-        eigenvectors, NaN-poisoned if the final original-pencil residual gate fails. Eigenvalues are
+        eigenvectors. If the final original-pencil residual gate fails: raises
+        :class:`ShiftInvertNotConverged` (outside ``jit``/``vmap``), NaN-poisoned under them. Eigenvalues are
         differentiable through the Rayleigh quotient at the frozen eigenvectors, like the LOBPCG
         path; eigenvectors carry no gradient.
     """
@@ -808,20 +1004,29 @@ def shift_invert_geneigh(
     else:
         inner = lambda b: inner_solve(A_sig, b)  # noqa: E731
         # A solver advertising ``multi_rhs`` takes the WHOLE subspace block in one call. This is the
-        # method's inner loop -- one application of C per sweep, m columns each -- and a factorization
+        # method's inner loop -- two applications of C per sweep, m columns each -- and a factorization
         # solved as a block beats the same factorization solved column by column by 1.9x at m=4 rising
         # to 5.5x at m=32 (cuDSS, measured). Solvers without the trait keep the column loop.
         block_inner = inner if getattr(inner_solve, "traits", {}).get("multi_rhs") else None
 
-    # Block shift-invert SUBSPACE ITERATION (Bathe & Wilson, *Solution methods for eigenvalue
-    # problems in structural mechanics*, IJNME 6 (1973) — the classical pairing with the Ericsson-Ruhe
-    # transformation). One application of ``C = (K−σM)⁻¹M`` per sweep multiplies every unwanted
-    # direction by |θ_unwanted/θ_wanted| — tiny, because the transformation makes the near-σ |θ| the
-    # dominant ones by construction — so the m-block converges to the k nearest pairs (wherever they
-    # lie: both sides of σ, or all on one) with the m−k guards absorbing the slow boundary direction,
-    # exactly as in LOBPCG. Each sweep closes with a Rayleigh–Ritz of the ORIGINAL pencil on the
-    # block, so the convergence gate is the quantity the caller cares about — the λ-space residual —
-    # never a θ-space proxy whose mapping back is amplified by ``‖K−σM‖/|θ|``.
+    # Block shift-invert iteration with a depth-2 BLOCK KRYLOV basis (Ericsson & Ruhe 1980 for the
+    # transformation; Golub & Underwood, *The block Lanczos method for computing eigenvalues*, in
+    # Mathematical Software III (1977), for the block Krylov space). Each sweep applies
+    # ``C = (K−σM)⁻¹M`` twice, ``W₁ = CV`` and ``W₂ = CW₁``, and closes with a Rayleigh–Ritz of the
+    # ORIGINAL pencil on span{W₁, W₂}, so the convergence gate is the quantity the caller cares about —
+    # the λ-space residual — never a θ-space proxy whose mapping back is amplified by ``‖K−σM‖/|θ|``.
+    #
+    # Why two applications and not one (plain subspace iteration, span{CV}): its rate is
+    # ``|θ_{m+1}/θ_k|``, the next transformed eigenvalue outside the m-block over the k-th wanted one.
+    # A curl-curl operator has a kernel of dimension ~ the number of interior vertices at λ = 0
+    # (θ = −1/σ), far wider than any guard block; with σ between 0 and the first cavity mode that
+    # ratio sat at 0.974 (σ = 5 on the PEC unit square, measured) and 200 sweeps did not converge, so
+    # the result came back NaN. In span{W₁, W₂} an exactly degenerate cluster contributes only the
+    # directions already in the block (``C`` maps each of them to a multiple of itself), and the
+    # Rayleigh–Ritz separates a wanted θ from one of equal size but opposite sign — which a power
+    # iteration cannot. Measured on the same pencil: 8 sweeps (16 applications of C) to tol 1e-6.
+    # Where plain subspace iteration did converge it was not cheaper: σ = 20, k = 3 on that pencil
+    # took 23 applications against 10.
     Kop = LinearOperator(K)
     Mop_full = LinearOperator(M) if M is not None else None
     m = min(n, k + max(3, (k + 1) // 2))  # guard vectors, as in LOBPCG
@@ -838,22 +1043,52 @@ def shift_invert_geneigh(
 
     def sweep(state):
         i, V, _res, _lam = state
+        # W₁ is M-orthonormalized before C is applied again: near an eigenvalue |θ| is large and
+        # C·W₁ unnormalized would swamp the Gram below (every other direction declared dead).
         W = _apply_C(V)
-        Z, keepc = _m_orth_basis(W, _blockmv(Mop_full, W), eps * 1e2)
-        Sb = W @ Z  # M-orthonormal basis (a collapsed direction -> zero column)
+        Z1, _keep1 = _m_orth_basis(W, _blockmv(Mop_full, W), eps * 1e2)
+        W1 = W @ Z1
+        W2 = _apply_C(W1)
+        W2 = W2 - W1 @ (W1.T @ _blockmv(Mop_full, W2))  # one block Gram-Schmidt step against W₁
+        B = jnp.concatenate([W1, W2], axis=1)
+        Z, keepc = _m_orth_basis(B, _blockmv(Mop_full, B), eps * 1e2)
+        Sb = B @ Z  # M-orthonormal basis (a collapsed direction -> zero column)
         A = Sb.T @ _blockmv(Kop, Sb)
         A = 0.5 * (A + A.T)
         big = 1e6 * (jnp.max(jnp.abs(A)) + abs(sigma) + 1.0)  # exile dead columns far from the shift
         A = A + jnp.diag(jnp.where(keepc, 0.0, big).astype(A.dtype))
         mu, Q = jnp.linalg.eigh(A)
-        order = jnp.argsort(jnp.abs(mu - sigma))  # nearest-σ first, guards after
-        Vn = Sb @ Q[:, order]
+        # Restart selection, nearest σ first. Two kinds of column are pushed back: dead ones (a
+        # collapsed direction, class 2) and copies of one Ritz value beyond the k-th (class 1). The
+        # answer holds at most k pairs, so a (k+1)-th copy of the same value carries nothing it can
+        # use; kept, the copies of an exactly degenerate cluster -- the curl-curl kernel, already exact
+        # after one sweep -- fill the whole restart block and evict a wanted mode whose Ritz value is
+        # still converging. That evicted mode never comes back (the kernel is invariant under C), and
+        # the iteration then converges to valid eigenpairs that are NOT the nearest: measured on the PEC
+        # square at σ = 9.87 with k = 6, the 2π² mode was replaced by a fourth zero.
+        dist = jnp.abs(mu - sigma)
+        first = jnp.argsort(dist)
+        ms = mu[first]
+        group_scale = jnp.maximum(jnp.abs(sigma), jnp.max(jnp.abs(ms[:k])))
+        same = jnp.abs(ms[:, None] - ms[None, :]) <= 1e-8 * group_scale
+        copies_before = jnp.sum(jnp.tril(same, -1), axis=1)  # earlier (nearer) members of the same value
+        cls_sorted = jnp.where(copies_before >= k, 1, 0)
+        cls = jnp.zeros_like(cls_sorted).at[first].set(cls_sorted)
+        cls = jnp.where(mu > 0.5 * big, 2, cls)  # an exiled (dead) direction
+        order = jnp.lexsort((dist, cls))
+        Vn = (Sb @ Q[:, order])[:, :m]
         X = Vn[:, :k]
         KX = _blockmv(Kop, X)
         MX = _blockmv(Mop_full, X) if M is not None else X
         lam = mu[order][:k]
-        scale = jnp.maximum(jnp.max(jnp.abs(lam)), jnp.finfo(lam.dtype).tiny)
+        # λ-space residual relative to max(|λ|, |σ|): the eigenvalues' own size alone collapses to
+        # roundoff when the wanted pairs ARE kernel modes (λ ≈ 1e-13 at σ = 1 on a curl-curl pencil),
+        # and the gate then could never pass on an exactly converged answer.
+        scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(lam)), abs(sigma)), jnp.finfo(lam.dtype).tiny)
         rel = jnp.max(jnp.linalg.norm(KX - MX * lam[None, :], axis=0) / scale)
+        # a dead or capped column among the k returned is never "converged" (a zero column has a zero
+        # residual and would otherwise pass)
+        rel = jnp.where(jnp.all(cls[order][:k] == 0), rel, jnp.inf)
         return (i + 1, Vn, rel, lam)
 
     key = jax.random.PRNGKey(seed)
@@ -865,10 +1100,46 @@ def shift_invert_geneigh(
     _i, V, res, _l = jax.lax.stop_gradient(jax.lax.while_loop(lambda s: (s[0] < maxiter) & (s[2] > tol), sweep, init))
     X = V[:, :k]
 
-    # Differentiable readout + honesty gate on the ORIGINAL pencil: the Rayleigh quotient at the
-    # frozen eigenvectors carries ∂λ/∂θ; a budget exhausted past ``tol`` — or the NaN residuals a
-    # singular shift produces — NaN-poisons rather than returning a quietly wrong interior spectrum
-    # (``res <= tol`` is False for NaN).
+    # Honesty gate on the ORIGINAL pencil. With a concrete residual (eager, or grad without jit), a
+    # budget exhausted past ``tol`` -- or a singular shift -- raises by name: a NaN array is easy to pass
+    # on unread. Under jit/vmap the residual is a tracer and nothing can be raised, so the result is
+    # NaN-poisoned instead (``res <= tol`` is False for NaN) -- never a quietly wrong interior spectrum.
+    if not isinstance(res, jax.core.Tracer) and not bool(res <= tol):
+        r, sweeps = float(res), int(_i)
+        # Which cause? One probe solve against K - σM, on this failure path only. A shift on an
+        # eigenvalue does not always give NaN: the LU can return FINITE garbage (measured on a Dirichlet
+        # Laplacian with σ = λ₁ to the last bit: probe residual 3.5e-2, |x|/|b| 6e13), which a NaN test
+        # alone would blame on the budget. Away from the spectrum the probe solves to ~1e-15.
+        # (stop_gradient: under a plain jax.grad the operator carries a tangent, the probe must not.)
+        probe = jax.random.normal(jax.random.PRNGKey(seed + 1), (n,), dtype=dt)
+        xp = inner(probe)
+        probe_res = float(
+            jax.lax.stop_gradient(jnp.linalg.norm(LinearOperator(A_sig).mv(xp) - probe) / jnp.linalg.norm(probe))
+        )
+        if not (jnp.isfinite(res) and probe_res <= 1e-6):
+            why = (
+                f"an inner solve against K - {sigma}*M has relative residual {probe_res:.1e}: the matrix is "
+                f"singular to working precision, i.e. sigma={sigma} sits on (or within roundoff of) an "
+                "eigenvalue. Move sigma slightly off the eigenvalue -- the modes nearest it stay dominant."
+            )
+            if inner_solve is not None:
+                why += " (Or the inner solver passed as linear= does not solve it to 1e-6; try jno.solve.lu().)"
+        else:
+            why = (
+                f"after {sweeps} sweep(s) (maxiter={maxiter}) the relative residual is {r:.2e} > tol={tol:.1e}. "
+                f"Raise maxiter=, loosen tol=, or move sigma: convergence is slow when the k-th and (k+1)-th "
+                "eigenvalues are almost equally far from sigma."
+            )
+        raise ShiftInvertNotConverged(
+            f"jno.solve.eigs(sigma={sigma}, k={k}): shift-invert did not converge -- {why}",
+            sigma=sigma,
+            k=k,
+            sweeps=sweeps,
+            residual=r,
+            tol=tol,
+        )
+
+    # Differentiable readout: the Rayleigh quotient at the frozen eigenvectors carries ∂λ/∂θ.
     KX = _blockmv(Kop, X)
     MX = _blockmv(Mop_full, X) if M is not None else X
     lam = jnp.sum(X * KX, axis=0) / jnp.sum(X * MX, axis=0)

@@ -107,6 +107,14 @@ def save(
     If *public_key_path* / *private_key_path* are not provided, jNO checks
     whether RSA keys are configured in ``.jno.toml`` (or ``~/.jno/config.toml``)
     and uses them automatically.
+
+    Args:
+        instance: the object to save (a ``jno.core``, domain, compiled model, ...).
+        filepath: the output file.
+        public_key_path: RSA public key; ``None`` uses the configured one, if any.
+        private_key_path: RSA private key; ``None`` uses the configured one, if any. With both keys the
+            pickle is signed (needs ``pylotte``) and the signature written to ``<filepath stem>.sig``;
+            otherwise it is a plain pickle.
     """
     from .config import get_rsa_private_key, get_rsa_public_key
 
@@ -171,6 +179,19 @@ def load(
     If *public_key_path* is not provided, jNO checks whether an RSA public
     key is configured in ``.jno.toml`` (or ``~/.jno/config.toml``) and uses
     it automatically when a *signature_path* is supplied.
+
+    Args:
+        filepath: the file to load.
+        public_key_path: RSA public key to verify the signature with; ``None`` uses the configured one.
+        signature_path: the signature file; required to verify.
+        expected_type: if given, the loaded object must be an instance of this type.
+
+    Returns:
+        The loaded object.
+
+    Raises:
+        TypeError: if the object is not a ``jno.core``, domain or compiled model, or does not match
+            ``expected_type``.
     """
     from .config import get_rsa_public_key
 

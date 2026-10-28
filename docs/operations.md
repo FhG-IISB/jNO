@@ -77,6 +77,29 @@ either a whole scheme or an AD sub-mode (`"forward"` / `"reverse"`, its original
 per-call `scheme=` always overrides it, which is how one term keeps finite differences while the
 run is spectral.
 
+#### How the default AD derivatives are computed
+
+With the default `"automatic_differentiation"`, all derivatives one evaluation takes over the same
+point set are computed together, per point, with time as one more coordinate: a Laplacian or a single
+second derivative (`u.xx`, `u.tt`) from one *forward-Laplacian* pass that carries value, gradient and
+summed second derivative through the network at once (Li et al., *Nat. Mach. Intell.* 6, 209 (2024),
+via [`folx`](https://github.com/microsoft/folx)); other first derivatives from one forward-mode pass
+per coordinate; mixed second derivatives from a forward pass over that one. A network read by several
+fields and derivatives is evaluated once per pass. A scheme with an explicit sub-mode
+(`"automatic_differentiation:reverse"`, `:fwd-over-rev`, ...) keeps the one-derivative-at-a-time path.
+
+An AD derivative is taken one point at a time, so it is the derivative of a target only if the target's
+value at a point depends on that point alone. jNO **measures** this when the problem is compiled (the
+target is differentiated on three of its points with the real weights) and raises for a target that
+couples points -- `u - jno.np.mean(u, axis=0)`, attention across points, an operator over the point set
+-- naming `scheme="finite_difference"` instead. For a pointwise target, the value of a field that is also
+differentiated (`u` in `u * u.d(x)`) comes from the derivative pass rather than a second evaluation.
+
+Derivatives of order three and up (`u.d(x).d(x).d(x)`, `u.laplacian(x, y).laplacian(x, y)`) come from
+univariate Taylor passes along a few fixed directions, which give every mixed partial of that order
+exactly (Griewank, Utke & Walther, *Math. Comp.* 69, 1117 (2000)); a pass along one coordinate also gives
+the lower derivatives along it, so `u`, `u_x` and `u_xxx` in a KdV residual come from one pass.
+
 #### Spectral differentiation
 
 On a uniform grid the derivative is a multiply in Fourier space, which is **exact** for a
@@ -208,6 +231,19 @@ Every functional over one `fem` shares a single solve. See
 [`fem.eval` on a test-free expression](fem/boundary-conditions.md#integrating-a-quantity-femeval-on-a-test-free-expression)
 for the eager form and the scope limits.
 
+**Over a domain, of known fields** — pass the domain, and the integrand is integrated over its mesh
+with each field on its own element. The fields are known: frozen data, parameters, coordinates, or
+solutions frozen with `.freeze(fem.solve())`, from any number of forms:
+
+```python
+Phi = [phi.bind(x=x, y=y).freeze(f.solve()) for f in fems]
+C01 = (eps * inner(grad(Phi[0]), grad(Phi[1]))).integrate(d)      # C_01 = ∫ ε ∇φ_0 · ∇φ_1
+```
+
+The whole volume of a simplex mesh; it follows trainable coordinates, and `d.cell_size` /
+`d.cell_metric` resolve per cell. An expression with a trial or test function is a form, integrated
+over its form with `integrate(fem)`.
+
 ### Reductions, math & comparisons
 
 Reductions are properties returning a squeezed scalar node; the loss helpers are the ones you reach for
@@ -233,7 +269,8 @@ u.scalar   u.vector   u.complex   u.matrix   u.voigt   u.field
 ```
 
 **Components.** A subscript indexes the leading axis, as in NumPy, and a per-point field is
-`(points, components)`: on a network `u[1]` is point 1. Component `i` is `u[..., i]` or `u.vector[i]`, on
+`(points, components)`, so on a network or a coordinate `u[1]` would be point 1, and it raises instead of picking it
+silently. Component `i` is `u[..., i]` or `u.vector[i]`, on
 every trial and path (network, grid unknown, FE trial), and it keeps its axis, `(N, 1)`, like every other
 per-point scalar in a trace. (A bare `(N,)` would broadcast against an `(N, 1)` coordinate to `(N, N)`.) On an
 FE symbol `u[i]` is read as the component too; on a derived FE expression (`grad(u, X)[0]`) `jno.fem` refuses

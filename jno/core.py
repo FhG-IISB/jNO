@@ -34,9 +34,11 @@ from .architectures.lora import (
 from .domain import DomainData, domain
 from .domain.domain_class import _is_lazy_source
 from .trace import (
+    AugLagConstraint,
     BinaryOp,
     Choice,
     Constraint,
+    Flow,
     FunctionCall,
     Hessian,
     IntegralTime,
@@ -54,12 +56,12 @@ from .trace import (
     collect_operations,
     collect_tags,
     cse,
-    dump_tree,
     fuse_laplacian,
     get_primary_tag,
+    refuse_point_index,
 )
 from .trace_compiler import TraceCompiler
-from .trace_evaluator import TraceEvaluator
+from .trace_evaluator import TraceEvaluator, mark_pointwise_targets
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .utils import (
     LearningRateSchedule,
@@ -67,6 +69,7 @@ from .utils import (
     get_seed,
     statistics,
 )
+from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
@@ -79,8 +82,8 @@ def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
         if nid in seen:
             return False
         seen.add(nid)
-        if isinstance(node, ModelCall):
-            return node.model.layer_id == lid
+        if isinstance(node, (ModelCall, Flow)):
+            return node.model.layer_id == lid or any(visit(a) for a in node.args if isinstance(a, Placeholder))
         if isinstance(node, BinaryOp):
             return visit(node.left) or visit(node.right)
         if isinstance(node, FunctionCall):
@@ -406,6 +409,40 @@ def _active_model_lids(exprs):
     return set(_reachable_models(exprs))
 
 
+def _refuse_collocation_on_parametric_shape(constraints):
+    """A loss that samples a domain whose shape has `jno.np.parameter`s in its coordinates would sample
+    the REFERENCE geometry whatever the design: the points are drawn once, at the parameters' initial
+    values, and nothing moves them. Refused by name until collocation follows the stretch (the solvers
+    that do -- jno.fem, jno.peec -- consume their domain inside their own solve, not here)."""
+    from .geometry import parametric as _par
+    from .utils.solver.solver_helper import iter_children as _iter_children_core
+
+    seen, bad = set(), {}
+
+    def walk(node):
+        if id(node) in seen or not isinstance(node, Placeholder):
+            return
+        seen.add(id(node))
+        if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+            dom = getattr(node, "_domain", None)
+            plan = getattr(dom, "_shape_plan", None) or getattr(dom, "__dict__", {}).get("_lazy_plan")
+            if plan is not None and getattr(plan, "_node", None) is not None and _par.has_params(plan._node):
+                bad[id(dom)] = getattr(node, "tag", "?")
+        for c in _iter_children_core(node) or ():
+            walk(c)
+
+    for c in constraints or ():
+        walk(c)
+    if bad:
+        raise NotImplementedError(
+            f"jno.core: a loss samples the domain variable(s) {sorted(set(bad.values()))} of a shape with "
+            "`jno.np.parameter`s in its coordinates. Collocation points are drawn at the parameters' "
+            "initial values and do not move with the design, so this loss would see the reference geometry "
+            "whatever the parameters. Solve on that domain with jno.fem or jno.peec (which follow it) and "
+            "put their readouts in the loss, or build the shape with numbers."
+        )
+
+
 def _reachable_models(exprs) -> Dict[int, Any]:
     """Map ``layer_id -> Model`` for every Model reachable without crossing stop_gradient.
 
@@ -423,7 +460,7 @@ def _reachable_models(exprs) -> Dict[int, Any]:
         # stop_gradient boundary — everything inside is frozen, skip
         if isinstance(node, FunctionCall) and node.fn is jax.lax.stop_gradient:
             return
-        if isinstance(node, ModelCall):
+        if isinstance(node, (ModelCall, Flow)):
             active[node.model.layer_id] = node.model
             for arg in node.args:
                 if isinstance(arg, Placeholder):
@@ -538,6 +575,183 @@ def _extract_user_name(orig_expr) -> str | None:
     return None
 
 
+class _RebuildWatch(_CallbackBase):
+    """Stops a training stretch at the first epoch where a watched domain's ``when`` holds, and keeps
+    the parameter values it held at -- what the rebuild builds the shape at."""
+
+    def __init__(self, domains):
+        from ._fem import _walk
+
+        self.domains = list(domains)
+        self._fns = []
+        for d in self.domains:
+            when = d._rebuild_spec["when"]
+            mcs = {m.model.layer_id: m for m in _walk(when) if type(m).__name__ == "ModelCall"}
+            fn = jax.jit(lambda tab, _w=when: TraceEvaluator(tab).evaluate(_w, context={}))
+            self._fns.append((d, mcs, fn))
+        self.arm()
+
+    def arm(self):
+        self.fired, self.modules, self.values, self.epochs_run = [], {}, {}, 0
+
+    def holding(self, modules):
+        """The watched domains whose condition holds with the parameter modules ``{layer_id: module}``
+        (a parameter not in it keeps its own)."""
+        out = []
+        for d, mcs, fn in self._fns:
+            tab = {lid: modules.get(lid, mc.model.module) for lid, mc in mcs.items()}
+            hold = np.asarray(fn(tab))
+            if hold.size != 1:
+                raise ValueError(
+                    f"domain.rebuild(when=...): the condition gave {hold.size} values; it must be ONE. "
+                    "Reduce it first, e.g. `d.cell_aspect().max > 6`."
+                )
+            if bool(hold.reshape(())):
+                out.append(d)
+        return out
+
+    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_epoch_end
+    def on_epoch_end(self, *, epoch, trainable, **kwargs) -> bool:
+        """Called at the end of every outer training step.
+
+        Keyword Args:
+            epoch (int): Current epoch number (0-indexed).
+            trainable: Trainable parameter pytree (Equinox partition).
+            opt_states: ``dict[str, optax.OptState]`` per-model optimizer states.
+            rng: Current JAX PRNG key.
+            total_loss: Scalar total loss (JAX array, still on device).
+            individual_losses: Per-constraint losses (JAX array).
+            log: Logger instance (when called from ``core.solve``).
+
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
+        self.fired = self.holding(trainable)
+        if self.fired:
+            # copies: the training loop donates these buffers to its next step
+            self.modules = {
+                lid: jax.tree_util.tree_map(lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, m)
+                for lid, m in trainable.items()
+            }
+            self.values = {lid: np.asarray(getattr(m, "value", m)) for lid, m in self.modules.items()}
+            self.epochs_run = int(epoch) + 1
+            return True
+        return False
+
+
+def _release_idle_solver_memory() -> None:
+    """Between two compiled programs: free the factors of the extra cuDSS slots a program left behind (a form
+    solved more than once in it). Each solve keeps its factors for its own adjoint, so inside a program they
+    are needed; after it they only pile up, across the gradient, a hook's Jacobian and an evaluation, until the
+    card runs out (measured: 12 slots on two forms in one MMA step). A no-op unless that path was used."""
+    from .utils.solver import linear as _lin
+
+    if _lin._LDL_PLANS:
+        _lin.release_idle_ldl()
+
+
+def _with_poisoned_gates(fn):
+    """``fn``, traced with poisoned residual gates (``solver_api.poison_gates``): a solve that fails its residual
+    check gives NaN instead of a host callback, so the compiled program can be stored in the persistent cache.
+    The caller checks every output with :func:`_raise_if_step_not_finite`."""
+    from .utils.solver.solver_api import poison_gates
+
+    @functools.wraps(fn)
+    def traced(*args, **kwargs):
+        with poison_gates():
+            return fn(*args, **kwargs)
+
+    return traced
+
+
+def _raise_if_step_not_finite(epoch, total_loss, losses, grads, jac=None):
+    """Raise when a step traced with poisoned gates returned a non-finite loss, gradient or constraint Jacobian."""
+    parts = {"loss": [total_loss, losses], "gradient": jax.tree_util.tree_leaves(grads), "constraint Jacobian": [jac]}
+    bad = [name for name, vals in parts.items() if any(v is not None and not bool(jnp.all(jnp.isfinite(v))) for v in vals)]
+    if bad:
+        raise RuntimeError(
+            f"jno.core.solve: step {epoch} gave a non-finite {', '.join(bad)}. Inside the compiled step a linear "
+            "solve that fails its residual check returns NaN (instead of calling back to the host, which would keep "
+            "the program out of the persistent compile cache), so this is a solve that did not converge, or a "
+            "genuine NaN in the problem. Evaluate the objective and constraints with crux.eval([...]) at the current "
+            "parameters to have the failing solve named, with its residual."
+        )
+
+
+def _trainable_filter(models, flax_mods):
+    """``{layer_id: filter}``: which arrays of each model train, from its ``Model`` state (frozen, LoRA, a
+    parameter mask). Shared by ``core.solve`` and ``jno.info``, so the report says what training does."""
+    filter_spec = {}
+    for lid, model in models.items():
+        fm = flax_mods.get(lid)
+        if fm is not None and fm._lora_config is not None:
+            # LoRA modes:
+            # 1) fm._frozen=True  -> freeze everything; only LoRA adapters trainable.
+            #    (freeze().lora() or freeze().mask(M).lora() both land here — base
+            #    params outside LoRA-wrapped layers are frozen too.)
+            # 2) otherwise        -> partial LoRA: adapters trainable, wrapped bases
+            #    frozen, every other param stays trainable (mask(M).lora() case).
+            if fm._frozen:
+                filter_spec[lid] = _lora_trainable_filter(model)
+            else:
+                filter_spec[lid] = _partial_lora_trainable_filter(model)
+        elif fm is not None and fm._frozen:
+            # Whole model frozen – no arrays trainable
+            filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)
+        elif fm is not None and fm._trainable_param_mask is not None:
+            # Partial mask — only leaves marked True in the mask are trained.
+            # Non-array leaves (e.g. activation functions kept as module
+            # attributes) are always False so equinox does not misinterpret
+            # them as sub-filter callables.
+            filter_spec[lid] = jax.tree_util.tree_map(
+                # Only train floating/complex arrays; integer/bool arrays
+                # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
+                lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
+                model,
+                fm._trainable_param_mask,
+            )
+        else:
+            # Normal – every array trainable, non-arrays (e.g. activation
+            # functions stored as attributes) must be False, not the
+            # original value — equinox interprets callables in the
+            # filter spec as sub-filters.
+            filter_spec[lid] = jax.tree_util.tree_map(
+                # Gradients are defined only for inexact dtypes.
+                lambda leaf: True if eqx.is_inexact_array(leaf) else False,
+                model,
+            )
+    return filter_spec
+
+
+def _parameter_counts(models, filter_spec, flax_mods, lora_counts):
+    """``[(name, policy, trainable, frozen, lora)]`` per model, from :func:`_trainable_filter`."""
+    rows = []
+    for lid, model in models.items():
+        fm = flax_mods.get(lid)
+        if fm is None:
+            continue
+        mname = fm.name or type(fm.module).__name__
+        m_total = sum(param.size for param in jax.tree_util.tree_leaves(model) if eqx.is_array(param))
+        fspec = filter_spec.get(lid)
+        if fspec is not None:
+            m_train = sum(
+                param.size
+                for param, f in zip(
+                    jax.tree_util.tree_leaves(model),
+                    jax.tree_util.tree_leaves(fspec),
+                )
+                if eqx.is_array(param) and f is True
+            )
+        else:
+            m_train = m_total
+        policy = "LoRA" if fm._lora_config else ("frozen" if fm._frozen else "full fine-tune")
+        if fm._trainable_param_mask is not None and fm._lora_config:
+            policy = "LoRA + partial base"
+        rows.append((mname, policy, m_train, m_total - m_train, lora_counts.get(lid, 0)))
+    return rows
+
+
 class core:
     """core solver using traced operations."""
 
@@ -619,11 +833,30 @@ class core:
                 ``orbax-checkpoint`` package.
         """
         self.log = get_logger()
+        # `jno.le(...).auglag()` is one entry for the user and two rows for the core: the constraint
+        # itself (reported, and seen by callbacks) and its multiplier penalty (added to the loss).
+        if isinstance(constraints, (list, tuple)):
+            from .trace import AugLagConstraint as _ALC
+
+            constraints = [r for c in constraints for r in ((c, c.penalty) if isinstance(c, _ALC) else (c,))]
         self.constraints: List[Placeholder] = constraints
 
         # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
         # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
         # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
+        # A jno.peec network and the jno.fem problem it heats are coupled by their references (`em.loss`
+        # in the heat source, the FEM field in sigma) and solved by `heat.solve()` / `em.solve()`, not
+        # listed here: a core is for losses. Listing them is refused with the spelling that works.
+        from .utils.solver.electrothermal import detect_pair
+
+        if detect_pair(constraints) is not None:
+            raise TypeError(
+                "jno.core: a jno.peec network and a jno.fem problem are not losses. A pair coupled through "
+                "`em.loss` is solved by solving either: `T = heat.solve()` (the converged field) and "
+                "`sol = em.solve()` (the network there). Put their readouts in jno.core to optimise -- "
+                "`jno.core([sol.L / L0 + jno.np.max(T) / T0, jno.le(...)])`."
+            )
+
         _detected = _detect_subdomains(constraints)
         self._dd_subdomains = None
         if _detected is not None:
@@ -655,6 +888,7 @@ class core:
                 self.domain = _trivial_domain()
         else:
             self.domain = None
+        _refuse_collocation_on_parametric_shape(constraints)
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
@@ -773,22 +1007,6 @@ class core:
 
         return jax.tree_util.tree_map(shard_leaf, params)
 
-    def _shape_probe_context(self) -> Dict:
-        """The full context with lazy handles replaced by zeros of the same shape and dtype.
-
-        Shape logging and trace printing run `jax.eval_shape` over the WHOLE context, which a lazy
-        handle cannot satisfy -- it is not an array and `jnp.asarray` on it raises deep inside JAX.
-        Only the shapes matter to those callers, so a zero stand-in is exact for their purpose and
-        still never reads the source.
-        """
-        ctx = self.domain_data.context
-        if not any(_is_lazy_source(v) for v in ctx.values()):
-            return ctx
-        return {
-            k: (jnp.zeros(tuple(v.shape), dtype=getattr(v, "dtype", jnp.float32)) if _is_lazy_source(v) else v)
-            for k, v in ctx.items()
-        }
-
     def _host_batch(self, host_context: Dict, indices) -> Dict:
         """One mini-batch gathered on the host and moved to device — the single slice path.
 
@@ -877,7 +1095,14 @@ class core:
         return data
 
     def wrap_constraints(self, constraints: List) -> List:
-        """Auto-wrap raw expressions in OperationDef."""
+        """Auto-wrap raw expressions in :class:`OperationDef`, so every constraint is a compiled operation.
+
+        Args:
+            constraints: the constraint list (expressions, operations, inequality constraints).
+
+        Returns:
+            list: the wrapped constraints, in order.
+        """
         wrapped: List[Any] = []
         for expr in constraints:
             if isinstance(expr, (OperationDef, OperationCall)):
@@ -901,6 +1126,27 @@ class core:
                     all_ops.append(op)
         return all_ops
 
+    def _multipliers_now(self, trainable) -> Optional[np.ndarray]:
+        """The Lagrange multiplier of every constraint row, in ``_inequality_idx`` order, or None.
+
+        An ``.auglag()`` row's is read from its ``[lam, mu]`` parameter, an MMA row's from the dual of
+        MMA's last subproblem; both are multipliers of the loss as descended. NaN where none exists yet.
+        """
+        rows = getattr(self, "_inequality_idx", None)
+        if not rows:
+            return None
+        from jax.flatten_util import ravel_pytree
+
+        out = np.full(len(rows), np.nan)
+        mma = getattr(self, "_mma_cb", None)
+        if mma is not None and mma.multipliers is not None:
+            out[:] = mma.multipliers
+        for j, i in enumerate(rows):
+            lid = self._auglag_lid.get(i)
+            if lid is not None and lid in trainable:
+                out[j] = float(jax.device_get(ravel_pytree(trainable[lid])[0][0]))
+        return out
+
     def _collect_flax_modules(self) -> Dict[int, Model]:
         """Return ``{layer_id: Model}`` for every model in the problem."""
         from .trace_compiler import TraceCompiler
@@ -920,8 +1166,8 @@ class core:
 
         Args:
             opt_fn: Optimizer factory with the rate baked in, e.g. ``optax.adam(1e-3)``.
-            scale:  Optional ``LearningRateSchedule`` / ``dlrs(...)`` / float that
-                    multiplies the optimizer's learning rate (see :meth:`Model.scale`).
+            scale: Optional ``LearningRateSchedule`` / ``dlrs(...)`` / float that
+                multiplies the optimizer's learning rate (see :meth:`Model.scale`).
         """
         for fm in self._collect_flax_modules().values():
             fm.optimizer(opt_fn)
@@ -930,7 +1176,14 @@ class core:
         return self
 
     def get_constraint_tags(self, constraints: List) -> List[str]:
-        """Get the primary tag for each constraint."""
+        """The primary domain tag (point set) each constraint is evaluated on.
+
+        Args:
+            constraints: the wrapped constraints.
+
+        Returns:
+            list[str]: one tag per constraint.
+        """
         tags = []
         for expr in constraints:
             tag = get_primary_tag(expr)
@@ -988,7 +1241,14 @@ class core:
         return node
 
     def compute_tensor_dims(self, domain) -> Dict[str, Tuple]:
-        """Compute input dimensions for each context entry."""
+        """Input dimensions for each context entry, used to initialise the models.
+
+        Args:
+            domain: the domain whose context arrays are measured.
+
+        Returns:
+            dict: tag to its dimension tuple.
+        """
         tensor_dims = {}
         if hasattr(domain, "context"):
             for name, tensor in domain.context.items():
@@ -1225,13 +1485,17 @@ class core:
         # (substeps, `compiled_constraints_fn=`), where a full-length mask would not broadcast.
         objective_mask = getattr(self, "_objective_mask", None) if getattr(self, "_inequality_idx", None) else None
         n_objective = float(int(np.asarray(objective_mask).sum())) if objective_mask is not None else 0.0
+        penalty_mask = getattr(self, "_penalty_mask", None) if getattr(self, "_penalty_idx", None) else None
+        # Point-axis mini-batch size, set by solve(points=...). Read once here (not inside loss_fn) so
+        # it stays a Python static through the trace, exactly like `batchsize`.
+        points = getattr(self, "_points", None)
 
         def loss_fn(trainable, context, rng):
             full_models = eqx.combine(trainable, frozen, static)
             full_models = _paramax.unwrap(full_models)
 
             if checkpoint_gradients:
-                _fn, _bs = compiled_constraints_fn, batchsize
+                _fn, _bs, _pts = compiled_constraints_fn, batchsize, points
 
                 # Equinox wrapper avoids JAX export false-positives in type stubs.
                 @eqx.filter_checkpoint
@@ -1242,6 +1506,7 @@ class core:
                         batchsize=_bs,
                         key=key,
                         min_consecutive=min_consecutive,
+                        points=_pts,
                     )
 
                 all_residuals = _remat_eval(full_models, context, rng)
@@ -1253,6 +1518,7 @@ class core:
                     batchsize=batchsize,
                     key=rng,
                     min_consecutive=min_consecutive,
+                    points=points,
                 )
 
             # all_residuals is a list of (B, T, ...) arrays — one per constraint
@@ -1264,7 +1530,12 @@ class core:
             # out of the scalar being descended. Summing a constraint into the objective would make
             # it a soft penalty on top of whatever the constrained optimiser does in the dual.
             obj = jnp.where(objective_mask, losses, 0.0)
-            return jnp.sum(obj) / n_objective, losses
+            total = jnp.sum(obj) / n_objective
+            if penalty_mask is not None:
+                # Augmented-Lagrangian penalties: summed, not averaged with the objective rows, so
+                # d(total)/d(lambda) is the violation itself and the multiplier update reads it exactly.
+                total = total + jnp.sum(jnp.where(penalty_mask, losses, 0.0))
+            return total, losses
 
         return loss_fn
 
@@ -1341,8 +1612,14 @@ class core:
         * makes progress logging trivial (no ``io_callback``).
 
         Args:
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            group_lr_schedules: per-parameter-group schedules ``{layer_id_str: [(mask, schedule), ...]}`` set
+                with ``model.mask(...).scale(...)``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
             per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
-            lr_schedules:   ``{layer_id_str: LearningRateSchedule}``.
+            lr_schedules: ``{layer_id_str: LearningRateSchedule}``.
             checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
             compiled_constraints_fn: Override the default combined constraint function.
                 Used by ``substeps`` to supply per-substep compiled functions.
@@ -1598,6 +1875,18 @@ class core:
 
         where ``samples`` is a dict keyed by ``bayesian_handles`` keys, each
         entry stacked along a leading axis of length ``keep``.
+
+        Args:
+            bayesian_handles: ``{key: _KernelHandle}`` of the Bayesian models.
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            compiled_constraints_fn: override of the combined constraint function.
+            checkpoint_gradients: wrap constraint evaluations in ``jax.checkpoint``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
+            warmup: number of warm-up (discarded) steps.
+            keep: number of samples kept.
+            thin: steps between kept samples.
         """
         if compiled_constraints_fn is None:
             compiled_constraints_fn = self.compiled_constraints_fn
@@ -1788,6 +2077,7 @@ class core:
         static,
         checkpoint_gradients=False,
         min_consecutive=1,
+        jacobian=None,
     ):
         """Build a function that computes gradients without an optimizer update.
 
@@ -1798,6 +2088,16 @@ class core:
 
         Used by gradient accumulation to compute gradients on multiple
         micro-batches before averaging and applying a single update.
+
+        Args:
+            batchsize: mini-batch size (``None`` for full batch).
+            frozen: the frozen half of the partitioned parameters (``eqx.partition``).
+            static: the static (non-array) half.
+            checkpoint_gradients: wrap constraint evaluations in ``jax.checkpoint``.
+            min_consecutive: minimum number of consecutive time steps per constraint evaluation.
+            jacobian: ``(rows, lids)`` to also return constraint-row Jacobians for a constrained optimiser
+                (MMA): the rows of ``individual_losses`` and the parameter blocks, raveled in that order.
+                ``None`` returns only the objective gradient.
         """
         loss_fn = self._make_loss_fn(
             self.compiled_constraints_fn,
@@ -1817,7 +2117,48 @@ class core:
             (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
             return grads, rng, total_loss, individual_losses
 
-        return grad_fn
+        if jacobian is None:
+            return grad_fn
+        rows, lids = list(jacobian[0]), list(jacobian[1])
+
+        def grad_jac_fn(trainable, rng, context):
+            """The objective gradient AND the constraint rows (w.r.t. the blocks ``lids``, raveled in that order)
+            from ONE forward pass: one ``jax.vjp``, then its pullback over the stacked seeds (objective first,
+            then one per row) in ONE ``lax.map``. A constrained optimiser otherwise ran a second program for its
+            Jacobian, with a second forward solve -- a second factorisation of every FEM system per step.
+
+            ``lax.map`` and not a Python loop: each pullback call traces the whole backward graph again (every
+            solve's adjoint, every assembly), so a loop put 1 + rows copies of it into the program and the
+            compile grew with the number of constraints. The map traces it once and runs it once per seed, in
+            sequence, so the peak memory is one backward pass. Not ``vmap`` (or ``lax.map(batch_size=...)``):
+            that holds every row's backward pass at once and batches host-callback and sparse solves, whose
+            cotangents ``custom_linear_solve`` gets wrong under ``vmap`` (see ``shared_solve.py``)."""
+            from jax.flatten_util import ravel_pytree
+
+            rng, step_rng = jax.random.split(rng)
+
+            def loss_wrapper(p):
+                with jax.named_scope("jno/core/loss"):
+                    return loss_fn(p, context, step_rng)
+
+            (total_loss, losses), pullback = jax.vjp(loss_wrapper, trainable)
+            n = 1 + len(rows)
+            seed_total = jnp.zeros((n,) + jnp.shape(total_loss), total_loss.dtype).at[0].set(1)
+            seed_rows = np.zeros((n,) + tuple(jnp.shape(losses)))
+            for r, i in enumerate(rows):
+                seed_rows[(r + 1, i)] = 1.0
+            seed_rows = jnp.asarray(seed_rows, losses.dtype)
+
+            def one(seed):
+                (g,) = pullback(seed)
+                block = jnp.concatenate([leaf.ravel() for lid in lids for leaf in jax.tree_util.tree_leaves(g[lid])])
+                return ravel_pytree(g)[0], block
+
+            flat, blocks = jax.lax.map(one, (seed_total, seed_rows))
+            grads = ravel_pytree(trainable)[1](flat[0])
+            return grads, rng, total_loss, losses, blocks[1:] if rows else jnp.zeros((0, 1))
+
+        return grad_jac_fn
 
     def make_apply_fn(
         self,
@@ -1833,6 +2174,11 @@ class core:
                 -> (trainable, opt_states)
 
         Used together with :meth:`make_grad_fn` for gradient accumulation.
+
+        Args:
+            per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
+            lr_schedules: ``{layer_id_str: LearningRateSchedule}``.
+            group_lr_schedules: per-parameter-group schedules, as for :meth:`make_step_fn`.
         """
         lid_keys = sorted(per_model_opts.keys())
         base_epoch = self._total_epochs
@@ -1878,33 +2224,16 @@ class core:
 
         return apply_fn
 
-    def _tree_text(self) -> str:
-        """Print the computation tree for every constraint and tracker.
+    def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
+        """Compile the constraint list: wrap, deduplicate and fuse expressions, prepare the domain data,
+        and initialise and shard the models.
 
-        Call this **after** constructing the ``core`` object (which calls
-        ``compile`` internally) so that ``self.constraints`` is populated.
+        Called by :meth:`solve` and :meth:`eval`; call it directly only to compile ahead of time.
 
         Args:
-            file: Optional path.  When given the tree is written to that
-        Text builder behind ``jno.info(crux, deep=True)``; not a public entry of its own.
+            mesh: device-mesh shape ``(batch, model)`` for data and model parallelism; ``(1, 1)`` runs
+                on one device.
         """
-        constraints = self.wrap_constraints(self.constraints)
-        parts: list[str] = []
-        for i, expr in enumerate(constraints):
-            if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
-                parts.append(f"=== Tracker {i} ===")
-                parts.append(dump_tree(expr))
-            elif isinstance(expr, Tracker):
-                parts.append(f"=== Tracker {i} ===")
-                parts.append(dump_tree(expr))
-            else:
-                parts.append(f"=== Constraint {i} ===")
-                parts.append(dump_tree(expr))
-            parts.append("")
-
-        return "\n".join(parts)
-
-    def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
         # === Parallelism ===
         self._setup_parallelism(mesh)
 
@@ -1922,7 +2251,7 @@ class core:
         # Runs after CSE so structurally identical targets are already a single
         # object and the per-coordinate terms can be matched by identity; the
         # second CSE re-shares whatever the rewrite introduced.
-        constraints = [cse(fuse_laplacian(c)) for c in constraints]
+        constraints = [cse(fuse_laplacian(refuse_point_index(c))) for c in constraints]
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
@@ -1949,6 +2278,7 @@ class core:
             # swap the core has NOT seen can be caught instead of silently ignored (see
             # `_check_modules_unchanged`).
             self._module_refs = {lid: layer.module for lid, layer in self._collect_flax_modules().items()}
+            mark_pointwise_targets(constraints, self._unwrapped_models, self.domain_data.context, self.log)
         else:
             self.domain_data = None
             self.models = {}
@@ -1973,12 +2303,23 @@ class core:
         # optimiser descends. See `jno.le` and `_make_loss_fn`.
         self._inequality_idx: list[int] = []
         self._inequality_senses: list[str] = []
+        # Rows of `.auglag()` constraints (a subset of the inequality rows: handled by their own
+        # multipliers, not by a constrained optimiser), and the rows of their penalties, which are
+        # summed into the loss unaveraged so each multiplier reads its exact gradient.
+        self._auglag_idx: list[int] = []
+        self._penalty_idx: list[int] = []
+        # Rows of `jno.eq` constraints (a subset of the `.auglag()` rows): feasible at |g| = 0, not g <= 0.
+        self._equality_idx: list[int] = []
+        # Row -> layer id of its `.auglag()` multiplier parameter, read for the progress line and logs.
+        self._auglag_lid: dict[int, int] = {}
 
         for orig_expr, expr in zip(self.constraints, constraints):
             inner = expr
             tracker_interval = None
             tracker_reduce = None
             inequality_sense = None
+            _bare = expr.expr if isinstance(expr, OperationDef) else expr
+            penalty = bool(getattr(_bare, "_auglag_penalty", False))
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
                 tracker_interval = expr.expr.interval
                 tracker_reduce = expr.expr.reduce
@@ -1995,8 +2336,20 @@ class core:
                 inner = expr.residual
 
             if inequality_sense is not None:
+                if isinstance(_bare, AugLagConstraint):
+                    self._auglag_idx.append(len(constraint_exprs))
+                    self._auglag_lid[len(constraint_exprs)] = _bare.state.model.layer_id
+                elif inequality_sense == "eq":
+                    raise ValueError(
+                        "jno.core: a jno.eq constraint is enforced only by an augmented Lagrangian; "
+                        "write jno.eq(g, b).auglag(). MMA and GCMMA take inequalities only."
+                    )
+                if inequality_sense == "eq":
+                    self._equality_idx.append(len(constraint_exprs))
                 self._inequality_idx.append(len(constraint_exprs))
                 self._inequality_senses.append(inequality_sense)
+            if penalty:
+                self._penalty_idx.append(len(constraint_exprs))
 
             if tracker_interval is not None:
                 fn_expr = TraceCompiler.compile_traced_expression(inner, self.all_ops)
@@ -2008,7 +2361,8 @@ class core:
                 constraint_exprs.append(inner)
                 self._constraint_exprs.append(inner)
                 self._user_constraint_exprs.append(orig_expr)
-                self._constraint_names.append(_extract_user_name(orig_expr))
+                _nm = _extract_user_name(orig_expr)
+                self._constraint_names.append(f"auglag({_nm})" if penalty and _nm else ("auglag" if penalty else _nm))
 
         # Compile all normal constraints in ONE combined function so XLA
         # can apply CSE across shared sub-expressions.
@@ -2039,7 +2393,7 @@ class core:
         # Boolean row selector for the entries the loss is the mean OF. Built once, here, so the
         # step function stays free of Python-level branching.
         _obj = np.ones(self.n_constraints, dtype=bool)
-        for _i in self._inequality_idx:
+        for _i in self._inequality_idx + self._penalty_idx:
             _obj[_i] = False
         if self._inequality_idx and not _obj.any():
             raise ValueError(
@@ -2047,6 +2401,9 @@ class core:
                 "minimise. Add the quantity you want minimised as a plain (unwrapped) entry."
             )
         self._objective_mask = jnp.asarray(_obj)
+        _pen = np.zeros(self.n_constraints, dtype=bool)
+        _pen[self._penalty_idx] = True
+        self._penalty_mask = jnp.asarray(_pen)
 
         # Keep tag metadata and a pointwise residual function for adaptive
         # resampling. The normal training loss still uses reduced constraints
@@ -2067,6 +2424,7 @@ class core:
         self,
         epochs: int = 1000,
         batchsize: Optional[int] = None,
+        points: Optional[int] = None,
         checkpoint_gradients: bool = False,
         offload_data: bool = False,
         inner_steps: int = 1,
@@ -2085,7 +2443,25 @@ class core:
 
         Args:
             epochs: Number of training epochs.
-            batchsize: Mini-batch size (``None`` for full-batch).
+            batchsize: Mini-batch size over the **sample** axis — the one ``n * domain`` builds
+                (``None`` for full-batch). A single un-stacked domain has one sample, so
+                ``batchsize`` has nothing to draw from there; use *points* instead. Asking for
+                more than the number of stacked samples raises rather than sampling with
+                replacement.
+            points: Mini-batch size over the **collocation-point** axis (``None`` for all points).
+                This is the one to use for a dataset attached with :meth:`jno.domain.from_array`,
+                where every training example is a point rather than a stacked domain::
+
+                    crux.solve(epochs=4000, points=1024)      # 1024 of the N data points per step
+
+                Orthogonal to *batchsize*, so the two compose (``batchsize=8, points=1024``).
+                Tags holding fewer than *points* points are used whole, and any two tags with the
+                **same** point count are sliced identically, so an input field and its target stay
+                aligned. ``jno.noise.*`` follows the sub-sampled count automatically.
+
+                Raises when any constraint needs the full point set — a finite-difference
+                derivative (whose stencil reads a node's neighbours) or a FEM assembly (which
+                integrates over cells). Use ``scheme='automatic_differentiation'`` in that case.
             checkpoint_gradients: If ``True``, wrap each constraint's
                 forward pass in ``jax.checkpoint`` (gradient
                 checkpointing / activation rematerialisation).  Trades
@@ -2093,8 +2469,9 @@ class core:
                 memory.  Default ``False``.
             offload_data: If ``True``, keep the full training dataset in
                 host (CPU) memory and stream only the current mini-batch
-                to the device each step.  Requires ``batchsize`` to be
-                set.  Default ``False``.
+                to the device each step.  Requires a mini-batch on either
+                axis (``batchsize`` below the number of samples, or
+                *points*).  Default ``False``.
             inner_steps: Number of gradient steps to fuse into a single
                 ``jax.lax.fori_loop`` call, amortising Python dispatch
                 overhead.  Must evenly divide *epochs*.  Default ``1``.
@@ -2102,8 +2479,9 @@ class core:
                 are averaged before a single optimizer update.  The
                 effective batch size becomes
                 ``batchsize * accumulation_steps`` while peak activation
-                memory stays proportional to *batchsize*.  Requires
-                ``batchsize`` to be set.  Default ``1``.
+                memory stays proportional to *batchsize*.  Requires a
+                mini-batch on either axis (``batchsize`` below the number
+                of samples, or *points*).  Default ``1``.
             min_consecutive: Minimum number of consecutive time steps
                 fed to each constraint evaluation. ``None`` means use all
                 available time steps. Default ``1``.
@@ -2131,9 +2509,31 @@ class core:
                     crux.solve(1_500, substeps=[[0, 1], [2, 3]])
                     # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
 
+        A domain with a ``rebuild(when=...)`` is watched: after every epoch its condition is read at
+        the current parameters, and once it holds the domain and the solvers built on it are rebuilt at
+        the current design and training continues (see :meth:`jno.domain.rebuild`). Callbacks then see
+        one ``on_solve_begin`` / ``on_training_end`` per stretch of training between rebuilds.
+
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        watched = self._rebuild_watch()
+        if watched and not self.__dict__.get("_in_rebuild_segment", False):
+            return self._solve_rebuilding(
+                watched,
+                epochs,
+                dict(
+                    batchsize=batchsize,
+                    checkpoint_gradients=checkpoint_gradients,
+                    offload_data=offload_data,
+                    inner_steps=inner_steps,
+                    accumulation_steps=accumulation_steps,
+                    min_consecutive=min_consecutive,
+                    profile=profile,
+                    substeps=substeps,
+                ),
+                callbacks,
+            )
         # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
         # couple them by the inferred method (line Dirichlet-Neumann or overlapping Schwarz), no PINN
         # training. `epochs` maps to the coupling iteration cap (line DN needs a few hundred).
@@ -2149,6 +2549,8 @@ class core:
 
         from jax._src import profiler as _jax_profiler
 
+        _epochs_run = epochs  # lowered where a callback stops the loop early
+
         if not self.constraints:
             raise ValueError(
                 "solve() requires at least one constraint. "
@@ -2161,10 +2563,19 @@ class core:
 
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
+        # Point-axis mini-batching. Stashed on self rather than threaded through every
+        # _make_loss_fn call site (bayesian / VI / substeps all build their own loss); it is read
+        # once at loss-build time, so it stays a Python static exactly like `batchsize`.
+        if points is not None and int(points) < 1:
+            raise ValueError(f"points must be >= 1, got {points}.")
+        self._points = int(points) if points is not None else None
+
         # Validate accumulation_steps
         if accumulation_steps < 1:
             raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
-        if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
+        # "Full batch" now means neither axis is sub-sampled: `points` splits the collocation points
+        # even when there is a single stacked sample, and accumulation is meaningful in that case.
+        if accumulation_steps > 1 and batchsize >= self.domain.total_samples and self._points is None:
             self.log.warning(
                 "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
             )
@@ -2278,11 +2689,19 @@ class core:
         from .optimizers import MMACallback as _MMACallback
         from .optimizers import MMAOptimizer as _MMAOptimizer
 
+        self._mma_cb = None
         _mma_blocks = [
             (_lid, _fm._opt_fn)
             for _lid, _fm in sorted(self._collect_flax_modules().items())
             if isinstance(_fm._opt_fn, _MMAOptimizer)
         ]
+        _plain_ineq = [i for i in getattr(self, "_inequality_idx", []) if i not in getattr(self, "_auglag_idx", [])]
+        if _mma_blocks and getattr(self, "_auglag_idx", None):
+            raise ValueError(
+                "jno.core: an .auglag() constraint cannot be combined with jno.optimizers.mma/gcmma. "
+                "MMA handles every jno.le/jno.ge row in its own dual, so the row would be enforced "
+                "twice. Drop .auglag() and let MMA take it, or optimise with a non-MMA optimiser."
+            )
         if _mma_blocks:
             if not getattr(self, "_inequality_idx", None):
                 raise ValueError(
@@ -2293,14 +2712,16 @@ class core:
             import optax as _optax_mma
 
             _cb_mma = _MMACallback(_mma_blocks, list(self._inequality_idx))
+            self._mma_cb = _cb_mma
             callbacks = [_cb_mma] + list(callbacks or [])
             for _lid, _ in _mma_blocks:
                 _engd_opt_overrides[_lid] = _optax_mma.sgd(1.0)
-        elif getattr(self, "_inequality_idx", None):
+        elif _plain_ineq:
             raise ValueError(
                 "jno.core: jno.le/jno.ge constraints were declared but no constrained optimiser "
                 "is attached, so they would be evaluated and then ignored. Attach one — e.g. "
-                "`param.optimizer(jno.optimizers.mma(move=0.2, lower=..., upper=...))`."
+                "`param.optimizer(jno.optimizers.mma(move=0.2, lower=..., upper=...))` — or enforce "
+                "the constraint with any optimiser through `jno.le(g, b).auglag()`."
             )
 
         # Guard: on_before_update hook callbacks (e.g. ENGDCallback).
@@ -2396,13 +2817,21 @@ class core:
             return None, sharded_ctx.context, total_samples_local
 
         # ── 0. Validate offload_data ──
-        if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
+        # `points` counts as sub-sampling here too: with it set, only a slice of each step's points is
+        # needed on device, which is exactly the case offloading exists for.
+        if (
+            offload_data
+            and getattr(self, "_points", None) is None
+            and (batchsize is None or batchsize >= self.domain.total_samples)
+        ):
             # A lazy source is the exception: streaming it is not a throughput choice but the only
             # way to read it at all, so keep offloading on even at full batch.
             if any(_is_lazy_source(v) for v in self.domain_data.context.values()):
                 batchsize = batchsize or self.domain.total_samples
             else:
-                self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
+                self.log.warning(
+                    "offload_data requires batchsize < total_samples (or points= set); ignoring offload_data for this run."
+                )
                 offload_data = False
 
         self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
@@ -2492,45 +2921,7 @@ class core:
                     self.log.warning(f"LoRA: No layers were adapted for model {lid}! LoRA has NO EFFECT on this model.")
 
         # ── 3. Build trainable filter ──
-        filter_spec = {}
-        for lid, model in models.items():
-            fm = flax_mods.get(lid)
-            if fm is not None and fm._lora_config is not None:
-                # LoRA modes:
-                # 1) fm._frozen=True  -> freeze everything; only LoRA adapters trainable.
-                #    (freeze().lora() or freeze().mask(M).lora() both land here — base
-                #    params outside LoRA-wrapped layers are frozen too.)
-                # 2) otherwise        -> partial LoRA: adapters trainable, wrapped bases
-                #    frozen, every other param stays trainable (mask(M).lora() case).
-                if fm._frozen:
-                    filter_spec[lid] = _lora_trainable_filter(model)
-                else:
-                    filter_spec[lid] = _partial_lora_trainable_filter(model)
-            elif fm is not None and fm._frozen:
-                # Whole model frozen – no arrays trainable
-                filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)
-            elif fm is not None and fm._trainable_param_mask is not None:
-                # Partial mask — only leaves marked True in the mask are trained.
-                # Non-array leaves (e.g. activation functions kept as module
-                # attributes) are always False so equinox does not misinterpret
-                # them as sub-filter callables.
-                filter_spec[lid] = jax.tree_util.tree_map(
-                    # Only train floating/complex arrays; integer/bool arrays
-                    # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
-                    lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
-                    model,
-                    fm._trainable_param_mask,
-                )
-            else:
-                # Normal – every array trainable, non-arrays (e.g. activation
-                # functions stored as attributes) must be False, not the
-                # original value — equinox interprets callables in the
-                # filter spec as sub-filters.
-                filter_spec[lid] = jax.tree_util.tree_map(
-                    # Gradients are defined only for inexact dtypes.
-                    lambda leaf: True if eqx.is_inexact_array(leaf) else False,
-                    model,
-                )
+        filter_spec = _trainable_filter(models, flax_mods)
 
         # ── 4. Three-way partition ──
         trainable, rest = eqx.partition(models, filter_spec)
@@ -2559,29 +2950,9 @@ class core:
             self.log.info(f"    LoRA % of total:       {100.0 * n_lora_params_total / n_total_params:>11.2f}%")
 
         # ── Per-model policy report ──
-        for lid, model in models.items():
-            fm = flax_mods.get(lid)
-            if fm is None:
-                continue
-            mname = fm.name or type(fm.module).__name__
-            m_total = sum(param.size for param in jax.tree_util.tree_leaves(model) if eqx.is_array(param))
-            fspec = filter_spec.get(lid)
-            if fspec is not None:
-                m_train = sum(
-                    param.size
-                    for param, f in zip(
-                        jax.tree_util.tree_leaves(model),
-                        jax.tree_util.tree_leaves(fspec),
-                    )
-                    if eqx.is_array(param) and f is True
-                )
-            else:
-                m_train = m_total
-            m_frozen = m_total - m_train
-            m_lora = lora_param_counts.get(lid, 0)
-            policy = "LoRA" if fm._lora_config else ("frozen" if fm._frozen else "full fine-tune")
-            if fm._trainable_param_mask is not None and fm._lora_config:
-                policy = "LoRA + partial base"
+        for mname, policy, m_train, m_frozen, m_lora in _parameter_counts(
+            models, filter_spec, flax_mods, lora_param_counts
+        ):
             self.log.info(f"    [{mname}] policy={policy}  train={m_train:,}  frozen={m_frozen:,}  lora={m_lora:,}")
 
         # Shard trainable params
@@ -3013,7 +3384,13 @@ class core:
                     opt_fn = opt_fn.build()
                     lr_sched = _normalize_lr_sched(LearningRateSchedule(1.0))
 
-                per_model_opts[k] = _build_opt_chain(opt_fn, lr_sched)
+                from .optimizers import BoundedOptimizer as _BoundedOptimizer
+
+                if isinstance(opt_fn, _BoundedOptimizer):
+                    # The projection goes after the whole chain, the LR scale included.
+                    per_model_opts[k] = opt_fn.project(_build_opt_chain(opt_fn.inner, lr_sched))
+                else:
+                    per_model_opts[k] = _build_opt_chain(opt_fn, lr_sched)
                 lr_schedules[k] = lr_sched
 
         # Validate that all Bayesian models in this solve share the same
@@ -3081,8 +3458,6 @@ class core:
                 ),
                 state,
             )
-
-        self._log_constraint_shapes(batchsize, min_consecutive=min_consecutive)
 
         # ── 5b. Resume from checkpoint (optional) ──
         if self._resume_from is not None:
@@ -3428,13 +3803,26 @@ class core:
 
         # ── 7c. Build split grad/apply for on_before_update hooks (non-accumulation) ──
         # Not needed for the accumulation path — it already separates grad and apply.
+        _jac_requests = [
+            (cb, cb.jacobian_request()) for cb in (callbacks or []) if callable(getattr(cb, "jacobian_request", None))
+        ]
+        _jac_requests = [(cb, req) for cb, req in _jac_requests if req is not None]
+        if len(_jac_requests) > 1:  # one shared program serves one request; more fall back to their own
+            _jac_requests = []
+        _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)
         if _has_before_update_hooks and not _use_accumulation:
-            _hook_grad_fn = self.make_grad_fn(
-                batchsize=effective_batchsize,
-                frozen=frozen_arrays,
-                static=static,
-                checkpoint_gradients=checkpoint_gradients,
-                min_consecutive=min_consecutive,
+            # traced with poisoned residual gates: no host callback in the program, so JAX's persistent cache
+            # can store it (a design step can take many minutes to compile); every step's outputs are then
+            # checked for finiteness below, where a failed solve shows as NaN
+            _hook_grad_fn = _with_poisoned_gates(
+                self.make_grad_fn(
+                    batchsize=effective_batchsize,
+                    frozen=frozen_arrays,
+                    static=static,
+                    checkpoint_gradients=checkpoint_gradients,
+                    min_consecutive=min_consecutive,
+                    jacobian=_jac_req,
+                )
             )
             _hook_apply_fn = self.make_apply_fn(
                 per_model_opts=per_model_opts,
@@ -3612,7 +4000,8 @@ class core:
                 _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
                 _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
 
-                jit_hook_grad = _cache.get("hook_grad") or jax.jit(
+                _hg_key = "hook_grad" if _jac_req is None else ("hook_grad_jac", tuple(_jac_req[0]), tuple(_jac_req[1]))
+                jit_hook_grad = _cache.get(_hg_key) or jax.jit(
                     _hook_grad_fn,
                     in_shardings=(
                         _trainable_sharding,
@@ -3624,7 +4013,8 @@ class core:
                         replicated,  # rng
                         replicated,  # total_loss
                         replicated,  # individual_losses
-                    ),
+                    )
+                    + ((replicated,) if _jac_req is not None else ()),  # constraint Jacobian rows
                 )
                 jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
@@ -3642,7 +4032,7 @@ class core:
                     donate_argnums=(2,),  # donate grads buffer
                 )
                 if _step_key is not None:
-                    _cache["hook_grad"], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
+                    _cache[_hg_key], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
             if has_trackers:
                 jit_track = jax.jit(track_fn)
@@ -3747,18 +4137,13 @@ class core:
                         f"Substep {_si}: constraints={_indices}, n_steps={_n_steps_i}, active_models={sorted(_active_lids)}"
                     )
 
-            self.log.info("JIT compiling step function with mesh sharding — this might take a while")
+            if _cached_step is None or _use_substeps or _use_accumulation:  # a reused step compiles nothing
+                self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
-            # ── Enable persistent XLA compilation cache ──
-            # On the first run XLA compiles and writes artifacts to disk.
-            # Subsequent runs with the same network/batchsize/dtype reload
-            # from disk and skip compilation entirely, saving minutes for
-            # large models.  The cache is keyed on the full XLA program hash
-            # so stale entries are never loaded for a different graph.
-            _cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jno", "xla_cache")
-            os.makedirs(_cache_dir, exist_ok=True)
-            jax.config.update("jax_compilation_cache_dir", _cache_dir)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+            # The persistent compilation cache is configured once, at `import jno` (jno.utils.config:
+            # on by default, or the user's opt-out); solve() leaves that setting alone. (It used to set a
+            # second directory here and raise the minimum compile time from 0 to 1 s for the rest of the
+            # process, overriding an opt-out.)
 
             # Trigger AOT compilation so the first real step is fast.
 
@@ -3855,7 +4240,7 @@ class core:
                     del _gw
                 elif _has_before_update_hooks:
                     for _ in range(3):
-                        _gw, _rw, _, _ = jit_hook_grad(_tw, _rw, trace_context)
+                        _gw, _rw = jit_hook_grad(_tw, _rw, trace_context)[:2]  # (+ Jacobian rows when requested)
                         _, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 else:
@@ -3887,6 +4272,8 @@ class core:
                         min_consecutive=min_consecutive,
                         constraint_exprs=self._user_constraint_exprs,
                         constraint_names=self._constraint_names,
+                        inequality_idx=list(getattr(self, "_inequality_idx", None) or []),
+                        equality_idx=list(getattr(self, "_equality_idx", None) or []),
                         all_ops=self.all_ops,
                         domain=self.domain,
                     )
@@ -3909,6 +4296,7 @@ class core:
             log_total_loss = []
             log_timestamps = []
             log_track_stats = []
+            log_multipliers = []
 
             # Bayesian sample buffers — one per Bayesian model.  We append the
             # post-update position (a device array pytree) every `thin` outer
@@ -4463,6 +4851,7 @@ class core:
                                 _micro_grads,
                             )
                         _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
+                        _release_idle_solver_memory()
                         _acc_losses = _acc_losses + _micro_indiv * _inv_accum
 
                     # Apply on_before_update hooks to accumulated gradients.
@@ -4508,9 +4897,14 @@ class core:
 
                     if _has_before_update_hooks:
                         # Split path: grad → on_before_update hooks → apply.
-                        _hgrads, self.rng, total_loss, individual_losses = jit_hook_grad(trainable, self.rng, context)
+                        _hout = jit_hook_grad(trainable, self.rng, context)
+                        _hgrads, self.rng, total_loss, individual_losses = _hout[:4]
+                        _hjac = _hout[4] if len(_hout) > 4 else None
+                        _raise_if_step_not_finite(outer_epoch, total_loss, individual_losses, _hgrads, _hjac)
+                        _release_idle_solver_memory()
                         for _cb in callbacks:
                             if type(_cb).on_before_update is not _Callback.on_before_update:
+                                _extra = {"constraint_jacobian": _hjac} if (_cb is _jac_cb and _hjac is not None) else {}
                                 _modified = _cb.on_before_update(
                                     grads=_hgrads,
                                     trainable=trainable,
@@ -4519,9 +4913,11 @@ class core:
                                     epoch=outer_epoch,
                                     total_loss=total_loss,
                                     individual_losses=individual_losses,
+                                    **_extra,
                                 )
                                 if _modified is not None:
                                     _hgrads = _modified
+                        _release_idle_solver_memory()  # a hook may have run programs of its own (MMA's Jacobian)
                         trainable, opt_states = jit_hook_apply(trainable, opt_states, _hgrads, epoch_jnp, prev_losses)
                         epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
                         _step_bayesian_info: Dict[str, Dict[str, jnp.ndarray]] = {}
@@ -4714,6 +5110,9 @@ class core:
 
                     log_epochs.append(displayed_epoch)
                     log_losses.append(losses_np)
+                    _lam_np = self._multipliers_now(trainable)
+                    if _lam_np is not None:
+                        log_multipliers.append(_lam_np)
                     log_total_loss.append(total_np)
                     log_timestamps.append(time.time())
 
@@ -4744,6 +5143,15 @@ class core:
                         f"{(_cn_log[i] if i < len(_cn_log) and _cn_log[i] else f'C{i}')}: {float(v):>10.4e}"
                         for i, v in enumerate(losses_np)
                     )
+                    if _lam_np is not None:
+                        # The Lagrange multiplier of each constraint row that has one (MMA's dual, or
+                        # an `.auglag()` multiplier): how much the objective would drop per unit of
+                        # slack in that bound, and zero for an inactive inequality.
+                        loss_strs += "".join(
+                            f" | λ[{_cn_log[i] if i < len(_cn_log) and _cn_log[i] else f'C{i}'}]: {float(lv):>10.4e}"
+                            for i, lv in zip(self._inequality_idx, _lam_np)
+                            if np.isfinite(lv)
+                        )
                     if track_stats_np is not None:
                         track_strs = " | ".join(
                             f"{(_tn_log[i] if i < len(_tn_log) and _tn_log[i] else f'T{i}')}: {float(v):>10.4e}"
@@ -4774,6 +5182,7 @@ class core:
                         if cb.on_epoch_end(**cb_info):
                             _stop_requested = True
                     if _stop_requested:
+                        _epochs_run = epoch + inner_steps
                         break
 
                 # Commit the W&B row for this step.  When step= is passed to
@@ -4939,6 +5348,10 @@ class core:
                 "total_params": n_total_params,
                 "lora_params": n_lora_params_total,
             }
+            if log_multipliers:
+                # (logged epochs, constraint rows), columns in the order of `_inequality_idx`; NaN
+                # where a row has no multiplier yet (MMA's before its first step).
+                logs["multipliers"] = np.stack(log_multipliers)
             if log_track_stats:
                 _all_scalar = all(v.ndim == 0 for row in log_track_stats for v in row)
                 logs["track_stats"] = np.array(log_track_stats) if _all_scalar else log_track_stats
@@ -4984,7 +5397,7 @@ class core:
                 )
                 wandb_log_model(self)
 
-        self._total_epochs += epochs
+        self._total_epochs += _epochs_run
         # Hand the optimizer states to the next solve() so schedules continue across the call.
         self._opt_states = opt_states
 
@@ -5091,114 +5504,6 @@ class core:
             "path, which reads the module at solve time."
         )
 
-    def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
-        """Log the output shape of each constraint by doing a test evaluation.
-
-        When the log level is DEBUG, prints a full shape-annotated tree
-        for each constraint so users can see how shapes evolve through
-        every node of the expression.
-        """
-
-        # Create dummy inputs for shape inference
-        test_rng = jax.random.PRNGKey(0)
-
-        # Use jax.eval_shape to get output shape without computation
-        _models = self._unwrapped_models
-        out_shape = jax.eval_shape(
-            lambda: self.compiled_constraints_fn(
-                _models,
-                self._shape_probe_context(),
-                batchsize=batchsize,
-                key=test_rng,
-                min_consecutive=min_consecutive,
-            )
-        )
-
-        # For each constraint, also get the shape *before* the final
-        # reduction (e.g. .mse) so the log shows the residual geometry.
-        # Constraints are stored as OperationDef(inner_expr); unwrap first.
-        constraint_exprs = getattr(self, "_constraint_exprs", [])
-
-        def _unwrap(expr):
-            """Unwrap OperationDef to get the inner expression."""
-            inner = expr.expr if isinstance(expr, OperationDef) else expr
-            if isinstance(inner, FunctionCall):
-                return inner.args[0], inner._name
-            return inner, None
-
-        parent_exprs = [_unwrap(expr) for expr in constraint_exprs]
-        # Only compile the parent layer if at least one expr has a parent
-        if any(name is not None for _, name in parent_exprs):
-            parent_fn = TraceCompiler.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
-            parent_shape = jax.eval_shape(
-                lambda: parent_fn(
-                    _models,
-                    self._shape_probe_context(),
-                    batchsize=batchsize,
-                    key=test_rng,
-                    min_consecutive=min_consecutive,
-                )
-            )
-        else:
-            parent_shape = [None] * len(out_shape)
-
-        for i, (const, (_, op_name)) in enumerate(zip(out_shape, parent_exprs)):
-            p_shape = parent_shape[i]
-            if op_name is not None and p_shape is not None:
-                self.log.info(f"Constraint {i}: Shape = {p_shape.shape} → .{op_name}() → {const.shape}")
-            else:
-                self.log.info(f"Constraint {i}: Shape = {const.shape}")
-
-        for i, (_, fn) in enumerate(self.compiled_trackers):
-            # Use jax.eval_shape to get output shape without computation
-            out_shape = jax.eval_shape(
-                lambda: fn(
-                    _models,
-                    self._shape_probe_context(),
-                    batchsize=batchsize,
-                    key=test_rng,
-                    min_consecutive=min_consecutive,
-                )
-            )
-
-            # Also get the pre-reduction shape for tracker expressions
-            tracker_exprs = getattr(self, "_tracker_exprs", [])
-            tracker_expr = tracker_exprs[i] if i < len(tracker_exprs) else None
-            # Trackers may also be wrapped in OperationDef
-            if tracker_expr is not None and isinstance(tracker_expr, OperationDef):
-                tracker_expr = tracker_expr.expr
-            if tracker_expr is not None and isinstance(tracker_expr, FunctionCall):
-                t_parent_fn = TraceCompiler.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
-                t_parent_shape = jax.eval_shape(
-                    lambda: t_parent_fn(
-                        _models,
-                        self._shape_probe_context(),
-                        batchsize=batchsize,
-                        key=test_rng,
-                        min_consecutive=min_consecutive,
-                    )
-                )
-                t_shape = t_parent_shape[0]
-                op_name = tracker_expr._name
-            else:
-                t_shape = None
-                op_name = None
-
-            if not isinstance(out_shape, tuple):
-                if t_shape is not None:
-                    self.log.info(f"Tracker {i}: Shape = {t_shape.shape} → .{op_name}() → {out_shape.shape}")
-                else:
-                    self.log.info(f"Tracker {i}: Shape = {out_shape.shape}")
-            else:
-                self.log.info(f"Tracker {i}: {out_shape}")
-
-        # === Detailed shape trace (logged at DEBUG level) ===
-        is_enabled_for = getattr(self.log, "isEnabledFor", None)
-        if callable(is_enabled_for) and bool(is_enabled_for(10)):
-            self._log_shape_traces(min_consecutive=min_consecutive)
-
-        return None
-
     def _build_shape_context(self, min_consecutive: Optional[int] = 1) -> dict:
         """Build a single-sample runtime context for shape tracing.
 
@@ -5245,60 +5550,6 @@ class core:
                 ctx_single[tag] = arr
         return ctx_single
 
-    def _log_shape_traces(self, min_consecutive: Optional[int] = 1):
-        """Emit per-node shape trees for constraints and trackers.
-
-        Called automatically when log level is DEBUG, and by ``jno.info(crux, deep=True)``.
-        """
-        ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self._unwrapped_models)
-
-        all_exprs = getattr(self, "_constraint_exprs", [])
-        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
-
-        for i, expr in enumerate(all_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.debug(f"Constraint {i} shape trace:\n{tree}")
-            except Exception as exc:
-                self.log.debug(f"Constraint {i} shape trace failed: {exc}")
-
-        for i, expr in enumerate(all_tracker_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                self.log.debug(f"Tracker {i} shape trace:\n{tree}")
-            except Exception as exc:
-                self.log.debug(f"Tracker {i} shape trace failed: {exc}")
-
-    def _shapes_text(self, min_consecutive: Optional[int] = 1) -> str:
-        """Print shape-annotated expression trees to stdout.
-
-        Can be called any time after ``compile()`` or ``solve()`` has run. Reachable as
-        ``print(jno.info(crux, deep=True))`` -- useful for troubleshooting shape mismatches.
-        """
-        _out: list[str] = []
-        ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self._unwrapped_models)
-
-        all_exprs = getattr(self, "_constraint_exprs", [])
-        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
-
-        for i, expr in enumerate(all_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out += [f"═══ Constraint {i} ═══", str(tree)]
-            except Exception as exc:
-                _out.append(f"═══ Constraint {i} ═══  FAILED: {exc}")
-
-        for i, expr in enumerate(all_tracker_exprs):
-            try:
-                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
-                _out += [f"═══ Tracker {i} ═══", str(tree)]
-            except Exception as exc:
-                _out.append(f"═══ Tracker {i} ═══  FAILED: {exc}")
-
-        return "\n".join(_out)
-
     def sweep(
         self,
         space: ArchSpace,
@@ -5311,7 +5562,7 @@ class core:
         Args:
             space: ArchSpace defining the search space (architecture + training params)
             optimizer: Nevergrad optimizer name (e.g., "NGOpt", "OnePlusOne", "CMA"),
-                      class, or None for exhaustive grid search
+                class, or None for exhaustive grid search
             budget: Number of configurations to try (ignored for grid search)
             devices: Device specification for parallel execution:
                 - None: auto-detect and use all available devices
@@ -5424,6 +5675,67 @@ class core:
 
         return choices
 
+    def _rebuild_watch(self):
+        """The domains with a ``rebuild(when=...)`` whose condition reads this core's parameters."""
+        from .domain.domain_class import _REBUILDING_DOMAINS
+
+        if not _REBUILDING_DOMAINS:
+            return []
+        from ._fem import _walk
+
+        # by the parameter OBJECTS: layer ids restart with every core, so an old domain's condition
+        # could otherwise name this core's parameters
+        ours = {id(m) for m in self._collect_flax_modules().values()}
+        out = []
+        for d in list(_REBUILDING_DOMAINS):
+            when = d._rebuild_spec["when"]
+            mine = {id(m.model) for m in _walk(when) if type(m).__name__ == "ModelCall"}
+            if mine & ours:
+                out.append(d)
+        return out
+
+    def _solve_rebuilding(self, watched, epochs, kw, callbacks):
+        """:meth:`solve` in stretches that end where a watched domain's condition holds; between two,
+        the domain is rebuilt at the current design. The optimizer state carries over (a second
+        ``solve`` continues the first), unless a domain asked for ``keep_opt_state=False``."""
+        watch = _RebuildWatch(watched)
+        done, out = 0, None
+        while done < epochs:
+            watch.arm()
+            self._in_rebuild_segment = True
+            try:
+                out = self.solve(epochs - done, callbacks=list(callbacks or []) + [watch], **kw)
+            finally:
+                self._in_rebuild_segment = False
+            if not watch.fired:
+                break  # the stretch ran to its end, or a user callback stopped it
+            done += watch.epochs_run
+            if done >= epochs:
+                break  # it held on the last epoch: there is no training left to rebuild for
+            n = sum(d._rebuild_at(watch.values) for d in watch.fired)
+            self.__dict__.setdefault("_rebuild_epochs", []).append(self._total_epochs)
+            self.log.info(
+                f"rebuild after epoch {self._total_epochs}: `when` held on {len(watch.fired)} domain(s); the shape "
+                f"is rebuilt at the current design with {n} solver(s), and training continues"
+            )
+            modules, fired = watch.modules, list(watch.fired)
+            watch = _RebuildWatch(watched)  # its compiled conditions read the old discretisation
+            still = watch.holding(modules)
+            if still:
+                raise RuntimeError(
+                    f"domain.rebuild: `when` still holds on {len(still)} domain(s) just rebuilt at the current "
+                    "design, so the next epoch would rebuild again, and again. A fresh discretisation "
+                    "cannot satisfy this condition here: loosen it, or make the cells finer (a smaller "
+                    "`size=` / `pitch=`) so the rebuilt cells meet it."
+                )
+            self._jit_program_cache = None
+            self._eval_cache = weakref.WeakKeyDictionary()
+            if self.domain in fired:
+                self.domain_data = self.prepare_domain_data(self.domain)
+            if not all(d._rebuild_spec["keep_opt_state"] for d in fired):
+                self._opt_states = None
+        return out
+
     def eval(
         self,
         operation: Union[List[BinaryOp], BinaryOp],
@@ -5436,7 +5748,7 @@ class core:
 
         Args:
             operation: Expression(s) to evaluate.
-            domain:    Override the stored domain.
+            domain: Override the stored domain.
             min_consecutive: Consecutive-time-step window for time-dependent
                 expressions.
             key: Optional PRNG key for stochastic ops.
@@ -5498,15 +5810,53 @@ class core:
                 # Same rewrite the training path gets, so an expression evaluated here
                 # costs what it costs inside the loss. The cache stays keyed on the
                 # caller's original object.
-                raw_fn = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(op)), self.all_ops)
+                raw_fn = TraceCompiler.compile_traced_expression(cse(fuse_laplacian(refuse_point_index(op))), self.all_ops)
                 # Bake min_consecutive into the closure — it controls array shapes
                 # inside the compiled function and must remain a static Python int
                 # for XLA to reuse the compiled kernel across calls.
                 op_entry[min_consecutive] = eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive))
-            return op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            out = op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
+            _release_idle_solver_memory()  # one program per expression: free what it left behind
+            return out
+
+        def _batch_sizes(op):
+            """the sample-batch sizes the compiled function would see for ``op`` alone (its tags' leading axes)"""
+            from .trace import collect_tags
+            from .trace_compiler import CONTEXT_METADATA_TAGS
+
+            tags = collect_tags(op)
+            return frozenset(
+                int(arr.shape[0])
+                for tag, arr in ctx.items()
+                if tag in tags and tag != "__time__" and tag not in CONTEXT_METADATA_TAGS and getattr(arr, "ndim", 0) >= 1
+            )
+
+        def _point_eval_all(ops):
+            """Several expressions as ONE program (one evaluator scope, as the training step evaluates its list):
+            a solve or integral they share is computed once, and there is one compile instead of one per
+            expression. Expressions the compiled function would batch differently (different sample-batch sizes)
+            keep one program each, so every result has the shape it has alone."""
+            if len(ops) < 2 or len({_batch_sizes(op) for op in ops}) > 1:
+                return [_point_eval(op) for op in ops]
+            entry = self._eval_cache.get(ops[0])
+            if entry is None:
+                self._eval_cache[ops[0]] = entry = {}
+            slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
+            hit = entry.get(slot)
+            if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
+                raw_fn = TraceCompiler.compile_multi_expression(
+                    [cse(fuse_laplacian(refuse_point_index(op))) for op in ops], self.all_ops
+                )
+                hit = entry[slot] = (
+                    [weakref.ref(op) for op in ops[1:]],
+                    eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
+                )
+            out = list(hit[1](_models, ctx, batchsize=None, key=key))
+            _release_idle_solver_memory()
+            return out
 
         if samples == "point":
-            results = [_point_eval(op) for op in operation]
+            results = _point_eval_all(operation)
             return results[0] if len(results) == 1 else results
 
         # samples == "auto" or "chain": walk each expression to discover its
@@ -5578,12 +5928,12 @@ class core:
             # ``(K, N, *expr_shape)``.
             return jax.vmap(jax.vmap(_one))(chain_part)
 
-        results = []
-        for op, posterior_by_lid in zip(operation, per_op_chains):
-            if posterior_by_lid or (samples == "chain"):
-                results.append(_chain_eval(op, posterior_by_lid))
-            else:
-                results.append(_point_eval(op))
+        chained = [bool(posterior_by_lid) or samples == "chain" for posterior_by_lid in per_op_chains]
+        pointwise = iter(_point_eval_all([op for op, c in zip(operation, chained) if not c]))
+        results = [
+            _chain_eval(op, posterior_by_lid) if c else next(pointwise)
+            for op, posterior_by_lid, c in zip(operation, per_op_chains, chained)
+        ]
 
         return results[0] if len(results) == 1 else results
 

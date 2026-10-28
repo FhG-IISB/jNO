@@ -111,44 +111,22 @@ from .weak_form_helpers import (
 
 @dataclass(frozen=True)
 class LoweredChannelTerm:
-    """
-    One lowered weak-form term in backend-neutral IR.
+    """One lowered weak-form term in backend-neutral IR.
 
-    A symbolic weak-form expression is first split into additive terms. Each
-    additive term is then classified by support, region, and channel.
+    A symbolic weak-form expression is first split into additive terms; each is then classified by
+    support, region and channel.
 
-    Fields
-    ------
-    sign:
-        Original additive sign of the term, usually +1.0 or -1.0.
-    support:
-        Geometric support of the term. Usually `"volume"` or `"boundary"`.
-    region_id:
-        Region identifier. For volume terms this is usually `"volume"`.
-        For boundary terms this is the boundary tag, for example `"left"`,
-        `"right"`, or `"top"`.
-    channel:
-        Lowered channel name.
-
-        For VPINN lowering:
-            `"test_value"`:
-                volume term multiplying the test function value.
-            `"test_grad"`:
-                volume term multiplying the test function gradient.
-            `"boundary_test_value"`:
-                boundary term multiplying the test function value.
-
-        For FEM lowering:
-            `"raw"`:
-                original weak-form term kept in raw symbolic form.
-    coeff:
-        Symbolic coefficient expression after channel extraction.
-    variable_id:
-        Reserved id for multi-field systems. Currently usually 0.
-    value_shape:
-        Value shape of the weak unknown/test function.
-    original_expr:
-        Original symbolic term before channel extraction.
+    Attributes:
+        sign: the term's additive sign, usually ``+1.0`` or ``-1.0``.
+        support: ``"volume"`` or ``"boundary"``.
+        region_id: the region: ``"volume"`` for volume terms, the boundary tag (``"left"``, ...) otherwise.
+        channel: how the test function enters: ``"test_value"`` (volume, times ``phi``),
+            ``"test_grad"`` (volume, times ``grad phi``), ``"boundary_test_value"`` (boundary, times
+            ``phi``) for VPINN lowering, or ``"raw"`` (the term kept as written) for FEM lowering.
+        coeff: the coefficient expression after channel extraction.
+        variable_id: the field index in a multi-field system (currently usually 0).
+        value_shape: value shape of the unknown/test function.
+        original_expr: the term before channel extraction.
     """
 
     sign: float
@@ -163,8 +141,7 @@ class LoweredChannelTerm:
 
 @dataclass
 class LoweredWeakForm:
-    """
-    Backend-neutral lowered representation of a weak form.
+    """Backend-neutral lowered representation of a weak form.
 
     `LoweredWeakForm` stores a list of `LoweredChannelTerm` objects and exposes
     convenience properties for the different backend routes.
@@ -185,20 +162,26 @@ class LoweredWeakForm:
             Dictionary mapping boundary region id to coefficients multiplying
             boundary test-function values.
 
-    Parameters
-    ----------
-    domain:
-        Domain that owns the quadrature/FEM context.
-    terms:
-        Lowered weak-form terms.
+    Args:
+        domain: Domain that owns the quadrature/FEM context.
+        terms: Lowered weak-form terms.
     """
 
     domain: Any
     terms: List[LoweredChannelTerm] = field(default_factory=list)
 
     def select(self, *, support=None, region_id=None, channel=None, variable_id=None):
-        """
-        Select lowered terms matching optional support, region, channel, and variable id.
+        """Select the lowered terms matching the given filters.
+
+        Args:
+            support: ``"volume"`` or ``"boundary"``; ``None`` matches any.
+            region_id: the region; ``None`` matches any.
+            channel: ``"test_value"``, ``"test_grad"``, ``"boundary_test_value"`` or ``"raw"`` (see
+            :class:`LoweredChannelTerm`); ``None`` matches any.
+            variable_id: the unknown (field) index; ``None`` matches any.
+
+        Returns:
+            list: the matching terms.
         """
         out = []
         for t in self.terms:
@@ -214,10 +197,17 @@ class LoweredWeakForm:
         return out
 
     def sum_coeffs(self, *, support=None, region_id=None, channel=None, variable_id=None):
-        """
-        Sum coefficients of all lowered terms matching the given filters.
+        """Sum the coefficients of all lowered terms matching the given filters.
 
-        Returns None if no matching terms exist.
+        Args:
+            support: ``"volume"`` or ``"boundary"``; ``None`` matches any.
+            region_id: the region; ``None`` matches any.
+            channel: ``"test_value"``, ``"test_grad"``, ``"boundary_test_value"`` or ``"raw"`` (see
+            :class:`LoweredChannelTerm`); ``None`` matches any.
+            variable_id: the unknown (field) index; ``None`` matches any.
+
+        Returns:
+            The summed coefficient expression, or ``None`` if no term matches.
         """
         coeffs = [
             t.coeff
@@ -256,14 +246,17 @@ class LoweredWeakForm:
     # VPINN-facing canonical channels
     @property
     def volume_value_expr(self):
+        """The volume coefficient multiplying ``phi`` (field 0), or ``None``."""
         return self.sum_coeffs(support="volume", channel="test_value", variable_id=0)
 
     @property
     def volume_grad_expr(self):
+        """The volume coefficient multiplying ``grad phi`` (field 0), or ``None``."""
         return self.sum_coeffs(support="volume", channel="test_grad", variable_id=0)
 
     @property
     def boundary_value_exprs(self) -> Dict[str, Placeholder]:
+        """The boundary coefficients multiplying ``phi`` (field 0), by region."""
         out = {}
         region_ids = sorted({t.region_id for t in self.terms if t.support == "boundary"})
         for rid in region_ids:
@@ -781,7 +774,14 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         # inner(grad u, grad u). It stays in ``linearish`` for the common bilinear case
         # inner(grad u, grad v), where the second factor is the *test* function (not the unknown);
         # so we count factors carrying the unknown (any node type, not only Placeholder args).
-        if name in {"inner", "einsum"} and sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2:
+        # The same holds for every bilinear wrapper in ``linearish``: ``S @ S`` (a matrix unknown squared,
+        # e.g. an Oldroyd / Giesekus quadratic stress term), ``dot(u, u)``, ``u × u``. Only ``inner`` and
+        # ``einsum`` were checked once, so ``inner(S @ S, T)`` classified LINEAR; the linear path builds
+        # its operator at u = 0, where a quadratic term has no slope, and the term silently vanished
+        # (measured: scaling it by 10 left the solution unchanged to the last bit).
+        if name in {"inner", "einsum", "matmul", "matvec", "dot", "cross"} and (
+            sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2
+        ):
             return True
 
         # Jacobian/Hessian are handled through their own nodes
@@ -807,24 +807,17 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
 def lower_weak_form(domain, expr, trial_value=None):
-    """
-    Lower a symbolic weak-form expression into backend-neutral VPINN IR.
+    """Lower a symbolic weak-form expression into backend-neutral VPINN IR.
 
-    Parameters
-    ----------
-    domain:
-        Domain that owns the sampled quadrature/FEM context.
-    expr:
-        Symbolic weak-form expression.
-    trial_value:
-        Optional neural trial expression used when substituting TrialFunction
-        symbols for VPINN training.
+    Args:
+        domain: Domain that owns the sampled quadrature/FEM context.
+        expr: Symbolic weak-form expression.
+        trial_value: Optional neural trial expression used when substituting TrialFunction symbols for
+            VPINN training.
 
-    Returns
-    -------
-    LoweredWeakForm
-        Backend-neutral IR containing lowered weak-form terms, each split into
-        canonical VPINN channels: test-value, test-gradient, boundary-test-value.
+    Returns:
+        LoweredWeakForm: Backend-neutral IR containing lowered weak-form terms, each split into
+            canonical VPINN channels: test-value, test-gradient, boundary-test-value.
     """
     terms = _split_additive_terms(domain, expr)
     lowered_terms = []
@@ -867,24 +860,18 @@ def lower_weak_form(domain, expr, trial_value=None):
 
 
 def assemble_weak_form(domain, expr, **kwargs):
-    """
-    Assemble a jNO weak-form expression into a differentiable VPINN GroupedAssembly.
+    """Assemble a jNO weak-form expression into a differentiable VPINN GroupedAssembly.
 
     This is the implementation behind VPINN training in ``jno.core`` and ``jno.fem``.
     FEM matrix/residual assembly goes through ``jno.fem([...])``, not this function.
 
-    Parameters
-    ----------
-    domain:
-        Domain owning the expression. If None, inferred from symbolic variables in ``expr``.
-    expr:
-        Symbolic weak-form expression.
-    **kwargs:
-        ``trial_value`` (or legacy ``u_net``): optional neural trial expression.
+    Args:
+        domain: Domain owning the expression. If None, inferred from symbolic variables in ``expr``.
+        expr: Symbolic weak-form expression.
+        **kwargs: ``trial_value`` (or legacy ``u_net``): optional neural trial expression.
 
-    Returns
-    -------
-    GroupedAssembly
+    Returns:
+        GroupedAssembly
     """
     if domain is None:
         domain = _infer_domain_from_expr(expr)
@@ -900,8 +887,7 @@ def assemble_weak_form(domain, expr, **kwargs):
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
-    """
-    Convert lowered VPINN weak-form IR into a differentiable GroupedAssembly.
+    """Convert lowered VPINN weak-form IR into a differentiable GroupedAssembly.
 
     Returns:
         GroupedAssembly containing:
@@ -915,10 +901,9 @@ def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
         - num_total_nodes:
             number of global FEM/test nodes.
 
-    Notes
-    -----
-    This route does not solve a FEM system. It creates a differentiable weak
-    residual object evaluated during neural training.
+    Note:
+        This route does not solve a FEM system. It creates a differentiable weak
+        residual object evaluated during neural training.
     """
     if ir.volume_value_expr is None and ir.volume_grad_expr is None and len(ir.boundary_value_exprs) == 0:
         raise ValueError("No terms found for VPINN assembly.")

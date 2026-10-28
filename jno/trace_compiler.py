@@ -31,6 +31,8 @@ from .trace import (
     Assembly,
     BinaryOp,
     Choice,
+    Constraint,
+    Flow,
     FunctionCall,
     GroupedAssembly,
     Hessian,
@@ -44,9 +46,27 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    Tracker,
     TunableModule,
     TunableModuleCall,
     collect_tags,
+)
+
+# Context entries that are FEM metadata, not sample batches: never vmapped over, never a batch size.
+CONTEXT_METADATA_TAGS = frozenset(
+    {
+        "JxW",
+        "flat_cells",
+        "global_areas",
+        "N_flat",
+        "dN_dx_flat",
+        "dirichlet_nodes",
+        "cells",
+        "quad_points",
+        "boundary_nodes",
+        "surface_data",
+        "v_grads_JxW_flat",
+    }
 )
 
 
@@ -164,6 +184,67 @@ def _find_fd_domain(expr):
     return domain
 
 
+def _requires_full_point_set(expr):
+    """Why point-axis mini-batching (``points=``) must be refused for *expr*, or ``None`` if it is fine.
+
+    Sub-sampling the N axis hands each constraint a random subset of the collocation points. That is
+    exactly what a *pointwise* residual wants and exactly what a *structured* one cannot survive: a
+    finite-difference stencil reads a node's neighbours, and a FEM assembly integrates over cells, so
+    both need the full point set in its original ordering. Silently dropping points there would not
+    raise -- it would return a plausible, wrong number.
+
+    Returns a human-readable reason so the caller can name the offending construct in the error.
+    Traverses by attribute name (the same shape as :func:`_find_fd_domain`), so a new node type is
+    reached for free as long as it names its children ``expr``/``target``/``args``.
+    """
+    visited = set()
+    reason = None
+
+    def _walk(node):
+        nonlocal reason
+        if reason is not None:
+            return
+        nid = id(node)
+        if nid in visited:
+            return
+        visited.add(nid)
+
+        if isinstance(node, (Jacobian, Hessian)) and str(getattr(node, "scheme", "")).startswith("finite_difference"):
+            reason = f"a finite-difference derivative (scheme={getattr(node, 'scheme')!r})"
+            return
+        if isinstance(node, (Assembly, GroupedAssembly)):
+            reason = "a FEM assembly"
+            return
+
+        for attr in ("target", "left", "right", "expr", "volume_expr"):
+            child = getattr(node, attr, None)
+            if child is not None:
+                _walk(child)
+        for attr in ("variables", "args", "boundary_exprs"):
+            children = getattr(node, attr, None)
+            if isinstance(children, (list, tuple)):
+                for c in children:
+                    if c is not None:
+                        _walk(c)
+
+    for e in expr if isinstance(expr, (list, tuple)) else [expr]:
+        _walk(e)
+    return reason
+
+
+def _point_subset_indices(arrays_by_n, key):
+    """One index set per distinct point count ``N`` -> ``{N: indices}``.
+
+    Keyed on ``N`` rather than on the tag so that any two tags with the same point count are sliced
+    *identically*. Tags are frequently aligned element-for-element (an input field and its target),
+    and drawing them independently would silently break that pairing while every shape still matched.
+    """
+    return {
+        n: jnp.sort(jax.random.choice(jax.random.fold_in(key, n), n, shape=(k,), replace=False))
+        for n, k in arrays_by_n.items()
+    }
+
+
 import numpy as _np  # used only for _grouped_vmap index manipulation
 
 
@@ -187,25 +268,16 @@ def _grouped_vmap(
     4. Restores the original ``mesh_connectivity``.
     5. Concatenates all group outputs in the original batch order.
 
-    Parameters
-    ----------
-    scan_fn : callable
-        The per-sample evaluation function ``(spatial_vals, rng_key) -> result``.
-    spatial_ctx : tuple of arrays
-        Context arrays (potentially batched along axis 0).
-    ctx_in_axes : tuple
-        Per-array vmap in_axes (0 or None).
-    spatial_tag_order : tuple of str
-        Tag names corresponding to ``spatial_ctx``.
-    fd_domain : domain
-        The domain with ``_sub_domains`` and ``_domain_mesh_connectivities``.
-    batch_domain_map : ndarray of int, shape (B,)
-        Maps each batch index to its source domain index.
-    B : int
-        Total batch size.
-    key : jax random key or None
-    is_multi : bool
-        If True, scan_fn returns a list of arrays (multi-expression).
+    Args:
+        scan_fn (callable): The per-sample evaluation function ``(spatial_vals, rng_key) -> result``.
+        spatial_ctx (tuple of arrays): Context arrays (potentially batched along axis 0).
+        ctx_in_axes (tuple): Per-array vmap in_axes (0 or None).
+        spatial_tag_order (tuple of str): Tag names corresponding to ``spatial_ctx``.
+        fd_domain (domain): The domain with ``_sub_domains`` and ``_domain_mesh_connectivities``.
+        batch_domain_map (ndarray of int, shape (B,)): Maps each batch index to its source domain index.
+        B (int): Total batch size.
+        key (jax random key or None)
+        is_multi (bool): If True, scan_fn returns a list of arrays (multi-expression).
     """
     connectivities = fd_domain._domain_mesh_connectivities
     original_mc = fd_domain.mesh_connectivity
@@ -326,6 +398,9 @@ class TraceCompiler:
         Traverses depth-first so that dependencies (modules whose outputs feed
         into other modules) are collected before the modules that consume them.
 
+        Args:
+            expr: the expression to walk.
+
         Returns:
             List of ``(Model, call_args | None)`` tuples.
             ``call_args`` is ``None`` for standalone parameter modules.
@@ -358,12 +433,19 @@ class TraceCompiler:
                         seen.add(flax_mod.layer_id)
                         layers.append((flax_mod, node.args))
 
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 # Visit args first (dependency order)
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
                 flax_mod = node.model
+                # `.derives(expr)`: this parameter's value IS `expr`, so everything the expression
+                # references is a dependency of it -- and has to be visited FIRST, since it is read
+                # to produce this one's value. Without this the referenced models are never
+                # collected and the solve fails with "No model for Model <id>" at evaluation.
+                _derived = getattr(flax_mod, "_derived_expr", None)
+                if isinstance(_derived, Placeholder):
+                    visit(_derived)
                 if flax_mod.layer_id not in seen:
                     seen.add(flax_mod.layer_id)
                     layers.append((flax_mod, node.args))
@@ -397,6 +479,10 @@ class TraceCompiler:
             elif isinstance(node, (Integral, IntegralTime)):
                 visit(node.target)
             elif isinstance(node, Assembly):
+                visit(node.expr)
+            elif isinstance(node, Constraint):  # a jno.le / jno.ge row: its models count even when no other entry has them
+                visit(node.residual)
+            elif isinstance(node, Tracker):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
                 if node.volume_value_expr is not None:
@@ -454,13 +540,20 @@ class TraceCompiler:
 
     @staticmethod
     def merge_pretrained_params(pretrained_params: dict, new_params: dict, logger) -> dict:
-        """
-        Merge pretrained weights with new params, replacing embedding/recovery layers
+        """Merge pretrained weights with new params, replacing embedding/recovery layers
         when shapes don't match (for different channel dimensions).
 
         A concise summary (counts) is logged to the main logger.  Detailed
         per-parameter information is written to ``weight_merge.log`` in the
         same directory as the logger's output path.
+
+        Args:
+            pretrained_params: the loaded parameter tree.
+            new_params: the freshly initialised parameter tree.
+            logger: the jNO logger to report to.
+
+        Returns:
+            dict: the merged parameters.
         """
         stats = {"matched": 0, "replaced": 0}
         details: list = []  # collect per-param detail lines
@@ -867,11 +960,19 @@ class TraceCompiler:
         )
 
     @staticmethod
-    def build_single_layer_params(layer, arg_shapes, rng, logger):
+    def build_single_layer_params(layer, rng, logger):
         """Retrieve or construct the model for a single layer.
 
         The model was already fully constructed at factory time — we just
         return ``layer.module``, optionally loading pretrained weights.
+
+        Args:
+            layer: the :class:`Model` node.
+            rng: PRNG key for a callable initializer that was given no key of its own.
+            logger: the jNO logger to report to.
+
+        Returns:
+            The Equinox module, with pretrained weights loaded if requested.
         """
         if not isinstance(layer, Model):
             raise ValueError(f"Unknown layer type: {type(layer)}")
@@ -949,6 +1050,13 @@ class TraceCompiler:
         already constructed eagerly at factory time — we just store it
         directly (with optional pretrained weight loading).
 
+        Args:
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+            domain_dim: the domain's spatial dimension.
+            tensor_dims: input dimensions per context entry (:meth:`core.compute_tensor_dims`).
+            rng: PRNG key.
+            logger: the jNO logger to report to.
+
         Returns:
             all_models: Dict mapping layer_id -> callable model
             rng: Updated RNG key
@@ -964,7 +1072,7 @@ class TraceCompiler:
                 seen.add(layer.layer_id)
 
                 rng, init_rng = jax.random.split(rng)
-                model = TraceCompiler.build_single_layer_params(layer, None, init_rng, logger)
+                model = TraceCompiler.build_single_layer_params(layer, init_rng, logger)
                 all_models[layer.layer_id] = model
 
         return all_models, rng
@@ -986,23 +1094,19 @@ class TraceCompiler:
         The ``"__time__"`` context entry (shape ``(T, 1)``) is **not**
         batched — it is shared and scanned over T together with the
         spatial arrays.
+
+        Args:
+            expr: the expression to compile.
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+
+        Returns:
+            Callable: the compiled function ``(params, context=None, batchsize=None, key=None,
+            min_consecutive=1)``.
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -1071,8 +1175,16 @@ class TraceCompiler:
                 if key is None:
                     raise ValueError("A JAX random key must be provided when batchsize is specified.")
                 if batchsize > B:
-                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
-                    indices = jnp.sort(indices)
+                    raise ValueError(
+                        f"batchsize={batchsize} exceeds the number of stacked samples (B={B}). `batchsize` "
+                        f"draws along the SAMPLE axis -- the one `n * domain` builds -- not the collocation "
+                        f"points inside one sample, so there is nothing further to draw from. This used to "
+                        f"sample with replacement and silently evaluate {batchsize} duplicate copies of the "
+                        f"same {B} sample(s) at {batchsize}x the cost. To mini-batch the COLLOCATION POINTS "
+                        f"instead -- which is what a `jno.domain.from_array` dataset (B=1) needs -- use "
+                        f"`solve(points={batchsize})`. Otherwise use batchsize<={B}, or stack more samples "
+                        f"(`{batchsize} * domain`)."
+                    )
                 elif batchsize < B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
                     indices = jnp.sort(indices)
@@ -1351,36 +1463,52 @@ class TraceCompiler:
 
         Mirrors ``compile_traced_expression`` exactly — only
         ``evaluate_single_point_set`` changes.
+
+        Args:
+            exprs: the constraint expressions.
+            all_ops: every :class:`OperationDef` of the problem (the compiled operation set).
+
+        Returns:
+            Callable: one function returning the list of residual arrays.
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat",
-        }
+        METADATA_TAGS = CONTEXT_METADATA_TAGS
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
             evaluator = TraceEvaluator(params)
-            # One evaluator → one JAX trace → XLA sees all constraints together
-            return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            # One evaluator → one JAX trace → XLA sees all constraints together. One per-evaluation scope
+            # over ALL of them, too: a solve or integral node shared by the objective and a constraint is
+            # computed once for the whole list, not once per expression (the evaluator's memo is scoped to
+            # the outermost evaluate; this makes the list that outermost scope).
+            evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots, evaluator._node_memo = (
+                True,
+                {},
+                list(exprs),
+                {},
+            )
+            try:
+                return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+            finally:
+                evaluator._in_evaluate, evaluator._per_eval_memo, evaluator._per_eval_roots, evaluator._node_memo = (
+                    False,
+                    {},
+                    [],
+                    None,
+                )
 
         # Collect tags from ALL expressions so batch inference is scoped.
         expr_tags = set()
         for _expr in exprs:
             expr_tags |= collect_tags(_expr)
 
+        # Computed once at compile time, not per step: whether any constraint needs the full point set
+        # and therefore forbids `points=` mini-batching.
+        _full_point_set_reason = _requires_full_point_set(exprs)
+
         # Everything below mirrors compile_traced_expression.
-        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=None):
+        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=None, points=None):
             context = context or {}
 
             all_tags = set(expr_tags)
@@ -1414,8 +1542,16 @@ class TraceCompiler:
                 if key is None:
                     raise ValueError("A JAX random key must be provided when batchsize is specified.")
                 if batchsize > B:
-                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
-                    indices = jnp.sort(indices)
+                    raise ValueError(
+                        f"batchsize={batchsize} exceeds the number of stacked samples (B={B}). `batchsize` "
+                        f"draws along the SAMPLE axis -- the one `n * domain` builds -- not the collocation "
+                        f"points inside one sample, so there is nothing further to draw from. This used to "
+                        f"sample with replacement and silently evaluate {batchsize} duplicate copies of the "
+                        f"same {B} sample(s) at {batchsize}x the cost. To mini-batch the COLLOCATION POINTS "
+                        f"instead -- which is what a `jno.domain.from_array` dataset (B=1) needs -- use "
+                        f"`solve(points={batchsize})`. Otherwise use batchsize<={B}, or stack more samples "
+                        f"(`{batchsize} * domain`)."
+                    )
                 elif batchsize < B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
                     indices = jnp.sort(indices)
@@ -1431,6 +1567,38 @@ class TraceCompiler:
 
                 ctx_tuple = tuple(subset_entry(t, a) for t, a in zip(tag_order, ctx_tuple))
                 B = batchsize
+
+            if points is not None:
+                if key is None:
+                    raise ValueError("A JAX random key must be provided when points is specified.")
+                if _full_point_set_reason is not None:
+                    raise ValueError(
+                        f"points={points} cannot be combined with {_full_point_set_reason}: it needs the full "
+                        f"point set in its original ordering (a stencil reads a node's neighbours; an assembly "
+                        f"integrates over cells). Use points=None, or switch the derivative to "
+                        f"scheme='automatic_differentiation'."
+                    )
+
+                # A tag is ONE (B, [T,] N, D) array, so the coordinates of a tag stay paired for free;
+                # only the point count needs a shared draw across tags -- see _point_subset_indices.
+                def _point_axis_len(tag_name, arr):
+                    if tag_name == TIME_TAG or tag_name in METADATA_TAGS or tag_name not in expr_tags:
+                        return None
+                    if not hasattr(arr, "ndim") or arr.ndim < 3:
+                        return None  # (B, N) and below cannot be told apart from the sample axis
+                    return int(arr.shape[-2])
+
+                wanted = {
+                    n: int(points)
+                    for n in {_point_axis_len(t, a) for t, a in zip(tag_order, ctx_tuple)}
+                    if n is not None and n > points
+                }
+                if wanted:
+                    idx_by_n = _point_subset_indices(wanted, jax.random.fold_in(key, 0x504F494E))  # "POIN"
+                    ctx_tuple = tuple(
+                        jnp.take(a, idx_by_n[_point_axis_len(t, a)], axis=-2) if _point_axis_len(t, a) in idx_by_n else a
+                        for t, a in zip(tag_order, ctx_tuple)
+                    )
 
             time_arr = None
             passive_ctx = {}

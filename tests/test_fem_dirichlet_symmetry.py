@@ -142,13 +142,23 @@ def test_a_symmetric_form_now_has_a_symmetric_tangent():
 
 def test_a_vector_form_is_symmetric_to_roundoff():
     """A vector element block contracts components in a different order for (a,i),(b,j) than for
-    (b,j),(a,i), so it differs by an ulp — assembly round-off, not the Dirichlet structure. Measured
-    ~0.25 ulps, against ~1e-1 before this change."""
+    (b,j),(a,i), so its two triangles differ by an ulp; each element block is averaged within the
+    solver's symmetry gate, which makes it bitwise symmetric. The ASSEMBLED matrix is bitwise symmetric
+    only where the global sum is deterministic (the CPU): a GPU scatter-add sums the many tetrahedra on
+    one edge in a varying order, so (i,j) and (j,i) may still differ by an ulp there -- round-off, which
+    the solver's own 64-ulp gate averages."""
     fem, _d = _elasticity()
     A = _dense_tangent(fem, np.asarray(fem.solve()))
     rel = _asymmetry(A)
     assert rel < ULPS, f"vector tangent asymmetry {rel:.3e} ({rel / EPS:.1f} ulps) exceeds a few ulps"
-    assert rel > 0.0, "bitwise symmetry here would mean the element block changed — see the docstring"
+
+
+def test_the_weakest_genuine_asymmetry_is_not_averaged_away():
+    """The element-level average must not reach a real asymmetry. An advection coefficient of 1e-12 is
+    physically nothing beside the Laplacian, and still ~191 ulps -- outside the 64-ulp gate."""
+    fem, _d = _advection(b=1e-12)
+    A = _dense_tangent(fem, np.asarray(fem.solve()))
+    assert not np.array_equal(A, A.T), "a 1e-12 advection term was averaged into a symmetric tangent"
 
 
 def test_a_genuinely_nonsymmetric_form_is_not_symmetrized():
@@ -169,7 +179,9 @@ def test_cg_solves_a_dirichlet_nonlinear_problem():
         got = np.asarray(fem.solve(linear=jno.solve.cg()))
         assert np.all(np.isfinite(got)), f"{maker.__name__}: cg returned a non-finite solution"
         rel = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
-        assert rel < 1e-8, f"{maker.__name__}: cg disagrees with the default driver, rel {rel:.3e}"
+        # Two Newton roots to the same 1e-8 residual bound (the default's steps are solved inexactly), so they
+        # agree to that bound times the conditioning -- 4e-8 measured -- not to round-off. NaN is what broke.
+        assert rel < 1e-6, f"{maker.__name__}: cg disagrees with the default driver, rel {rel:.3e}"
 
 
 # --------------------------------------------------------------------------------------------------
@@ -178,14 +190,19 @@ def test_cg_solves_a_dirichlet_nonlinear_problem():
 def test_a_starting_iterate_violating_the_boundary_values_converges_the_same():
     g = 0.35
     fem, _d = _poisson(g=g)
-    base = np.asarray(fem.solve())
+    # Both solves converge far below the bound, so the comparison is about the start and not about where
+    # Newton stops: from the default start it now takes a different path (a first linearised step).
+    tight = jno.solve.newton(rtol=1e-12, atol=0.0)
+    base = np.asarray(fem.solve(nonlinear=tight))
     bad = jnp.full((fem.dofs,), -5.0)  # nowhere near the pinned value, nor near the solution
-    got = np.asarray(fem.solve(x0=bad))
+    got = np.asarray(fem.solve(x0=bad, nonlinear=tight))
     rel = np.abs(got - base).max() / np.abs(base).max()
     assert rel < 1e-8, f"a non-conforming x0 changed the answer: rel {rel:.3e}"
     pts = np.asarray(fem.points)
     pinned = (pts[:, 0] < 1e-9) | (pts[:, 0] > 1 - 1e-9) | (pts[:, 1] < 1e-9) | (pts[:, 1] > 1 - 1e-9)
-    assert np.abs(got[pinned] - g).max() < 1e-12, "the pins must land exactly on g regardless of the start"
+    # To Newton's tolerance: a pinned row is an identity row of the tangent, solved -- like every row -- only as
+    # accurately as the Newton step needs (6e-12 measured), so not to round-off; a wrong start leaves O(1).
+    assert np.abs(got[pinned] - g).max() < 1e-8 * max(1.0, abs(g)), "the pins must land on g regardless of the start"
 
 
 # --------------------------------------------------------------------------------------------------

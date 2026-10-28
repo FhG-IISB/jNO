@@ -1,5 +1,160 @@
 # Changelog
 
+## [0.4.2] — 2026-10-23
+
+jNO 0.4.2 adds `jno.peec`, a differentiable partial-element equivalent-circuit solver, and makes a shape's coordinates design variables shared by PEEC and FEM. PINN derivatives are cheaper: every AD derivative on one point set now comes from one shared forward-mode pass. `jno.info` writes the equations in math notation. A comparison against other FEM libraries on the same problems found the FEM fixes below.
+
+### Breaking changes and migration
+- `d.stretch()` is removed: geometry moves through `jno.np.parameter` expressions in the shape's own coordinates, and `d.rebuild(when=...)` re-meshes during training (#185).
+- A derivative of a target that couples points (it is not pointwise) raises; it used to return a wrong derivative (#186).
+- An integer index on the point axis, `net(x, y)[0]`, raises; it picked collocation point 0 and broadcast it, where `[..., 0]` was meant (#186).
+- A field parameter of the wrong size in `fem.solve(k=v)` raises (#186).
+- A mixed partial of order 3 or more is a weighted sum of univariate Taylor passes and carries a few float32 ulp more round-off than nested passes (#186).
+
+### Added
+- `jno.peec`: conductors as bar lattices, round-wire filaments and two-terminal devices in one equation list; readouts `L`, `R`, `Z`, terminal currents and voltages and dissipation, each with its adjoint. FFT operator on uniform lattices, hierarchical (ACA) on graded `faces` grids, matrix-free GMRES with a near-field preconditioner (optionally cuDSS) (#185).
+- Geometry design variables: `jno.np.parameter` in box/rect faces, extrusion height, translation, a line's vertices and radius. A PEEC face grid and a FEM mesh on the same domain both follow the design, with exact derivatives; what cannot move is refused by name (#185).
+- Electro-thermal coupling through references: a `jno.fem` heated by `em.loss` and a network whose sigma(T) reads that field converge as one differentiable fixed point (#185).
+- `d.rebuild(when=...)`: the shape is rebuilt at the current design when a condition holds during `jno.core.solve`; solvers and readouts follow, `keep_opt_state=` decides whether the optimizer state carries over (#185).
+- FEM point loads and point values (#185).
+- PINN derivatives: one jvp pass per coordinate for all AD derivatives on a point set, Laplacians by a forward-Laplacian pass (`folx`), order 3 and up by univariate Taylor passes (Griewank, Utke & Walther 2000). The Kovasznay Navier–Stokes training step went from 3.3x to 1.3x the FLOPs of a hand-written step (#186).
+- `jno.info` writes the equations of a core, a fem and an fdm in math notation, reports what training does with each model's parameters, and with `deep=True` draws every constraint as one expression tree with shapes (#186).
+
+### Fixed: silent wrong answers
+- The FEM kernel cache ignored module-level names a coefficient reads: a sweep changing a global between `jno.fem` builds got the first build's solution every time (#185).
+- `.msh` 2.2 physical groups were dropped; they now become tags (#186).
+- `fem.solve(k=v)` with a field parameter of the wrong length solved with clamped gathers (#186).
+
+### Fixed
+- A solve stopped early by a callback advanced the epoch count by the full request, so the next solve's schedules skipped ahead (#185).
+- PEEC near-field preconditioner values follow traced geometry; the hierarchical structure cache is keyed on the network (#185).
+- `symgrad(u, coords)` accepts a coordinate tuple (#186).
+- A direct solver works in a parametric transient march (#186).
+- PARDISO and cuDSS keep one plan per matrix type, so a Newton solve switching between symmetric and general values on one pattern no longer redoes the symbolic analysis (#186).
+- Newton from rest with large prescribed values takes a first linearised step that moves the interior with the boundary, instead of inverting the cells next to it (#186).
+- A tag in `jno.info` reports the points in use, not the mesh pool; a reused step no longer announces a JIT compile (#186).
+
+### Packaging
+- New dependency `folx` (forward Laplacian) (#186); the CUDA sources in `jno/_ext` ship with the package (#185).
+
+## [0.4.1] — 2026-10-21
+
+jNO 0.4.1 continues the correctness work of 0.4.0: about thirty more silent wrong answers are fixed, among them RCWA layer thickness and polarisation, a field parameter in a coupled form, properties attached after a build, and early stopping on constrained problems. It adds higher-order Nédélec and Raviart–Thomas elements, matrix-valued and constant unknowns, band structures and contour integration in `fem.eigs`, GCMMA and an augmented Lagrangian for constraints, flow matching, and checkpointed fixed-mesh marches. Repeated nonlinear solves in an optimisation loop do less work: inexact Newton steps, reusable preconditioners and one factorisation per form. Read the breaking changes before upgrading: `cached()` preconditioners are replaced by `reuse=`, and some solves that used to return now raise.
+
+### Breaking changes and migration
+
+**Renamed and removed**
+- `jno.precond.cached(spec)` and `spec.cached()` are removed: use `reuse=` on any preconditioner. `cached(spec)` is `spec` with `reuse=True`, `cached(spec, refresh=k)` is `reuse=k` (#170).
+- `patch_topology` and `interior_facets` in the topology-optimisation helpers are internal (#155).
+
+**Changed defaults, behaviour and results**
+- The default Newton takes inexact steps (Eisenstat–Walker): a nonlinear root is as accurate as Newton's `rtol`/`atol` (default 1e-8) and no more. To compare solves below that, ask for it, e.g. `jno.solve.newton(rtol=1e-12, atol=1e-12)` (#170).
+- An explicit `quad_degree` is used as given; it was silently raised to the mass-exact degree (#170).
+- `jno.np.dot` in a weak form is the per-point product, chosen from each operand's tensor rank; where the rank is unknown it raises and names `inner`/`matmul`/`einsum` (#170).
+- `simp_continuation`'s `mnd_tol` defaults to 1e-4, the cited value, not 1e-2 (#155).
+- RCWA results change for any layered problem whose interfaces did not fall on the permittivity's z-samples, and for scalar term lists on 1-D gratings (see below) (#156).
+- `relocate(objective="energy")` descends the Ritz functional `a(u,u) - 2 l(u)`; with a load the result differs from 0.4.0 (#161).
+
+**New refusals**
+- `jno.solve.eigs(sigma=...)` raises `ShiftInvertNotConverged` (a `RuntimeError`) instead of returning NaN when the residual is concrete; under `jit`/`vmap` it still returns NaN (#157).
+- `fem.solve(param=value)` raises when the nonlinear solve does not converge; it returned the unconverged iterate (#163).
+- Every Krylov solve that misses its requested tolerance by more than 100x but stays under the hard residual gate warns with `UnconvergedSolveWarning` (#165).
+- A `checkpoint=` that no march uses raises, and a checkpointed march raises under `jit`, `grad` and `jno.core` (#161).
+- A property attached as an expression and re-attached after `jno.fem(...)` was built refuses to solve; build a new `jno.fem` (#181).
+- `core.solve` raises on a non-finite optimisation step and names the next diagnostic (#183).
+- A `batchsize` larger than the number of points raises and names `solve(points=N)` (#172).
+
+### Fixed: silent wrong answers
+- RCWA: a layer was as thick as the z-samples of its permittivity covered, not as thick as the permittivity says; interfaces now sit where it crosses halfway (#156).
+- RCWA: every problem was solved with x-polarised incidence, so a scalar term list on a 1-D grating was solved as TM; it is now solved in the polarisation the scalar equation describes (#156).
+- A FEM field parameter in a coupled form was gathered on the surrounding field's numbering, so a P1 parameter inside a P2-tested term read the wrong nodes (#174).
+- `domain.attach(...)` after `jno.fem(...)` was built had no effect on the solve; the fem now re-assembles when a property it reads changes (#181).
+- `early_stopping` on a problem with `jno.le`/`jno.ge` rows could stop on, and return, an infeasible design; only feasible iterates now count (#179).
+- A tau history march with `u.i(-1)` dropped periodic ties (#153).
+- A vector Dirichlet value imposed only its first component, broadcast (#153).
+- `exponential()` returned a non-zero wall value as 0 (#153).
+- `adapt=remesh` counted vertices, not DOFs, against `max_dofs` (#153).
+- `fem.solve(k=v)` ignored `v` on transients, load-path marches and remeshing transients (#153).
+- A parameter-valued wall dropped a tau-ramped wall on the same form; a `Coupling` shifted essential rows by its own contribution, and was dropped on a `u_tt` or tied single-field transient (#153).
+- The term-lowering memo could serve one form's lowered terms to another (#153).
+- A constant traction on a reused region name assembled the previous build's value (#155).
+- A surface traction on `space="cover"` assembled the wrong number of test rows (#155).
+- `fem.solve(checkpoint=...)` on anything but a moving-mesh march wrote nothing (#161).
+- `relocate(objective="energy")` descended the bare Dirichlet energy whatever the load, which with a source made the error worse (#161).
+- `Placeholder.T` transposed every axis instead of the last two (#162).
+- `S @ S`, `dot(u, u)` and `u x u` were classified as linear in the unknown (#162).
+- A node on two Dirichlet regions took half of its value; a per-point scalar times a constant matrix was not per point (#162).
+- `dom.cell_size` on the non-nodal (H(curl)/H(div)/plate) path was `-1`; `dom.cell_metric` is supported there too (#165).
+- A Lagrange form on interior body faces assembled to zero (#165).
+- Edges along the junction of a tag were left unpinned when its predicate disagreed between facet centroids and vertices; non-nodal pinning now uses the facet closure (#165).
+- A Krylov solve asked for a tight tolerance that stopped at its iteration cap returned silently as long as it was under 1e-4 (#165).
+- A rebuilt preconditioner spec was ignored by the compiled solve (#170).
+- A non-symmetric coupled pencil in `fem.eigs` returned the wrong spectrum above about 50 DOFs; every returned pair is now checked against the pencil (#173).
+
+### Added
+
+**Elements and spaces**
+- N1E, N2E and RT elements of any degree on triangles and tetrahedra, and `space="DG"`, with degree-k AMS, Bloch ties, read-back, `u.across` for thin-layer coupling, and surface terms on a body's faces inside a conforming mesh (#157).
+- Matrix-valued fields (`value_shape=(n, m)`), `symmetric=True` storage of a square matrix field, and `A[i, j]`, `A[i]`, `A.T`, `B @ A` on matrix views (#162).
+- `d.unknown.scalar()`, `.vector(n)`, `.matrix(n, m, symmetric=)` and `u.test()`: one unknown for FEM and FDM, with its test function derived from it (#162).
+- Constant unknowns (`d.unknown.scalar(constant=True)`), tied to a field by `u(region) - U`, pinned by `U - g`, boxed by `U.bounds()` (#162).
+- Non-nodal forms take coefficient fields on any element space, including P0 parameters and a field frozen to another form's solve (#183).
+- `d.mask(name)`: a boolean mask over the mesh nodes of a named region, e.g. `T[d.mask("core")]` (#171).
+- `tag_node_mask(closure=True)` (#165).
+
+**Solvers**
+- Inexact Newton in the default assembled-tangent Newton and in Krylov solvers composed through `linear=`/`precond=`, which take a per-call `rtol=` (#170).
+- `newton(direct=False)` is Jacobi-preconditioned through `jacobian(..., diag=True)`, without assembling the tangent (#170).
+- `reuse=False | True | k` on every preconditioner, and `amg(nullspace="rigid")` (#170).
+- `lu(backend="cudss")` runs a differentiable, GPU-resident symmetric LDL^T inside the compiled program, for complex-symmetric and provably symmetric real forms (#183).
+- Forms that differ only in their load share one factorisation, forward and adjoint (PARDISO, cuDSS LU) (#183).
+- `fem.eigs` on Bloch-tied band structures, warm-started from the previous k-point, and `fem.eigs(contour=jno.solve.contour(...))` for every eigenvalue inside a circle (Beyn 2012) (#173).
+- hypre AMS takes `interior_nodes=` and `zero_beta=True` for an H(curl) block with no mass where the conductivity vanishes (#165).
+- `fem.stats["linear_iterations"]` reports Krylov iteration counts for an eager steady solve; Newton steps record theirs (#161, #170).
+
+**Marches**
+- Periodic ties on every transient path (tau history, `u_tt`, single-field vector, `.bounds`, `p.pin()`), block preconditioners on the reduced system, and time-varying Dirichlet data `g(x, t)` on nonlinear and parametric transients (#153).
+- An eager march keeps past states on the host, and its Newton keeps the tangent within and across steps (#153).
+- `fem.solve(checkpoint=...)` on transient marches with a built-in scheme and on the fixed-grid `tau` load path; a killed run resumes from its last chunk (#161).
+- A trainable amplitude in a `tau`-ramped essential value, e.g. `u(top)[1] - g*tau`, differentiable in `g` (#161).
+
+**Optimisation and training**
+- `jno.optimizers.gcmma`: globally convergent MMA (Svanberg 2002), feasible at every accepted step from a feasible start (#179).
+- `.auglag()` / `jno.auglag(c)`: an augmented Lagrangian for `jno.le`/`jno.ge` with any optimiser, and equality constraints `jno.eq(g, b).auglag()` (#179).
+- `jno.optimizers.bounded(opt, lower=, upper=)`: box bounds for any optax optimiser (#179).
+- Every constraint row's multiplier is logged as `λ[name]` and kept in `training_logs[-1]["multipliers"]` (#179).
+- `expr.integrate(d)`: integrals of known fields, frozen solutions included, over a domain, also on a moving mesh (#183); `expr.integrate(fem, solver=)` (#155); `fem.eval` and `expr.integrate(fem)` take volume functionals on non-nodal forms (#183).
+- One program per optimisation step for the objective gradient and the constraint Jacobian, a solve or integral node evaluated once per evaluation, and `crux.eval([a, b, ...])` as one program; the design step can go into the persistent compile cache (#183).
+- `Model.flow` marches a network as an ODE (or an SDE with `noise=`) inside the trace, for conditional flow matching; `noise(like=expr)`; `solve(points=N)` mini-batches collocation points (#172).
+
+**Topology optimisation** (#155)
+- Tetrahedral meshes: `transfer_cell_field` onto tets, the patch criterion on tetrahedral edge fans, `cell_angles` as dihedrals; quadrilateral cells for the deformable-mesh geometry.
+- `curvature()`: a local surface-smoothness term, one value per ridge, beside the perimeter budget; a density projection with a sharpness ramp a schedule can reach.
+- MMA takes the constraint Jacobian over the inequality rows only, reports where every constraint starts, and refuses one no step can satisfy.
+- A warning when a boundary condition is anchored to nodes that can move.
+
+### Fixed
+- `jno.np.vector(1.0, 0.0, x)` and a region coefficient inside a vector hung `jno.fem` (#157, #164).
+- `jno.solve.eigs(sigma=...)` returned NaN next to a wide degenerate cluster (the curl-curl gradient kernel) (#157). A Bloch tie with |c| != 1 crashed `fem.eigs` (#173). ARPACK starts from a fixed vector, so a solve no longer fails depending on what ran before it.
+- A singular operator in the host sparse-direct solve fails by name with the system size, and a non-finite Newton residual points at a singular tangent instead of `max_steps` (#163).
+- PARDISO aborted the process on a non-finite system; it raises `FloatingPointError` (#155).
+- A mutated reparameterisation constant did not reach the step program, and the GPU saturation floor was applied on CPU (#155).
+- A coupled linear form with a field parameter assembles; a parameter shared by fields of differing order warns instead of raising (#174).
+- An empty array (e.g. a region with no nodes) raised from the FEM cache key (#180).
+- The Hessian finite-difference evaluator raised `ConcretizationTypeError` under `jit` (#160).
+- `jno.np.dot` in a weak form died on a shape error; contact rounds in an undamped march were reported as oscillating (#170).
+- Large mesh arrays are passed to element kernels as arguments instead of compiled in as constants, so a same-sized mesh reuses the compiled kernels; `JNO_ELEM_MAP_LIFT=0` restores the old path (#154).
+- Host memory at build: the sparsity plan is built from element blocks, and large boundary regions are resolved in batches (#170).
+- Element chunks are rematerialised in reverse mode; `jno.shape` meshes a thin extrusion as one structured layer; a parameter that appears only in a constraint row counts as a model; `core.solve` leaves the persistent compile-cache setting alone (#183).
+
+### Packaging, CI and docs
+- numpy and scipy are linked against OpenBLAS instead of the reference BLAS in the pixi environment; set `OPENBLAS_NUM_THREADS` next to other CPU-heavy work (#167).
+- The Docker release image is built, smoke-tested in the container, and then pushed; a manual run can publish an existing tag's image (#152).
+- CI: a test file killed by a signal runs once more without output capture and warns if it then passes (#176); MPI in the test runner uses shared memory only (`UCX_TLS=self,sm`) (#178).
+- Tests: a mesh-file domain round-trips through `jno.save` / `jno.load` (#164).
+- New docs: a constraints section in the training guide (#179), `domain.mask` in the API reference and domain guide (#171, #182), limitations of symmetric fields and `d.unknown` (#162), eigensolver limits in `docs/fem/limitations.md` (#173).
+- New tutorials: constant unknowns (#162), conditional flow matching (#172); the topology-optimisation tutorial covers 3-D and GCMMA (#155, #179).
+
 ## [0.4.0] — 2026-09-29
 
 jNO 0.4.0 is mostly a correctness release. It fixes more than thirty bugs that returned plausible but wrong results, and many former silent failures now raise a named error. It also adds scalable preconditioners, new time integrators, moving-mesh adaptivity with checkpointing, mesh-free geometry sampling, `jno.info` diagnostics and multi-device execution. Read the breaking changes before upgrading: several APIs were renamed or retired and some defaults changed.

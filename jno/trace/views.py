@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 
 from ..jnp_ops import concat
-from . import FunctionCall, Placeholder
+from . import FunctionCall, Placeholder, _matmul
 
 # ---------------------------------------------------------------------------
 # Stable spectral matrix functions (logm / expm / Aⁿ) on symmetric matrices.
@@ -350,6 +350,9 @@ class ScalarView(_DelegatesToPlaceholder):
 
     Unknown attributes fall through to the underlying Placeholder so things
     like ``.mse``, ``.mean``, ``.d(x)`` work transparently.
+
+    Args:
+        expr: the Placeholder the view wraps.
     """
 
     def __init__(self, expr: Placeholder) -> None:
@@ -376,8 +379,25 @@ class ScalarView(_DelegatesToPlaceholder):
         """
         return ScalarView(new_expr)
 
-    def integrate(self, **kwargs) -> "ScalarView":
-        """Integrate the underlying scalar, preserving the ScalarView type."""
+    def integrate(self, *args, **kwargs) -> "ScalarView":
+        """Integrate the underlying field, keeping the view type.
+
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
+        """
+        if args:
+            return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
@@ -399,6 +419,20 @@ class ScalarView(_DelegatesToPlaceholder):
         ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
         ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
         of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
         """
         if isinstance(v, (tuple, list)):
             return _directional(self, v, scheme)
@@ -407,7 +441,15 @@ class ScalarView(_DelegatesToPlaceholder):
     def grad(self, *args):
         """Spatial gradient ``(∂/∂x, ∂/∂y[, ∂/∂z])`` → VectorView, over the coordinates bound with
         ``.bind(x=.., y=..)`` when none are given (as ``VectorView.grad`` does); finite differences by
-        default for a nodal field. ``grad(model)`` is the parameter gradient, unchanged."""
+        default for a nodal field. ``grad(model)`` is the parameter gradient, unchanged.
+
+        Args:
+            *args: the coordinate Variables (``x, y[, z]``); none uses the bound coordinates. A single
+                :class:`Model` gives the parameter gradient instead.
+
+        Returns:
+            VectorView: the spatial gradient (or the parameter gradient for a model).
+        """
         from . import Variable
 
         if args and not all(isinstance(a, Variable) for a in args):
@@ -429,11 +471,38 @@ class ScalarView(_DelegatesToPlaceholder):
         )
 
     def d2(self, v, scheme: str | None = None) -> "ScalarView":
-        """``∂²self/∂v²`` — same view type."""
+        """``∂²self/∂v²`` — the second derivative in one variable, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The second derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.d2(v, scheme=_view_scheme(self, scheme)))
 
     def dd(self, v, w=None, scheme: str | None = None) -> "ScalarView":
-        """Mixed second derivative ``∂²self/∂v∂w`` — same view type."""
+        """Mixed second derivative ``∂²self/∂v∂w``, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again (``∂²/∂v²``).
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The mixed derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.dd(v, w, scheme=_view_scheme(self, scheme)))
 
     def partials(self, **named_vars):
@@ -443,6 +512,15 @@ class ScalarView(_DelegatesToPlaceholder):
         ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
         ``u.t`` works the same as any other bound name — registration is
         purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
         """
         return _coords_dispatch(self, (), named_vars)
 
@@ -520,21 +598,31 @@ class ScalarView(_DelegatesToPlaceholder):
 
     # -- scalar operations --
     def abs(self) -> "ScalarView":
+        """``|self|``, element-wise, as a :class:`ScalarView`."""
         return ScalarView(FunctionCall(jnp.abs, [self._expr], "abs"))
 
     def sign(self) -> "ScalarView":
+        """The sign of ``self`` (-1, 0 or 1), element-wise, as a :class:`ScalarView`."""
         return ScalarView(FunctionCall(jnp.sign, [self._expr], "sign"))
 
     def log(self) -> "ScalarView":
+        """The natural logarithm ``log(self)``, element-wise, as a :class:`ScalarView`."""
         return ScalarView(FunctionCall(jnp.log, [self._expr], "log"))
 
     def exp(self) -> "ScalarView":
+        """The exponential ``exp(self)``, element-wise, as a :class:`ScalarView`."""
         return ScalarView(FunctionCall(jnp.exp, [self._expr], "exp"))
 
     def sqrt(self) -> "ScalarView":
+        """The square root ``sqrt(self)``, element-wise, as a :class:`ScalarView`."""
         return ScalarView(FunctionCall(jnp.sqrt, [self._expr], "sqrt"))
 
     def pow(self, n: float) -> "ScalarView":
+        """``self ** n``, element-wise, as a :class:`ScalarView`.
+
+        Args:
+            n: the exponent.
+        """
         return ScalarView(self._expr**n)
 
     # -- arithmetic with cross-type dispatch (all paths go through _rewrap so
@@ -592,13 +680,19 @@ class ScalarView(_DelegatesToPlaceholder):
 
 
 class VectorView(_DelegatesToPlaceholder):
-    """Semantic view of a Placeholder as a spatial vector field ``[..., n]``."""
+    """Semantic view of a Placeholder as a spatial vector field ``[..., n]``.
+
+    Args:
+        expr: the Placeholder the view wraps.
+    """
 
     def __init__(self, expr: Placeholder) -> None:
         self._expr = expr
 
+    # docstring-from: jno.trace.views.ScalarView.expr
     @property
     def expr(self) -> Placeholder:
+        """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
     @property
@@ -685,8 +779,26 @@ class VectorView(_DelegatesToPlaceholder):
         underlying Placeholder must carry that layout. See :class:`ComplexVectorView`."""
         return ComplexVectorView(self._expr)
 
-    def integrate(self, **kwargs) -> "VectorView":
-        """Component-wise integral, preserving VectorView type."""
+    # docstring-from: jno.trace.views.ScalarView.integrate
+    def integrate(self, *args, **kwargs) -> "VectorView":
+        """Integrate the underlying field, keeping the view type.
+
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
+        """
+        if args:
+            return self._expr.integrate(*args, **kwargs)
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
@@ -694,23 +806,94 @@ class VectorView(_DelegatesToPlaceholder):
         """Block gradient flow component-wise, preserving the VectorView type."""
         return self._rewrap(self._expr.stop_gradient)
 
+    # docstring-from: jno.trace.views.ScalarView.d
     def d(self, v, scheme: str | None = None) -> "VectorView":
-        """Component-wise ``∂self/∂v`` — same view type. A vector ``v = (c_x, c_y[, c_z])`` gives the
-        component-wise directional derivative ``Σ c_i ∂self/∂x_i``, as for a scalar view."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
+        """
         if isinstance(v, (tuple, list)):
             return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.d2
     def d2(self, v, scheme: str | None = None) -> "VectorView":
+        """``∂²self/∂v²`` — the second derivative in one variable, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The second derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.d2(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.dd
     def dd(self, v, w=None, scheme: str | None = None) -> "VectorView":
+        """Mixed second derivative ``∂²self/∂v∂w``, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again (``∂²/∂v²``).
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The mixed derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.dd(v, w, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.partials
     def partials(self, **named_vars):
-        """Bind Variables to names for component-wise partial-derivative-by-attribute access.
+        """Bind Variables to names for partial-derivative-by-attribute access.
 
-        ``v.vector.partials(x=x, y=y).x`` → ``VectorView`` of ``∂v/∂x``.
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
         """
         return _coords_dispatch(self, (), named_vars, positional_factory=NamedVectorView)
 
@@ -723,6 +906,12 @@ class VectorView(_DelegatesToPlaceholder):
 
         returns a ``NamedVectorView`` whose components are reachable as ``.x``, ``.y``.
         To bind coordinates for derivatives use ``.bind(**vars)`` / ``.partials(**vars)``.
+
+        Args:
+            *args: the component names, as separate strings or one list.
+
+        Returns:
+            NamedVectorView: the same vector with named components.
         """
         return _coords_dispatch(self, args, {}, positional_factory=NamedVectorView)
 
@@ -777,6 +966,13 @@ class VectorView(_DelegatesToPlaceholder):
 
         With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         Number of variables must equal the last dimension of the vector.
+
+        Args:
+            *vars: the coordinate Variables (``x, y[, z]``); none uses the coordinates bound with
+                ``.bind(x=.., y=..)``.
+
+        Returns:
+            ScalarView: the divergence.
         """
         vars = self._ops_coords(vars)
         terms = [self._c(i).expr.d(v, scheme=_view_scheme(self)) for i, v in enumerate(vars)]
@@ -791,6 +987,13 @@ class VectorView(_DelegatesToPlaceholder):
         With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         2 variables (2-D) → ``ScalarView`` (∂u_y/∂x − ∂u_x/∂y).
         3 variables (3-D) → ``VectorView`` (the curl vector).
+
+        Args:
+            *vars: the coordinate Variables (``x, y[, z]``); none uses the coordinates bound with
+                ``.bind(x=.., y=..)``.
+
+        Returns:
+            ScalarView | VectorView: the scalar curl in 2-D, the curl vector in 3-D.
         """
         vars = self._ops_coords(vars)
         if len(vars) == 2:
@@ -816,12 +1019,26 @@ class VectorView(_DelegatesToPlaceholder):
         return ScalarView(FunctionCall(lambda x: jnp.linalg.norm(x, axis=-1), [self._expr], "norm", True))
 
     def dot(self, other) -> "ScalarView":
-        """Dot product u·v → ScalarView."""
+        """Dot product ``u·v`` → ScalarView.
+
+        Args:
+            other: a vector of the same length (a view, Placeholder or array).
+
+        Returns:
+            ScalarView: ``Σ_i u_i v_i``.
+        """
         product = self._expr * _unwrap(other)
         return ScalarView(FunctionCall(lambda x: jnp.sum(x, axis=-1), [product], "dot", True))
 
     def cross(self, other) -> "VectorView":
-        """Cross product u×v (3-D only) → VectorView."""
+        """Cross product ``u×v`` (3-D only) → VectorView.
+
+        Args:
+            other: a 3-vector (a view, Placeholder or array).
+
+        Returns:
+            VectorView: the cross product.
+        """
         return VectorView(FunctionCall(lambda a, b: jnp.cross(a, b), [self._expr, _unwrap(other)], "cross"))
 
     def normalize(self) -> "VectorView":
@@ -835,7 +1052,14 @@ class VectorView(_DelegatesToPlaceholder):
         )
 
     def outer(self, other) -> "MatrixView":
-        """Outer product v ⊗ w → ``[..., n, m]`` MatrixView."""
+        """Outer product ``v ⊗ w`` → ``[..., n, m]`` MatrixView.
+
+        Args:
+            other: the second vector, length ``m``.
+
+        Returns:
+            MatrixView: ``M[..., i, j] = v_i w_j``.
+        """
         return MatrixView(
             FunctionCall(
                 lambda a, b: a[..., :, jnp.newaxis] * b[..., jnp.newaxis, :],
@@ -851,6 +1075,13 @@ class VectorView(_DelegatesToPlaceholder):
         so for an ``[..., n]`` vector and ``m`` variables the result is
         ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``. With no arguments, uses the
         coordinates bound by ``.bind(x=.., y=..)``.
+
+        Args:
+            *vars: the coordinate Variables (``x, y[, z]``); none uses the coordinates bound with
+                ``.bind(x=.., y=..)``.
+
+        Returns:
+            MatrixView: the Jacobian, ``[..., n, m]``.
         """
         vars = self._ops_coords(vars)
         cols = [self._expr.d(v, scheme=_view_scheme(self)) for v in vars]
@@ -863,16 +1094,33 @@ class VectorView(_DelegatesToPlaceholder):
         )
 
     def grad(self, *vars) -> "MatrixView":
-        """Spatial gradient of a vector field = Jacobian → MatrixView.
+        """Spatial gradient of a vector field, i.e. its Jacobian ``∂u_i/∂x_j`` → MatrixView.
 
-        Alias for :meth:`jacobian` so that ``vec.grad(x, y)`` mirrors the
-        scalar ``u.grad(x, y) → VectorView`` pattern in dimension.
+        The same as :meth:`jacobian`, named so that ``vec.grad(x, y)`` mirrors the scalar
+        ``u.grad(x, y) → VectorView`` pattern in dimension.
+
+        Args:
+            *vars: the coordinate Variables (``x, y[, z]``); none uses the coordinates bound with
+                ``.bind(x=.., y=..)``.
+
+        Returns:
+            MatrixView: the Jacobian, ``[..., n, m]``.
         """
         return self.jacobian(*vars)
 
     def laplacian(self, *vars, scheme: str | None = None) -> "VectorView":
         """Component-wise Laplacian ``Σ_j ∂²u_i/∂x_j²`` → VectorView. With no arguments, uses the
-        coordinates bound by ``.bind(x=.., y=..)``; finite differences by default for a nodal field."""
+        coordinates bound by ``.bind(x=.., y=..)``; finite differences by default for a nodal field.
+
+        Args:
+            *vars: the coordinate Variables (``x, y[, z]``); none uses the coordinates bound with
+                ``.bind(x=.., y=..)``.
+            scheme: the derivative scheme; ``None`` uses the binding's scheme, else finite differences
+                for a nodal field and automatic differentiation otherwise.
+
+        Returns:
+            VectorView: the component-wise Laplacian.
+        """
         vars = self._ops_coords(vars)
         return self._rewrap(self._expr.laplacian(*vars, scheme=_view_scheme(self, scheme)))
 
@@ -920,12 +1168,12 @@ class VectorView(_DelegatesToPlaceholder):
         if isinstance(other, MatrixView):
             return VectorView(
                 FunctionCall(
-                    lambda v, A: (v[..., jnp.newaxis, :] @ A)[..., 0, :],
+                    lambda v, A: _matmul(v[..., jnp.newaxis, :], A)[..., 0, :],
                     [self._expr, other._expr],
                     "vecmat",
                 )
             )
-        return FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "dot")
+        return FunctionCall(_matmul, [self._expr, _unwrap(other)], "dot")
 
 
 # ---------------------------------------------------------------------------
@@ -938,13 +1186,18 @@ class ComplexView(_DelegatesToPlaceholder):
 
     For native JAX ``complex64`` Placeholders, use ``placeholder.real`` /
     ``.imag`` directly (added to :class:`Placeholder`).
+
+    Args:
+        expr: the Placeholder the view wraps.
     """
 
     def __init__(self, expr: Placeholder) -> None:
         self._expr = expr
 
+    # docstring-from: jno.trace.views.ScalarView.expr
     @property
     def expr(self) -> Placeholder:
+        """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
     def __getattr__(self, name: str):
@@ -956,32 +1209,119 @@ class ComplexView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return ComplexView(new_expr)
 
-    def integrate(self, **kwargs) -> "ComplexView":
-        """Component-wise integral of the [re, im] split, preserving ComplexView."""
-        return self._rewrap(self._expr.integrate(**kwargs))
+    # docstring-from: jno.trace.views.ScalarView.integrate
+    def integrate(self, *args, **kwargs) -> "ComplexView":
+        """Integrate the underlying field, keeping the view type.
+
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
+        """
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "ComplexView":
         """Block gradient flow through the [re, im] pair, preserving ComplexView."""
         return self._rewrap(self._expr.stop_gradient)
 
+    # docstring-from: jno.trace.views.ScalarView.d
     def d(self, v, scheme: str | None = None) -> "ComplexView":
-        """Component-wise ``∂self/∂v`` — same view type."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
+        """
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.d2
     def d2(self, v, scheme: str | None = None) -> "ComplexView":
+        """``∂²self/∂v²`` — the second derivative in one variable, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The second derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.d2(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.dd
     def dd(self, v, w=None, scheme: str | None = None) -> "ComplexView":
+        """Mixed second derivative ``∂²self/∂v∂w``, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again (``∂²/∂v²``).
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The mixed derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.dd(v, w, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.partials
     def partials(self, **named_vars):
         """Bind Variables to names for partial-derivative-by-attribute access.
 
-        ``ψ.complex.partials(x=x, y=y).x`` → ``ComplexView`` of ``∂ψ/∂x`` —
-        the partial is taken element-wise across the ``[re, im]`` split.
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
         """
         return _coords_dispatch(self, (), named_vars)
 
@@ -1024,7 +1364,14 @@ class ComplexView(_DelegatesToPlaceholder):
         return FunctionCall(lambda x: x[..., 0] + 1j * x[..., 1], [self._expr], "to_native")
 
     def mul(self, other) -> "ComplexView":
-        """Complex multiplication ``(a+bi)(c+di) = (ac-bd) + (ad+bc)i``."""
+        """Complex multiplication ``(a+bi)(c+di) = (ac-bd) + (ad+bc)i``.
+
+        Args:
+            other: a complex view, or a real expression (treated as its real part).
+
+        Returns:
+            ComplexView: the product.
+        """
         o = other if isinstance(other, ComplexView) else ComplexView(_unwrap(other))
         re = self.real.expr * o.real.expr - self.imag.expr * o.imag.expr
         im = self.real.expr * o.imag.expr + self.imag.expr * o.real.expr
@@ -1076,20 +1423,26 @@ class ComplexView(_DelegatesToPlaceholder):
 
 
 class ComplexVectorView(_DelegatesToPlaceholder):
-    """Semantic view of a Placeholder as a **complex vector** field, shape ``[..., d, 2]`` (``d``
+    r"""Semantic view of a Placeholder as a **complex vector** field, shape ``[..., d, 2]`` (``d``
     vector components; last axis ``= 2 = [re, im]``). Reached via ``placeholder.vector.complex``.
 
-    ``.real`` / ``.imag`` return the real and imaginary parts as :class:`VectorView`\\s (each a real
+    ``.real`` / ``.imag`` return the real and imaginary parts as :class:`VectorView`\s (each a real
     ``d``-vector), so ``E.real.dot(n)`` / ``E.imag.div(x, y)`` work. Complex algebra (``.mul``,
     ``.conj``) is componentwise (Hadamard) over the vector; ``.mul`` against a complex *scalar*
     (:class:`ComplexView`) broadcasts. Mirrors :class:`ComplexView`, but each part is a vector. The
-    natural FEM realisation is two coupled real vector fields ``(E_r, E_i)``."""
+    natural FEM realisation is two coupled real vector fields ``(E_r, E_i)``.
+
+    Args:
+        expr: the Placeholder the view wraps.
+    """
 
     def __init__(self, expr: Placeholder) -> None:
         self._expr = expr
 
+    # docstring-from: jno.trace.views.ScalarView.expr
     @property
     def expr(self) -> Placeholder:
+        """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
     def __getattr__(self, name: str):
@@ -1136,18 +1489,81 @@ class ComplexVectorView(_DelegatesToPlaceholder):
 
     @property
     def stop_gradient(self) -> "ComplexVectorView":
+        """The same complex vector with gradients stopped (``jax.lax.stop_gradient``)."""
         return self._rewrap(self._expr.stop_gradient)
 
-    def integrate(self, **kwargs) -> "ComplexVectorView":
-        return self._rewrap(self._expr.integrate(**kwargs))
+    # docstring-from: jno.trace.views.ScalarView.integrate
+    def integrate(self, *args, **kwargs) -> "ComplexVectorView":
+        """Integrate the underlying field, keeping the view type.
 
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
+        """
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
+
+    # docstring-from: jno.trace.views.ScalarView.d
     def d(self, v, scheme: str | None = None) -> "ComplexVectorView":
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
+        """
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.partials
     def partials(self, **named_vars):
-        """Bind Variables for partial-by-attribute access; partials are component-wise over [re, im]."""
+        """Bind Variables to names for partial-derivative-by-attribute access.
+
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
+        """
         return _coords_dispatch(self, (), named_vars)
 
     bind = partials
@@ -1279,14 +1695,17 @@ class ComplexPair:
     # -- accessors --
     @property
     def real(self):
+        """The real part."""
         return self._re
 
     @property
     def imag(self):
+        """The imaginary part (``0.0`` for a pair built from a real value)."""
         return self._im if self._im is not None else 0.0
 
     @property
     def conj(self) -> "ComplexPair":
+        """The complex conjugate, ``re - i·im``."""
         return ComplexPair(self._re, None if self._im is None else -self._im)
 
     # -- field-like passthroughs (map over both parts) --
@@ -1295,35 +1714,68 @@ class ComplexPair:
 
     @property
     def x(self) -> "ComplexPair":
+        """``∂/∂x`` of both parts (``x`` must be a bound coordinate name)."""
         return self._map(lambda p: p.x)
 
     @property
     def y(self) -> "ComplexPair":
+        """``∂/∂y`` of both parts (``y`` must be a bound coordinate name)."""
         return self._map(lambda p: p.y)
 
     @property
     def z(self) -> "ComplexPair":
+        """``∂/∂z`` of both parts (``z`` must be a bound coordinate name)."""
         return self._map(lambda p: p.z)
 
     @property
     def t(self) -> "ComplexPair":
+        """``∂/∂t`` of both parts (``t`` must be a bound coordinate name)."""
         return self._map(lambda p: p.t)
 
     def __getitem__(self, i) -> "ComplexPair":
         return self._map(lambda p: p[i])
 
     def bind(self, **kw) -> "ComplexPair":
+        """Bind named coordinate Variables on both parts (``partials`` is the same method).
+
+        Args:
+            **kw: coordinate name to Variable, e.g. ``x=x, y=y``.
+
+        Returns:
+            ComplexPair: the bound pair.
+        """
         return self._map(lambda p: p.bind(**kw))
+
+    def test(self) -> "ComplexPair":
+        """The test function of a complex unknown (``domain.unknown(..., complex=True)``): the pair of the
+        real and imaginary parts' test functions."""
+        return self._map(lambda p: p.test())
 
     partials = bind
 
     def d(self, v, **kw) -> "ComplexPair":
+        """``∂self/∂v`` of both parts, or a directional derivative.
+
+        Args:
+            v: a coordinate Variable, or direction components ``(c_x, c_y[, c_z])`` for ``Σ c_i ∂/∂x_i``.
+            **kw: passed to the parts' ``.d`` (e.g. ``scheme=``).
+
+        Returns:
+            ComplexPair: the derivative.
+        """
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, kw.get("scheme", "automatic_differentiation"))
         return self._map(lambda p: p.d(v, **kw))
 
     def dot(self, other) -> "ComplexPair":
-        """Complex dot ``∑_i self_i · other_i`` of two complex vectors → complex scalar."""
+        """Complex dot ``∑_i self_i · other_i`` of two complex vectors → complex scalar.
+
+        Args:
+            other: a complex vector (a pair, or a real vector).
+
+        Returns:
+            ComplexPair: the complex scalar.
+        """
         o = _as_pair(other)
         if o is NotImplemented:
             return NotImplemented
@@ -1397,13 +1849,18 @@ class MatrixView(_DelegatesToPlaceholder):
     (``from_upper_tri``, ``from_lower_tri``, ``from_flat``, ``from_diag``)
     accept compactly-stored data and return a ``MatrixView`` so all other
     methods can chain off the unpacked matrix.
+
+    Args:
+        expr: the Placeholder the view wraps.
     """
 
     def __init__(self, expr: Placeholder) -> None:
         self._expr = expr
 
+    # docstring-from: jno.trace.views.ScalarView.expr
     @property
     def expr(self) -> Placeholder:
+        """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
     def __getattr__(self, name: str):
@@ -1415,30 +1872,100 @@ class MatrixView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return MatrixView(new_expr)
 
-    def integrate(self, **kwargs) -> "MatrixView":
-        """Element-wise integral of each matrix component over the integration
-        domain (not a matrix-algebra integral) — MatrixView preserved.
+    # docstring-from: jno.trace.views.ScalarView.integrate
+    def integrate(self, *args, **kwargs) -> "MatrixView":
+        """Integrate the underlying field, keeping the view type.
 
-        Useful for things like the spatial average of an anisotropic
-        diffusivity field.  Each ``[i, j]`` entry is integrated independently.
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "MatrixView":
         """Block gradient flow element-wise, preserving the MatrixView type."""
         return self._rewrap(self._expr.stop_gradient)
 
+    # docstring-from: jno.trace.views.ScalarView.d
     def d(self, v, scheme: str | None = None) -> "MatrixView":
-        """Element-wise ``∂self/∂v`` — same view type."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
+        """
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.d2
     def d2(self, v, scheme: str | None = None) -> "MatrixView":
+        """``∂²self/∂v²`` — the second derivative in one variable, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The second derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.d2(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.dd
     def dd(self, v, w=None, scheme: str | None = None) -> "MatrixView":
+        """Mixed second derivative ``∂²self/∂v∂w``, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again (``∂²/∂v²``).
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The mixed derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.dd(v, w, scheme=_view_scheme(self, scheme)))
 
     # ------------------------------------------------------------------
@@ -1474,7 +2001,15 @@ class MatrixView(_DelegatesToPlaceholder):
         return VectorView(FunctionCall(lambda x: jnp.linalg.eigh(x)[0], [self._expr], "eigvals"))
 
     def norm(self, ord: str = "fro") -> "ScalarView":
-        """Matrix norm (Frobenius by default) → ScalarView."""
+        """Matrix norm (Frobenius by default) → ScalarView.
+
+        Args:
+            ord: the norm, as for ``jnp.linalg.norm`` over the last two axes: ``"fro"`` (default),
+                ``"nuc"``, ``1``, ``2``, ``-1``, ``-2``, ``inf`` or ``-inf``.
+
+        Returns:
+            ScalarView: the norm per point.
+        """
         return ScalarView(
             FunctionCall(
                 lambda x, _o=ord: jnp.linalg.norm(x, ord=_o, axis=(-2, -1)),
@@ -1488,6 +2023,41 @@ class MatrixView(_DelegatesToPlaceholder):
         """Swap last two dimensions → MatrixView."""
         return MatrixView(FunctionCall(lambda x: x.swapaxes(-2, -1), [self._expr], "transpose"))
 
+    @property
+    def T(self) -> "MatrixView":
+        """``A.T`` — the transpose over the two matrix axes (the last two), like :meth:`transpose`.
+
+        A field's leading axes are points (and test DOFs), so the array ``.T`` that reverses every axis
+        would be wrong here."""
+        return self.transpose()
+
+    def __getitem__(self, key):
+        """``A[i, j]`` → ScalarView of entry ``(i, j)``; ``A[i]`` → VectorView of row ``i``.
+
+        Indices address the matrix axes (the last two), as for a vector view; ``A[..., i, j]`` is the same
+        entry spelled explicitly. Any other key indexes the underlying expression, so a mistake there is
+        the array's own error rather than a silent reinterpretation."""
+        keys = key if isinstance(key, tuple) else (key,)
+        if keys and keys[0] is Ellipsis:
+            keys = keys[1:]
+        if len(keys) == 2 and all(isinstance(k, int) for k in keys):
+            out = ScalarView(self._expr[(Ellipsis,) + tuple(keys)])
+        elif len(keys) == 1 and isinstance(keys[0], int):
+            out = VectorView(self._expr[(Ellipsis, keys[0], slice(None))])
+        else:
+            out = None
+        if out is not None:
+            # Keep a bound view's coordinates, as a vector component does, so `S.bind(x=x, y=y)[0, 1].x`
+            # and a per-entry Dirichlet `S(region)[0, 1] - g` both still see the binding.
+            cv = getattr(self, "_coord_vars", None)
+            if cv:
+                return _with_scheme(out.bind(**cv), getattr(self, "_bind_scheme", None))
+            return out
+        raise TypeError(
+            f"{type(self).__name__}[{key!r}]: a matrix view is indexed by an entry `A[i, j]` or a row `A[i]` "
+            "(integers). Index the underlying expression (`A.expr[...]`) for anything else."
+        )
+
     def log(self) -> "MatrixView":
         """Matrix logarithm ``logm(A)`` via eigendecomposition (symmetric / SPD), with a gradient that
         stays finite at repeated eigenvalues (Daleckiĭ–Kreĭn form) → MatrixView."""
@@ -1500,7 +2070,14 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def pow(self, n: float) -> "MatrixView":
         """Matrix power ``Aⁿ`` via eigendecomposition (symmetric), stable at repeated eigenvalues (so
-        ``pow(0.5)`` is a differentiable ``sqrtm``) → MatrixView."""
+        ``pow(0.5)`` is a differentiable ``sqrtm``) → MatrixView.
+
+        Args:
+            n: the exponent (any real number; the matrix must be symmetric).
+
+        Returns:
+            MatrixView: ``Aⁿ``.
+        """
         return MatrixView(
             FunctionCall(lambda x, _n=float(n): _spectral_matrix_function(x, "pow", _n), [self._expr], f"mat_pow_{n}")
         )
@@ -1578,10 +2155,23 @@ class MatrixView(_DelegatesToPlaceholder):
 
         return FunctionCall(_fn, [self._expr], "to_lower_tri")
 
+    # docstring-from: jno.trace.views.ScalarView.partials
     def partials(self, **named_vars):
-        """Bind Variables to names for element-wise partial-derivative access.
+        """Bind Variables to names for partial-derivative-by-attribute access.
 
-        ``A.matrix.partials(x=x, y=y).x`` → ``MatrixView`` of ``∂A/∂x``.
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
         """
         return _coords_dispatch(self, (), named_vars, positional_factory=NamedMatrixView)
 
@@ -1594,6 +2184,12 @@ class MatrixView(_DelegatesToPlaceholder):
 
         returns a ``NamedMatrixView`` with element access via ``A.xy``, ``A.yy`` (``ScalarView``
         of ``A[..., 0, 1]``, etc.). To bind coordinates for derivatives use ``.bind(**vars)``.
+
+        Args:
+            *args: the axis names, as separate strings or one list.
+
+        Returns:
+            NamedMatrixView: the same matrix with named elements.
         """
         return _coords_dispatch(self, args, {}, positional_factory=NamedMatrixView)
 
@@ -1645,12 +2241,16 @@ class MatrixView(_DelegatesToPlaceholder):
         if isinstance(other, VectorView):
             return VectorView(
                 FunctionCall(
-                    lambda A, v: (A @ v[..., jnp.newaxis])[..., 0],
+                    lambda A, v: _matmul(A, v[..., jnp.newaxis])[..., 0],
                     [self._expr, other._expr],
                     "matvec",
                 )
             )
-        return MatrixView(FunctionCall(lambda a, b: a @ b, [self._expr, _unwrap(other)], "matmul"))
+        return MatrixView(FunctionCall(_matmul, [self._expr, _unwrap(other)], "matmul"))
+
+    def __rmatmul__(self, other):
+        """``B @ A`` with a constant (array) or an expression on the left → MatrixView."""
+        return MatrixView(FunctionCall(_matmul, [_unwrap(other), self._expr], "matmul"))
 
 
 # ---------------------------------------------------------------------------
@@ -1661,15 +2261,17 @@ class MatrixView(_DelegatesToPlaceholder):
 class NamedMatrixView(MatrixView):
     """MatrixView with coordinate labels for named component access.
 
-    Created by :meth:`MatrixView.coords`. Inherits every MatrixView operation
-    (``.trace()``, ``.det()``, …); adds attribute-style lookup of components.
+    Created by :meth:`MatrixView.coords`. Inherits every MatrixView operation (``.trace()``,
+    ``.det()``, …) and adds attribute-style lookup of components::
 
-    Examples
-    --------
-    >>> A = sigma.voigt.to_full().coords(["x", "y"])
-    >>> A.xy        # ScalarView for σ_xy
-    >>> A.trace()   # ScalarView for σ_xx + σ_yy (inherited)
-    >>> A.component("x", "y")   # explicit form, also returns ScalarView
+        A = sigma.voigt.to_full().coords(["x", "y"])
+        A.xy                  # ScalarView for σ_xy
+        A.trace()             # ScalarView for σ_xx + σ_yy (inherited)
+        A.component("x", "y") # explicit form, also a ScalarView
+
+    Args:
+        expr: the matrix Placeholder.
+        coord_names: one name per axis entry, e.g. ``["x", "y"]``.
     """
 
     def __init__(self, expr: Placeholder, coord_names: list) -> None:
@@ -1693,7 +2295,15 @@ class NamedMatrixView(MatrixView):
         return getattr(expr, key)
 
     def component(self, name1: str, name2: str) -> "ScalarView":
-        """Explicit component lookup → ScalarView."""
+        """Explicit component lookup → ScalarView.
+
+        Args:
+            name1: the row name.
+            name2: the column name.
+
+        Returns:
+            ScalarView: ``A[..., i, j]``.
+        """
         i = self._coord_map[name1]
         j = self._coord_map[name2]
         return ScalarView(self._expr[..., i, j])
@@ -1714,13 +2324,18 @@ class VoigtView(_DelegatesToPlaceholder):
     Arithmetic between two VoigtViews returns a VoigtView (componentwise).
     Use ``.to_full()`` to get a full ``[..., n, n]`` MatrixView for general
     matrix operations (``.inv``, ``.log``, ``.exp``, ``.coords``).
+
+    Args:
+        expr: the Placeholder the view wraps.
     """
 
     def __init__(self, expr: Placeholder) -> None:
         self._expr = expr
 
+    # docstring-from: jno.trace.views.ScalarView.expr
     @property
     def expr(self) -> Placeholder:
+        """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
     def __getattr__(self, name: str):
@@ -1732,33 +2347,119 @@ class VoigtView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VoigtView(new_expr)
 
-    def integrate(self, **kwargs) -> "VoigtView":
-        """Component-wise integral over the Voigt-packed tensor — VoigtView
-        preserved; each Voigt slot is integrated independently.
+    # docstring-from: jno.trace.views.ScalarView.integrate
+    def integrate(self, *args, **kwargs) -> "VoigtView":
+        """Integrate the underlying field, keeping the view type.
+
+        ``.integrate()`` (collocation / mesh quadrature over the field's points) returns the same kind
+        of view. ``.integrate(fem)`` / ``.integrate(d)`` -- an integral over a solve or a domain, one
+        number -- is handed through as the node it is: re-wrapped, it would carry the quadrature points'
+        coordinate bindings into any form it is multiplied into.
+
+        Args:
+            *args: optionally the ``jno.fem`` problem or domain to integrate over (see
+                :meth:`Placeholder.integrate`).
+            **kwargs: passed to :meth:`Placeholder.integrate` (e.g. ``quadrature=``).
+
+        Returns:
+            The integral: a view of the same kind, or the plain node for ``integrate(fem)`` /
+            ``integrate(d)``.
         """
-        return self._rewrap(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(*args, **kwargs))
 
     @property
     def stop_gradient(self) -> "VoigtView":
         """Block gradient flow component-wise, preserving the VoigtView type."""
         return self._rewrap(self._expr.stop_gradient)
 
+    # docstring-from: jno.trace.views.ScalarView.d
     def d(self, v, scheme: str | None = None) -> "VoigtView":
-        """Component-wise ``∂self/∂v`` — same view type."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+
+        ``v`` may also be a **vector of components** ``(c_x, c_y[, c_z])``: the directional derivative
+        ``Σ c_i ∂self/∂x_i`` along the coordinates bound with ``.bind(x=.., y=..)``. With the components
+        of a normal, ``ub.d((nx, ny))`` is ``∂u/∂n``; any other direction works the same way.
+
+        For a vector, matrix or complex view the derivative is taken component-wise and the result is a
+        view of the same kind.
+
+        Args:
+            v: a coordinate Variable, a normal from ``domain.variable(tag, normals=True)``, or a tuple of
+                direction components ``(c_x, c_y[, c_z])``.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The derivative, as a view of the same kind.
+        """
         if isinstance(v, (tuple, list)):  # a direction (c_x, c_y[, c_z]): Σ c_i ∂/∂x_i
             return _directional(self, v, scheme)
         return self._rewrap(self._expr.d(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.d2
     def d2(self, v, scheme: str | None = None) -> "VoigtView":
+        """``∂²self/∂v²`` — the second derivative in one variable, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The second derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.d2(v, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.dd
     def dd(self, v, w=None, scheme: str | None = None) -> "VoigtView":
+        """Mixed second derivative ``∂²self/∂v∂w``, as a view of the same kind.
+
+        For a vector, matrix or complex view it is taken component-wise.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again (``∂²/∂v²``).
+            scheme: the derivative scheme. ``None`` uses the one the binding carries
+                (``u.bind(x=x, y=y, scheme=jno.fd(order=4))``), else finite differences for a nodal
+                field and automatic differentiation otherwise. Explicit values are the scheme strings of
+                :meth:`Placeholder.d` / :meth:`Placeholder.d2` or a ``jno.fd(...)`` stencil.
+
+        Returns:
+            The mixed derivative, as a view of the same kind.
+        """
         return self._rewrap(self._expr.dd(v, w, scheme=_view_scheme(self, scheme)))
 
+    # docstring-from: jno.trace.views.ScalarView.partials
     def partials(self, **named_vars):
-        """Bind Variables to names for component-wise partial-derivative access.
+        """Bind Variables to names for partial-derivative-by-attribute access.
 
-        ``σ.voigt.partials(x=x, y=y).x`` → ``VoigtView`` of ``∂σ/∂x``.
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+
+        ``bind`` is the same method.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional
+                ``scheme=`` sets the derivative scheme every later ``.d`` / attribute derivative uses.
+
+        Returns:
+            The bound view (same kind), with attribute derivatives ``.x``, ``.xy``, ... available.
         """
         return _coords_dispatch(self, (), named_vars)
 
@@ -1944,6 +2645,10 @@ class NamedVectorView(VectorView):
     For partial-derivative-by-name semantics use the keyword form
     :meth:`VectorView.coords` with Variables — that returns a
     ``NamedVectorViewWithPartials`` instead.
+
+    Args:
+        expr: the vector Placeholder.
+        names: one name per component.
     """
 
     def __init__(self, expr: Placeholder, names) -> None:
@@ -1995,10 +2700,21 @@ class FieldView(ScalarView):
 
         u = NN(a_phys).field.bind(x=x_var, y=y_var, t=t_var)
         residual = u.t - 220.0**2 * (u.xx + u.yy) + u**3 - u
+
+    Args:
+        expr: the Placeholder the view wraps.
     """
 
     def partials(self, **named_vars):
-        """Bind Variables to names; returns a :class:`FieldViewWithPartials`."""
+        """Bind Variables to names; returns a :class:`FieldViewWithPartials` (``bind`` is the same method).
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y, t=t``; an optional ``scheme=``
+                sets the derivative scheme.
+
+        Returns:
+            FieldViewWithPartials: the bound view.
+        """
         scheme = named_vars.pop("scheme", None) if "scheme" in named_vars else getattr(self, "_bind_scheme", None)
         return _with_scheme(FieldViewWithPartials(self._expr, named_vars), scheme)
 
@@ -2046,6 +2762,11 @@ class FieldViewWithPartials(ScalarView):
     against the bound Variable's domain mesh and emit a warning if the
     distance exceeds ``1e-6``.  The validation is purely diagnostic — the
     FD computation always reads coordinates from the domain mesh.
+
+    Args:
+        expr: the field Placeholder.
+        coord_vars: name to Variable bindings, plus optional ``<name>_coords`` arrays checked
+            against the mesh.
     """
 
     _base_view = ScalarView
@@ -2138,7 +2859,7 @@ class FieldViewWithPartials(ScalarView):
         cv = object.__getattribute__(self, "_coord_vars")
         sc = object.__getattribute__(self, "_spatial_coords")
         other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-        tie_tags = None
+        tie_tags = extra = None
         if other_cv:
             conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
             if conflict and _is_periodic_tie_combination(
@@ -2146,7 +2867,15 @@ class FieldViewWithPartials(ScalarView):
             ):
                 # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
                 # the two region tags here (the only place they survive) for the classifier to read.
-                tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                prior = getattr(self, "_periodic_tie", None)
+                if prior is not None:
+                    # An ALREADY-tied view meeting a third region does not re-tie: `v(A) - v(B) - Z*i(C)`
+                    # used to come out stamped ('A', 'C'), quietly losing B and describing a pair the
+                    # user never wrote. Keep the original pair and record the newcomer separately, so a
+                    # reader can tell a two-terminal form from a three-terminal one instead of guessing.
+                    tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                else:
+                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
             else:
                 merged = dict(cv)
                 for name, var in other_cv.items():
@@ -2159,6 +2888,12 @@ class FieldViewWithPartials(ScalarView):
                         )
                     merged[name] = var
                 cv = merged
+        if tie_tags is None:
+            # An operation on a stamped tie keeps the stamp: `u(A) - u(B) - g` discards the tie's
+            # own view at the OUTER subtraction, and the region tags survive nowhere else. Whether
+            # the offset form means anything is the reading solver's call -- jno.fem still refuses
+            # it, loudly, because _tie_phase does not recognise the outer `-`.
+            tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
@@ -2166,6 +2901,9 @@ class FieldViewWithPartials(ScalarView):
         _with_scheme(new, getattr(self, "_bind_scheme", None))  # `.bind(..., scheme=...)` survives arithmetic
         if tie_tags is not None:
             object.__setattr__(new, "_periodic_tie", tie_tags)
+        extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+        if extra is not None:
+            object.__setattr__(new, "_tie_extra", extra)
         return new
 
     # ------------------------------------------------------------------
@@ -2187,13 +2925,32 @@ class FieldViewWithPartials(ScalarView):
         return self._rewrap(self._expr.d(v, scheme=scheme or self._default_deriv_scheme()))
 
     def d2(self, v, scheme: str | None = None) -> "ScalarView":
-        """``∂²self/∂v²`` — finite differences by default for a nodal field."""
+        """``∂²self/∂v²`` — finite differences by default for a nodal field.
+
+        Args:
+            v: the coordinate Variable.
+            scheme: the derivative scheme; ``None`` uses the binding's scheme, else finite differences
+                for a nodal field and automatic differentiation otherwise.
+
+        Returns:
+            ScalarView: the second derivative.
+        """
         if scheme is not None:
             _reject_whole_laplacian_scheme(scheme, "d2")
         return self._rewrap(self._expr.d2(v, scheme=scheme or self._default_deriv_scheme()))
 
     def dd(self, v, w=None, scheme: str | None = None) -> "ScalarView":
-        """Mixed second derivative ``∂²self/∂v∂w`` — finite differences by default for a nodal field."""
+        """Mixed second derivative ``∂²self/∂v∂w`` — finite differences by default for a nodal field.
+
+        Args:
+            v: the first coordinate Variable.
+            w: the second; ``None`` means ``v`` again.
+            scheme: the derivative scheme; ``None`` uses the binding's scheme, else finite differences
+                for a nodal field and automatic differentiation otherwise.
+
+        Returns:
+            ScalarView: the mixed derivative.
+        """
         if scheme is not None:
             _reject_whole_laplacian_scheme(scheme, "dd")
         return self._rewrap(self._expr.dd(v, w, scheme=scheme or self._default_deriv_scheme()))
@@ -2205,6 +2962,14 @@ class FieldViewWithPartials(ScalarView):
         ``"automatic_differentiation"``. AD is meaningless on a discrete nodal field, and the AD Hessian
         branch has no ``points`` to differentiate at, so it failed with an opaque ``AttributeError``
         instead of doing the finite-difference thing ``.d`` / ``.d2`` / ``.dd`` already do here.
+
+        Args:
+            *variables: the coordinate Variables; none uses the bound ones.
+            scheme: the derivative scheme; ``None`` uses the binding's scheme, else finite differences
+                for a nodal field and automatic differentiation otherwise.
+
+        Returns:
+            ScalarView: the Laplacian.
         """
         if not variables:  # the coordinates bound with `.bind(x=.., y=..)`, as `grad()` and `div()` use
             cv = getattr(self, "_coord_vars", None) or {}
@@ -2328,6 +3093,17 @@ def _make_named_with_partials_cls(view_cls):
     """
 
     class NamedWithPartials(view_cls):
+        """A view with coordinate names bound for attribute derivatives: what ``.bind(x=x, y=y)`` returns.
+
+        Every operation of the underlying view kind is available; in addition an attribute made of
+        bound names is a partial derivative: ``u.x`` is ``∂u/∂x``, ``u.xy`` is ``∂²u/∂x∂y``, ``u.t``
+        the time derivative (up to fourth order). ``u.fd.x`` forces finite differences.
+
+        Args:
+            expr: the field Placeholder.
+            coord_vars: name to Variable bindings, e.g. ``{"x": x, "y": y}``.
+        """
+
         _base_view = view_cls
 
         def __init__(self, expr, coord_vars: dict) -> None:
@@ -2349,7 +3125,7 @@ def _make_named_with_partials_cls(view_cls):
             """
             cv = object.__getattribute__(self, "_coord_vars")
             other_cv = getattr(other, "_coord_vars", None) if other is not None else None
-            tie_tags = None
+            tie_tags = extra = None
             if other_cv:
                 conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
                 if conflict and _is_periodic_tie_combination(
@@ -2358,7 +3134,11 @@ def _make_named_with_partials_cls(view_cls):
                     # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the
                     # `.x`-ambiguity guard does not apply. The BinaryOp discards the per-side views, so
                     # stash the two region tags here (the only place they survive) for jno.fem to read.
-                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                    prior = getattr(self, "_periodic_tie", None)
+                    if prior is not None:  # see the note in FieldViewWithPartials._rewrap
+                        tie_tags, extra = prior, _tag_of_coord_vars(other_cv)
+                    else:
+                        tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
                 else:
                     merged = dict(cv)
                     for name, var in other_cv.items():
@@ -2371,9 +3151,16 @@ def _make_named_with_partials_cls(view_cls):
                             )
                         merged[name] = var
                     cv = merged
+            if tie_tags is None:
+                # see the note in FieldViewWithPartials._rewrap: an operation on a stamped tie keeps
+                # the stamp, because the outer op discards the tie's own view.
+                tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
             res = _with_scheme(type(self)(new_expr, cv), getattr(self, "_bind_scheme", None))
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
+            extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
+            if extra is not None:
+                object.__setattr__(res, "_tie_extra", extra)
             return res
 
         def __getattr__(self, key: str):

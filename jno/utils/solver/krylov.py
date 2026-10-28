@@ -22,6 +22,8 @@ import jax
 import jax.numpy as jnp
 
 __all__ = [
+    "cg_counted",
+    "bicgstab_counted",
     "fgmres",
     "minres",
     "cocg",
@@ -58,7 +60,10 @@ def _effective_tol(tol, dtype, *, floor_factor=4.0):
     Floored at a small multiple of eps. **float64 is untouched** for any tolerance anyone passes in
     practice (the floor there is ~8.9e-16), so this changes no existing result.
     """
-    return float(max(float(tol), floor_factor * float(_EPS_OF(dtype))))
+    floor = floor_factor * float(_EPS_OF(dtype))
+    if isinstance(tol, jax.core.Tracer):  # a per-call tolerance (an inexact-Newton forcing term) is traced
+        return jnp.maximum(tol, floor)
+    return float(max(float(tol), floor))
 
 
 def _ident(v):
@@ -70,7 +75,7 @@ def _ident(v):
 # ---------------------------------------------------------------------------
 
 
-def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
+def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000, return_iters=False):
     """Flexible restarted GMRES — right preconditioning with a per-iteration-varying ``M``.
 
     Y. Saad, *A Flexible Inner-Outer Preconditioned GMRES Algorithm*, SIAM J. Sci. Stat.
@@ -84,6 +89,9 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
     Memory: two ``(restart, n)`` bases. Each restart cycle runs its ``restart`` inner steps at
     fixed shape (converged/broken-down steps become masked no-ops); the outer loop re-forms the
     true residual, so a masked cycle costs work but never accuracy.
+
+    ``return_iters=True`` returns ``(x, k)`` with ``k`` the Arnoldi steps actually taken (masked
+    no-op steps of a converged cycle are not counted) -- what ``fem.stats`` reports.
     """
     M = M or _ident
     b = jnp.asarray(b)
@@ -106,7 +114,9 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
         cs = jnp.zeros((m,), b.dtype)
         sn = jnp.zeros((m,), b.dtype)
 
-        def step(j, carry):
+        def step(j, carry_k):
+            carry, k = carry_k
+            k = k + carry[-1].astype(jnp.int32)  # this step runs (unmasked) iff the cycle is still active
             V, Z, H, g, cs, sn, active = carry
             z = M(V[j])
             w = matvec(z)
@@ -157,10 +167,12 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
                 active & (jnp.abs(s_new * gj) > tol_abs),  # |g[j+1]| is the residual norm
             )
             old = (V, Z, H, g, cs, sn, active)
-            return jax.tree_util.tree_map(lambda a, o: jnp.where(active, a, o), new, old)
+            return jax.tree_util.tree_map(lambda a, o: jnp.where(active, a, o), new, old), k
 
         active0 = beta > tol_abs
-        V, Z, H, g, cs, sn, _ = jax.lax.fori_loop(0, m, step, (V, Z, H, g, cs, sn, active0))
+        (V, Z, H, g, cs, sn, _), steps = jax.lax.fori_loop(
+            0, m, step, ((V, Z, H, g, cs, sn, active0), jnp.asarray(0, jnp.int32))
+        )
 
         # never-written columns are zero: unit diagonal keeps the triangular solve regular,
         # and their (spurious) y entries multiply the zero rows of Z — harmless by construction
@@ -168,14 +180,121 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
         written = jnp.abs(jnp.diagonal(Hm)) > 0.0
         Hm = Hm + jnp.diag(jnp.where(written, 0.0, 1.0))
         y = jax.scipy.linalg.solve_triangular(Hm, g[:m], lower=False)
-        return x + y @ Z
+        return x + y @ Z, steps
 
     def cond(state):
-        x, k = state
+        x, k, _n = state
         return (jnp.linalg.norm(b - matvec(x)) > tol_abs) & (k < max_cycles)
 
-    x, _ = jax.lax.while_loop(cond, lambda s: (cycle(s[0]), s[1] + 1), (x0, 0))
+    def outer(state):
+        x, k, n_steps = state
+        x, steps = cycle(x)
+        return x, k + 1, n_steps + steps
+
+    x, _, n_steps = jax.lax.while_loop(cond, outer, (x0, 0, jnp.asarray(0, jnp.int32)))
+    return (x, n_steps) if return_iters else x
+
+
+def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64, maxiter=1000, check_every=8, side="right"):
+    """Restarted, preconditioned GMRES that asks the host only every ``check_every`` steps.
+
+    Y. Saad & M. H. Schultz, *GMRES*, SIAM J. Sci. Stat. Comput. 7(3), 1986, with right
+    preconditioning (Saad, *Iterative Methods for Sparse Linear Systems*, 2nd ed., Alg. 9.5).
+
+    Why it exists: on a GPU every data-dependent ``lax.while_loop`` copies its predicate to the host
+    on every trip, which drains the stream. ``jax.scipy.sparse.linalg.gmres`` has several such loops
+    per Arnoldi step (the step loop and the Gram-Schmidt re-orthogonalisation), so a GMRES whose
+    matvec is many small kernels spends much of its time with the device idle -- measured on a
+    welded PEEC network, ~230 ms idle in a 485 ms gradient step. Here the Arnoldi steps run in
+    blocks of ``check_every`` inside a ``fori_loop`` of fixed trip count, which XLA runs without a
+    predicate copy, and convergence is read once per block. The price is at most
+    ``check_every - 1`` steps past convergence.
+
+    ``side="right"`` (Saad Alg. 9.5): the residual the least-squares problem minimises IS ``b - A x``
+    and ``tol`` means ``||b - A x|| <= max(tol ||b||, atol)``. ``side="left"`` (Alg. 9.4) measures
+    ``||M (b - A x)||`` instead, which is what ``jax.scipy.sparse.linalg.gmres`` stops on: for a good
+    ``M`` on an ill-conditioned ``A`` it tracks the ERROR far more closely than the true residual does.
+    Each restart re-forms the residual from ``x``, so an Arnoldi estimate that has drifted cannot end
+    the solve. Orthogonalisation is CGS2, vectorised
+    over the whole fixed-shape basis (unbuilt rows are zero, so they contribute nothing).
+    """
+    M = M or _ident
+    if side not in ("left", "right"):
+        raise ValueError(f"gmres_chunked: side must be 'left' or 'right', got {side!r}")
+    right = side == "right"
+    op = (lambda v: matvec(M(v))) if right else (lambda v: M(matvec(v)))
+    b = jnp.asarray(b)
+    resid = (lambda x: b - matvec(x)) if right else (lambda x: M(b - matvec(x)))
+    n = b.shape[0]
+    m = int(min(restart, n))
+    k = int(max(1, min(check_every, m)))
+    m = -(-m // k) * k  # whole blocks
+    dt = b.dtype
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    tiny = _tiny_of(dt)
+    tol = _effective_tol(tol, dt)
+    tol_abs = jnp.maximum(tol * jnp.maximum(jnp.linalg.norm(b), tiny), atol)
+    max_cycles = -(-int(maxiter) // m)
+    cols = jnp.arange(m)
+
+    def lsq(H, beta, j):
+        # min || beta e_1 - H y || over the first j columns. Unbuilt columns become e_{c+1}: they
+        # sit in rows the built ones never touch, so the problem decouples, stays full rank, and
+        # their y entries come out zero. A column built after a breakdown is all zero and is
+        # treated the same way.
+        fill = jnp.zeros((m + 1, m), dt).at[cols + 1, cols].set(1.0)
+        built = (cols < j) & jnp.any(H != 0, axis=0)
+        Hm = jnp.where(built[None, :], H, fill)
+        g = jnp.zeros((m + 1,), dt).at[0].set(beta)
+        Q, R = jnp.linalg.qr(Hm)
+        y = jax.scipy.linalg.solve_triangular(R, jnp.conj(Q.T) @ g, lower=False)
+        return y, jnp.linalg.norm(g - Hm @ y)
+
+    def arnoldi(i, carry):
+        V, H, j = carry
+        w = op(V[j])
+        # HERMITIAN inner products (see fgmres); rows past j are still zero, so no mask is needed
+        h = jnp.conj(V) @ w
+        w = w - h @ V
+        h2 = jnp.conj(V) @ w
+        w = w - h2 @ V
+        h = h + h2
+        hn = jnp.linalg.norm(w)
+        # a breakdown (an invariant subspace) leaves a zero row: later steps then build zeros, and
+        # the least-squares residual is already at the floor, so the block ends the cycle
+        V = V.at[j + 1].set(jnp.where(hn > tiny, w / jnp.maximum(hn, tiny), 0.0))
+        H = H.at[:, j].set(h.at[j + 1].set(hn))
+        return V, H, j + 1
+
+    def cycle(state):
+        x, r, c = state
+        beta = jnp.linalg.norm(r)
+        V = jnp.zeros((m + 1, n), dt).at[0].set(r / jnp.maximum(beta, tiny))
+        H = jnp.zeros((m + 1, m), dt)
+
+        def block(s):
+            V, H, j, _ = s
+            V, H, j = jax.lax.fori_loop(0, k, arnoldi, (V, H, j))
+            return V, H, j, lsq(H, beta, j)[1]
+
+        def more(s):
+            return (s[2] < m) & (s[3] > tol_abs)
+
+        V, H, j, _ = jax.lax.while_loop(more, block, (V, H, 0, beta))
+        y, _ = lsq(H, beta, j)
+        dx = y @ V[:m]
+        x = x + (M(dx) if right else dx)
+        return x, resid(x), c + 1
+
+    def go(state):
+        _, r, c = state
+        return (jnp.linalg.norm(r) > tol_abs) & (c < max_cycles)
+
+    x, _, _ = jax.lax.while_loop(go, cycle, (x0, resid(x0), 0))
     return x
+
+
+__all__.append("gmres_chunked")
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +302,7 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000):
 # ---------------------------------------------------------------------------
 
 
-def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
+def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000, return_iters=False):
     """MINRES — **symmetric** (possibly indefinite) systems: saddle points, Helmholtz-like shifts.
 
     C. C. Paige & M. A. Saunders, *Solution of Sparse Indefinite Systems of Linear Equations*,
@@ -256,7 +375,8 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
         x = x + phi * w
         return x, r1, r2, y, oldb, beta, dbar, epsln, phibar, cs, sn, w, w2, itn + 1
 
-    return jax.lax.while_loop(cond, body, state0)[0]
+    out = jax.lax.while_loop(cond, body, state0)
+    return (out[0], out[13]) if return_iters else out[0]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +384,7 @@ def minres(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
 # ---------------------------------------------------------------------------
 
 
-def flexible_cg(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, maxiter=2000):
+def flexible_cg(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, maxiter=2000, return_iters=False):
     """**Flexible** preconditioned CG: the Polak-Ribiere ``beta = z_new^T (r_new - r_old) / (z_old^T r_old)``.
 
     Y. Notay, *Flexible conjugate gradients*, SIAM J. Sci. Comput. 22(4), 2000, 1444-1460. Standard PCG's
@@ -299,10 +419,11 @@ def flexible_cg(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, maxiter=2000)
         beta = jnp.where(bad, 0.0, (z_new @ (r_new - r)) / jnp.where(bad, 1.0, rz))
         return (x, r_new, z_new, z_new + beta * p, r_new @ z_new, itn + 1, broke | bad)
 
-    return jax.lax.while_loop(cond, body, state0)[0]
+    out = jax.lax.while_loop(cond, body, state0)
+    return (out[0], out[5]) if return_iters else out[0]
 
 
-def cocg(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
+def cocg(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000, return_iters=False):
     """COCG — **complex-symmetric** systems, ``A = A^T`` (NOT ``A = A^H``).
 
     H. A. van der Vorst & J. B. M. Melissen, *A Petrov-Galerkin type method for solving Ax = b,
@@ -368,7 +489,8 @@ def cocg(matvec, b, *, M=None, x0=None, tol=1e-8, maxiter=2000):
         p = z + beta * p
         return (x, r, z, p, rho_new, itn + 1, broke | bad)
 
-    return jax.lax.while_loop(cond, body, state0)[0]
+    out = jax.lax.while_loop(cond, body, state0)
+    return (out[0], out[5]) if return_iters else out[0]
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +675,7 @@ def spectrum_bounds(matvec, n, *, dtype=None, iters=30, M=None, lmin=None, lmax=
     return _from_power()
 
 
-def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, maxiter=200):
+def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, maxiter=200, return_iters=False):
     """Chebyshev semi-iteration for SPD systems with spectrum inside ``[lmin, lmax]``.
 
     Y. Saad, *Iterative Methods for Sparse Linear Systems*, 2nd ed., SIAM 2003, §12.3,
@@ -591,7 +713,8 @@ def chebyshev_iteration(matvec, b, *, lmin, lmax, M=None, x0=None, tol=1e-8, max
         d = rho_new * rho * d + (2.0 * rho_new / delta) * M(r)
         return x, r, d, rho_new, k + 1
 
-    return jax.lax.while_loop(cond, body, (x, r, d, rho, 0))[0]
+    out = jax.lax.while_loop(cond, body, (x, r, d, rho, 0))
+    return (out[0], out[4]) if return_iters else out[0]
 
 
 def chebyshev_apply(matvec, v, *, lmin, lmax, degree, M=None):
@@ -622,6 +745,104 @@ def chebyshev_apply(matvec, v, *, lmin, lmax, degree, M=None):
 
 
 __all__.append("chebyshev_apply")
+
+
+def cg_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=None):
+    """``jax.scipy.sparse.linalg.cg``'s own loop, returning ``(x, k)``.
+
+    Line for line the upstream iteration (``jax/_src/scipy/sparse/linalg.py``, ``_cg_solve``): that loop
+    already counts its steps in its carry and discards the count. Keeping it is the only change, so the
+    arithmetic is the same -- measured on a 46,691-DOF Jacobi-preconditioned Poisson system: identical
+    iterations, ``x`` equal to 0 on CPU and 8.5e-13 on GPU (reduction order), and the same time (0.94-0.97x).
+    Real ``b`` only; the complex-symmetric case is :func:`cocg`."""
+    M = M or _ident
+    b = jnp.asarray(b)
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    maxiter = 10 * b.shape[0] if maxiter is None else int(maxiter)
+    atol2 = jnp.maximum(jnp.square(tol) * jnp.vdot(b, b).real, jnp.square(atol))
+
+    def cond(v):
+        _, r, gamma, _, k = v
+        rs = gamma.real if M is _ident else jnp.vdot(r, r).real
+        return (rs > atol2) & (k < maxiter)
+
+    def body(v):
+        x, r, gamma, p, k = v
+        Ap = matvec(p)
+        alpha = gamma / jnp.vdot(p, Ap).real.astype(gamma.dtype)
+        x_ = x + alpha * p
+        r_ = r - alpha * Ap
+        z_ = M(r_)
+        gamma_ = jnp.vdot(r_, z_).real.astype(gamma.dtype)
+        return x_, r_, gamma_, z_ + (gamma_ / gamma) * p, k + 1
+
+    r0 = b - matvec(x0)
+    z0 = M(r0)
+    x, _r, _g, _p, k = jax.lax.while_loop(cond, body, (x0, r0, jnp.vdot(r0, z0).real.astype(b.dtype), z0, 0))
+    return x, k
+
+
+#: BiCGStab iterations per trip of its while_loop (see ``bicgstab_counted``): the convergence test -- a
+#: device-to-host copy and a sync on a GPU -- runs once per this many iterations. Measured (RTX 3070, fp64,
+#: Jacobi-BiCGStab on a 3-D elasticity tangent): 5-9% per iteration at 20k-100k DOFs, flat beyond 8; an
+#: iteration then costs its two SpMVs, which run at the memory bandwidth. At most m-1 frozen iterations
+#: are computed and discarded per solve.
+_CHECK_EVERY = [8]
+
+
+def bicgstab_counted(matvec, b, *, M=None, x0=None, tol=1e-5, atol=0.0, maxiter=None):
+    """``jax.scipy.sparse.linalg.bicgstab``'s own loop, returning ``(x, k, broke)``.
+
+    Line for line the upstream iteration (``_bicgstab_solve``), which counts its steps and then discards
+    them -- and on breakdown (``rho = 0``, ``omega = 0`` or ``alpha = 0``) overwrites the count with a
+    negative code. Here the breakdown is a separate flag, so the count survives it; the arithmetic is
+    unchanged (measured on a 46,691-DOF advection-diffusion system: identical iterations, ``x`` within
+    7.2e-16 on CPU and 1.2e-10 on GPU, against a 1e-8 tolerance; the same time, 0.98-1.00x)."""
+    M = M or _ident
+    b = jnp.asarray(b)
+    x0 = jnp.zeros_like(b) if x0 is None else jnp.asarray(x0).reshape(-1)
+    maxiter = 10 * b.shape[0] if maxiter is None else int(maxiter)
+    atol2 = jnp.maximum(jnp.square(tol) * jnp.vdot(b, b).real, jnp.square(atol))
+
+    def cond(v):
+        _x, r, *_, k, broke = v
+        return (jnp.vdot(r, r).real > atol2) & (k < maxiter) & ~broke
+
+    def step(v):
+        x, r, rhat, alpha, omega, rho, p, q, k, _broke = v
+        rho_ = jnp.vdot(rhat, r)
+        beta = rho_ / rho * alpha / omega
+        p_ = r + beta * (p - omega * q)
+        phat = M(p_)
+        q_ = matvec(phat)
+        alpha_ = rho_ / jnp.vdot(rhat, q_)
+        s = r - alpha_ * q_
+        exit_early = jnp.vdot(s, s).real < atol2
+        shat = M(s)
+        t = matvec(shat)
+        omega_ = jnp.vdot(t, s) / jnp.vdot(t, t)
+        x_ = jnp.where(exit_early, x + alpha_ * phat, x + (alpha_ * phat + omega_ * shat))
+        r_ = jnp.where(exit_early, s, s - omega_ * t)
+        broke = (omega_ == 0) | (alpha_ == 0) | (rho_ == 0)
+        return x_, r_, rhat, alpha_, omega_, rho_, p_, q_, jnp.where(broke, k, k + 1), broke
+
+    m = int(_CHECK_EVERY[0])
+
+    def body(v):
+        # `m` iterations per trip of the loop: XLA runs a while_loop on the GPU by copying its condition
+        # to the host after every trip, a sync per iteration. Once an iteration of the block has converged
+        # or broken down the rest are FROZEN (computed, discarded), so the iterates, the count and the
+        # answer are the sequential loop's exactly.
+        for _ in range(m):
+            nxt = step(v)
+            live = cond(v)
+            v = tuple(jnp.where(live, n, o) for n, o in zip(nxt, v))
+        return v
+
+    r0 = b - matvec(x0)
+    one = jnp.asarray(1, b.dtype)
+    out = jax.lax.while_loop(cond, body, (x0, r0, r0, one, one, one, r0, r0, 0, jnp.asarray(False)))
+    return out[0], out[8], out[9]
 
 
 def gmres(A, b, x0=None, **kwargs):

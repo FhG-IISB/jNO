@@ -8,18 +8,29 @@ Operations trace computations and return callable placeholders.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ..architectures.lora import LoRAWrapper, _normalize_wrappers
 from ..tuner import Arch, ArchSpace
 from ..utils.adaptive import LearningRateSchedule
 from ..utils.iree import IREEModel
 from ..utils.logger import get_logger
+
+
+def _matmul(a, b):
+    """``a @ b`` for the ``@`` operators of the trace: small products lowered elementwise (see
+    :func:`jno.utils.solver.small_linalg.small_matmul`)."""
+    from ..utils.solver.small_linalg import small_matmul  # lazy: jno.utils.solver imports the trace
+
+    return small_matmul(a, b)
+
 
 __all__ = [
     "Placeholder",
@@ -35,6 +46,7 @@ __all__ = [
     "BinaryOp",
     "Tracker",
     "Constraint",
+    "AugLagConstraint",
     "Model",
     "TunableModule",
     "TunableModuleCall",
@@ -63,6 +75,7 @@ __all__ = [
     "TestFunction",
     "Assembly",
     "GroupedAssembly",
+    "Flow",
     "TrialFunction",
     "FemLinearSystem",
     "FemResidualOperator",
@@ -227,11 +240,25 @@ class Placeholder:
 
     # -- symbolic comparison operators (return traced FunctionCall nodes) ------
     def equal(self, other) -> FunctionCall:
-        """Element-wise symbolic equality (traced, not Python ``==``)."""
+        """Element-wise symbolic equality (traced, not Python ``==``).
+
+        Args:
+            other: Placeholder, array or scalar to compare against; broadcast against ``self``.
+
+        Returns:
+            FunctionCall: a boolean node, ``True`` where the two are equal.
+        """
         return FunctionCall(jnp.equal, [self, other])
 
     def not_equal(self, other) -> FunctionCall:
-        """Element-wise symbolic inequality (traced, not Python ``!=``)."""
+        """Element-wise symbolic inequality (traced, not Python ``!=``).
+
+        Args:
+            other: Placeholder, array or scalar to compare against; broadcast against ``self``.
+
+        Returns:
+            FunctionCall: a boolean node, ``True`` where the two differ.
+        """
         return FunctionCall(jnp.not_equal, [self, other])
 
     def __gt__(self, other) -> FunctionCall:
@@ -319,15 +346,20 @@ class Placeholder:
     def scale(self, value: float) -> "Placeholder":
         """Declare the characteristic *magnitude* of this variable/field.
 
-        Units give the *dimension* (``.unit("m")`` → a length); the scale gives
-        the *magnitude* in that unit (``.scale(0.1)`` → the characteristic length
-        is 0.1 m).  The two are orthogonal and used together by
-        :func:`jno.units.nondimensionalize` to derive dimensionless groups and
-        rescale a problem to ``O(1)``.  Returns *self* so it chains inline::
+        Units give the *dimension* (``.unit("m")`` → a length); the scale gives the *magnitude* in that
+        unit (``.scale(0.1)`` → the characteristic length is 0.1 m). The two are orthogonal and used
+        together by :func:`jno.units.nondimensionalize` to derive dimensionless groups and rescale a
+        problem to ``O(1)``::
 
             x = x.unit("m").scale(0.1)        # L  = 0.1 m
             u = net(x, t).unit("K").scale(50.0)
             alpha = alpha.unit("m^2/s").scale(1e-5)
+
+        Args:
+            value: the characteristic magnitude, in the unit set by :meth:`unit`; converted to ``float``.
+
+        Returns:
+            Placeholder: ``self``, so the call chains inline.
         """
         self._scale = float(value)
         return self
@@ -463,19 +495,19 @@ class Placeholder:
 
         # symbolic path
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [self, other])
+            return FunctionCall(_matmul, [self, other])
 
         # eager path (other is ndarray)
-        return FunctionCall(lambda a: a @ other, [self])
+        return FunctionCall(lambda a: _matmul(a, other), [self])
 
     def __rmatmul__(self, other) -> FunctionCall:
         """Matrix multiplication: other @ self"""
         other = self._wrap(other)
 
         if isinstance(other, Placeholder):
-            return FunctionCall(lambda a, b: a @ b, [other, self])
+            return FunctionCall(_matmul, [other, self])
 
-        return FunctionCall(lambda b: other @ b, [self])
+        return FunctionCall(lambda b: _matmul(other, b), [self])
 
     def reshape(self, *shape) -> FunctionCall:
         """Reshape this placeholder to a new shape."""
@@ -484,10 +516,18 @@ class Placeholder:
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
     def assemble(self, domain=None, target=None, **kwargs):
-        """Unified assembly entry point.
+        """Assemble this weak-form expression on a domain (the unified assembly entry point).
 
-        If domain is omitted, try to infer it from Variables/TestFunction/etc.
-        target=None lets weak_form.py infer the steady solver route in Phase 1.
+        Args:
+            domain: the ``jno.domain`` to assemble on. ``None`` infers it from the Variables, trial and
+                test functions the expression contains.
+            target: the solver route to assemble for. ``None`` lets the weak-form assembler pick the
+                steady route from the expression.
+            **kwargs: passed on to ``jno.utils.solver.weak_form.assemble_weak_form`` (for example
+                ``quad_degree``).
+
+        Returns:
+            The assembled operator for the chosen route.
         """
         from ..utils.solver.weak_form import assemble_weak_form
 
@@ -512,7 +552,8 @@ class Placeholder:
         Returns:
             A traced node that prints at runtime and returns the unchanged input.
 
-        Example:
+        Example::
+
             ``constraints.append((NN(*inpt) - u).print("stats", "residual"))``
             ``constraints.append((NN(*inpt) - u).print(lambda x: x.shape, "residual"))``
         """
@@ -580,6 +621,14 @@ class Placeholder:
 
     @property
     def shape(self) -> FunctionCall:
+        """A boolean array of ones shaped like this node's value, as a traced node.
+
+        Useful to broadcast a constant to the shape of a field (``u.shape * 0.0 + c``) without
+        evaluating anything.
+
+        Returns:
+            FunctionCall: the node; it evaluates to ``jnp.ones(value.shape, bool)``.
+        """
         # The trailing ``True`` is the ``reduces_axis`` slot. ``shape`` and ``T`` below are NOT
         # reductions, but they are marked as such on purpose: it is what stops them propagating the
         # weak-form mark to their operand. Left as-is deliberately -- see ``FunctionCall.reduces``.
@@ -587,26 +636,76 @@ class Placeholder:
 
     @property
     def mean(self) -> FunctionCall:
+        """The arithmetic mean over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
 
     @property
     def sum(self) -> FunctionCall:
+        """The sum over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(jnp.sum(x)), [self], "sum", True)
 
     @property
     def min(self) -> FunctionCall:
+        """The minimum over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(jnp.min(x)), [self], "min", True)
 
     @property
     def max(self) -> FunctionCall:
+        """The maximum over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
 
     @property
     def std(self) -> FunctionCall:
+        """The standard deviation over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
 
     @property
     def mse(self) -> FunctionCall:
+        """The mean of the squares over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+        For a residual ``r`` this is the usual collocation loss: ``jno.core([pde.mse, bc.mse])``.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
+
         def fn(x):
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
@@ -614,6 +713,14 @@ class Placeholder:
 
     @property
     def mae(self) -> FunctionCall:
+        """The mean of the absolute values over every point, as a traced scalar.
+
+        The reduction runs over all axes (points and channels) and the result is squeezed to a scalar,
+        so it drops straight into ``jno.core([...])`` as a loss term or a tracked metric.
+
+        Returns:
+            FunctionCall: the scalar node.
+        """
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     def patch(self) -> "FunctionCall":
@@ -714,7 +821,7 @@ class Placeholder:
         The outer sum runs over the **ridges** — a mesh vertex in 2-D, a mesh edge in 3-D — and the
         inner over pairs of interior facets meeting there (:meth:`~jno.domain.Domain._facet_ridges`),
         with ``w_r`` the ridge's measure (1 for a point, its length for an edge). For a facet with
-        density jump ``D`` and unit normal ``n``,
+        density jump ``D`` and unit normal ``n``::
 
             a = sqrt( (1 + 2z) D^2 + z^2 ) - z          how much boundary the facet carries
             v = n D sqrt(1 + z^2) / sqrt( D^2 + z^2 )   which way it faces, |v| <= 1
@@ -872,7 +979,7 @@ class Placeholder:
         logging a rising beta and a falling grey-level indicator. Passing ``beta`` as a parameter
         NODE here makes it a traced argument, and the schedule then actually reaches the physics.
 
-        So the composition rule is: **non-local maps reparameterise, pointwise maps compose.**
+        So the composition rule is: **non-local maps reparameterise, pointwise maps compose**::
 
             rho.patch().project(beta)      # filter in constrain(), projection in the form
 
@@ -986,7 +1093,13 @@ class Placeholder:
 
     @property
     def T(self) -> FunctionCall:
-        return FunctionCall(lambda x: x.T, [self], "transpose", True)
+        """The transpose over the LAST TWO axes (the matrix axes); a 0-/1-D value is returned as is.
+
+        The array ``.T`` reverses every axis, which is the transpose only for a plain 2-D array. In a trace
+        the leading axes are points (and, at assembly, quadrature points and test DOFs), so on a field of
+        2x2 tensors -- ``grad(u).T`` -- reversing them all produced a ``(2, 2, n)`` array: a broadcast error
+        at best, and for ``n = 2`` a silently wrong number. For a 2-D array both readings agree."""
+        return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2) if jnp.ndim(x) >= 2 else x, [self], "transpose", True)
 
     def eval(self, domain=None):
         """Eagerly evaluate this node and return the array — no ``jno.core`` boilerplate.
@@ -1185,23 +1298,77 @@ class Placeholder:
         _guard_ad_on_fd(self, scheme)
         return Jacobian(self, [variable], scheme)
 
+    # docstring-from: jno.trace.Placeholder.d
     def diff(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
-        """Alias for :meth:`d`."""
+        """Return ∂self/∂variable — shorthand for ``jnn.grad(self, variable)``.
+
+        Can be chained for higher-order derivatives::
+
+            u_xx = u.d(x).d(x)   # ∂²u/∂x²
+            u_xy = u.d(x).d(y)   # ∂²u/∂x∂y
+
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: First-order scheme string.
+
+                * ``"automatic_differentiation"`` (default) — uses the global
+                  AD mode set via :func:`jno.setup` (see :mod:`jno.utils.ad_mode`).
+                * ``"automatic_differentiation:forward"`` — ``jax.jacfwd``.
+                * ``"automatic_differentiation:reverse"`` — ``jax.jacrev``.
+                * ``"finite_difference"`` (optional sub-schemes:
+                  ``":lsq"`` / ``":uniform"`` / ``":inverse_distance"``).
+        """
         _guard_ad_on_fd(self, scheme)
         return Jacobian(self, [variable], scheme)
 
     def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
         """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
 
+        Example::
+
+            u_xx = u.d2(x)
+
         Args:
-            variable: The Variable to differentiate with respect to.
-            scheme: Second-order scheme string — see :meth:`laplacian`.
+            variable: The Variable to differentiate with respect to (twice).
+            scheme: Second-order scheme string.
+
+                * ``"automatic_differentiation"`` (default) — uses the global Hessian mode set via
+                  :func:`jno.setup` (see :mod:`jno.utils.ad_mode`).
+                * ``"automatic_differentiation:fwd-over-rev"`` — ``jacfwd(jacrev(f))``.
+                * ``"automatic_differentiation:fwd-over-fwd"`` — ``jacfwd(jacfwd(f))``.
+                * ``"automatic_differentiation:rev-over-rev"`` — ``jacrev(jacrev(f))``.
+                * ``"automatic_differentiation:rev-over-fwd"`` — ``jacrev(jacfwd(f))``.
+                * ``"finite_difference"`` (optional sub-schemes: ``":cotangent"`` (2-D), ``":lsq"``).
+
+        Returns:
+            Hessian: the second-derivative node.
         """
         _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
+    # docstring-from: jno.trace.Placeholder.d2
     def dd(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
-        """Alias for :meth:`d2`."""
+        """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
+
+        Example::
+
+            u_xx = u.d2(x)
+
+        Args:
+            variable: The Variable to differentiate with respect to (twice).
+            scheme: Second-order scheme string.
+
+                * ``"automatic_differentiation"`` (default) — uses the global Hessian mode set via
+                  :func:`jno.setup` (see :mod:`jno.utils.ad_mode`).
+                * ``"automatic_differentiation:fwd-over-rev"`` — ``jacfwd(jacrev(f))``.
+                * ``"automatic_differentiation:fwd-over-fwd"`` — ``jacfwd(jacfwd(f))``.
+                * ``"automatic_differentiation:rev-over-rev"`` — ``jacrev(jacrev(f))``.
+                * ``"automatic_differentiation:rev-over-fwd"`` — ``jacrev(jacfwd(f))``.
+                * ``"finite_difference"`` (optional sub-schemes: ``":cotangent"`` (2-D), ``":lsq"``).
+
+        Returns:
+            Hessian: the second-derivative node.
+        """
         _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
@@ -1260,7 +1427,7 @@ class Placeholder:
                 sub-region, or a geometry part. ``None`` (default) advances the state on every cell, and
                 is what the update did before this argument existed. Outside the region the state is
                 **frozen**: its next value is the value it already has. That is what makes an ordinary
-                multi-material problem expressible — a plastic strip drawn over an elastic die is
+                multi-material problem expressible — a plastic strip drawn over an elastic die is::
 
                     ep.evolves(ep.i(-1) + rt * dg * n, region="strip")
 
@@ -1375,6 +1542,12 @@ class Placeholder:
 
             space_time_integral = u_net(x, t).integrate().integrate(t)
 
+        **Domain integral of known fields** (``var=d`` — a domain): an expression of frozen fields (data, or
+        solutions of any number of forms frozen with ``u.bind(...).freeze(fem.solve())``), parameters and
+        coordinates, integrated over the volume with each field's own element -- so a reciprocity matrix is its
+        formula, e.g. ``C_jk = (eps * inner(grad(Phi[k]), grad(Phi[j]))).integrate(d)``. See
+        ``Domain._integral_node``.
+
         **FEM integral** (``var=fem`` — a ``jno.fem(...)`` object):
         Integrates an expression built from that FEM's own symbols over its basis, at its
         solution, returning a differentiable scalar. This is the FEM twin of the collocation
@@ -1393,8 +1566,8 @@ class Placeholder:
         ``quadrature=`` does not apply: a FEM functional inherits the rule its operator was
         assembled with, which is what makes ``∫ σ(u):ε(u) dΩ`` equal ``uᵀKu`` exactly. Every
         functional over one ``fem`` shares a single solve. See :meth:`jno.fem.eval` for the eager
-        form and for the scope limits (whole volume and tagged boundary regions, steady
-        native-Lagrange problems).
+        form and for the scope limits (steady problems; the whole volume and tagged boundary regions
+        of a native-Lagrange form, the whole volume of a non-nodal one, real or complex).
 
         ``solver=`` picks the backend for that shared solve, the same spec ``fem.solve()`` takes::
 
@@ -1451,6 +1624,17 @@ class Placeholder:
             all_false = jax.tree_util.tree_map(lambda _: False, net.module)
             mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
             J_w = crux.eval([u.grad(net.mask(mask))])[0]  # (N, P_weight)
+
+        Args:
+            *args: either the spatial Variables (``x, y`` or ``x, y, z``) for the spatial gradient,
+                or a single :class:`Model` for the parameter gradient.
+
+        Returns:
+            VectorView | NetworkGradient: the spatial gradient vector, or the per-point parameter
+            Jacobian.
+
+        Raises:
+            TypeError: if called with no arguments.
         """
         if not args:
             raise TypeError("grad() requires at least one Variable (spatial gradient) or a Model (parameter gradient).")
@@ -1467,7 +1651,11 @@ class Placeholder:
 
 
 class Literal(Placeholder):
-    """Concrete scalar/array embedded in the trace (no trainable params)."""
+    """Concrete scalar/array embedded in the trace (no trainable params).
+
+    Args:
+        value: the number or array; stored as ``jnp.asarray(value)``.
+    """
 
     def __init__(self, value):
         self.value = jnp.asarray(value)
@@ -1476,8 +1664,82 @@ class Literal(Placeholder):
         return f"Literal({self.value})"
 
 
+class AttachedLiteral(Literal):
+    """A region's attached value inside ``d.<prop>``, read from the domain each time it is lowered.
+
+    ``domain.attach`` can change the value after the term is written; reading it here rather than
+    copying it is what lets a built ``jno.fem`` re-assemble with the new value (the fem watches the
+    property's version, see ``FEM._refresh_attachments``). Only values that resolve to a plain number or
+    array are carried this way. It prints as the ``Literal`` it stands for.
+
+    Args:
+        domain: the domain the value is attached to.
+        prop: the attached property's name (the ``<prop>`` in ``d.<prop>``).
+        target: the region (tag) whose value this node reads.
+    """
+
+    def __init__(self, domain, prop: str, target: str):
+        self._domain, self.prop, self.target = domain, prop, target
+
+    @property
+    def value(self):
+        """The attached value as it is now, resolved to a ``jnp`` array (read on every access)."""
+        raw = self._domain.__dict__["_region_attachments"][self.prop][self.target]
+        return jnp.asarray(self._domain._resolve_attached(raw))
+
+    def __repr__(self):
+        return f"Literal({self.value})"
+
+
 class FunctionCall(Placeholder):
-    """Call to a pure function over traced args."""
+    """Call to a pure function over traced arguments: the node behind every ``jno.np`` operation.
+
+    Args:
+        fn: the pure JAX function, called with the evaluated ``args`` (and ``kwargs``).
+        args: the arguments, Placeholders or constants; a single non-sequence is wrapped in a list.
+        name: display name used in printing and ``jno.info``; ``None`` derives one from ``fn``.
+        reduces_axis: set when ``fn`` reduces its input (``mean``, ``sum``, ...). A reduction does not
+            pass the weak-form mark of its operand on to the result.
+        kwargs: extra keyword arguments passed to ``fn`` unchanged.
+    """
+
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """``(a <= b).auglag(...)``: enforce the comparison by an augmented Lagrangian.
+
+        The comparison becomes a :class:`Constraint` with the same treatment as
+        ``jno.le(a, b).auglag(...)``: it stays a reported row, a multiplier penalty is added to the loss,
+        and every ``every`` steps the multiplier is updated from the current violation (method of
+        multipliers, Nocedal & Wright 2006, Sec. 17.4). Only ``<=`` and ``>=`` qualify. A strict ``<`` /
+        ``>`` bound is refused: its optimum sits on the boundary it excludes, so it has none::
+
+            jno.core([loss, (volume <= 0.4).auglag(mu=10.0, every=100)]).solve(5000)
+
+        Args:
+            mu: Starting penalty weight (> 0), in units of the objective per unit violation squared.
+                It grows tenfold while the violation stops shrinking.
+            every: Optimiser steps between multiplier updates: enough for the optimiser to settle on the
+                current augmented loss (a quasi-Newton optimiser needs far fewer than Adam).
+
+        Returns:
+            AugLagConstraint: the constraint; its multiplier is ``.multiplier``.
+        """
+        if self.fn is jnp.less_equal or self.fn is jnp.greater_equal:
+            a, b = self.args
+            if not isinstance(a, Placeholder):  # `2.0 <= x` reached here as x >= 2.0 already; this is defensive
+                a, b = b, a
+                sense = "ge" if self.fn is jnp.less_equal else "le"
+            else:
+                sense = "le" if self.fn is jnp.less_equal else "ge"
+            return AugLagConstraint(a, b, sense, mu=mu, every=every)
+        if self.fn is jnp.less or self.fn is jnp.greater:
+            op = "<" if self.fn is jnp.less else ">"
+            raise ValueError(
+                f"auglag: a strict `{op}` has no optimum (it sits on the excluded boundary); write `{op}=` instead."
+            )
+        raise TypeError(
+            f".auglag() applies to a comparison `a <= b` / `a >= b` or to jno.le/jno.ge, not to a "
+            f"call of {getattr(self.fn, '__name__', self.fn)!r}."
+        )
 
     def __init__(
         self,
@@ -1520,7 +1782,14 @@ class FunctionCall(Placeholder):
         return f"{name}({args_str})"
 
     def copy_with_args(self, new_args):
-        """Create a new instance with different args."""
+        """Return a copy of this call with different arguments (same function, name and options).
+
+        Args:
+            new_args: the replacement argument list.
+
+        Returns:
+            FunctionCall: the new node.
+        """
         return FunctionCall(
             fn=self.fn,
             args=new_args,
@@ -1535,7 +1804,16 @@ class FunctionCall(Placeholder):
 
 
 class Choice(Placeholder):
-    """Tunable categorical choice between multiple traced expressions."""
+    """Tunable categorical choice between multiple traced expressions.
+
+    The tuner (:mod:`jno.tuner`) switches between the options; outside a tuning run the ``default``
+    option is used.
+
+    Args:
+        options: the candidate expressions; constants are wrapped as :class:`Literal`. Must not be empty.
+        name: name under which the tuner reports the choice; ``None`` gives ``choice_<id>``.
+        default: index of the option used until :meth:`select` picks another.
+    """
 
     def __init__(self, options: Union[list, tuple], name: str | None = None, default: int = 0):
         if not isinstance(options, (list, tuple)) or len(options) == 0:
@@ -1550,6 +1828,17 @@ class Choice(Placeholder):
             raise ValueError(f"Choice default index {self.selected} out of range for {len(self.options)} option(s)")
 
     def select(self, index: int) -> "Choice":
+        """Select which option this choice evaluates to.
+
+        Args:
+            index: position in ``options``; must be in ``range(len(options))``.
+
+        Returns:
+            Choice: ``self``, for chaining.
+
+        Raises:
+            ValueError: if ``index`` is out of range.
+        """
         idx = int(index)
         if not (0 <= idx < len(self.options)):
             raise ValueError(f"Choice index {idx} out of range for {len(self.options)} option(s)")
@@ -1561,14 +1850,15 @@ class Choice(Placeholder):
 
 
 class ConstantNamespace:
-    """Wrapper that allows attribute access to constants (P.k syntax).
+    """Wrapper that allows attribute access to constants (``P.k`` syntax).
 
-    Supports loading from:
-    - dict: Direct dictionary of key-value pairs
-    - str/Path: File path to .json, .yaml, .yml, .toml, .pkl, .pickle files
+    All numeric values are converted to JAX arrays at load time; nested dictionaries become nested
+    ``ConstantNamespace`` objects.
 
-    All numeric values are pre-converted to JAX arrays at load time.
-    Nested dictionaries become nested ConstantNamespace objects.
+    Args:
+        tag: name of this namespace (shown in printing and used to build constant tags).
+        data: the constants, as a dict or as a path (``str``/``Path``) to a ``.json``, ``.yaml``,
+            ``.yml``, ``.toml``, ``.pkl`` or ``.pickle`` file.
     """
 
     def __init__(
@@ -1864,9 +2154,14 @@ class ConstantNamespace:
 
 
 class Constant(Placeholder):
-    """Concrete scalar/array embedded in the trace.
+    """Concrete scalar/array embedded in the trace, as read from a :class:`ConstantNamespace`.
 
     Values are pre-converted to JAX arrays at creation time.
+
+    Args:
+        tag: the namespace tag the constant came from.
+        key: the constant's key inside that namespace.
+        value: the value, already a ``jnp`` array.
     """
 
     def __init__(self, tag: str | None, key: str | None, value: Any):
@@ -1889,16 +2184,25 @@ class Constant(Placeholder):
 
 
 class Variable(Placeholder):
-    """Independent variable placeholder (e.g., `x`, `y`, `t`).
+    """Independent variable placeholder (e.g. ``x``, ``y``, ``t``).
 
-    Carries the domain tag and dimension index so the solver can bind sampled
-    coordinates when evaluating traced expressions.
+    Carries the domain tag and dimension index so the solver can bind sampled coordinates when
+    evaluating traced expressions. Created by ``domain.variable(...)`` rather than directly.
 
-    For time-dependent problems, spatial variables (``axis='spatial'``) index
-    into the spatial context array ``context[tag]`` shaped ``(N, D_spatial)``
-    (after the outer B and T vmaps peel off their axes).  The temporal
-    variable (``axis='temporal'``) reads from a separate
+    For time-dependent problems, spatial variables (``axis='spatial'``) index into the spatial
+    context array ``context[tag]`` shaped ``(N, D_spatial)`` (after the outer B and T vmaps peel off
+    their axes). The temporal variable (``axis='temporal'``) reads from a separate
     ``context["__time__"]`` entry that is a scalar (after the T vmap).
+
+    Args:
+        tag: the domain tag (point set) the variable reads, e.g. ``"interior"``.
+        dim: ``[start, stop]`` column slice of the tag's coordinate array; ``stop=None`` runs to the end.
+        domain: the domain holding ``tag``; the tag must exist in ``domain.context``.
+        axis: ``"spatial"`` or ``"temporal"``.
+        fem_meta: optional FEM metadata (element type, node positions) attached by the FEM paths.
+
+    Raises:
+        KeyError: if ``tag`` is not in ``domain.context``.
     """
 
     def __init__(
@@ -2014,8 +2318,12 @@ class Variable(Placeholder):
 class TensorTag(Placeholder):
     """Named tensor tag used for parametric inputs or coefficients.
 
-    Backed by arrays attached to the domain; when domains merge, tags stack
-    along the batch dimension.
+    Backed by arrays attached to the domain; when domains merge, tags stack along the batch dimension.
+
+    Args:
+        tag: the name of the attached array.
+        domain: the domain the array is attached to.
+        dim_index: if set, the node reads only this index of the array's last axis.
     """
 
     def __init__(self, tag: str, domain=None, dim_index: int | None = None):
@@ -2089,7 +2397,16 @@ class BinaryOp(Placeholder):
 
 
 class Tracker(Placeholder):
-    """Wraps an expression to be monitored during training without contributing to the loss."""
+    """Wraps an expression to be monitored during training without contributing to the loss.
+
+    Built by :meth:`Placeholder.tracker`.
+
+    Args:
+        expr: the expression to evaluate.
+        interval: evaluate every ``interval`` epochs (>= 1).
+        reduce: optional callable applied to the evaluated numpy array to produce a scalar for W&B
+            and the progress line; ``None`` uses ``np.mean`` for non-scalar outputs.
+    """
 
     def __init__(self, expr: Placeholder, interval: int = 1, reduce=None):
         self.expr = expr
@@ -2101,8 +2418,11 @@ class Tracker(Placeholder):
         return f"Tracker({self.expr!r}, interval={self.interval})"
 
 
+_SENSE_OP = {"le": "<=", "ge": ">=", "eq": "=="}
+
+
 class Constraint(Placeholder):
-    """Wraps an expression that is an **inequality constraint**, not a loss to minimise.
+    """Wraps an expression that is a **constraint**, not a loss to minimise.
 
     ``jno.core`` evaluates it exactly like a constraint entry -- same compiled function, same
     differentiation -- so its value and gradient are available to a constrained optimiser. What it
@@ -2110,35 +2430,94 @@ class Constraint(Placeholder):
     summing a constraint into the objective makes it a soft penalty, which double-counts against an
     optimiser (MMA, OC, SQP) that already handles it in the dual.
 
-    ``sense`` is ``"le"`` (``expr <= bound``) or ``"ge"``; the stored residual is normalised to the
-    ``g <= 0`` convention either way, so a consumer never has to branch on the sense.
+    ``sense`` is ``"le"`` (``expr <= bound``), ``"ge"`` or ``"eq"`` (``expr == bound``, enforced only
+    through :meth:`auglag`); the stored residual is normalised to the ``g <= 0`` convention (``g == 0``
+    for an equality), so a consumer never has to branch on ``le`` versus ``ge``.
 
     Contrast with :class:`Tracker`, which is also kept out of the loss but is evaluated by a
     *separate* function on an interval, is not differentiated, and is invisible to the optimiser.
     """
 
     def __init__(self, expr: Placeholder, bound: float = 0.0, sense: str = "le"):
-        if sense not in ("le", "ge"):
-            raise ValueError(f"Constraint: sense must be 'le' or 'ge', got {sense!r}.")
+        if sense not in ("le", "ge", "eq"):
+            raise ValueError(f"Constraint: sense must be 'le', 'ge' or 'eq', got {sense!r}.")
+        from .views import _VIEW_TYPES
+
+        # a typed view (u.scalar, or an expression of frozen fields that stays a view) is its Placeholder here,
+        # as in jno.np.* and jno.core.eval: the evaluator has no handler for the view wrapper
+        expr = expr._expr if isinstance(expr, _VIEW_TYPES) else expr
         self.expr = expr
         self.bound = bound
         self.sense = sense
-        # g <= 0 when feasible, whichever way the user wrote it.
-        self.residual = (expr - bound) if sense == "le" else (bound - expr)
+        # g <= 0 when feasible, whichever way the user wrote it; g == 0 for an equality.
+        self.residual = (bound - expr) if sense == "ge" else (expr - bound)
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        op = "<=" if self.sense == "le" else ">="
-        return f"Constraint({self.expr!r} {op} {self.bound})"
+        return f"Constraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound})"
+
+    def auglag(self, mu: float = 10.0, every: int = 100) -> "AugLagConstraint":
+        """Enforce this constraint by an augmented Lagrangian, so ANY optimiser can be used.
+
+        The constraint stays a reported row; a multiplier penalty is added to the loss, and every
+        ``every`` steps the multiplier is updated from the current violation (method of
+        multipliers, Nocedal & Wright 2006, Sec. 17.4). An equality ``jno.eq`` gets the same treatment
+        with a multiplier of either sign (Sec. 17.3). ``mu`` is the starting penalty weight; it
+        grows tenfold while the violation stops shrinking. The design between updates may violate
+        the constraint: feasibility comes as the multiplier converges, unlike with ``mma``/``gcmma``.
+        The multiplier is ``.multiplier`` (evaluate it with ``crux.eval``)::
+
+            jno.core([loss, jno.le(volume, 0.4).auglag(mu=10.0, every=100)]).solve(5000)
+
+        Args:
+            mu: Starting penalty weight (> 0), in units of the objective per unit violation squared.
+            every: Optimiser steps between multiplier updates: enough for the optimiser to settle
+                on the current augmented loss (a quasi-Newton optimiser needs far fewer than Adam).
+        """
+        return AugLagConstraint(self.expr, self.bound, self.sense, mu=mu, every=every)
+
+
+class AugLagConstraint(Constraint):
+    """A :class:`Constraint` enforced by an augmented Lagrangian, built by :meth:`Constraint.auglag`.
+
+    ``jno.core`` keeps it as the constraint row it is and adds :attr:`penalty`, the multiplier term,
+    to the loss UNAVERAGED (the multiplier update reads its exact gradient). It is an ordinary
+    expression marked ``_auglag_penalty``, so its multiplier parameter is collected like any other.
+    ``multiplier`` is the Lagrange multiplier as a node.
+
+    Args:
+        expr: the constrained expression.
+        bound: the bound it is compared against.
+        sense: ``"le"`` (``expr <= bound``), ``"ge"`` or ``"eq"``.
+        mu: Starting penalty weight (> 0), in units of the objective per unit violation squared.
+            It grows tenfold while the violation stops shrinking.
+        every: Optimiser steps between multiplier updates: enough for the optimiser to settle on the
+            current augmented loss (a quasi-Newton optimiser needs far fewer than Adam).
+    """
+
+    def __init__(self, expr, bound=0.0, sense="le", *, mu: float = 10.0, every: int = 100):
+        super().__init__(expr, bound, sense)
+        from ..optimizers.auglag import penalty
+
+        self.mu, self.every = float(mu), int(every)
+        self.state, psi = penalty(
+            self.residual, mu=mu, every=every, name=getattr(expr, "_user_name", None), equality=sense == "eq"
+        )
+        self.multiplier = self.state[0]
+        psi._auglag_penalty = True
+        self.penalty = psi
+
+    def __repr__(self):
+        return f"AugLagConstraint({self.expr!r} {_SENSE_OP[self.sense]} {self.bound}, mu={self.mu}, every={self.every})"
 
 
 class Model(Placeholder):
-    """Wrapper for user-defined Equinox models.
+    """Wrapper for user-defined Equinox models: the object ``jno.nn(...)`` returns.
 
-    Allows using any Equinox module within the PINO tracing system.
-    The module is initialized lazily when the input dimension is known.
+    Allows using any Equinox module within the jNO trace. Calling it on Variables gives a
+    :class:`ModelCall`; training options (``optimizer``, ``freeze``, ``lora``, ``initialize``, ...) are
+    set on the model or, chained, on the call::
 
-    Example - Direct call style (module takes separate arguments):
         class MLP(eqx.Module):
             ...
             def __call__(self, x, y, *, key=None):
@@ -2146,17 +2525,17 @@ class Model(Placeholder):
                 ...
                 return z
 
-        uv_net = pnp.nn.wrap(MLP(..., key=key))
+        uv_net = jno.nn(MLP(..., key=key))
         u = uv_net(x, y)[..., 0]
+
+    Args:
+        module: an Equinox module instance (already constructed), or a callable / Flax ``nn.Module``
+            for backward compatibility.
+        name: display name in logs and ``jno.info``; empty uses the module's class name.
+        weight_path: optional checkpoint to load at initialisation (same forms as :meth:`initialize`).
     """
 
     def __init__(self, module: Any, name: str = "", weight_path: str | None = None):
-        """Create a Model wrapper.
-
-        Args:
-            module: An Equinox module instance (already constructed), or a
-                    callable / Flax nn.Module for backward compatibility.
-        """
         self.module = module
         self.name = name
         self.input_dim = None
@@ -2198,7 +2577,7 @@ class Model(Placeholder):
 
     @property
     def params(self):
-        """Alias for :attr:`module` — always reflects the current (post-training) weights."""
+        """The wrapped Equinox module, i.e. :attr:`module`: always the current (post-training) weights."""
         return self.module
 
     @property
@@ -2364,6 +2743,90 @@ class Model(Placeholder):
 
         return self
 
+    def flow(
+        self,
+        x0: Any,
+        *cond: Any,
+        time: Any,
+        save: bool = False,
+        noise: Any = None,
+        key: Any = None,
+    ) -> Any:
+        r"""March this network as an ODE **velocity field**: :math:`dx/dt = v(x, t, \ldots)`.
+
+        The network is called as ``v(x, t, *cond)`` -- state first, time second -- and must return the
+        same pytree structure as the state.
+
+        Args:
+            x0: Initial state. Any **pytree** of arrays; the trailing axis is the feature axis, so a
+                scalar field over ``N`` points is ``(N, 1)``, not ``(N,)``. Pass it explicitly rather
+                than drawing it inside: it is the thing an inverse problem optimises.
+            *cond: Extra arguments forwarded to the network unchanged every step -- a class label, a
+                physics parameter, a coefficient field.
+            time: The grid POINTS, as an array/sequence (the primary form) or a ``(t0, t1, n)``
+                triple. Step sizes are the consecutive differences, so a non-uniform schedule needs
+                no extra argument and a **decreasing** grid marches backwards, mapping data to its
+                latent. ``n`` counts points, matching ``domain(time=...)``, and must be a Python int
+                -- it is the scan length.
+            save: Return the whole trajectory (leading axis ``len(time)``) instead of the endpoint.
+            noise: A ``jno.noise`` spec turning the march into an **SDE** -- the deterministic step
+                plus ``draw * sqrt(|dt|)``, redrawn independently at every step. Here the node names
+                a *distribution*, not a draw: its shape comes from the state, so ``ndim=`` and
+                ``like=`` are rejected. Its parameters may be **schedules** -- callables of the march
+                time -- which is what an SDE sampler's ``sigma_t`` needs::
+
+                    v.flow(x0, time=ts, key=k,
+                           noise=jno.noise.gaussian(std=lambda t: 0.3 * jnp.sqrt(t / (1 - t))))
+
+            key: PRNG key for *noise*. Required on the eager path, where there is no solver key to
+                inherit; inside a term list the solver's step key is used and this may be omitted.
+
+        Returns:
+            Any: The final state (same pytree structure as *x0*), or the whole trajectory when
+                *save* is set -- each leaf gaining a leading axis of ``len(time)``. Returns a
+                :class:`Flow` node instead when *x0* or any *cond* is symbolic, in which case the
+                march composes into a ``jno.core([...])`` term list::
+
+                x  = v.flow(x0_array, time=ts)                        # sample after training
+                xg = v.flow(jno.noise.gaussian(ndim=2), time=ts)      # inside a constraint
+
+        Limitations:
+            Heun's method, fixed step, explicit -- no adaptive control and no error estimate, so the
+            step count is the accuracy knob: second order for the ODE, strong order 1/2 with ``noise=``
+            (the Euler--Maruyama increment sets it). No log-density: that needs the divergence of ``v`` with
+            respect to the state, which :func:`jno.np.divergence` (defined over coordinate
+            ``Variable``\ s) does not provide. Dropout must be off: the network is handed the evaluation key unchanged at every
+            step -- only the SDE increment folds in the step index -- so a mask would repeat
+            rather than resample.
+            Reverse mode stores every step, so a march inside a training loss costs its step count in
+            both compute and activation memory -- ``core.solve(checkpoint_gradients=True)`` trades
+            ~30 % compute back for the memory.
+        """
+        ts = resolve_flow_times(time)
+        _validate_flow_noise(noise, key)
+        if any(isinstance(a, Placeholder) for a in (x0, *cond)):
+            return Flow(self, x0, cond, ts, save, noise=noise, key=key)
+
+        # Concrete initial state: run it now. Routed through the evaluator rather than calling the
+        # Equinox module directly so that freeze / lora / dtype apply exactly as they do in training.
+        from ..trace_evaluator import TraceEvaluator
+
+        evaluator = TraceEvaluator({self.layer_id: self.params})
+        ctx = TraceEvaluator._EvalCtx(context={}, var_bindings={}, key=None)
+        n_args = 2 + len(cond)
+
+        def apply(state, t):
+            return evaluator._apply_model(self, [state, t, *cond], [False] * n_args, ctx)
+
+        if noise is not None and key is None:
+            raise ValueError(
+                "flow(noise=...) needs key= on the eager path. A concrete initial state marches "
+                "outside the solver, so there is no step key to inherit; without one the march would "
+                "silently drop the noise and return a deterministic ODE result labelled as an SDE. "
+                "Pass key=jax.random.PRNGKey(seed)."
+            )
+        return march_velocity(apply, x0, ts, save, diffusion=_diffusion_from_noise(noise), key=key)
+
     # ── finetuning helpers ───────────────────────────────────
 
     def freeze(self):
@@ -2399,6 +2862,39 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve instead of training it.
+
+        A coupled problem has coefficients that are neither constants nor unknowns: they are
+        *computed* from the rest of the state. The ohmic loss driving a thermal solve is the
+        canonical one -- it is whatever the electromagnetic solve just produced, and re-deriving it
+        is the coupling::
+
+            q = jno.np.parameter(qs, name="q").derives(jno.fn(cell_loss, [rho]))
+            fem = jno.fem([d.k * grad(T) . grad(s) - q * s, T(sink) - 300.0])
+
+        ``expr`` is a trace EXPRESSION, not a value and not a callable: a graph description, so
+        nothing is captured and nothing is stored. It is dispatched wherever the parameter would
+        have been read, which is once per solve at the whole-field level -- never inside the element
+        kernel -- so it may return the parameter's full array and the usual per-cell/per-node
+        threading applies to the result unchanged.
+
+        That is what makes the coupling jittable. A value handed over by mutation (``.update(...)``)
+        would have to be a tracer to carry a gradient, and a tracer stored on a python object
+        belongs to the trace that made it -- reusing one later raises ``UnexpectedTracerError``,
+        far from the cause. An expression has no such problem, and it also keeps the coupling part
+        of the problem statement rather than an ordering of calls.
+
+        A derived parameter is **not trained**: it carries no design freedom of its own, so it takes
+        no optimizer and needs no bounds. It stays a *runtime* parameter rather than a frozen
+        coefficient, because its value still changes every solve.
+        """
+        self._derived_expr = expr
+        self._frozen = True  # not a design variable: its value is computed, never searched
+        self._trainable_param_mask = None
+        self._mask_scope_pending = False
+        return self
+
     def constrain(self, transform: Callable) -> "Model":
         """Apply a paramax reparameterization to trainable parameter leaves.
 
@@ -2414,7 +2910,7 @@ class Model(Placeholder):
 
         Args:
             transform: A jit-compatible callable (e.g. ``jax.nn.softplus``,
-                       ``jax.nn.sigmoid``).
+                ``jax.nn.sigmoid``).
 
         Returns:
             self  (for chaining)
@@ -2503,17 +2999,17 @@ class Model(Placeholder):
             NN.mask(M).lora(rank=8, alpha=16)  # only M-selected layers are wrapped
 
         Args:
-            rank:    LoRA rank (uniform mode).
-            alpha:   LoRA scaling factor (uniform mode).
-            target:  Regex to restrict *which layers get LoRA adapters* (uniform
-                     mode only).  Layers whose pytree path does not match are left
-                     completely untouched.  Use ``specs=`` for per-group targeting.
+            rank: LoRA rank (uniform mode).
+            alpha: LoRA scaling factor (uniform mode).
+            target: Regex to restrict *which layers get LoRA adapters* (uniform
+                mode only).  Layers whose pytree path does not match are left
+                completely untouched.  Use ``specs=`` for per-group targeting.
             wrapper: Adapter class or list of classes to try in order.
-                     Defaults to ``(LoRALinear, LoRAConv)`` — wraps both linear
-                     and conv layers.  Pass a single class or list to override.
-            specs:   Per-target specs (per-target mode).  Each dict has keys
-                     ``target`` (str regex), ``rank`` (int), ``alpha`` (float),
-                     and optionally ``wrapper``.
+                Defaults to ``(LoRALinear, LoRAConv)`` — wraps both linear
+                and conv layers.  Pass a single class or list to override.
+            specs: Per-target specs (per-target mode).  Each dict has keys
+                ``target`` (str regex), ``rank`` (int), ``alpha`` (float),
+                and optionally ``wrapper``.
         """
         if self._mask_scope_pending and self._param_mask is not None:
             self._lora_param_mask = self._param_mask
@@ -2564,7 +3060,7 @@ class Model(Placeholder):
 
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
-                    or an already-constructed transform.
+                or an already-constructed transform.
         """
         if getattr(self, "_jno_fixed_by_eager_solve", False):
             # jno.fdm decides what is trainable when `.solve()` runs, and an eager solve already baked this
@@ -2662,11 +3158,11 @@ class Model(Placeholder):
                 samples from epoch 0.  For non-adaptive kernels (MALA,
                 SGLD, SGHMC) and ``adapt=False``: number of initial outer
                 epochs whose samples are discarded.  Default 500.
-            keep:   Number of post-warmup samples to retain (after thinning).
+            keep: Number of post-warmup samples to retain (after thinning).
                 Default 1000.
-            thin:   Keep one sample every ``thin`` post-warmup steps.
+            thin: Keep one sample every ``thin`` post-warmup steps.
                 Default 1.
-            adapt:  When ``True`` (default) and the kernel is in the HMC
+            adapt: When ``True`` (default) and the kernel is in the HMC
                 family, ``blackjax.window_adaptation`` runs for ``warmup``
                 steps before the main loop and adapts step size + inverse
                 mass matrix.  Silently no-op for non-adaptive kernels.
@@ -2889,8 +3385,8 @@ class Model(Placeholder):
             NN.mask(mask_decoder).scale(dlrs(lr0=1e-3))
 
         Args:
-            scale:  A ``LearningRateSchedule`` / ``dlrs(...)`` (or float) for this
-                    model. If *None*, a constant 1e-3 is used.
+            scale: A ``LearningRateSchedule`` / ``dlrs(...)`` (or float) for this
+                model. If *None*, a constant 1e-3 is used.
         """
         if self._mask_scope_pending and self._param_mask is not None:
             # Ensure a global fallback exists for uncovered leaves.
@@ -2918,34 +3414,34 @@ class Model(Placeholder):
         return g
 
     def initialize(self, weights: Any, *, key: Any = None) -> "Model":
-        """Load pretrained weights into this model at init time.
+        """Load pretrained weights into this model, or set how its parameters are initialised.
 
-                Accepted ``weights`` inputs:
+        Applied when the model is initialised (at the first compile), so it can be called before
+        ``jno.core(...)`` is built::
 
-                - ``str`` / ``Path``: load from checkpoint path.
-                    Supports Equinox ``.eqx`` files and Orbax checkpoint directories
-                    (optionally ``"<path>::<model_key>"``).
-                - Pytree object: copy array leaves directly from the provided tree.
-                - Callable initializer: apply a JAX initializer function to every
-                    floating-point array leaf at compile time.
+            net.initialize("./weights.eqx")                 # an Equinox file
+            net.initialize("./runs/ckpts/2000::1")          # an Orbax checkpoint, model key 1
+            net.initialize(other_model.module)              # copy another model's weights
 
-                Examples:
-
-                .. code-block:: python
-
-                        net.initialize("./weights.eqx")
-                        net.initialize("./runs/ckpts/2000::1")
-                        net.initialize(other_model.module)
-
-                        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0))
-                        p.initialize(jax.nn.initializers.ones)
+            p = jno.np.parameter((1,), key=jax.random.PRNGKey(0))
+            p.initialize(jax.nn.initializers.ones)          # a JAX initializer
 
         Args:
-            weights: File path / pytree / callable initializer.
-            key: Optional PRNG key used when ``weights`` is callable.
+            weights: what to load or how to initialise:
+
+                * ``str`` / ``Path`` — a checkpoint: an Equinox ``.eqx`` file or an Orbax checkpoint
+                  directory, optionally ``"<path>::<model_key>"`` to pick one model out of a
+                  multi-model checkpoint.
+                * a pytree (e.g. another model's ``.module``) — its array leaves are copied directly.
+                * a callable initializer ``(key, shape, dtype) -> array`` (e.g.
+                  ``jax.nn.initializers.zeros``) — applied to every floating-point array leaf at
+                  compile time.
+                * a log-density-aware initializer (an object with ``requires_logdensity = True``) —
+                  used by the Bayesian samplers to draw the starting state.
+            key: PRNG key passed to a callable initializer; ignored for the other forms.
 
         Returns:
-            self (for chaining).
+            ``self``, for chaining.
         """
         self._initialize_mask = None
         self._initializer_fn = None
@@ -3215,17 +3711,18 @@ def heaviside(rho, beta, eta: float = 0.5):
 
 
 class ModelCall(Placeholder):
-    """Represents a call to a Model with specific arguments.
+    """A call of a :class:`Model` on specific arguments: what ``net(x, y)`` returns.
 
-    This is created when you call a Model directly with variables:
-        uv_net = pnp.nn.wrap(MLP())
-        result = uv_net(x, y)  # Creates ModelCall
+    All training-configuration methods (``freeze``, ``lora``, ``optimizer``, ``dtype``,
+    ``initialize``, ``tune``, ...) are forwarded to the underlying :class:`Model`, so they chain
+    after the call::
 
-    All training-configuration methods (``freeze``, ``lora``, ``optimizer``,
-    ``dtype``, ``initialize``, ``tune``) are proxied to the underlying
-    :class:`Model` so you can chain them after the call::
+        u = jno.nn(foundax.mlp(2, hidden_dims=64))(x, y).freeze()
 
-        u = nn.mlp(2, 64, 1)(x, y).freeze()
+    Args:
+        model: the called model.
+        args: the call's arguments (Variables or other expressions); typed views are unwrapped to the
+            expressions they stand for.
     """
 
     def __init__(self, model: Model, args: list):
@@ -3242,17 +3739,32 @@ class ModelCall(Placeholder):
         return f"{self.model}({args_str})"
 
     def partials(self, **named_vars):
-        """Bind named coordinate Variables for attribute-style / ``.d`` derivatives — the SAME idiom as
-        the fem trial from :meth:`fem_symbols` (``u.bind(x=x, y=y).d2(x)``, ``ui.x``) and the PINN field
-        ``net(x).scalar.bind(x=x)``. Lets a valued field (``jno.np.parameter``/``domain.unknown()``) be
-        authored exactly like a fem symbol.
+        """Bind named coordinate Variables for attribute-style / ``.d`` derivatives.
+
+        The same idiom as the FEM trial from :meth:`fem_symbols` (``u.bind(x=x, y=y).d2(x)``, ``ui.x``)
+        and the PINN field ``net(x).scalar.bind(x=x)``, so a valued field (``jno.np.parameter`` /
+        ``domain.unknown()``) is written exactly like a FEM symbol.
 
         A **nodal field** (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``) is a mesh-shaped
         output whose coordinates are not network inputs, so it binds through the :class:`FieldView`
-        path — the SAME view the fem trial uses. That makes ``.t`` a genuine :class:`TemporalDerivative`
+        path, the same view the FEM trial uses. That makes ``.t`` a genuine :class:`TemporalDerivative`
         (not a lexical spatial partial), so the strong form reads identically to the weak form
-        (``ui.t - nu*(ui.d2(x) + ui.d2(y))``)."""
+        (``ui.t - nu*(ui.d2(x) + ui.d2(y))``). A vector or matrix unknown binds as the vector or matrix view.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y`` (``t=t`` for time). The names
+                become the attribute and ``.d`` spellings (``u.x``, ``u.d2(y)``).
+
+        Returns:
+            The bound view (scalar, vector or matrix, following the field's shape).
+        """
         if getattr(self.model, "_fem_field", None) == "node":
+            sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+            rank = len(getattr(sym, "value_shape", ()) or ()) if sym is not None else 0
+            if rank == 1:  # a vector unknown binds as the vector view, as its fem trial does (`ui[0]`, `ui.div()`)
+                return self.vector.partials(**named_vars)
+            if rank == 2:  # a matrix unknown as the matrix view (`Si[0, 1]`, `Si.T`, `Si @ W`)
+                return self.matrix.partials(**named_vars)
             return self.field.partials(**named_vars)
         return self.scalar.partials(**named_vars)
 
@@ -3270,6 +3782,164 @@ class ModelCall(Placeholder):
             return self.partials(**binding)
         return super().__call__(*coords, **named)
 
+    # ── an unknown from ``domain.unknown()``: the FEM side of the same field ─────────────
+
+    def _unknown_symbol_or_raise(self, what: str):
+        sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+        if sym is None:
+            raise TypeError(
+                f"{what} is defined for an unknown from `domain.unknown(...)` only; this is a "
+                f"{type(self.model).__name__} output, not an unknown."
+            )
+        return sym
+
+    def test(self) -> "TestFunction":
+        """The FEM **test function** of this unknown (``domain.unknown()``): ``v = u.test()``. In ``jno.fem``
+        the unknown is the trial function and ``v`` its test function -- same space, shape and order."""
+        return self._unknown_symbol_or_raise("u.test()").test()
+
+    # docstring-from: jno.trace.TrialFunction.pin
+    def pin(self, value=0.0, mean=False):
+        """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
+
+        For an incompressible pressure or a pure-Neumann scalar, whose solution is defined only
+        up to an additive constant. Drop the result straight into the ``jno.fem`` constraint
+        list -- no ``domain.point_region`` / coordinate plumbing needed::
+
+            fem = jno.fem([momentum, -q * div(u), p.pin(), *wall_bcs])
+
+        ``jno.fem`` pins a deterministic vertex, so the gauge is reproducible: the one nearest the
+        mesh min-corner, or -- when the problem has periodic ties ``u(A) - u(B)`` -- the one nearest
+        the min-corner that lies on no tied face, so the tie reduction never eliminates it or sums
+        another row into it. Pinning works the same under full or partial periodicity, steady or
+        transient, single-field or coupled. The location is intentionally not user-specified -- any
+        single DOF removes the null space.
+
+        ``mean=True`` swaps the gauge for the **zero-mean** one, ``int p dx == 0``::
+
+            fem = jno.fem([momentum, -q * div(u), p.pin(mean=True), *wall_bcs])
+
+        Reach for it whenever the *level* of the field is read, not just its gradient -- a point
+        pin leaves a constant that does not shrink under refinement, which is enough to stop a 3-D
+        pressure converging. It is exact, not an approximation: with the velocity fully Dirichlet
+        the constant is a genuine null vector, so shifting it changes no other field. An outflow
+        (natural) boundary fixes the level on its own and wants no pin at all. See :class:`GaugePin`.
+        """
+        return self._unknown_symbol_or_raise("u.pin()").pin(value, mean=mean)
+
+    # docstring-from: jno.trace.TrialFunction.dn
+    def dn(self, *coords, **named):
+        """Normal derivative ``∂u/∂n`` on the boundary region carried by ``coords``.
+
+        For a 4th-order (plate/biharmonic) field on a C¹ (Argyris) or Morley element, this is the second
+        essential boundary trace beside the deflection ``u(region)``: the **rotation**. Use it to write the
+        classical plate BCs — clamped ``u(reg)-g, u.dn(reg)-0``; simply-supported ``u(reg)-g`` alone; guided
+        ``u.dn(reg)-h`` alone; free (write neither). The physical outward normal is recomputed per boundary
+        edge at assembly, so no explicit normal is needed.
+
+        Args:
+            *coords: the boundary Variables of the region, as in ``u(xb, yb)``.
+            **named: the same coordinates by name (``x=xb, y=yb``).
+
+        Returns:
+            NormalDerivative: the trace, to be written as an essential condition ``u.dn(xb, yb) - h``.
+        """
+        return self._unknown_symbol_or_raise("u.dn()").dn(*coords, **named)
+
+    # docstring-from: jno.trace.TrialFunction.gap
+    def gap(self, secondary: str, main, *, domain):
+        """Signed **contact gap** between two tagged boundary faces, as a symbol usable in a weak form.
+
+        ``g = g0 - n . (u_secondary - u_main . Phi)`` at the secondary face's quadrature points: ``g0`` is the
+        initial along-normal separation, the second term how the two bodies have since moved relative
+        to each other. Positive is open, negative is penetrating -- the sign the augmented-Lagrangian
+        pressure ``max(0, lam + c*(-g))`` expects::
+
+            g = u.gap("sheet", "die", domain=d)
+            n = d.variable("sheet", normals=True, split=True)
+            p = jno.np.maximum(0.0, lam.i(-1) + c * (-g))      # AL pressure -- a formula
+            fem = jno.fem([..., p * jno.np.inner(n, phi.bind(...), n_contract=1), lam.evolves(p)])
+
+        The traction is an ordinary weak boundary term, so nothing is passed to ``fem.solve()``. The
+        gap is **non-local** -- it reads DOFs on the main body's cells, not the secondary face's parent
+        cell -- so assembly emits a second Jacobian block whose columns are those main DOFs, which is
+        what keeps the tangent consistent.
+
+        Write the traction **once**, on the secondary face. The equal-and-opposite traction on the main
+        body is the same integrand tested against the main's projected trace, and the pairing supplies
+        it -- so Newton's third law holds without restating it, and two bonded bodies converge to the
+        single-body answer as ``c`` stiffens. ``n`` is the secondary's *outward* normal, which points at the
+        main; ``g > 0`` is open, ``g < 0`` penetrating, and the traction sign is ``+p * inner(n, phi)``
+        (with ``dg/du_s = -n``, that is the one that makes the tangent contribution positive-definite).
+
+        Like ``domain.cell_size`` this is a placeholder symbol: the real per-quadrature-point value is
+        packed during assembly and overrides the context entry everywhere it is used.
+
+        ``main`` may also be a **list of candidate surfaces**, and each secondary quadrature point then
+        pairs with the nearest facet across all of them -- which is what a body that may strike any of
+        several others needs. Listing the secondary itself is **self-contact** (``u.gap("strip",
+        ["strip"])``): a facet is then barred from pairing with itself or its immediate neighbours, so a
+        folding surface can close on itself without every facet trivially contacting its own ring. A
+        list requires ``fem.solve(contact=...)`` and is refused without it -- a frozen pairing can only
+        ever be built against one configuration, and silently choosing a candidate is the failure this
+        whole mechanism exists to remove.
+
+        **Scope:** by default small sliding -- the pairing is frozen at build time, so a configuration
+        that slides far must be rebuilt; ``fem.solve(contact=jno.solve.contact())`` is what lifts that,
+        re-running the search from ``x + u`` until it settles. Differentiable in the DOF values but
+        **not** in the mesh coordinates, since the projection weights are host-computed; and
+        non-differentiable at contact onset -- ``max(0, .)`` gives a subgradient, which is what a
+        semismooth Newton wants but an optimizer differentiating through contact will see as a kink.
+        """
+        return self._unknown_symbol_or_raise("u.gap()").gap(secondary, main, domain=domain)
+
+    # docstring-from: jno.trace.TrialFunction.slide
+    def slide(self, secondary: str, main, *, domain):
+        """Tangential **relative displacement** across a contact interface — the sibling of :meth:`gap`.
+
+        ``s = D - (n . D) n``  with  ``D = u_secondary - u_main . Phi``, at the same quadrature points,
+        through the same mortar projection ``Phi`` as the gap. Where ``gap`` returns the scalar normal
+        component, ``slide`` returns the **vector** that is left in the tangent plane, in global
+        coordinates (not an ``(t1, t2)`` local frame — a consistent tangent basis is discontinuous on a
+        curved surface, and the global form composes with ``n`` and ``inner`` like the rest of the
+        vocabulary).
+
+        Both come from one packed relative displacement, so they cannot disagree about the geometry.
+
+        This is what lets **Coulomb friction be a formula** — the plasticity return map, read on a
+        surface, with the accumulated slip as an ordinary surface state::
+
+            n  = d.variable(sec, normals=True)
+            g  = u.gap(sec, main, domain=d)
+            st = u.slide(sec, main, domain=d)
+            sl, _ = d.fem_symbols(value_shape=(3,))            # the slip STATE
+            p    = mx(0.0, -c_n * g)                           # normal pressure
+            t_tr = c_t * (st - sl.i(-1))                       # elastic trial traction
+            dgam = mx(norm(t_tr) - mu_f * p, 0.0) / c_t        # the return map
+            fem = jno.fem([...,
+                           p * inner(n, phi, 1) + inner(t_tr * (1 - dgam*c_t/norm(t_tr)), phi, 1),
+                           sl.evolves(sl.i(-1) + dgam * t_tr / norm(t_tr))])
+
+        Like :meth:`gap` (and ``domain.cell_size``) this is a placeholder symbol whose real
+        per-quadrature-point value is packed during assembly; an unpacked one raises rather than reading
+        as zero. Same scope as the gap, and the same ``main`` forms: one surface, or a list of candidates
+        (which requires ``fem.solve(contact=...)``). By default **small sliding** — the pairing and the
+        projection are frozen at build time; ``fem.solve(contact=jno.solve.contact())`` re-runs the
+        search from ``x + u`` and is what a configuration that slides far needs.
+
+        Args:
+            secondary: the tag of the secondary (slave) boundary face, where the quadrature points live and
+                where the traction is written.
+            main: the tag of the main (master) face, or a list of candidate tags (each point pairs with the
+                nearest facet; listing ``secondary`` itself is self-contact). A list requires
+                ``fem.solve(contact=...)``.
+            domain: the domain holding both faces.
+
+        Returns:
+            The tangential relative displacement, a vector symbol in global coordinates.
+        """
+        return self._unknown_symbol_or_raise("u.slide()").slide(secondary, main, domain=domain)
+
     # ── proxied helpers (delegate to Model) ─────────────
 
     def dont_show(self):
@@ -3277,24 +3947,160 @@ class ModelCall(Placeholder):
         self.model.show = False
         return self
 
+    # docstring-from: jno.trace.Model.freeze
     def freeze(self):
+        """Mark this model as frozen (not trained).
+
+        When preceded by ``mask(...)``, only the currently selected
+        parameters are frozen and everything else remains trainable::
+
+            NN.mask(param_mask).freeze()         # True leaves frozen, False leaves trainable
+            NN.freeze()                          # whole model frozen
+
+        Order matters: ``mask()`` must be called before ``freeze()``.
+        """
         self.model.freeze()
         return self
 
+    # docstring-from: jno.trace.Model.derives
+    def derives(self, expr):
+        """Take this parameter's value from ``expr`` each solve instead of training it.
+
+        A coupled problem has coefficients that are neither constants nor unknowns: they are
+        *computed* from the rest of the state. The ohmic loss driving a thermal solve is the
+        canonical one -- it is whatever the electromagnetic solve just produced, and re-deriving it
+        is the coupling::
+
+            q = jno.np.parameter(qs, name="q").derives(jno.fn(cell_loss, [rho]))
+            fem = jno.fem([d.k * grad(T) . grad(s) - q * s, T(sink) - 300.0])
+
+        ``expr`` is a trace EXPRESSION, not a value and not a callable: a graph description, so
+        nothing is captured and nothing is stored. It is dispatched wherever the parameter would
+        have been read, which is once per solve at the whole-field level -- never inside the element
+        kernel -- so it may return the parameter's full array and the usual per-cell/per-node
+        threading applies to the result unchanged.
+
+        That is what makes the coupling jittable. A value handed over by mutation (``.update(...)``)
+        would have to be a tracer to carry a gradient, and a tracer stored on a python object
+        belongs to the trace that made it -- reusing one later raises ``UnexpectedTracerError``,
+        far from the cause. An expression has no such problem, and it also keeps the coupling part
+        of the problem statement rather than an ordering of calls.
+
+        A derived parameter is **not trained**: it carries no design freedom of its own, so it takes
+        no optimizer and needs no bounds. It stays a *runtime* parameter rather than a frozen
+        coefficient, because its value still changes every solve.
+        """
+        self.model.derives(expr)
+        return self
+
+    # docstring-from: jno.trace.Model.unfreeze
     def unfreeze(self):
+        """Unfreeze this model so it is trained normally."""
         self.model.unfreeze()
         return self
 
+    # docstring-from: jno.trace.Model.mask
     def mask(self, param_mask=None):
-        """Proxy for :meth:`Model.mask`."""
+        """Set the current mask scope using an explicit boolean pytree mask.
+
+        ``param_mask`` must mirror the parameter tree structure and contain
+        boolean leaves where ``True`` selects leaves in the masked scope.
+
+        This scope is consumed by grouped optimizer/lr calls and by
+        ``mask(...).freeze()``.  It is also read by ``u.grad(net.mask(...))``
+        to restrict the Jacobian to only the selected parameters.
+
+        Example::
+
+            import equinox as eqx, jax
+
+            all_false = jax.tree_util.tree_map(lambda _: False, model.module)
+            param_mask = eqx.tree_at(
+                lambda m: (m.layers[0].weight, m.layers[0].bias),
+                all_false, (True, True),
+            )
+            model.mask(param_mask).optimizer(optax.adam(1e-3))
+            J = crux.eval([u.grad(model.mask(param_mask))])[0]  # (N, P_selected)
+        """
         self.model.mask(param_mask)
         return self
 
+    # docstring-from: jno.trace.Model.lora
     def lora(self, rank: int = 4, alpha: float = 1.0, *, target=None, wrapper=None, specs=None):
+        """Enable LoRA fine-tuning for this model.
+
+        Two calling conventions:
+
+        1. **Uniform**::
+
+               NN.lora(rank=8, alpha=16)
+               NN.lora(rank=4, wrapper=MyConvAdapter)          # custom adapter
+               NN.lora(rank=4, wrapper=[LoRALinear, MyConv])   # tried in order
+
+        2. **Per-target** — different rank/alpha/adapter per layer group::
+
+               NN.lora(specs=[
+                   {"target": "encoder", "rank": 4,  "alpha": 1.0},
+                   {"target": "conv",    "rank": 8,  "alpha": 2.0, "wrapper": MyConvAdapter},
+               ])
+
+           Each ``target`` is a regex matched against the pytree path.
+           The first matching spec wins.
+
+        By default only the low-rank adapters are trained; base weights are
+        frozen.  Layers that are NOT wrapped by LoRA remain fully trainable.
+        Call ``freeze()`` before ``lora()`` to also freeze any parameters
+        outside LoRA-wrapped layers::
+
+            NN.freeze().lora(rank=8, alpha=16)
+
+        Use ``mask(M)`` to restrict which layers receive LoRA adapters::
+
+            NN.mask(M).lora(rank=8, alpha=16)  # only M-selected layers are wrapped
+
+        Args:
+            rank: LoRA rank (uniform mode).
+            alpha: LoRA scaling factor (uniform mode).
+            target: Regex to restrict *which layers get LoRA adapters* (uniform
+                mode only).  Layers whose pytree path does not match are left
+                completely untouched.  Use ``specs=`` for per-group targeting.
+            wrapper: Adapter class or list of classes to try in order.
+                Defaults to ``(LoRALinear, LoRAConv)`` — wraps both linear
+                and conv layers.  Pass a single class or list to override.
+            specs: Per-target specs (per-target mode).  Each dict has keys
+                ``target`` (str regex), ``rank`` (int), ``alpha`` (float),
+                and optionally ``wrapper``.
+        """
         self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
+    # docstring-from: jno.trace.Model.optimizer
     def optimizer(self, opt_fn: Any) -> "ModelCall":
+        """Attach an optimizer to this model.
+
+        When preceded by ``mask(param_mask)``, the optimizer applies only
+        to matching parameters; everything else uses the global optimizer
+        (set via a bare ``optimizer()`` call)::
+
+            NN.mask(mask_decoder).optimizer(optax.adam)  # decoder group
+            NN.mask(mask_encoder).optimizer(optax.sgd)   # encoder group
+            NN.optimizer(optax.adam)                   # global fallback
+
+        Bake the learning rate into the optax optimizer (e.g. ``optax.adam(1e-3)``);
+        use :meth:`scale` to multiply it -- e.g. with a ``dlrs(...)`` schedule for
+        loss-adaptive learning-rate scaling. ``mask(...)`` is one-shot, so to scale a
+        masked group call ``mask(...)`` again before ``scale(...)``::
+
+            NN.mask(mask_decoder).optimizer(optax.adam(1e-3))
+            NN.mask(mask_decoder).scale(my_schedule)
+
+        A bare/global call (not preceded by ``mask(...)``) replaces any
+        previously configured parameter groups.
+
+        Args:
+            opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
+                or an already-constructed transform.
+        """
         self.model.optimizer(opt_fn)
         return self
 
@@ -3312,11 +4118,27 @@ class ModelCall(Placeholder):
         self._scale = float(scale)
         return self
 
+    # docstring-from: jno.trace.Model.constrain
     def constrain(self, transform: Callable) -> "ModelCall":
-        """Proxy for :meth:`Model.constrain` -- paramax reparameterization applied
-        before every forward pass (e.g. ``jax.nn.softplus`` to keep a parameter or a
-        ``jno.np.parameter(phi)`` coefficient field positive). Chains after
-        :meth:`mask`."""
+        """Apply a paramax reparameterization to trainable parameter leaves.
+
+        Parameters are stored in their unconstrained form and transformed by
+        ``transform`` before every forward pass via ``paramax.unwrap()``,
+        which jno's training loop calls automatically.
+
+        When preceded by ``mask(...)``, only leaves where the mask is ``True``
+        are wrapped — all other leaves remain unconstrained::
+
+            k_net.mask(output_mask).constrain(jax.nn.softplus)  # output layer only
+            k_net.constrain(jax.nn.softplus)                    # all parameters
+
+        Args:
+            transform: A jit-compatible callable (e.g. ``jax.nn.softplus``,
+                ``jax.nn.sigmoid``).
+
+        Returns:
+            self  (for chaining)
+        """
         self.model.constrain(transform)
         return self
 
@@ -3378,8 +4200,107 @@ class ModelCall(Placeholder):
             "('l2'/'tikhonov' is FEM-only); use 'smooth', 'tv', 'nonneg', or 'bounded'."
         )
 
+    # docstring-from: jno.trace.Model.bayesian
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
-        """Proxy for :meth:`Model.bayesian`."""
+        """Sample this model's parameters from a posterior via blackjax.
+
+        Mirrors :meth:`optimizer` but uses an MCMC kernel instead of an
+        optax update.  The model's parameters become the *position* of a
+        chain initialised at the current weights; each training step is
+        one transition of ``kernel_factory(logdensity_fn, **kernel_kwargs)``
+        for full-data kernels (NUTS/HMC/MALA), or
+        ``kernel_factory(grad_estimator, **kernel_kwargs)`` for SG-MCMC
+        (SGLD/SGHMC).  jno chooses the dispatch shape by inspecting the
+        factory's signature.
+
+        After :meth:`jno.core.core.solve` returns, the chain is available
+        on the model via :attr:`posterior_samples` — a pytree mirroring
+        the model parameters with a leading sample axis of length
+        ``keep // thin``.
+
+        Example — NUTS on a scalar PDE coefficient::
+
+            import blackjax, jax.numpy as jnp
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=500,
+                keep=1000,
+            )
+            crux = jno.core([residual.mse])
+            crux.solve(2000)
+            chain = a.posterior_samples            # (1000, 1)
+
+        Example — SGLD on a small MLP (BNN PINN)::
+
+            import blackjax
+            net = jno.nn.wrap(foundax.mlp(...))
+            net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
+
+        References:
+            * NUTS — Hoffman & Gelman (2014), *The No-U-Turn Sampler*, JMLR
+              15(1), 1593-1623.
+            * SGLD — Welling & Teh (2011), *Bayesian Learning via Stochastic
+              Gradient Langevin Dynamics*, ICML 2011, 681-688.
+
+        Args:
+            kernel_factory: A blackjax kernel constructor, e.g.
+                ``blackjax.nuts`` or ``blackjax.sgld``.  Any callable that
+                takes ``logdensity_fn`` (full-data) or ``grad_estimator``
+                (SG-MCMC) as its first positional argument is accepted.
+            prior: Optional ``pytree -> float`` log-prior.  Default: a wide
+                isotropic Gaussian with σ=10 over all inexact-array leaves.
+            warmup: For adaptive HMC-family kernels (``blackjax.nuts`` /
+                ``blackjax.hmc``) with ``adapt=True``: number of
+                ``blackjax.window_adaptation`` steps run before the main
+                loop.  Adapted ``step_size`` and ``inverse_mass_matrix``
+                replace the initial values, and the main loop collects
+                samples from epoch 0.  For non-adaptive kernels (MALA,
+                SGLD, SGHMC) and ``adapt=False``: number of initial outer
+                epochs whose samples are discarded.  Default 500.
+            keep: Number of post-warmup samples to retain (after thinning).
+                Default 1000.
+            thin: Keep one sample every ``thin`` post-warmup steps.
+                Default 1.
+            adapt: When ``True`` (default) and the kernel is in the HMC
+                family, ``blackjax.window_adaptation`` runs for ``warmup``
+                steps before the main loop and adapts step size + inverse
+                mass matrix.  Silently no-op for non-adaptive kernels.
+                Set ``False`` to revert to the "discard first N samples"
+                semantics with the user-supplied hyperparameters.
+            num_chains: Number of parallel MCMC chains run via
+                ``jax.vmap``.  Default 1.  Output
+                :attr:`posterior_samples` has leading axes ``(K, N, *)``
+                regardless of K (arviz / `az.from_dict` compatible).
+                All ``.bayesian()`` models in a single :meth:`solve` call
+                must share the same ``num_chains``.
+            init_jitter: When ``num_chains > 1``, perturb each chain's
+                initial position by ``N(0, init_jitter)`` for
+                over-dispersion (gives a more conservative R-hat).
+                Default 0.0 = all chains start from the same point with
+                different PRNG keys.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the per-step logdensity.  Default ``1.0``.  The
+                canonical Gaussian-noise log-likelihood is a *sum* over
+                data points; jno's ``residual.mse`` returns a *mean*.
+                Pass ``N_obs`` (the data-point count) — or
+                ``N_obs / sigma**2`` more generally — to recover the
+                correct posterior magnitude.  Without this, MCMC chains
+                on multi-thousand-point PINN losses move much more
+                slowly than they should and VI is often stuck near the
+                prior.
+            **kernel_kwargs: Forwarded to ``kernel_factory``.  ``step_size``
+                is optional for HMC-family kernels (NUTS / HMC) when
+                ``adapt=True`` and ``warmup > 0`` — window adaptation
+                picks one.  **Required** for ``adapt=False``, MALA, and
+                SG-MCMC.  May include e.g. ``inverse_mass_matrix=``
+                (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
+
+        Returns:
+            self, for chaining.
+        """
         self.model.bayesian(
             kernel_factory,
             prior=prior,
@@ -3391,8 +4312,84 @@ class ModelCall(Placeholder):
         )
         return self
 
+    # docstring-from: jno.trace.Model.vi
     def vi(self, factory, *, optimizer, num_samples=8, posterior_draws=500, prior=None, **factory_kwargs):
-        """Proxy for :meth:`Model.vi`."""
+        """Fit a variational approximation to this model's posterior.
+
+        Mirrors :meth:`bayesian` but optimises the **evidence lower bound**
+        (ELBO) of a variational family ``q`` instead of running an MCMC
+        chain.  After :meth:`jno.core.core.solve` returns, ``posterior_draws``
+        i.i.d. samples are drawn from the fitted ``q`` and stored on the
+        model as :attr:`posterior_samples` — same ``(1, N, *param)`` layout
+        as the MCMC path, so all downstream code (:func:`crux.eval` with
+        ``samples="auto"``, :func:`jno.bayesian.rhat`, wandb stats) keeps
+        working transparently.
+
+        Example — mean-field VI on a scalar PDE coefficient::
+
+            import blackjax, optax
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.vi(
+                blackjax.meanfield_vi,
+                optimizer=optax.adam(1e-3),
+                num_samples=8,
+                posterior_draws=500,
+            )
+            crux = jno.core([residual.mse])
+            crux.solve(2000)            # 2000 ELBO optimisation steps
+            chain = a.posterior_samples  # (1, 500, 1) — draws from fitted q
+
+        References:
+            * Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei,
+              D. M. (2017).  *Automatic Differentiation Variational
+              Inference.*  JMLR 18(1), 430–474.
+            * Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
+              *Stochastic Variational Inference.*  JMLR 14(1), 1303–1347.
+
+        Args:
+            factory: A blackjax VI factory, e.g. :func:`blackjax.meanfield_vi`.
+                Detected via signature (first arg ``logdensity_fn``, second
+                ``optimizer``).
+            optimizer: An optax ``GradientTransformation`` used to
+                optimise the ELBO.  Common choice: ``optax.adam(1e-3)``.
+            num_samples: Monte-Carlo sample count used to estimate the ELBO
+                at each step.  Higher = lower-variance gradient, slower
+                step.  Default 8.
+            posterior_draws: After solve(), draw this many i.i.d. samples
+                from the fitted variational distribution and store them on
+                :attr:`posterior_samples`.  Default 500.
+            prior: Optional ``pytree -> float`` log-prior.  Default: the
+                same wide isotropic Gaussian (σ=10) used by
+                :meth:`bayesian`.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the ELBO.  Default ``1.0``.  The canonical
+                Gaussian-noise log-likelihood is a *sum* over data
+                points; jno's ``residual.mse`` returns a *mean*.  For
+                mean-field VI in particular, pass ``N_obs`` (or
+                ``N_obs / sigma**2``) so the likelihood actually pulls
+                the variational mean away from the prior.  Without
+                this, VI is often stuck near its initialisation
+                because the prior dominates by a factor of
+                ``N_obs``.
+            init_log_std: Initial value for ``state.rho`` (log-std of the
+                variational ``q``) on every weight.  Default ``-3.0``
+                (σ ≈ 0.05) — keeps the initial MC ELBO sample tight so
+                gradients are low-variance from the start; the
+                optimiser then grows rho where the posterior is wide.
+                Pass ``0.0`` (σ ≈ 1.0) to restore blackjax's default
+                broad init.
+            init_mu_at_position: When ``True`` (default), initialise
+                ``state.mu`` at the user-supplied position (matches
+                numpyro's autoguide).  ``False`` keeps blackjax's
+                zero start — only useful on toy problems where the
+                MAP is exactly zero.
+            **factory_kwargs: Forwarded to ``factory``.  E.g. an explicit
+                ``objective=blackjax.vi.meanfield_vi.RenyiAlpha(alpha=0.5)``
+                or ``stl_estimator=False``.
+
+        Returns:
+            self, for chaining.
+        """
         self.model.vi(
             factory,
             optimizer=optimizer,
@@ -3403,39 +4400,372 @@ class ModelCall(Placeholder):
         )
         return self
 
+    # docstring-from: jno.trace.Model.posterior_samples
     @property
     def posterior_samples(self):
-        """Shortcut to the underlying :attr:`Model.posterior_samples`."""
+        """Post-warmup MCMC samples for this model, or ``None`` if it was not
+        configured with :meth:`bayesian`.
+
+        Returns the stacked module pytree (leading axis = number of kept
+        samples).  For :func:`jno.np.parameter` models, the single-leaf
+        ``_Parameter(value=…)`` wrapper is unwrapped to a plain array, so
+        ``a.posterior_samples`` has shape ``(N, *a_shape)`` directly.
+        """
         return self.model.posterior_samples
 
+    # docstring-from: jno.trace.Model.posterior_diagnostics
     @property
     def posterior_diagnostics(self):
-        """Shortcut to the underlying :attr:`Model.posterior_diagnostics`."""
+        """Per-step blackjax kernel info aggregated across the chain.
+
+        Returns a ``{field: (K, N) array}`` dict — one entry per field
+        the kernel surfaces:
+
+        * **NUTS / HMC** — ``is_divergent`` (bool), ``acceptance_rate``
+          (float), ``energy`` (float).
+        * **MALA** — ``acceptance_rate`` only.
+        * **SG-MCMC / VI** — ``None``: those kernels expose no
+          per-step info object.
+
+        Returns ``None`` if this model is not Bayesian, or if its
+        kernel doesn't surface per-step diagnostics.  Inspect
+        ``is_divergent`` first — non-zero counts mean the integrator
+        is repeatedly failing and the chain cannot be trusted at the
+        posted ``step_size`` / ``inverse_mass_matrix``.
+        """
         return self.model.posterior_diagnostics
 
+    # docstring-from: jno.trace.Model.initialize
     def initialize(self, weights: Any, *, key: Any = None) -> "ModelCall":
+        """Load pretrained weights into this model, or set how its parameters are initialised.
+
+        Applied when the model is initialised (at the first compile), so it can be called before
+        ``jno.core(...)`` is built::
+
+            net.initialize("./weights.eqx")                 # an Equinox file
+            net.initialize("./runs/ckpts/2000::1")          # an Orbax checkpoint, model key 1
+            net.initialize(other_model.module)              # copy another model's weights
+
+            p = jno.np.parameter((1,), key=jax.random.PRNGKey(0))
+            p.initialize(jax.nn.initializers.ones)          # a JAX initializer
+
+        Args:
+            weights: what to load or how to initialise:
+
+                * ``str`` / ``Path`` — a checkpoint: an Equinox ``.eqx`` file or an Orbax checkpoint
+                  directory, optionally ``"<path>::<model_key>"`` to pick one model out of a
+                  multi-model checkpoint.
+                * a pytree (e.g. another model's ``.module``) — its array leaves are copied directly.
+                * a callable initializer ``(key, shape, dtype) -> array`` (e.g.
+                  ``jax.nn.initializers.zeros``) — applied to every floating-point array leaf at
+                  compile time.
+                * a log-density-aware initializer (an object with ``requires_logdensity = True``) —
+                  used by the Bayesian samplers to draw the starting state.
+            key: PRNG key passed to a callable initializer; ignored for the other forms.
+
+        Returns:
+            ``self``, for chaining.
+        """
         self.model.initialize(weights, key=key)
         return self
 
+    # docstring-from: jno.trace.Model.dtype
     def dtype(self, dtype: Any) -> "ModelCall":
+        """Set this model's working dtype (parameters **and** compute).
+
+        Casts all floating-point parameters to *dtype* and — at the forward
+        seam — casts the model's inputs to match, so the network actually
+        *computes* in *dtype* rather than promoting back to float32.  The cast is
+        symmetric: it lowers (float32 → bfloat16) **and** promotes (load a
+        bfloat16 checkpoint, then ``.dtype(jnp.float32)``), and applies to both
+        training and inference.  Integer arrays (e.g. indices) are left unchanged.
+
+        This is the model-precision knob.  **Data** precision (float32 vs
+        float64) is JAX's ``jax_enable_x64`` flag — *not* a jNO setting.  Enable
+        it before building models/domains (``JAX_ENABLE_X64=1`` or
+        ``jax.config.update("jax_enable_x64", True)``).
+
+        Args:
+            dtype: A JAX floating dtype object, e.g. ``jnp.bfloat16``,
+                ``jnp.float16``, ``jnp.float32`` or ``jnp.float64``.
+
+        Caveats:
+            * bfloat16 *compute* degrades autodiff derivatives
+              (``.laplacian`` / ``.hessian``) — keep derivative-critical (PINN)
+              models in float32 and opt only data-loss / operator backbones into
+              bf16.
+            * bfloat16 parameters mean the optimizer update also runs in
+              bfloat16, which can stall on very small updates.
+
+        Example::
+
+            backbone.dtype(jnp.bfloat16)   # real bf16 compute for this model
+            pinn_net.dtype(jnp.float32)    # keep its derivatives full precision
+        """
         self.model.dtype(dtype)
         return self
 
+    # docstring-from: jno.trace.Model.summary
     def summary(self):
-        """Proxy for :meth:`Model.summary`."""
+        """Print and persist a complete model-control summary.
+
+        The summary is always printed to stdout. If a default jNO logger is
+        active, the same content is appended to ``<logger.path>/log.log``.
+
+        Returns:
+            self (for chaining).
+        """
         self.model.summary()
         return self
 
-    def tune(self, **kwargs):
-        """Proxy for :meth:`Model.tune`."""
-        self.model.tune(**kwargs)
+    # docstring-from: jno.trace.Model.tune
+    def tune(self, *, freeze=None, lora=None, optimizer=None, lr=None, dtype=None):
+        """Declare per-model tunable options for hyperparameter sweeps.
+
+        Each argument accepts a list of candidate values.  During a sweep
+        the tuner searches over all combinations.
+
+        Args:
+            freeze: List of bool, e.g. ``[True, False]``.
+            lora: List of ``(rank, alpha)`` tuples **or** ``None`` values,
+                e.g. ``[(4, 1.0), (8, 1.0), None]``.
+            optimizer: List of optax factories, e.g. ``[optax.adam]``.
+            lr: List of :class:`LearningRateSchedule` objects.
+            dtype: List of dtypes, e.g. ``[jnp.float32, jnp.bfloat16]``.
+
+        Returns:
+            self (for chaining).
+
+        Example::
+
+            backbone = nn.poseidon(...)
+            backbone.initialize("weights.msgpack")
+            backbone.tune(
+                freeze=[True, False],
+                lora=[(4, 1.0), None],
+                optimizer=[optax.adam],
+                lr=[lrs.constant(1e-4), lrs.constant(1e-5)],
+            )
+        """
+        self.model.tune(freeze=freeze, lora=lora, optimizer=optimizer, lr=lr, dtype=dtype)
         return self
 
 
-class TunableModule(Placeholder):
+def _validate_flow_noise(noise, key):
+    """Reject the ways ``flow(noise=...)`` could quietly mean something other than an SDE."""
+    if noise is None:
+        if key is not None:
+            raise ValueError(
+                "flow(key=...) was given without noise=. The key exists only to drive the SDE "
+                "increment, so on a deterministic march it would do nothing -- which reads as "
+                "stochastic sampling that is not happening. Pass noise= too, or drop key=."
+            )
+        return
+    if not isinstance(noise, Noise):
+        raise TypeError(
+            f"flow(noise=...) expects a jno.noise spec (jno.noise.gaussian(...), .uniform(...), "
+            f".laplace(...)), got {type(noise).__name__}."
+        )
+    if getattr(noise, "shape_explicit", False):
+        raise ValueError(
+            "flow(noise=...) takes the DISTRIBUTION only -- its shape is the state's, resolved per "
+            "step from the pytree being marched. `ndim=`/`like=` describe a shape and would be "
+            "ignored here, so they are refused rather than silently dropped. Write "
+            "jno.noise.gaussian(std=...) with no shape argument."
+        )
+
+
+def _schedule_value(name, value, t, where):
+    """Resolve a distribution parameter that may be a **schedule** -- a callable of the march time.
+
+    A plain number passes through. A callable is the sigma_t of an SDE sampler and only has meaning
+    while marching, so it raises anywhere there is no march time rather than being silently called
+    with the wrong argument (or, worse, used as a float).
     """
-    Wraps a Flax module CLASS + ArchSpace.
-    Behaves like Model but with lazy instantiation.
+    if not callable(value):
+        return value
+    if t is None:
+        raise ValueError(
+            f"{name}= was given a schedule (a callable of the march time t), but {where} there is no "
+            f"march time to evaluate it at. A schedule is only meaningful inside "
+            f"`Model.flow(..., noise=...)`; elsewhere pass a number."
+        )
+    return value(t)
+
+
+def draw_distribution(distribution, params, shape, key, t=None, where="at this noise node"):
+    """Draw one realisation of *distribution* with *shape*. The single implementation.
+
+    Shared by the evaluator's ``Noise`` handler and by the SDE increment inside
+    :func:`march_velocity`, so a noise node means the same thing in a term list and in a march.
+    Parameters may be schedules (callables of *t*) only where a march time exists.
+    """
+
+    def par(name, default):
+        return _schedule_value(name, params.get(name, default), t, where)
+
+    if distribution == "gaussian":
+        return jax.random.normal(key, shape) * par("std", 1.0)
+    if distribution == "uniform":
+        return jax.random.uniform(key, shape, minval=par("low", -1.0), maxval=par("high", 1.0))
+    if distribution == "laplace":
+        std = par("std", 1.0)
+        u = jax.random.uniform(key, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
+        return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
+    raise ValueError(f"Unknown noise distribution {distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'.")
+
+
+def _diffusion_from_noise(noise):
+    """Build the per-step SDE increment from a ``jno.noise`` spec, or ``None`` for a plain ODE.
+
+    The increment is ``draw * sqrt(|dt|)`` -- Euler--Maruyama on top of the deterministic step. The
+    magnitude uses ``|dt|`` so a *decreasing* grid (marching data back to its latent) is a real
+    backward SDE rather than a NaN from ``sqrt`` of a negative step.
+    """
+    if noise is None:
+        return None
+
+    def diffusion(t0, dt, state, key):
+        leaves, treedef = jax.tree_util.tree_flatten(state)
+        keys = jax.random.split(key, len(leaves))
+        scale = jnp.sqrt(jnp.abs(dt))
+        drawn = [
+            draw_distribution(noise.distribution, noise.params, jnp.shape(leaf), k, t=t0, where="in this march") * scale
+            for leaf, k in zip(leaves, keys)
+        ]
+        return jax.tree_util.tree_unflatten(treedef, drawn)
+
+    return diffusion
+
+
+def resolve_flow_times(time):
+    """Normalise the ``time=`` argument of :meth:`Model.flow` to the grid POINTS.
+
+    An array (or any sequence) is the primary form and is taken as the grid itself, so a non-uniform
+    schedule needs no extra argument, and a *decreasing* grid marches the ODE backwards -- which is
+    how the same trained velocity encodes data back to its latent. A ``(t0, t1, n)`` triple is sugar
+    for ``linspace(t0, t1, n)``; ``n`` counts grid POINTS, matching ``domain(time=(t0, t1, n))``, so
+    the number of steps is ``n - 1``.
+    """
+    if isinstance(time, tuple) and len(time) == 3 and isinstance(time[2], int):
+        t0, t1, n = time
+        if int(n) < 2:
+            raise ValueError(f"time=(t0, t1, n): n counts grid POINTS and must be >= 2 (n - 1 steps), got n={n}.")
+        return jnp.linspace(float(t0), float(t1), int(n))
+
+    ts = jnp.asarray(time, dtype=jnp.result_type(float))
+    if ts.ndim != 1 or ts.shape[0] < 2:
+        raise ValueError(
+            f"time= must be a 1-D sequence of at least 2 grid points, or a (t0, t1, n) triple; got shape {tuple(ts.shape)}."
+        )
+    return ts
+
+
+def march_velocity(apply, x0, ts, save=False, diffusion=None, key=None):
+    """March ``dx/dt = apply(x, t)`` over the grid points *ts*, returning the endpoint (or the path).
+
+    Heun's method (explicit trapezoid): second order, two evaluations per step, and no state beyond
+    ``x`` -- see Butcher, *Numerical Methods for Ordinary Differential Equations* (2nd ed., 2016),
+    §2.3. Fixed-step and explicit: there is no adaptive control and no error estimate, so the step
+    count in *ts* is the accuracy knob.
+
+    The step sizes are the consecutive differences of *ts*, so a non-uniform grid and a decreasing
+    one both work with no flag. The state is any **pytree**; ``apply`` must return the same structure,
+    which is checked at trace time. Written as one :func:`jax.lax.scan`, so the whole march is
+    reverse-mode differentiable in ``x0``, in the weights ``apply`` closes over, and in *ts*.
+
+    With *diffusion* the march becomes an **SDE**: the deterministic Heun step is taken first and the
+    increment ``diffusion(t0, dt, x, subkey)`` is added after it (Euler--Maruyama). Each step draws
+    from ``fold_in(key, i)``, so the increments are **independent across steps** -- a single shared
+    draw would not be Brownian motion at all, and its endpoint variance would be wrong by a factor of
+    the step count. Mixing a second-order deterministic step with an Euler--Maruyama increment gives
+    strong order 1/2 overall, as any explicit fixed-step SDE scheme without Levy-area terms does.
+    """
+    ts = jnp.asarray(ts)
+
+    def step(x, i):
+        t0, t1 = ts[i], ts[i + 1]
+        dt = t1 - t0
+        k1 = apply(x, t0)
+        if jax.tree_util.tree_structure(k1) != jax.tree_util.tree_structure(x):
+            raise ValueError(
+                f"the velocity must return the same pytree structure as the state it is handed: "
+                f"state is {jax.tree_util.tree_structure(x)}, velocity returned "
+                f"{jax.tree_util.tree_structure(k1)}."
+            )
+        predictor = jax.tree_util.tree_map(lambda a, b: a + dt * b, x, k1)
+        k2 = apply(predictor, t1)
+        nxt = jax.tree_util.tree_map(lambda a, b, c: a + 0.5 * dt * (b + c), x, k1, k2)
+        if diffusion is not None:
+            # A fresh subkey PER STEP -- reusing one draw across the march is the failure this
+            # guards: the increments would be perfectly correlated and the endpoint variance would
+            # come out a factor of `len(ts) - 1` too large, worsening as the step count is raised.
+            increment = diffusion(t0, dt, nxt, jax.random.fold_in(key, i))
+            nxt = jax.tree_util.tree_map(lambda a, b: a + b, nxt, increment)
+        return nxt, (nxt if save else None)
+
+    x_end, path = jax.lax.scan(step, x0, jnp.arange(ts.shape[0] - 1))
+    if not save:
+        return x_end
+    # Prepend the initial state so the trajectory lines up with `ts` one-for-one.
+    return jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a[None], b], axis=0), x0, path)
+
+
+class Flow(Placeholder):
+    """A network marched as an ODE velocity field, ``dx/dt = v(x, t, *cond)``.
+
+    Produced by :meth:`Model.flow` when its initial state is *symbolic*, so the march composes into a
+    ``jno.core([...])`` term list rather than only running after training. That is what makes a
+    constraint on **generated** samples expressible (a PDE residual on what the model produces) and
+    what lets a gradient reach an optimisable latent through the whole march.
+
+    Handed a concrete array instead, :meth:`Model.flow` runs the march eagerly and returns the array;
+    this node is never built. Both routes share :func:`march_velocity` and the evaluator's
+    ``_apply_model``, so ``freeze`` / ``lora`` / ``dtype`` apply identically either way.
+
+    Args:
+        model: the velocity network ``v``.
+        x0: the initial state (a symbolic expression).
+        cond: extra conditioning inputs passed to ``v`` after ``(x, t)``.
+        ts: the time points of the march.
+        save: ``True`` returns the state at every time in ``ts``; ``False`` only the final state.
+        noise: a ``jno.noise`` spec, which turns the march into an SDE; ``None`` for an ODE.
+        key: PRNG key for the noise.
+    """
+
+    def __init__(self, model, x0, cond, ts, save=False, noise=None, key=None):
+        self.model = model
+        self.x0 = x0
+        self.cond = list(cond)
+        self.ts = ts
+        self.save = bool(save)
+        # A `jno.noise` spec turns the march into an SDE. It is NOT exposed through `args`: it names
+        # a distribution rather than a sub-expression, has no children (shape arguments are refused),
+        # and evaluating it as an array would draw once for the whole march -- the one thing the
+        # per-step redraw exists to prevent.
+        self.noise = noise
+        self.key = key
+        self.op_id = _next_op_id()
+
+    @property
+    def args(self):
+        """The traced children of the march, ``[x0, *cond]``, for the generic tree walkers."""
+        return [self.x0, *self.cond]
+
+    def __repr__(self):
+        cond = "".join(f", {c}" for c in self.cond)
+        sde = f", sde={self.noise.distribution}" if self.noise is not None else ""
+        return f"flow({self.model}, {self.x0}{cond}, steps={int(jnp.asarray(self.ts).shape[0]) - 1}{sde})"
+
+
+class TunableModule(Placeholder):
+    """A module CLASS plus an architecture search space, instantiated lazily by the tuner.
+
+    Behaves like :class:`Model`, but the module is built from the hyperparameters the tuner picks.
+
+    Args:
+        module_cls: the module class to instantiate.
+        space: the :class:`ArchSpace` describing its tunable constructor arguments.
     """
 
     def __init__(self, module_cls: Type, space: "ArchSpace"):
@@ -3468,7 +4798,12 @@ class TunableModule(Placeholder):
 
 
 class TunableModuleCall(Placeholder):
-    """Call to a TunableModule - resolved at solve time."""
+    """A call of a :class:`TunableModule`, resolved to a concrete model at solve time.
+
+    Args:
+        model: the tunable module.
+        args: the call's arguments.
+    """
 
     def __init__(self, model: TunableModule, args: list):
         self.model = model
@@ -3486,10 +4821,14 @@ class TunableModuleCall(Placeholder):
 
 
 class OperationDef(Placeholder):
-    """An operation definition - traces a computation graph.
+    """An operation definition: a traced expression reusable as a function of its input Variables.
 
-    When called with variables, returns an OperationCall that can be
-    evaluated during solve iterations.
+    Calling it with Variables returns an :class:`OperationCall` that is evaluated during solve
+    iterations.
+
+    Args:
+        expr: the expression that defines the operation.
+        input_vars: the Variables that form its input signature; ``None`` collects them from ``expr``.
     """
 
     def __init__(self, expr: Placeholder, input_vars: List[Variable] | None = None):
@@ -3514,7 +4853,7 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow, Noise)):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
@@ -3547,7 +4886,7 @@ class OperationDef(Placeholder):
         def visit(node):
             if isinstance(node, Model):
                 return True
-            elif isinstance(node, ModelCall):
+            elif isinstance(node, (ModelCall, Flow)):
                 return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
@@ -3590,9 +4929,11 @@ class OperationDef(Placeholder):
 
 
 class OperationCall(Placeholder):
-    """A call to an operation with specific input variables.
+    """A call of an :class:`OperationDef` on specific inputs, e.g. ``u(x, y)``.
 
-    Example: u(x, y) where u is an OperationDef and x, y are Variables.
+    Args:
+        operation: the operation being called.
+        args: the inputs, Variables or other operation calls, one per input Variable.
     """
 
     def __init__(self, operation: OperationDef, args: tuple):
@@ -3606,13 +4947,21 @@ class OperationCall(Placeholder):
 
 
 class Hessian(Placeholder):
-    """Second-order differential operator.
+    """Second-order differential operator; built by :meth:`Placeholder.d2`, ``.dd`` and ``.laplacian``.
 
-    When ``trace=False`` (default), computes the full Hessian matrix
-    H[i,j] = d²u / (dxᵢ dxⱼ).
+    When ``trace=False`` (default), computes the full Hessian matrix ``H[i,j] = d²u / (dxᵢ dxⱼ)``.
+    When ``trace=True``, computes the Laplacian (trace of the Hessian), ``∇²u = Σᵢ d²u/dxᵢ²``.
 
-    When ``trace=True``, computes the Laplacian (trace of the Hessian):
-    ∇²u = Σᵢ d²u/dxᵢ².
+    Args:
+        target: the expression to differentiate.
+        variables: the Variables to differentiate with respect to (one or a list).
+        scheme: how the derivative is computed:
+
+            * ``"automatic_differentiation"`` (default) — the global Hessian mode set via :func:`jno.setup`.
+            * ``"automatic_differentiation:fwd-over-rev"``, ``":fwd-over-fwd"``, ``":rev-over-rev"``,
+              ``":rev-over-fwd"`` — the nesting of ``jacfwd`` / ``jacrev``.
+            * ``"finite_difference"`` (optional sub-schemes ``":cotangent"`` (2-D), ``":lsq"``).
+        trace: ``True`` sums the diagonal (Laplacian) instead of returning the full matrix.
     """
 
     def __init__(
@@ -3623,7 +4972,7 @@ class Hessian(Placeholder):
         trace: bool = False,
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         self.trace = trace  # True → Laplacian (sum of diagonal)
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
@@ -3636,11 +4985,20 @@ class Hessian(Placeholder):
 
 
 class Jacobian(Placeholder):
-    """First-order differential operator.
+    """First-order differential operator; built by :meth:`Placeholder.d` and ``.diff``.
 
-    Computes J[i] = du/dxᵢ for each variable xᵢ.  When only one
-    variable is supplied this is equivalent to a partial derivative
-    (gradient), and the result is squeezed to a scalar per point.
+    Computes ``J[i] = du/dxᵢ`` for each variable ``xᵢ``. When only one variable is supplied this is a
+    partial derivative, and the result is squeezed to a scalar per point.
+
+    Args:
+        target: the expression to differentiate.
+        variables: the Variables to differentiate with respect to (one or a list).
+        scheme: how the derivative is computed:
+
+            * ``"automatic_differentiation"`` (default) — the global AD mode set via :func:`jno.setup`.
+            * ``"automatic_differentiation:forward"`` / ``":reverse"`` — ``jax.jacfwd`` / ``jax.jacrev``.
+            * ``"finite_difference"`` (optional sub-schemes ``":lsq"``, ``":uniform"``,
+              ``":inverse_distance"``).
     """
 
     def __init__(
@@ -3650,7 +5008,7 @@ class Jacobian(Placeholder):
         scheme: str = "automatic_differentiation",
     ):
         self.target = target
-        self.variables = variables if isinstance(variables, list) else [variables]
+        self.variables = list(variables) if isinstance(variables, (list, tuple)) else [variables]
         self.scheme = scheme
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
         _propagate_weak(self, target, *weak_vars)
@@ -3676,6 +5034,37 @@ class NormalDerivative(Placeholder):
 
     def __repr__(self):
         return f"NormalDerivative({self.target})"
+
+
+def _is_per_point_field(expr) -> bool:
+    """Whether ``expr`` certainly has one entry per collocation point along its first axis.
+
+    True for a network or a coordinate and for what pointwise operations build from them (arithmetic, a
+    component ``[..., i]``, a derivative); anything else met on the way (a reduction, an integral, a
+    user function, a FE symbol) makes the answer "not certain", and :meth:`Placeholder.__getitem__` then
+    indexes as asked. Used by :func:`refuse_point_index`.
+    """
+    seen, stack, found = set(), [expr], False
+    while stack:
+        n = stack.pop()
+        if id(n) in seen or not isinstance(n, Placeholder):
+            continue
+        seen.add(id(n))
+        if isinstance(n, Variable):
+            if getattr(n, "axis", "spatial") != "spatial":
+                return False
+            found = True
+        elif isinstance(n, ModelCall):  # per point through its inputs; a parameter (no inputs) is not
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif isinstance(n, BinaryOp):
+            stack.extend((n.left, n.right))
+        elif isinstance(n, (Jacobian, Hessian)):
+            stack.append(n.target)
+        elif isinstance(n, FunctionCall) and getattr(n, "getitem_key", (None,))[:1] == (Ellipsis,):
+            stack.extend(a for a in n.args if isinstance(a, Placeholder))
+        elif not isinstance(n, (Literal, Constant)):
+            return False
+    return found
 
 
 def _component_keeps_axis(expr) -> bool:
@@ -3707,6 +5096,16 @@ def _component_keeps_axis(expr) -> bool:
     return True
 
 
+def _check_symmetric_shape(value_shape, symmetric) -> bool:
+    """``symmetric=True`` is meaningful for a square matrix field only; anything else is refused."""
+    symmetric = bool(symmetric)
+    if symmetric and not (len(value_shape) == 2 and int(value_shape[0]) == int(value_shape[1])):
+        raise ValueError(
+            f"symmetric=True needs a square matrix field, value_shape=(n, n); got value_shape={tuple(value_shape)}."
+        )
+    return symmetric
+
+
 class _FieldComponentIndex:
     """``field[i]`` is the i-th COMPONENT — the mixin that makes one spelling mean one thing.
 
@@ -3724,6 +5123,14 @@ class _FieldComponentIndex:
     are unaffected.
     """
 
+    @property
+    def T(self):
+        """A matrix field's transpose swaps its two VALUE axes. The array ``.T`` would reverse every axis,
+        and at assembly the leading ones are quadrature points (and test DOFs)."""
+        if len(tuple(getattr(self, "value_shape", ()) or ())) == 2:
+            return FunctionCall(lambda x: jnp.swapaxes(x, -1, -2), [self], "transpose")
+        return Placeholder.T.fget(self)
+
     def __getitem__(self, key):
         keys = key if isinstance(key, tuple) else (key,)
         if any(k is Ellipsis for k in keys):
@@ -3740,7 +5147,12 @@ class _FieldComponentIndex:
 class DiffSlot(Placeholder):
     """A leaf standing in for a value injected at evaluation time — the hole :class:`Diff` differentiates
     through. Carries no children and no coordinates, so it composes as a plain value in any formula. Not
-    user-facing: it exists only inside the rewritten copy of a :class:`Diff` target."""
+    user-facing: it exists only inside the rewritten copy of a :class:`Diff` target.
+
+    Args:
+        key: the name under which the evaluator injects the value.
+        value_shape: the per-point shape of the injected value; ``()`` for a scalar.
+    """
 
     def __init__(self, key: str, value_shape=()):
         self.key = str(key)
@@ -3828,6 +5240,13 @@ class Cellwise(Placeholder):
 
     The reduction is over the quadrature axis of a *single* cell: the element kernel is a function of one
     cell index, so it cannot average across cells.
+
+    Args:
+        target: the expression to average; must not itself contain an integral.
+
+    Raises:
+        TypeError: if ``target`` is not a trace expression.
+        ValueError: if ``target`` contains an integral.
     """
 
     def __init__(self, target: "Placeholder"):
@@ -3895,13 +5314,17 @@ def contains_integral(expr) -> bool:
 class Integral(Placeholder):
     """Mesh-based integral reduction of an expression over its domain region.
 
-    Created by :meth:`Placeholder.integrate`.  The region (boundary vs volume)
-    is auto-detected at evaluation time from the Variable tags inside
-    ``target`` via ``domain._boundary_registry``.
+    Created by :meth:`Placeholder.integrate`. The region (boundary vs volume) is auto-detected at
+    evaluation time from the Variable tags inside ``target`` via ``domain._boundary_registry``.
 
-    When ``integration_var`` is set (the outer/collocation Variable), the
-    evaluator uses ``jax.vmap`` to return an ``(N, 1)`` array instead of a
-    scalar, enabling non-separable Fredholm kernels.
+    When ``integration_var`` is set (the outer/collocation Variable), the evaluator uses ``jax.vmap``
+    to return an ``(N, 1)`` array instead of a scalar, enabling non-separable Fredholm kernels.
+
+    Args:
+        target: the integrand.
+        integration_var: the outer Variable for a kernel integral (one value per outer point);
+            ``None`` integrates to a scalar.
+        quadrature: ``"nodal"`` (mesh-node weights, the default) or an integer quadrature degree.
     """
 
     def __init__(self, target: "Placeholder", integration_var: "Variable | None" = None, quadrature: "str | int" = "nodal"):
@@ -3919,15 +5342,17 @@ class Integral(Placeholder):
 class IntegralTime(Placeholder):
     """Trapezoidal time integral of an expression over the current time window.
 
-    Created by :meth:`Placeholder.integrate` when passed a temporal Variable.
-    At evaluation time the handler reads ``context["__time_window__"]`` (shape
-    ``(W, 1)``) injected by the compiler before the per-step vmap, evaluates
-    ``target`` at each of the W time values with the current spatial context,
-    applies trapezoidal weights, and sums to return the integral.
+    Created by :meth:`Placeholder.integrate` when passed a temporal Variable. At evaluation time the
+    handler reads ``context["__time_window__"]`` (shape ``(W, 1)``), evaluates ``target`` at each of
+    the W times with the current spatial context, applies trapezoidal weights and sums.
 
     Chain with a spatial :class:`Integral` for space-time integrals::
 
         u.integrate().integrate(t)   # ∫∫ u dΩ dt
+
+    Args:
+        target: the integrand.
+        time_var: the temporal Variable integrated over.
     """
 
     def __init__(self, target: "Placeholder", time_var: "Variable"):
@@ -3942,21 +5367,24 @@ class IntegralTime(Placeholder):
 class TemporalDerivative(Placeholder):
     """First-order time derivative via cross-step finite differences.
 
-    Created by :class:`FieldView` when a temporally-tagged Variable is bound
-    via ``.field.bind(t=t_var)``.  Higher-order temporal derivatives are
-    expressed by chaining (``.tt`` → ``TemporalDerivative(TemporalDerivative(u, t), t)``).
+    Created by :class:`FieldView` when a temporally-tagged Variable is bound via
+    ``.field.bind(t=t_var)``. Higher-order temporal derivatives are expressed by chaining
+    (``.tt`` → ``TemporalDerivative(TemporalDerivative(u, t), t)``).
 
     At evaluation time the handler reads:
 
-    * ``ctx["__temporal_fd_cache__"][id(target)]`` — the pre-computed window
-      ``u_window`` of shape ``(W, ...)`` injected by the compiler before the
-      per-step vmap;
+    * ``ctx["__temporal_fd_cache__"][id(target)]`` — the pre-computed window ``u_window`` of shape
+      ``(W, ...)`` injected by the compiler before the per-step vmap;
     * ``ctx["__step_index__"]`` — the current step index within the window;
     * ``ctx["__time_window__"]`` — the ``(W, 1)`` array of time values.
 
-    Applies a clamped central difference at interior steps and one-sided
-    differences at window edges.  Requires ``min_consecutive >= 2`` in
-    :meth:`Crux.solve` (>= 3 recommended for proper central differences).
+    Applies a clamped central difference at interior steps and one-sided differences at window edges.
+    Requires ``min_consecutive >= 2`` in :meth:`Crux.solve` (>= 3 recommended for proper central
+    differences).
+
+    Args:
+        target: the expression to differentiate in time.
+        time_var: the temporal Variable.
     """
 
     def __init__(self, target: "Placeholder", time_var: "Variable"):
@@ -3971,8 +5399,8 @@ class TemporalDerivative(Placeholder):
 class NetworkGradient(Placeholder):
     """Per-point Jacobian of an expression w.r.t. a model's trainable parameters.
 
-    Created by ``expr.grad(model)``.  Evaluated by :class:`TraceEvaluator`
-    using ``jax.jacrev`` over ``eqx.partition``-ed parameters.
+    Created by ``expr.grad(model)``. Evaluated by :class:`TraceEvaluator` using ``jax.jacrev`` over
+    ``eqx.partition``-ed parameters.
 
     **Post-training analysis** (via ``crux.eval``)::
 
@@ -3986,10 +5414,14 @@ class NetworkGradient(Placeholder):
 
         loss = (jax.lax.stop_gradient(u.grad(net)) ** 2).mean()
 
-    Output shape inside ``crux.eval``: ``(B, N, P)`` for scalar-output expressions;
-    ``(B, N, D, P)`` for D-dimensional output.
-    N = spatial points, P = number of selected trainable parameters.
-    When *selector* is ``None``, P = all trainable array leaves flattened.
+    Output shape inside ``crux.eval``: ``(B, N, P)`` for scalar-output expressions; ``(B, N, D, P)``
+    for D-dimensional output. N = spatial points, P = number of selected trainable parameters.
+
+    Args:
+        target: the expression to differentiate.
+        model_node: the model whose parameters are differentiated.
+        selector: ``None`` for all trainable array leaves (flattened), or an ``eqx.tree_at``-style
+            selector (set via ``model.mask(...)``) choosing a subset.
     """
 
     def __init__(self, target: Placeholder, model_node: "Model", selector=None):
@@ -4005,37 +5437,58 @@ class NetworkGradient(Placeholder):
 class Noise(Placeholder):
     """Stochastic noise term regenerated every training step.
 
-    Created by :mod:`jno.noise`.  Produces an array of shape ``(N, ndim)``
-    where ``N`` is inferred at evaluation time from the number of active
-    spatial points and ``ndim`` (default 1) controls the trailing dimension.
+    Created by :mod:`jno.noise`. Produces an array of shape ``(N, ndim)`` where ``N`` is inferred at
+    evaluation time from the number of active spatial points and ``ndim`` (default 1) controls the
+    trailing dimension.
 
-    The realisation is derived from the solver's step PRNG key via
-    ``jax.random.fold_in``, so it is fully reproducible when the global seed
-    is fixed (via :func:`jno.setup` or ``.jno.toml``).
+    The realisation is derived from the solver's step PRNG key via ``jax.random.fold_in``, so it is
+    fully reproducible when the global seed is fixed (via :func:`jno.setup` or ``.jno.toml``).
 
-    Parameters
-    ----------
-    distribution : str
-        ``'gaussian'``, ``'uniform'``, or ``'laplace'``.
-    **params
-        Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
+    With ``like=`` the draw instead takes the shape of another traced expression, resolved at
+    evaluation time rather than written down — so it follows ``batchsize``, ``points=`` and time
+    windows automatically, where a shape spelled out in the script would silently go stale.
+
+    Args:
+        distribution: ``"gaussian"``, ``"uniform"`` or ``"laplace"``.
+        like: shape reference (a traced expression); mutually exclusive with ``ndim``.
+        shape_explicit: whether the caller asked for a shape (``ndim`` defaults to 1, so ``params``
+            alone cannot tell); ``flow(noise=...)`` refuses an explicit shape.
+        **params: distribution parameters: ``std`` (gaussian/laplace), ``low`` and ``high``
+            (uniform), and ``ndim``.
     """
 
-    def __init__(self, distribution: str, **params):
+    def __init__(self, distribution: str, like=None, shape_explicit: bool = False, **params):
         self.distribution = distribution
         self.params = params
+        self.like = like
+        # Whether the caller actually asked for a shape. `ndim` defaults to 1, so params alone
+        # cannot tell that apart from silence -- and `flow(noise=...)` must refuse an explicit
+        # shape (its own comes from the state) without refusing every plain distribution.
+        self.shape_explicit = bool(shape_explicit)
         self._noise_id = _next_op_id()
+
+    @property
+    def args(self):
+        """The shape reference, for the tree walkers — it may carry Variables whose tags must be
+        collected even when the reference appears nowhere else in the term list."""
+        return [self.like] if self.like is not None else []
 
     def __repr__(self):
         params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        if self.like is not None:
+            params_str += f", like={self.like}"
         return f"Noise({self.distribution}, {params_str})"
 
 
 def check_runtime_values(names, values):
-    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter or leaves one out.
+    """Refuse a ``fem.solve(name=value, ...)`` call that names an unknown parameter, leaves one out, or gives
+    a FIELD parameter (one value per cell, node or dof) a value of the wrong size.
 
     Every solve that accepts the values (steady linear and nonlinear, transient, load-path march) checks
-    them here, so the same call fails the same way whichever path the form takes."""
+    them here, so the same call fails the same way whichever path the form takes. ``names`` is the
+    operator's ``runtime_parameter_exprs`` mapping (or just the names, which skips the size check). The
+    size check matters because the element kernels GATHER from a field value and JAX clamps an
+    out-of-range gather: a vector of the wrong length used to solve without a word."""
     unknown = sorted(set(values) - set(names))
     if unknown:
         raise TypeError(f"fem.solve(): unknown runtime parameter(s) {unknown!r}. This problem exposes {sorted(names)!r}.")
@@ -4046,10 +5499,78 @@ def check_runtime_values(names, values):
             f"for {missing!r}. Give every parameter a value to solve here and now, or give none and "
             "let `crux` resolve them (the solve is then a trace node, not an array)."
         )
+    for name, expr in names.items() if isinstance(names, dict) else ():
+        model = getattr(expr, "model", None)
+        kind = getattr(model, "_fem_field", None)
+        if not kind or name not in values:
+            continue
+        want = tuple(model.module.value.shape)
+        got = tuple(jnp.shape(values[name]))
+        if math.prod(got) != math.prod(want):
+            per = {"cell": "cell", "node": "mesh node"}.get(kind, "dof of its space")
+            raise ValueError(
+                f"fem.solve(): the field parameter {name!r} takes one value per {per}, shape {want} "
+                f"({math.prod(want)} values); it was given shape {got}. Pass a value of shape {want}."
+            )
+
+
+class FemSolutionCall(FunctionCall):
+    """The node a parametric ``fem.solve()`` returns: the nodal solution, and callable at POINTS.
+
+    ``u(px, py, pz)`` -- coordinate arrays (numbers, arrays or ``jno.np.parameter``s) -- is a node whose
+    value is the solution at those points, through the shape functions of the elements holding them
+    (``fem_points.PointShape``). It composes like any expression (``u(pa...) - u(pb...)``), ``.eval()``s
+    to an array, and differentiates through the solve and in the points. Any other call keeps
+    ``FunctionCall``'s meaning.
+
+    Args:
+        fn: the solve function (as for :class:`FunctionCall`).
+        args: its arguments (the runtime parameters).
+        name: display name.
+        point_space: the element space used to evaluate the solution at points.
+        **kw: further :class:`FunctionCall` options (``reduces_axis``, ``kwargs``).
+    """
+
+    def __init__(self, fn, args, name=None, point_space=None, **kw):
+        super().__init__(fn, args, name=name, **kw)
+        self._point_space = point_space
+
+    def __call__(self, *coords, **named):
+        if not coords or named or not all(_is_point_coord(c) for c in coords):
+            if len(coords) == 1 and not named:
+                return super().__call__(coords[0])
+            raise TypeError(
+                "jno.fem: call the solution with point coordinate ARRAYS, one per axis -- u(px, py, pz) -- "
+                "made of numbers, arrays or jno.np.parameter(...)s."
+            )
+        if self._point_space is None:
+            raise NotImplementedError("jno.fem: this solve cannot be read at points (no point space was built for it).")
+        shape_fn, cdofs0 = self._point_space()
+        nodes = [c if isinstance(c, Placeholder) else Literal(c) for c in coords]
+
+        def _at(u, *cs):
+            cs = [jnp.reshape(jnp.asarray(c), (-1,)) for c in cs]
+            n = max(int(c.shape[0]) for c in cs)
+            pos = jnp.stack([jnp.broadcast_to(c, (n,)) for c in cs], axis=1)
+            cell, N = shape_fn(pos)
+            return jnp.sum(N * jnp.reshape(u, (-1,))[cdofs0[cell]], axis=1)
+
+        return FunctionCall(_at, [self, *nodes], name="fem_point_value")
 
 
 class FemLinearSystem:
-    """Container for a steady linear FEM system ``A(args) x = b(args)``."""
+    """Container for a steady linear FEM system ``A(args) x = b(args)``; ``fem.operator`` for a linear form.
+
+    Args:
+        A: the assembled matrix (BCOO), or a placeholder when ``operator_fn`` is set.
+        b: the assembled right-hand side, or a placeholder when ``rhs_fn`` is set.
+        operator_fn: ``args -> A(args)`` for a form whose matrix depends on runtime parameters.
+        rhs_fn: ``args -> b(args)`` for a right-hand side that depends on runtime parameters.
+        runtime_parameter_exprs: the runtime parameters the form declares, by name.
+        operator_basis: affine decomposition of the matrix, ``A = A0 + sum_k p_k A_k``, by parameter name.
+        rhs_basis: the same for the right-hand side.
+        metadata: free-form diagnostics recorded during lowering.
+    """
 
     def __init__(
         self,
@@ -4074,9 +5595,18 @@ class FemLinearSystem:
 
     @property
     def is_parametric(self) -> bool:
+        """Whether the matrix or the right-hand side depends on runtime parameters."""
         return self.operator_fn is not None or self.rhs_fn is not None
 
     def evaluate(self, args=None):
+        """The system at given parameter values.
+
+        Args:
+            args: runtime parameter values by name; ignored for a non-parametric system.
+
+        Returns:
+            tuple: ``(A, b)``, the sparse matrix and the right-hand side.
+        """
         A = self.A if self.operator_fn is None else self.operator_fn(args)
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
@@ -4144,11 +5674,15 @@ class FemLinearSystem:
             return solve_fn(A, b)
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FemSolutionCall(_solve, params, name="fem_solve", point_space=getattr(self, "_point_space", None))
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            if periodic is None:  # a shared factorisation needs the operator as assembled (trace_evaluator)
+                node._solve_fls, node._solve_recombine, node._solve_fn = self, None, solve_fn
+            return node
         # ``fem.solve(k=2.0)``: the caller named the parameters, so solve at them now and return the array,
         # as the nonlinear operator does. (The values used to be dropped here, and the node then solved at
         # the parameters' STORED values -- a silently wrong answer.)
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         return _solve(*(jnp.asarray(values[n]) for n in names))
 
     def __iter__(self):
@@ -4170,6 +5704,14 @@ class FemLinearSystem:
         return FemLinearSystem(self.A + other.A, self.b + other.b)
 
     def todense(self, args=None):
+        """The system at given parameter values, with the matrix as a dense array.
+
+        Args:
+            args: runtime parameter values by name; ignored for a non-parametric system.
+
+        Returns:
+            tuple: ``(A, b)`` with ``A`` dense. For inspection and small systems only.
+        """
         A, b = self.evaluate(args=args)
         A_dense = A.todense() if hasattr(A, "todense") else A
         return A_dense, b
@@ -4189,8 +5731,27 @@ class FemLinearSystem:
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)}, parametric={self.is_parametric})"
 
 
+#: Compiled solve programs kept per operator (`FemResidualOperator.solve`); least recently used dropped first.
+_EAGER_SOLVE_CACHE_MAX = 8
+
+
+def _takes_jacobian(solve_fn) -> bool:
+    """Whether a composed solver is handed the tangent: an assembled-tangent Newton needs the matrix
+    (``wants_jacobian``), the matrix-free one only its diagonal-only pass (``wants_jacobian_diag``)."""
+    return bool(getattr(solve_fn, "wants_jacobian", False) or getattr(solve_fn, "wants_jacobian_diag", False))
+
+
 class FemResidualOperator:
-    """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
+    """Container for a steady nonlinear FEM residual ``R(u, args) = 0``; ``fem.operator`` for a nonlinear form.
+
+    Args:
+        residual_fn: ``(u, args) -> R(u, args)``.
+        jacobian_fn: ``(u, args) -> dR/du`` as a sparse matrix; ``None`` when unavailable.
+        size: number of DOFs.
+        runtime_parameter_exprs: the runtime parameters the form declares, by name.
+        residual_basis: affine decomposition of the residual in the parameters, by name.
+        metadata: free-form diagnostics recorded during lowering.
+    """
 
     def __init__(
         self,
@@ -4204,6 +5765,8 @@ class FemResidualOperator:
     ):
         self.residual = residual_fn
         self.jacobian = jacobian_fn
+        # ``(u, args) -> diag J(u)`` without the matrix, when the assembler provides it (see `_jacobian_handle`)
+        self.jacobian_diag = None
         self.size = size
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
@@ -4215,12 +5778,25 @@ class FemResidualOperator:
 
     @property
     def is_parametric(self) -> bool:
+        """Whether the residual depends on runtime parameters."""
         return bool(self.runtime_parameter_exprs)
 
     def __call__(self, u, args=None):
         return self.residual(u, args)
 
     def linearize(self, u, args=None):
+        """The Newton system at a state: the Jacobian and the negated residual.
+
+        Args:
+            u: the DOF vector to linearise at.
+            args: runtime parameter values by name.
+
+        Returns:
+            tuple: ``(J(u), -R(u))``, so a Newton step solves ``J du = -R``.
+
+        Raises:
+            ValueError: if no Jacobian function is available.
+        """
         if self.jacobian is None:
             raise ValueError("No jacobian function available.")
 
@@ -4228,6 +5804,17 @@ class FemResidualOperator:
             self.jacobian(u, args),
             -self.residual(u, args),
         )
+
+    def _jacobian_handle(self, args):
+        """``u -> J(u)`` at these ``args``, carrying ``.diag`` (``u -> diag J(u)``) when the assembler has a
+        diagonal-only pass: the matrix-free Newton preconditions with it (``newton_krylov(jacobian_diag=)``)."""
+
+        def jac(u):
+            return self.jacobian(u, args)
+
+        if self.jacobian_diag is not None:
+            jac.diag = lambda u: self.jacobian_diag(u, args)
+        return jac
 
     def solve(self, solve_fn=None, *, u0=None, values=None):
         """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
@@ -4256,6 +5843,7 @@ class FemResidualOperator:
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the residual is float64).
         """
+        default_start = u0 is None
         if u0 is None:
             if self.size is None:
                 raise ValueError("FemResidualOperator.solve: pass u0= (operator size is unknown).")
@@ -4283,20 +5871,37 @@ class FemResidualOperator:
         # wrapper needs them when a slip surface moves with runtime coordinates (its P is rebuilt per solve).
         _xa = (lambda a: {"args": a}) if getattr(solve_fn, "wants_args", False) else (lambda a: {})  # noqa: E731
 
-        def _solve(*values):
-            args = dict(zip(names, values))
-            residual_fn = lambda u: self.residual(u, args)  # noqa: E731
+        def _drive(driver, u_start, args):
             # A sparse-direct Newton (``jno.solve.newton(direct=True)``) flags ``wants_jacobian`` and
             # factorizes the ASSEMBLED tangent each step; hand it ``self.jacobian`` (the per-element
             # assembled BCOO, with Dirichlet rows already set). Every other driver stays matrix-free.
-            if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                return solve_fn(residual_fn, u0, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
-            return solve_fn(residual_fn, u0, **_xa(args))
+            def call(res, x0, jac):
+                if _takes_jacobian(driver) and jac is not None:
+                    return driver(res, x0, jacobian=jac, **_xa(args))
+                return driver(res, x0, **_xa(args))
+
+            # From the default start (zeros) on a problem with non-zero prescribed values, first take the
+            # linearised step that carries the boundary increment into the interior (`dirichlet_lift_start`);
+            # otherwise Newton would begin at the projected start, which a large prescribed displacement
+            # can turn inside out. Decided statically -- a caller's own `x0` is left alone -- and called
+            # plainly, so a driver that works on the host runs it as it runs any solve. Only an initial
+            # guess: no gradient flows through it.
+            lift = getattr(self, "lift_start", None) if default_start else None
+            if lift is not None:
+                res_l, jac_l, _gap = lift(u_start, args)
+                u_start = jax.lax.stop_gradient(call(res_l, u_start, jac_l))
+            jac = self._jacobian_handle(args) if self.jacobian is not None else None
+            return call(lambda u: self.residual(u, args), u_start, jac)
+
+        def _solve(*values):
+            return _drive(solve_fn, u0, dict(zip(names, values)))
 
         if values is None:
-            return FunctionCall(_solve, params, name="fem_solve")
+            node = FunctionCall(_solve, params, name="fem_solve")
+            node._per_evaluation = True  # depends on the parameters only: evaluated once per evaluation
+            return node
         # Eager: the caller named the parameters, so there is nothing left for `crux` to resolve.
-        check_runtime_values(names, values)
+        check_runtime_values(self.runtime_parameter_exprs, values)
         # JITTED and cached, with the values and the initial guess as TRACED arguments. Without the
         # jit, every call re-stages the solver -- `lax.while_loop` / `custom_root` / `linearize` trace
         # their bodies on each Python call -- so an 8-value sweep cost 48 tracings and the whole point,
@@ -4308,21 +5913,28 @@ class FemResidualOperator:
         # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
         # per call, so `id()` alone never matched and every call re-compiled.
         _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
+        from ..utils.solver.newton_krylov import _FORCING
         from ..utils.solver.sharding import element_token
 
         # ... and by the element sharding the residual is traced under: a program compiled across N devices
-        # must not answer a later `shard=False` call (nor the reverse).
-        key = (_sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token())
+        # must not answer a later `shard=False` call (nor the reverse); and by whether Newton steps are
+        # inexact (`_FORCING`, read when the driver is traced), for the same reason.
+        key = (
+            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0])
+        )  # fmt: skip
+        # A built preconditioner's arrays are ARGUMENTS of the program, not constants baked into it: a spec
+        # rebuilt between solves (same shapes) reuses the program with its new arrays (`precond_state`).
+        from ..utils.solver.solver_api import bound_state, precond_state
+
+        states = precond_state(getattr(solve_fn, "precond", None))[1]
         cache = self.__dict__.setdefault("_eager_solve_cache", {})
         fn = cache.get(key)
         if fn is None:
+            first = solve_fn  # the program holds THIS solver's spec objects; a later call binds its own arrays
 
-            def _run(u0_arg, *value_args):
-                args = dict(zip(names, value_args))
-                rf = lambda u: self.residual(u, args)  # noqa: E731
-                if getattr(solve_fn, "wants_jacobian", False) and self.jacobian is not None:
-                    return solve_fn(rf, u0_arg, jacobian=lambda u: self.jacobian(u, args), **_xa(args))
-                return solve_fn(rf, u0_arg, **_xa(args))
+            def _run(u0_arg, pstates, *value_args):
+                with bound_state(precond_state(getattr(first, "precond", None))[0], pstates):
+                    return _drive(first, u0_arg, dict(zip(names, value_args)))
 
             if names:
                 fn = cache[key] = jax.jit(_run)
@@ -4333,11 +5945,17 @@ class FemResidualOperator:
                 from ..utils.solver.newton_krylov import compiled_with_verdicts
 
                 fn = cache[key] = compiled_with_verdicts(_run)
+            # Bounded: each entry holds an executable. A configuration not used for a while is dropped
+            # (and recompiled if it comes back) rather than kept until the device runs out of memory.
+            while len(cache) > _EAGER_SOLVE_CACHE_MAX:
+                cache.pop(next(iter(cache)))
+        else:
+            cache[key] = cache.pop(key)  # most recently used last
         if names:
-            return fn(u0_t, *vals_t)
+            return fn(u0_t, states, *vals_t)
         from ..utils.solver.newton_krylov import judge_verdicts
 
-        u, verdicts = fn(u0_t)
+        u, verdicts = fn(u0_t, states)
         if not isinstance(u, jax.core.Tracer):  # a caller tracing the solve (grad/vmap) gets the cap only
             judge_verdicts(verdicts)
         return u
@@ -4363,6 +5981,9 @@ class ModelWeights(Placeholder):
     FunctionCall's params where a scalar parameter would put its zero-arg ``ModelCall``; the trace
     evaluator resolves it to ``params[layer_id]`` — the trainable module crux recombines each step
     — so gradients flow from the solve back into the network's weights.
+
+    Args:
+        model: the model whose current weights the node evaluates to.
     """
 
     def __init__(self, model: Model):
@@ -4381,6 +6002,12 @@ class StateField(Placeholder):
 
     This wraps the original NN-valued expression so the same weak graph can be
     lowered either to VPINN (bind back to expr) or FEM (replace by TrialFunction).
+
+    Args:
+        expr: the network-valued expression that stands for the unknown.
+        state_id: index of the unknown when there are several.
+        name: symbol name used in printing.
+        value_shape: shape of the unknown's value at one point.
     """
 
     def __init__(
@@ -4434,30 +6061,79 @@ class GaugePin:
         return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r}{extra})"
 
 
+def _is_point_coord(c) -> bool:
+    """A coordinate that names a POINT rather than a region: a number, an array, a runtime parameter
+    (``jno.np.parameter``), or arithmetic of those. A region ``Variable`` -- or anything built on one,
+    like ``x + 1`` -- is not: calling a field with it binds the field to that region, as it always has."""
+    if isinstance(c, Variable):
+        return False
+    if isinstance(c, (int, float, np.ndarray, np.number)) or isinstance(c, jax.Array):
+        return True
+    if isinstance(c, (Literal, Constant)):
+        return True
+    if isinstance(c, ModelCall):
+        return len(c.args) == 0 and bool(getattr(c.model, "_is_parameter", False))
+    if isinstance(c, BinaryOp):
+        return _is_point_coord(c.left) and _is_point_coord(c.right)
+    return False
+
+
+class PointEval(Placeholder):
+    """A field evaluated at POINTS: ``v(px, py, pz)`` with point coordinates (numbers, arrays or
+    ``jno.np.parameter``s, one array per axis). On a test function inside ``jno.fem([...])`` it is a
+    point load, ``sum_i c_i v(p_i)``; on a solution node it is the solution's value there. Both go
+    through the shape functions of the element that contains each point (``fem_points.PointShape``).
+
+    Args:
+        field: the field (test function or solution) evaluated.
+        coords: one coordinate array per axis (numbers, arrays or ``jno.np.parameter`` nodes).
+    """
+
+    def __init__(self, field, coords):
+        self.of = field  # the field evaluated (`field` is taken: a Placeholder property)
+        self.coords = tuple(coords)
+
+    def __repr__(self):
+        return f"{self.of!r}@points"
+
+
+def _point_call(field, coords, named):
+    """``PointEval`` when every spatial coordinate names a point; None for today's region binding."""
+    if named or not coords or not all(_is_point_coord(c) for c in coords):
+        return None
+    return PointEval(field, coords)
+
+
 class TrialFunction(_FieldComponentIndex, Placeholder):
+    """Generic variational unknown symbol: the trial function of ``jno.fem``.
+
+    Usually created by ``d.unknown(...)`` (or ``d.fem_symbols(...)``). Its meaning depends on the
+    assembly target: the FE trial function of a linear system, the FE unknown of a nonlinear
+    residual, or (in a VPINN) the network that replaces it.
+
+    Args:
+        name: symbol name used in printing, ``jno.info`` and error messages (default ``"u"``).
+        value_shape: shape of the field value at one point: ``()`` scalar, ``(2,)`` / ``(3,)`` vector,
+            ``(2, 2)`` second-order tensor, and so on.
+        order: polynomial degree of the element space (``1`` linear, ``2`` quadratic, ...).
+        space: the element family: ``"Lagrange"`` (default), ``"P0"`` (one value per cell),
+            ``"N1E"`` / ``"N2E"`` (Nédélec, H(curl)), ``"RT"`` (Raviart–Thomas, H(div)),
+            ``"Hermite"``, ``"Argyris"``, ``"Morley"`` (C¹ plates).
+        symmetric: for a square matrix ``value_shape``, store only the upper triangle
+            (``n(n+1)/2`` values per node); the symbol still behaves as the full matrix.
+        constant: ``True`` makes ONE value (scalar, vector or matrix) over the whole domain,
+            solved for with the fields; it has no element, so ``order``/``space`` do not apply.
     """
-    Generic variational unknown symbol.
 
-    Interpretation depends on assembly target:
-      - vpinn         -> interpreted via model/u_net
-      - fem_system    -> interpreted as FE trial function
-      - fem_residual  -> interpreted as FE unknown in a nonlinear residual operator
-
-    Parameters
-    ----------
-    name : str
-        Symbol name used for printing/debugging.
-    value_shape : tuple
-        Shape of the field value at one spatial point:
-          ()    -> scalar
-          (2,)  -> 2D vector
-          (3,)  -> 3D vector
-          (2,2) -> second-order tensor, etc.
-    """
-
-    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -4467,8 +6143,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -4488,6 +6168,13 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         ``u.bind(x=xi, y=yi).x`` -> ``du/dx`` (a ``Jacobian`` node identical to
         ``u.d(xi)``); ``.xx`` / ``.xy`` give higher partials. Mirrors the PINN
         field idiom ``net(x).scalar.bind(x=x)``.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=xi, y=yi`` (``t=ti`` for time). The names
+                become the attribute and ``.d`` spellings.
+
+        Returns:
+            The bound field view.
         """
         return self._field_view().partials(**named_vars)
 
@@ -4637,6 +6324,17 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         (which requires ``fem.solve(contact=...)``). By default **small sliding** — the pairing and the
         projection are frozen at build time; ``fem.solve(contact=jno.solve.contact())`` re-runs the
         search from ``x + u`` and is what a configuration that slides far needs.
+
+        Args:
+            secondary: the tag of the secondary (slave) boundary face, where the quadrature points live and
+                where the traction is written.
+            main: the tag of the main (master) face, or a list of candidate tags (each point pairs with the
+                nearest facet; listing ``secondary`` itself is self-contact). A list requires
+                ``fem.solve(contact=...)``.
+            domain: the domain holding both faces.
+
+        Returns:
+            The tangential relative displacement, a vector symbol in global coordinates.
         """
         dom = domain
         if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
@@ -4648,6 +6346,75 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 
             dom.context[key] = _np.zeros((1, _dim))
         return Variable(tag=key, dim=[0, _dim], domain=dom, axis="spatial")
+
+    def test(self) -> "TestFunction":
+        """This field's **test function**: same space, value shape, order, symmetry and field.
+
+        ``v = u.test()`` is derived from the unknown, so the pair cannot be mismatched. Repeated calls
+        return the same symbol (the one ``fem_symbols`` paired it with, if it came from there)."""
+        t = self.__dict__.get("_test")
+        if t is None:
+            t = TestFunction(
+                name=f"v_{self.name}",
+                value_shape=self.value_shape,
+                order=self.order,
+                space=self.space,
+                symmetric=self.__dict__.get("symmetric", False),
+                constant=self.__dict__.get("_is_constant", False),
+            )
+            t.field_key = self.field_key
+            if "_domain" in self.__dict__:
+                t._domain = self._domain
+            if self.__dict__.get("_complex_field_member", False):
+                t._complex_field_member = True
+            self._test = t
+        return t
+
+    def across(self, main: str, *, domain):
+        """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak
+        term integrated on ANOTHER face -- the non-local ingredient of a two-face (thin-layer) condition.
+
+        At every quadrature point of the face the term lives on, the value is this field evaluated at
+        the point of ``main`` facing it (its projection onto ``main``), with ``main``'s own adjacent
+        cell and basis. So a coupling between the two faces of a thin conductor removed from the mesh
+        is written as ordinary terms, once per face -- the exact layered-conductor two-port (Dowell, Proc.
+        IEE 113(8), 1966) in admittance form, ``Y = (1/Zc) [[coth γt, -csch γt], [-csch γt, coth γt]]``,
+        ``Zc = γ/σ``. Per face ``c11 = jωσ coth(γt)/γ`` and ``c12 = -jωσ csch(γt)/γ``; both stay finite as
+        ``ω -> 0`` (``±1/(μt)``), and their sum, the conductance, is a difference of large numbers there --
+        relative accuracy ``~ ε (δ/t)²``, i.e. 1e-9 at 1 Hz for a 35 µm copper foil::
+
+            ua = u.across("cu_bot", domain=d)            # on the top face, read the bottom face
+            n = d.variable("cu_top", normals=True)
+            c11 = 1j*w*sigma*coth(g*t)/g;  c12 = -1j*w*sigma/(g*sinh(g*t))
+            fem = jno.fem([..., c11*inner(u.vector.cross(n), v.vector.cross(n))
+                                + c12*inner(jno.np.cross(ua, n), v.vector.cross(n)), ...])  # + same on cu_bot
+
+        Like :meth:`gap` it is a placeholder symbol: the per-point value is packed during assembly (it is
+        LINEAR in the main face's DOFs, so the operator gains the main-cell columns exactly), and the
+        pairing is frozen at build time from the static mesh -- differentiable in the DOF values, not
+        in the mesh coordinates. Assembled on the non-nodal path, for every family it carries (N1E /
+        N2E / RT of any degree, Lagrange, DG, P0), in 2-D and 3-D.
+
+        **Matched faces.** The two faces should carry matching meshes (e.g. an extruded foil), so each
+        point's partner lies exactly on ``main``. On non-matching faces the partner is the closest point
+        of ``main``, and a strongly coupling coefficient -- the ``±1/(μt)`` of a thin conductor's
+        two-port at low frequency -- then acts like a penalty on that mismatch: correct only to the
+        resolution of the coarser face.
+        """
+        dom = domain
+        if not hasattr(dom, "context") or not hasattr(dom, "_boundary_regions"):
+            raise TypeError(f"u.across: `domain=` must be a jno domain, got {type(dom).__name__}.")
+        breg = getattr(dom, "_boundary_regions", {}) or {}
+        if main not in breg:
+            raise ValueError(f"u.across: {main!r} is not a boundary region on this domain. Known: {sorted(breg)}.")
+        import numpy as _np
+
+        n = int(_np.prod(self.value_shape)) if self.value_shape else 1
+        key = f"across_{self.field_key}_{main}"
+        dom.__dict__.setdefault("_across_pairs", {})[key] = (self.field_key, main)
+        if key not in dom.context:  # placeholder so the Variable constructs; assembly packs the value
+            dom.context[key] = _np.zeros((1, n))
+        return Variable(tag=key, dim=[0, n], domain=dom, axis="spatial")
 
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
@@ -4703,6 +6470,9 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         without the filter the ``t`` would silently bind to ``z``.
         """
         spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        pe = _point_call(self, spatial, named)
+        if pe is not None:  # u(px, py, pz) with point coordinates: the field at those points
+            return pe
         binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:
@@ -4716,7 +6486,15 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
         essential boundary trace beside the deflection ``u(region)``: the **rotation**. Use it to write the
         classical plate BCs — clamped ``u(reg)-g, u.dn(reg)-0``; simply-supported ``u(reg)-g`` alone; guided
         ``u.dn(reg)-h`` alone; free (write neither). The physical outward normal is recomputed per boundary
-        edge at assembly, so no explicit normal is needed."""
+        edge at assembly, so no explicit normal is needed.
+
+        Args:
+            *coords: the boundary Variables of the region, as in ``u(xb, yb)``.
+            **named: the same coordinates by name (``x=xb, y=yb``).
+
+        Returns:
+            NormalDerivative: the trace, to be written as an essential condition ``u.dn(xb, yb) - h``.
+        """
         return NormalDerivative(self(*coords, **named))
 
     def __repr__(self):
@@ -4726,6 +6504,12 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
 class FrozenField(Placeholder):
     """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
     precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
+
+    ``values`` holds one entry per DOF of the source's space: per node (times the value_shape) for
+    Lagrange, per cell for P0, and for N1E / N2E / RT one per DOF (edge circulations, face fluxes: the basis
+    carries the vector). On a non-nodal form a frozen field of ANY of these spaces is a coefficient,
+    evaluated with its space's own basis and Piola map (value and gradient), whether or not the space is
+    among the solved unknowns.
 
     It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
     / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
@@ -4740,7 +6524,14 @@ class FrozenField(Placeholder):
     so it (and its ``.x`` / ``.y`` gradient) can be **read out standalone via ``.eval()``** — the
     boundary-functional readout the evaluator handles in ``_eval_frozen_field`` (value → nodal values
     mapped to the sample points) and ``_eval_jacobian`` (gradient → FD-over-mesh). This turns a
-    functional of a solved field, e.g. the normal-flux ``∇T·n``, into an evaluable traced expression."""
+    functional of a solved field, e.g. the normal-flux ``∇T·n``, into an evaluable traced expression.
+
+    Args:
+        source: the field (trial symbol) whose space and identity the frozen field takes.
+        values: the known DOF values, one per DOF of the source's space.
+        domain: the mesh domain, needed to read the field out standalone with ``.eval()``.
+        coord_tag: the point set the field was bound to.
+    """
 
     def __init__(self, source, values, domain=None, coord_tag=None):
         self.name = f"frozen[{getattr(source, 'name', 'u')}]"
@@ -4749,10 +6540,34 @@ class FrozenField(Placeholder):
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
         self.field_key = source.field_key  # share the source field's shape data
+        # VALUES FROM THE TRACE: `u.bind(...).freeze(fem.solve())` -- the solution of a form, known to any
+        # expression read after the solve (and differentiable through it). A solve of a form with several
+        # fields is sliced to this field's block. Read today by `expr.integrate(domain)`.
+        _node = (
+            values._expr
+            if (not isinstance(values, Placeholder) and isinstance(getattr(values, "_expr", None), Placeholder))
+            else values
+        )
+        self.values_node, self.values_block = None, None
+        if isinstance(_node, Placeholder):
+            self.values_node = _node
+            _fem = getattr(_node, "_fem_ref", None)
+            _offs = None if _fem is None else getattr(_fem, "offsets", None)
+            if _offs is not None and len(_offs) > 2:
+                _i = _fem.block_index(source)
+                self.values_block = (int(_offs[_i]), int(_offs[_i + 1]))
+            self._values = None
+            self.frozen_id = _next_op_id()
+            self._domain = domain
+            self._coord_tag = coord_tag
+            return
         _v = jnp.asarray(values)
         # scalar field: a flat global nodal vector (n_nodes,); VECTOR field: (n_nodes, vec) so the assembler
         # gathers each cell's per-node vec-vectors (the kernel interpolates either). value_shape is set above.
-        self.values = _v.reshape(-1) if self.num_components == 1 else _v.reshape(-1, self.num_components)
+        # An H(curl)/H(div) field (N1E, N2E, RT) carries ONE value per DOF (edge circulations, face fluxes):
+        # its vector value comes from the basis, not from per-node components, so it stays flat.
+        _per_dof = self.space.upper() in ("N1E", "N2E", "RT") or self.num_components == 1
+        self._values = _v.reshape(-1) if _per_dof else _v.reshape(-1, self.num_components)
         self.frozen_id = _next_op_id()  # kernel gather-table key
         # Standalone ``.eval()`` support (distinct from the kernel gather-table used during assembly):
         # the mesh domain + the coordinate region this field was bound to, so the evaluator can map the
@@ -4762,10 +6577,29 @@ class FrozenField(Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Number of scalar components per point (the product of ``value_shape``)."""
         n = 1
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    @property
+    def values(self):
+        """The known DOF values. A field frozen to a SOLVE has none until evaluation: it is read by
+        ``expr.integrate(domain)`` and, as a runtime input (one-way coupling), by a non-nodal form; the nodal
+        Lagrange assembler and a standalone ``.eval()`` cannot take it yet."""
+        if self.values_node is not None:
+            raise NotImplementedError(
+                f"{self.name}: a field frozen to a solve (`freeze(fem.solve())`) has its values only inside the "
+                "trace. It is read by `expr.integrate(domain)` and by non-nodal forms (N1E / N2E / RT / DG / P_k "
+                "unknowns); the nodal Lagrange assembler and a standalone `.eval()` need a concrete solution "
+                "array -- freeze that there."
+            )
+        return self._values
+
+    @values.setter
+    def values(self, v):
+        self._values = v
 
     def _field_view(self):
         n = len(self.value_shape)
@@ -4776,12 +6610,22 @@ class FrozenField(Placeholder):
         return self.matrix
 
     def partials(self, **named_vars):
+        """Bind named coordinate Variables, so ``.x`` / ``.d(x)`` give the frozen field's gradient.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=x, y=y``.
+
+        Returns:
+            The bound field view.
+        """
         return self._field_view().partials(**named_vars)
 
     bind = partials
 
     def __repr__(self):
-        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+        if self.values_node is not None:
+            return f"FrozenField(source_key={self.field_key}, values=<solve>)"
+        return f"FrozenField(source_key={self.field_key}, ndof={self._values.shape[0]})"
 
 
 class LoadPathField(FrozenField):
@@ -4796,6 +6640,13 @@ class LoadPathField(FrozenField):
     solve or prescribed data — drive a load path (a one-way coupling: the field history *is* the load).
     Requires a ``tau=`` march (fails loud on a plain domain, where no driver would supply the per-step
     slice). Scalar Lagrange fields only.
+
+    Args:
+        source: the field (trial symbol) whose space the history lives in.
+        frames: the nodal values per load step, shape ``(n_load_steps, n_nodes)`` (or
+            ``(n_load_steps, n_nodes, n_components)`` for a vector field).
+        domain: the mesh domain.
+        coord_tag: the point set the field was bound to.
     """
 
     def __init__(self, source, frames, domain=None, coord_tag=None):
@@ -4900,6 +6751,13 @@ class DerivedField(FrozenField):
     the field it lives ``on`` (whose space and connectivity it borrows -- a real field of the problem, so
     unlike :class:`LoadPathField` it borrows no foreign P1 basis and any nodal Lagrange order works), its
     ``every`` cadence and any ``params``.
+
+    Args:
+        fn: the pure-JAX rule ``f(*input_values, **params) -> nodal values``.
+        input_keys: the field keys of the inputs whose nodal slices ``fn`` receives.
+        on: the field whose space and connectivity the derived field lives on.
+        every: recompute cadence, in nonlinear iterations or steps.
+        params: extra keyword arguments for ``fn``.
     """
 
     def __init__(self, fn, *, input_keys, on, every, params=None):
@@ -5066,6 +6924,7 @@ class HistoryRef(Placeholder):
 
     @property
     def base(self):
+        """The state field this history read refers to (the ``u`` of ``u.i(-1)``)."""
         return self.target
 
     @property
@@ -5088,7 +6947,14 @@ class StateUpdate(Placeholder):
     ``state.i(-1)`` reads. Its :attr:`history_key` matches the base variable's :class:`HistoryRef` key, so
     the write lands in the exact buffer the read consumes. Both children (``target`` = the state field,
     ``expr`` = the update formula) are walked, so any ``.i(k)`` *inside* the formula still contributes to
-    the inferred keep-depth (see :func:`history_variables`)."""
+    the inferred keep-depth (see :func:`history_variables`).
+
+    Args:
+        base: the state field being advanced.
+        formula: the expression the state becomes at the current step.
+        region: restrict the update to one region (a tag, a ``shape.regions()`` sub-region or a
+            geometry part); ``None`` updates every cell. Outside the region the state is frozen.
+    """
 
     def __init__(self, base, formula, region=None):
         base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
@@ -5106,10 +6972,12 @@ class StateUpdate(Placeholder):
 
     @property
     def base(self):
+        """The state field being advanced."""
         return self.target
 
     @property
     def formula(self):
+        """The expression the state becomes at the current step."""
         return self.expr
 
     @property
@@ -5134,7 +7002,16 @@ class BoundConstraint(Placeholder):
     them to DOF-space vectors needs the assembled field layout, so it happens at solve time. Either may
     be ``None`` for a one-sided bound. Only ``target`` is walked as a child: ``lo``/``hi`` live in
     DOF space, and walking them would let a ``self.i(-1)`` bound allocate a per-quadrature-point history
-    buffer it never reads."""
+    buffer it never reads.
+
+    Args:
+        base: the unknown being bounded.
+        lo: lower bound (number, coordinate expression or history read), or ``None``.
+        hi: upper bound, or ``None``. At least one of ``lo``/``hi`` is required.
+
+    Raises:
+        ValueError: if both bounds are ``None``.
+    """
 
     def __init__(self, base, lo=None, hi=None):
         base = base._expr if hasattr(base, "_expr") else base  # unwrap a typed view
@@ -5342,27 +7219,33 @@ def state_updates(terms):
 
 
 class TestFunction(_FieldComponentIndex, Placeholder):
+    """Generic variational test function: the ``v`` of a weak form, usually from ``u.test()``.
+
+    It is resolved against the active bucket (volume or boundary region) during assembly.
+
+    Args:
+        name: symbol name used in printing, ``jno.info`` and error messages (default ``"phi"``).
+        value_shape: shape of the field value at one point: ``()`` scalar, ``(2,)`` / ``(3,)`` vector,
+            ``(2, 2)`` second-order tensor, and so on.
+        order: polynomial degree of the element space (``1`` linear, ``2`` quadratic, ...).
+        space: the element family: ``"Lagrange"`` (default), ``"P0"`` (one value per cell),
+            ``"N1E"`` / ``"N2E"`` (Nédélec, H(curl)), ``"RT"`` (Raviart–Thomas, H(div)),
+            ``"Hermite"``, ``"Argyris"``, ``"Morley"`` (C¹ plates).
+        symmetric: for a square matrix ``value_shape``, store only the upper triangle
+            (``n(n+1)/2`` values per node); the symbol still behaves as the full matrix.
+        constant: ``True`` makes ONE value (scalar, vector or matrix) over the whole domain,
+            solved for with the fields; it has no element, so ``order``/``space`` do not apply.
     """
-    Generic variational test function.
 
-    It is resolved against the active bucket (volume or boundary region)
-    during evaluation/assembly.
-
-    Parameters
-    ----------
-    name : str
-        Symbol name used for printing/debugging.
-    value_shape : tuple
-        Shape of the field value at one spatial point:
-          ()    -> scalar
-          (2,)  -> 2D vector
-          (3,)  -> 3D vector
-          (2,2) -> second-order tensor, etc.
-    """
-
-    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange", symmetric=False, constant=False):
         self.name = name
         self.value_shape = tuple(value_shape)
+        # A symmetric square matrix field stores its upper triangle only (n(n+1)/2 values per node) and
+        # behaves as the full n x n matrix in every expression; see ``fem_utils._symmetric_basis``.
+        self.symmetric = _check_symmetric_shape(self.value_shape, symmetric)
+        # A constant unknown is ONE value (vector, matrix) over the whole domain, solved with the fields.
+        # Private on purpose: the trace's constant-folding helpers read public `constant`/`value` attributes.
+        self._is_constant = bool(constant)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
@@ -5371,8 +7254,12 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
     @property
     def num_components(self) -> int:
+        """Values stored per node: ``n(n+1)/2`` for a symmetric ``n x n`` field, else the product of the shape."""
         if len(self.value_shape) == 0:
             return 1
+        if self.__dict__.get("symmetric", False):
+            n = int(self.value_shape[0])
+            return n * (n + 1) // 2
         n = 1
         for s in self.value_shape:
             n *= int(s)
@@ -5391,13 +7278,27 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
         ``phi.bind(x=xi, y=yi).x`` -> ``dphi/dx`` (a ``Jacobian`` node identical
         to ``phi.d(xi)``); ``.xx`` / ``.xy`` give higher partials.
+
+        Args:
+            **named_vars: coordinate name to Variable, e.g. ``x=xi, y=yi`` (``t=ti`` for time). The names
+                become the attribute and ``.d`` spellings.
+
+        Returns:
+            The bound field view.
         """
         return self._field_view().partials(**named_vars)
 
     bind = partials
 
     def pin(self, value=0.0):
-        """Reject ``pin()`` on a test function -- only the unknown has a null space to fix."""
+        """Refuse ``pin()`` on a test function: only the unknown has a null space to fix.
+
+        Args:
+            value: unused; the signature mirrors :meth:`TrialFunction.pin`.
+
+        Raises:
+            ValueError: always. Call ``pin()`` on the trial symbol (``p.pin()``).
+        """
         raise ValueError(
             "jno.fem: pin() gauge-fixes the unknown's constant null space -- call it on the "
             "trial symbol (e.g. p.pin()), not the test function."
@@ -5414,6 +7315,9 @@ class TestFunction(_FieldComponentIndex, Placeholder):
         rather than bound to a spatial axis — the region carries the time.
         """
         spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        pe = _point_call(self, spatial, named)
+        if pe is not None:  # phi(px, py, pz) with point coordinates: a point load in a weak form
+            return pe
         binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:
@@ -5427,7 +7331,15 @@ class TestFunction(_FieldComponentIndex, Placeholder):
         assembled as the boundary load ``∮_region M_n ∂φ/∂n ds`` on the Argyris/Morley plate elements (the
         moment does work through the plate rotation; see :func:`jno.utils.solver.fem_nonnodal._plate_moment_load`).
         The conjugate **shear** term (the effective Kirchhoff shear ``V_n``, with corner forces) is not yet
-        wired. The *essential* rotation BC instead uses the *trial* form ``u.dn(region) - h``."""
+        wired. The *essential* rotation BC instead uses the *trial* form ``u.dn(region) - h``.
+
+        Args:
+            *coords: the boundary Variables of the region, as in ``phi(xb, yb)``.
+            **named: the same coordinates by name (``x=xb, y=yb``).
+
+        Returns:
+            NormalDerivative: the boundary trace.
+        """
         return NormalDerivative(self(*coords, **named))
 
     def __repr__(self):
@@ -5435,8 +7347,13 @@ class TestFunction(_FieldComponentIndex, Placeholder):
 
 
 class Assembly(Placeholder):
-    """
-    Internal assembly node for one already-bucketed variational contribution.
+    """Internal assembly node for one already-bucketed variational contribution.
+
+    Args:
+        expr: the weak-form contribution.
+        domain_or_nodes: the domain (or node set) it is assembled on.
+        support: ``"volume"`` or ``"boundary"``.
+        region_id: the region, e.g. ``"cells"``, ``"right"``, ``"wall_3"``.
     """
 
     def __init__(self, expr: Placeholder, domain_or_nodes, support: str, region_id: str):
@@ -5454,13 +7371,19 @@ class Assembly(Placeholder):
 
 
 class GroupedAssembly(Placeholder):
-    """
-    Internal node for grouped variational assembly.
+    """Internal node for grouped variational assembly.
 
-    Separate channels:
-      - volume_value_expr   : terms multiplied by TestFunction(phi)
-      - volume_grad_expr    : terms multiplied by grad(TestFunction(phi))
-      - boundary_value_exprs: boundary terms multiplied by TestFunction(phi)
+    The weak form split into channels by how the test function enters:
+
+    * ``volume_value_expr`` — volume terms multiplied by ``phi``;
+    * ``volume_grad_expr`` — volume terms multiplied by ``grad(phi)``;
+    * ``boundary_value_exprs`` — boundary terms multiplied by ``phi``, by region.
+
+    Args:
+        volume_value_expr: the ``phi`` channel, or ``None``.
+        volume_grad_expr: the ``grad(phi)`` channel, or ``None``.
+        boundary_value_exprs: ``{region: expression}`` for the boundary channel.
+        domain_or_nodes: the domain (or node set) the contribution is assembled on.
     """
 
     def __init__(self, volume_value_expr, volume_grad_expr, boundary_value_exprs, domain_or_nodes):
@@ -5589,7 +7512,14 @@ def cse(expr: Placeholder) -> Placeholder:
         elif isinstance(node, FunctionCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
-                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                # keep what the call carries beyond its constructor arguments: ``getitem_key``, a solve's
+                # ``_solve_fls`` / ``_fem_ref`` / ``_linear_spec``, ``_per_evaluation``, an integral's spec --
+                # dropping them silently turned off the shared factorisation and the per-evaluation memo
+                for k, v in vars(node).items():
+                    if k not in vars(rebuilt):
+                        setattr(rebuilt, k, v)
+                node = rebuilt
         elif isinstance(node, Choice):
             new_opts = [_visit(a) if isinstance(a, Placeholder) else a for a in node.options]
             if any(n is not o for n, o in zip(new_opts, node.options)):
@@ -5600,6 +7530,13 @@ def cse(expr: Placeholder) -> Placeholder:
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
                 new_node = ModelCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                node = new_node
+        elif isinstance(node, Flow):
+            new_x0 = _visit(node.x0) if isinstance(node.x0, Placeholder) else node.x0
+            new_cond = [_visit(c) if isinstance(c, Placeholder) else c for c in node.cond]
+            if new_x0 is not node.x0 or any(n is not o for n, o in zip(new_cond, node.cond)):
+                new_node = Flow(node.model, new_x0, new_cond, node.ts, node.save, noise=node.noise, key=node.key)
                 new_node.op_id = node.op_id
                 node = new_node
         elif isinstance(node, OperationDef):
@@ -5811,6 +7748,41 @@ def _child_placeholders(node):
     return []
 
 
+def refuse_point_index(expr: Placeholder) -> Placeholder:
+    """``expr`` unchanged, after refusing an integer index on the point axis of a per-point field.
+
+    A per-point field is ``(points, components)``, so on the collocation path ``u[0]`` -- for
+    ``u = net(x, y)``, a coordinate, or what pointwise arithmetic and derivatives build from them -- is
+    POINT 0, broadcast against every other point: a plausible residual of the wrong problem, never an
+    error. Component ``i`` is ``u[..., i]``.
+
+    Weak-form (``jno.fem``) trees are left alone: their lowering reads ``u[i]`` on a trial as the
+    component. That is why this runs where a collocation expression is compiled rather than in
+    ``Placeholder.__getitem__``, which cannot tell the two apart.
+
+    Raises:
+        IndexError: naming the expression and the ``[..., i]`` spelling.
+    """
+    if _contains_variational(expr):
+        return expr
+    seen, stack = set(), [expr]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, Placeholder) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        key = getattr(node, "getitem_key", None) if isinstance(node, FunctionCall) else None
+        if key and isinstance(key[0], int) and not isinstance(key[0], bool) and _is_per_point_field(node.args[0]):
+            i = key[0]
+            raise IndexError(
+                f"{node.args[0]!r}[{i}] picks collocation POINT {i}: the first axis of a per-point field has one "
+                f"entry per point. For component {i} (an output of a network, a coordinate of a vector field) "
+                f"write [..., {i}]. To read the value at one point, evaluate the field and index the array."
+            )
+        stack.extend(_child_placeholders(node))
+    return expr
+
+
 def fuse_laplacian(expr: Placeholder) -> Placeholder:
     """Fold ``Σᵢ ∂²u/∂xᵢ²`` into a single Laplacian node, however it was spelled.
 
@@ -5972,7 +7944,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6005,6 +7977,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
+        elif isinstance(node, Constraint):
+            visit(node.residual)
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
@@ -6047,7 +8021,7 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, ModelCall):
+        elif isinstance(node, (ModelCall, Flow, Noise)):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -6099,10 +8073,10 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
     """Return a human-readable indented string of the expression tree.
 
     Args:
-        expr:   Any trace node (Placeholder subclass).
+        expr: Any trace node (Placeholder subclass).
         indent: Current indentation level (used by recursion).
-        seen:   Set of already-visited ``OperationDef.op_id`` values to
-                avoid infinite recursion on shared sub-graphs.
+        seen: Set of already-visited ``OperationDef.op_id`` values to
+            avoid infinite recursion on shared sub-graphs.
 
     Returns:
         Multi-line string with the full computation tree.
@@ -6162,8 +8136,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
                     _visit(arg, depth + 1)
                 else:
                     lines.append(f"{p}  {arg}")
-        elif isinstance(node, ModelCall):
-            lines.append(f"{p}ModelCall({_node_label(node.model)})")
+        elif isinstance(node, (ModelCall, Flow)):
+            lines.append(f"{p}{type(node).__name__}({_node_label(node.model)})")
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _visit(arg, depth + 1)

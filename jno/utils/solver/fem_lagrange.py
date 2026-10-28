@@ -13,10 +13,9 @@ This is the Lagrange analogue of the contravariant and covariant Piola maps in
 (:func:`fem_utils._promote_to_degree`, which puts :func:`lagrange_interp_points` on each cell)
 always matches the tabulated shape functions.
 
-References
-----------
-P.G. Ciarlet, *The Finite Element Method for Elliptic Problems*, SIAM (2002),
-§§ 2.2–2.3 (Lagrange elements on simplices, isoparametric mapping).
+References:
+    P.G. Ciarlet, *The Finite Element Method for Elliptic Problems*, SIAM (2002),
+    §§ 2.2–2.3 (Lagrange elements on simplices, isoparametric mapping).
 """
 
 from __future__ import annotations
@@ -361,19 +360,17 @@ def identity_pushforward(
 
         ``∂φ/∂x = ∂φ/∂ξ J⁻¹``
 
-    Parameters
-    ----------
-    ref_values : ``(n_quad, n_dof, 1)``  scalar shape values from basix tabulation.
-    ref_grads  : ``(n_quad, n_dof, 1, tdim)``  ``∂φ/∂ξ`` from basix (value_size=1).
-    J          : ``(tdim, tdim)`` affine cell Jacobian (columns = physical edge vectors), **or**
-                 ``(n_quad, tdim, tdim)`` for **curved (isoparametric)** geometry, where the map is
-                 no longer affine and ``J`` varies over the cell.
-    detJ       : scalar or ``(n_quad,)``, unused (kept for API symmetry with the Piola push-forwards).
+    Args:
+        ref_values (``(n_quad, n_dof, 1)``  scalar shape values from basix tabulation.)
+        ref_grads (``(n_quad, n_dof, 1, tdim)``  ``∂φ/∂ξ`` from basix (value_size=1).)
+        J (``(tdim, tdim)`` affine cell Jacobian (columns = physical edge vectors), **or**): ``(n_quad,
+            tdim, tdim)`` for **curved (isoparametric)** geometry, where the map is no longer affine and
+            ``J`` varies over the cell.
+        detJ (scalar or ``(n_quad,)``, unused (kept for API symmetry with the Piola push-forwards).)
 
-    Returns
-    -------
-    phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
-    dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
+    Returns:
+        ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).: phi
+        ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.: dphi_phys
     """
     if K is None:  # a caller with a static mesh passes its cached J⁻¹ (see fem_native `_static_geometry`)
         K = small_inv(J)  # J⁻¹, (tdim, tdim) or (n_quad, tdim, tdim)
@@ -409,20 +406,20 @@ def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndar
 
         ``∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j``,   ``K = J⁻¹``.
 
-    Parameters
-    ----------
-    ref_hess : ``(n_quad, n_dof, 1, tdim, tdim)``  reference second derivatives ``∂²φ/∂ξ∂ξ`` (value_size=1).
-    J        : ``(tdim, tdim)``  affine cell Jacobian.
+    Args:
+        ref_hess (``(n_quad, n_dof, 1, tdim, tdim)``  reference second derivatives ``∂²φ/∂ξ∂ξ``
+            (value_size=1).)
+        J (``(tdim, tdim)``  affine cell Jacobian.)
 
-    Returns
-    -------
-    hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
-
-    A P1 basis has an identically zero reference Hessian, and it is tabulated anyway. The push-forward
-    of a zero table is returned as a zero CONSTANT, not an einsum: the einsum was the most expensive
-    kernel of a 3-D stabilised Navier-Stokes residual (``lap(u)`` in the strong residual, ~9 of 26 ms
-    at 55k DOFs), and a constant lets XLA drop every contraction against it. The zero terms stay
-    exactly zero; the sums around them may fuse in a different order (round-off, 1e-16 relative).
+    Returns:
+        ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).: hess_phys
+        A P1 basis has an identically zero reference Hessian, and it is tabulated anyway. The
+            push-forward
+        of a zero table is returned as a zero CONSTANT, not an einsum: the einsum was the most expensive
+        kernel of a 3-D stabilised Navier-Stokes residual (``lap(u)`` in the strong residual, ~9 of 26
+            ms
+        at 55k DOFs), and a constant lets XLA drop every contraction against it. The zero terms stay
+        exactly zero; the sums around them may fuse in a different order (round-off, 1e-16 relative).
     """
     _refuse_curved_hessian(J)
     if _is_zero_table(ref_hess):

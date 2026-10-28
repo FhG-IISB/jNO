@@ -507,10 +507,8 @@ def test_coupled_damage_state_is_irreversible_only_with_the_running_max():
 
 
 # --------------------------------------------------------------------------------------------------
-# Oracle 6d — differentiability of the COUPLED march. A parametric coupled steady form is otherwise
-# refused (the coupled *linear* assembly has no parametric route), but a history-carrying form never
-# takes that route — it assembles as a residual operator that re-evaluates at the runtime args, which is
-# field-agnostic. Without this the coupled march could not do the material-identification inverse the
+# Oracle 6d — differentiability of the COUPLED march. A history-carrying form assembles as a residual
+# operator that re-evaluates at the runtime args, which is field-agnostic. Without this the coupled march could not do the material-identification inverse the
 # single-field march already does. FD-checked through the whole scan, both blocks in the objective.
 # --------------------------------------------------------------------------------------------------
 def test_gradient_flows_through_a_coupled_march_to_a_material_parameter():

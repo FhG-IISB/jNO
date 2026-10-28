@@ -31,6 +31,13 @@ rho.optimizer(jno.optimizers.mma(move=0.15, lower=1e-3, upper=1.0))
 detected by `solve()` rather than being a plain optax transform, because it needs the individual
 constraint values and gradients that a scalar-loss transform never sees.
 
+`jno.optimizers.gcmma` takes the same arguments and is the globally convergent variant (Svanberg
+2002): it evaluates the objective and constraints at each trial design and re-solves with a more
+convex approximation wherever that approximation was optimistic. From a feasible start every
+accepted design then stays feasible and the objective never rises, at the cost of one extra
+evaluation of values (not gradients) per re-solve. Reach for it when MMA oscillates about a curved
+constraint such as the angle aggregate below.
+
 ## The constraints that make it legal
 
 Free nodal movement will happily invert an element, so the mesh needs its own constraints — minimum

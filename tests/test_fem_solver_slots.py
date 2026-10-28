@@ -350,13 +350,9 @@ def test_nonlinear_slot_on_linear_problem_raises():
         fem.solve(nonlinear=jno.solve.newton())
 
 
-def test_jacobi_on_matrix_free_nonlinear_raises():
-    """(Explicitly matrix-free Newton; the default assembles the tangent and jacobi then composes.)
-    precond= composes with the nonlinear path (materialized per linearization against the JVP
-    operator) — but jacobi needs the assembled diagonal, which a matvec-only operator lacks."""
-    fem = _nonlinear()
-    with pytest.raises(TypeError, match="matvec-only"):
-        fem.solve(nonlinear=jno.solve.newton(direct=False), precond=jno.precond.jacobi())
+# NOTE: the former ``test_jacobi_on_matrix_free_nonlinear_raises`` is gone. The matrix-free Newton now
+# gets the tangent's diagonal from a diagonal-only assembly pass, so ``precond=jno.precond.jacobi()``
+# composes there too; ``test_fem_jacobian_diagonal_matrix_free.py`` checks it against the default.
 
 
 # NOTE: the former ``test_complex_transient_slots_raise`` is gone. A complex transient is now assembled
@@ -464,7 +460,7 @@ def test_host_side_slots_stay_eager_and_correct():
         (cg, jno.precond.nystrom(rank=12)),
         (my_linear, None),  # bare callables: no traits, no key
         (cg, my_precond),
-        (cg, jno.precond.jacobi().cached()),  # .cached() owns its own reuse; do not compile over it
+        (cg, jno.precond.jacobi(reuse=True)),  # a kept setup owns its own reuse; do not compile over it
     ]
     for linear, precond in eager:
         assert not _compilable(linear, precond), f"{linear} + {precond} must not be compiled"

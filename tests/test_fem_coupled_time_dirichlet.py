@@ -469,7 +469,10 @@ def test_gradient_wrt_boundary_amplitude_matches_finite_differences(nonlinear):
             return jnp.sum(_march(bp, scheme, {"a": jnp.reshape(av, (1,))}, save)[-1, idx] ** 2)
 
         gr = float(jax.grad(loss)(A_TRUE))
-        fd = float((loss(A_TRUE + 1e-6) - loss(A_TRUE - 1e-6)) / 2e-6)
+        # h = 1e-4, not 1e-6: the march's Krylov solves stop at a relative tolerance, and a difference over
+        # 2e-6 turns that into ~1e-6 noise (measured: 1.3e-8 to 1.2e-6 off, depending on the iteration path).
+        # The truncation error at 1e-4 is ~1e-11 here (fd(1e-3) and fd(1e-4) agree to 2e-12).
+        fd = float((loss(A_TRUE + 1e-4) - loss(A_TRUE - 1e-4)) / 2e-4)
         assert abs(gr) > 1e-3, "the amplitude must actually move the interior"
         np.testing.assert_allclose(gr, fd, rtol=1e-6, err_msg=f"{scheme}")
 
