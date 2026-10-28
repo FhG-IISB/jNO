@@ -732,9 +732,10 @@ the time. Reach for a coarser mesh or a better preconditioner instead.
 | **Between `jacobi` and multigrid** | `nystrom` (randomized low-rank, SPD); `fsai` (factored sparse approximate inverse, SPD — applied as two sparse products, numeric setup in JAX; see [FSAI](solvers.md#fsai-jnoprecondfsai)) |
 | **Multigrid** | `amg` (algebraic, pyamg), `jaxamg` (GPU AmgX), `gmg` (geometric — a structured-grid V-cycle), `ams` (H(curl) auxiliary-space Maxwell), `hypre` (AMS / BoomerAMG via PETSc) |
 | **Domain decomposition** | `schwarz` (overlapping Schwarz on a METIS partition, two-level by default; needs the `[metis]` extra — see [Overlapping Schwarz](solvers.md#overlapping-schwarz-jnoprecondschwarz)) |
+| **Coarse spaces / deflation** | `coarse(space, parts=)` — the correction `Z (ZᵀAZ)⁻¹ Zᵀ` on a subspace written as formulas, an array or a callable, combined with `>>` (`Q >> M >> Q` BNN, `M >> Q` A-DEF2); see [Coarse spaces](solvers.md#coarse-spaces-and-deflation-jnoprecondcoarse) |
 | **Incomplete factorization** | `ilu` (SuperLU `spilu`, complex-capable) |
 | **Block / saddle point** | `block_diag` / `triangular` (block / Schur), `saddle`, `lsc`, `pcd` |
-| **Composition** | `form` (weak-form auxiliary operator), `inner` (any solver as `M⁻¹`), `real_equivalent` (a complex system through its real block); `reuse=True` / `reuse=k` on any of them keeps its setup across solves |
+| **Composition** | `M1 + M2`, `M1 @ M2`, `M1 >> M2` (multiplicative: `M2` on the residual `M1` left); `form` (weak-form auxiliary operator), `inner` (any solver as `M⁻¹`), `real_equivalent` (a complex system through its real block); `reuse=True` / `reuse=k` on any of them keeps its setup across solves |
 | **Precision** | `float32=True` on every constructor — built and applied in single precision while the solve stays in double; see [Single precision](solvers.md#single-precision-inside-a-double-solve-float32true) |
 
 **Process-wide solver settings** (`jno.setup`, or the same keys under `[jno]` in `.jno.toml`):

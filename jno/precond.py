@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import functools
 import inspect
+import itertools
+import logging
 
 import jax
 import jax.numpy as jnp
@@ -59,6 +61,7 @@ __all__ = [
     "nystrom",
     "fsai",
     "schwarz",
+    "coarse",
 ]
 
 
@@ -362,7 +365,8 @@ class _Then(_Combination):
     (``Q >> M >> Q``) is materialized once. The transpose is the reversed chain of the children's
     transposes on ``A^T``. The applier is symmetric (for a symmetric ``A``) when the chain reads the same
     both ways and every child is symmetric -- BNN is, A-DEF1/A-DEF2 are not, and say so (``nonsymmetric``),
-    which switches ``jno.solve.cg`` to flexible CG.
+    which switches ``jno.solve.cg`` to flexible CG. That copes with a small asymmetry, not with A-DEF's:
+    drive A-DEF with ``gmres``/``fgmres`` and use BNN under ``cg`` (see :func:`coarse`).
     """
 
     _OP = ">>"
@@ -3500,6 +3504,253 @@ class _Schwarz(_Spec):
             f"jno.precond.schwarz(parts={self.parts}, overlap={self.overlap}, coarse={self.coarse}, "
             f"restricted={self.restricted}, built={self._pattern is not None})"
         )
+
+
+_COARSE_TOKENS = itertools.count()
+
+
+def _space_repr(space):
+    if isinstance(space, dict):
+        return "{" + ", ".join(f"{getattr(f, 'name', f)}: <{len(v)} formulas>" for f, v in space.items()) + "}"
+    if isinstance(space, list):
+        return f"<{len(space)} formulas>"
+    if hasattr(space, "shape"):
+        return f"<array {tuple(np.shape(space))}>"
+    return repr(space) if hasattr(space, "basis") else getattr(space, "__name__", type(space).__name__)
+
+
+def _region_parts(fem, regions, n, iso):
+    """Part of every DOF from named volume regions: one part per region, a DOF shared by several (an
+    interface node) owned by the FIRST listed, every other DOF one more part. Eliminated rows: outside."""
+    from .utils.solver.fem_utils import _cell_region_mask
+    from .utils.solver.solver_api import _field_layout
+
+    if getattr(fem, "blocks", None) is None:
+        raise ValueError("jno.precond.coarse(parts=[regions]): needs a jno.fem problem (its cells carry the regions).")
+    if _field_layout(fem, n)[1] is not None:
+        raise NotImplementedError(
+            "jno.precond.coarse(parts=[regions]) on a reduced system (periodic tie / slip / hanging nodes) is not "
+            "supported: a DOF tied across a region boundary has no single region. Use parts=<int> (METIS)."
+        )
+    domain = fem.domain
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None)
+    layout = _dof_layout(fem, n)
+    if cells_all is None or len(cells_all) != len(layout):
+        raise ValueError("jno.precond.coarse(parts=[regions]): this problem's per-field cells are not available.")
+    part = np.full(int(n), len(regions), np.int64)
+    for (pts, idx), cells in zip(layout, cells_all):
+        cells = np.asarray(cells)
+        if cells.size and int(cells.max()) >= pts.shape[0]:
+            raise ValueError("jno.precond.coarse(parts=[regions]): the problem's cells do not match its DOF nodes.")
+        node_part = np.full(pts.shape[0], len(regions), np.int64)
+        for r in reversed(range(len(regions))):  # reversed: the first listed region wins a shared node
+            try:
+                m = np.asarray(_cell_region_mask(domain, regions[r])).reshape(-1) > 0
+            except Exception as e:  # noqa: BLE001 -- name the region, keep the cause
+                raise ValueError(
+                    f"jno.precond.coarse(parts=[...]): {regions[r]!r} is not a volume region of this domain."
+                ) from e
+            if m.shape[0] != cells.shape[0] or not m.any():
+                raise ValueError(f"jno.precond.coarse(parts=[...]): region {regions[r]!r} has no cells in this problem.")
+            node_part[np.unique(cells[m])] = r
+        for c in range(idx.shape[1]):
+            part[idx[:, c]] = node_part
+    part[iso] = len(regions) + 1
+    used = np.unique(part[part <= len(regions)])
+    remap = np.full(len(regions) + 2, -1)
+    remap[used] = np.arange(used.size)
+    p = int(used.size)
+    remap[len(regions) + 1] = p
+    return remap[part], p
+
+
+class _Coarse(_Spec):
+    """Spec for a coarse-space correction; see :func:`coarse`."""
+
+    complex_ok = True  # the space is real; E = Z^T A Z is complex with A and inverted as such
+
+    def __init__(self, space, parts):
+        self.space, self.parts = space, parts
+        self._pattern = None
+        self._token = None
+        self._symmetric = False
+
+    @property
+    def traceable(self):
+        return self._pattern is not None
+
+    @property
+    def host_setup(self):  # resolving the space and partitioning read concrete values on the host
+        return self._pattern is None
+
+    @property
+    def key(self):
+        return None if self._pattern is None else (type(self), self._token)
+
+    def _parts_of(self, A_conc, fem, n):
+        """``(part, p, iso)`` for this spec's ``parts``."""
+        from .utils.solver.deflation import metis_parts, operator_graph
+
+        iso = np.zeros(int(n), bool)
+        G = None
+        if A_conc is not None:
+            _S, G, iso = operator_graph(A_conc)
+        parts = self.parts
+        if parts is None:
+            return np.where(iso, 1, 0), 1
+        if isinstance(parts, _Schwarz):
+            if parts.coarse is not False:
+                raise ValueError(
+                    "jno.precond.coarse(parts=jno.precond.schwarz(...)): that Schwarz spec applies its own coarse "
+                    "level, so this would be a second one. Share the partition of schwarz(coarse=False)."
+                )
+            if parts._pattern is None:
+                if A_conc is None:
+                    raise TypeError(
+                        "jno.precond.coarse(parts=schwarz(...)): the Schwarz partition needs the assembled operator."
+                    )
+                parts.build(A_conc, fem)
+            if parts._pattern.n != int(n):
+                raise ValueError("jno.precond.coarse(parts=schwarz(...)): that Schwarz spec was built for another system.")
+            return np.asarray(parts._pattern.part), int(parts._pattern.p)
+        if isinstance(parts, (list, tuple)) and parts and all(isinstance(r, str) for r in parts):
+            return _region_parts(fem, list(parts), n, iso)
+        if isinstance(parts, (int, np.integer)) and not isinstance(parts, bool) and int(parts) >= 1:
+            if G is None:
+                raise TypeError("jno.precond.coarse(parts=<int>): the METIS partition needs the assembled operator.")
+            part = metis_parts(G, iso, int(parts))
+            return part, int(part[~iso].max()) + 1 if (~iso).any() else 1
+        raise ValueError(
+            f"jno.precond.coarse(parts={parts!r}): must be None (a global space), a whole number of METIS parts, a "
+            "jno.precond.schwarz(coarse=False) spec (share its partition), or a list of region names."
+        )
+
+    def build(self, A, fem=None) -> "_Coarse":
+        """Eager setup: the space resolved to numbers, the partition and the entry tables, from a CONCRETE
+        operator (or, for a global space on a matrix-free solve, from its size alone)."""
+        from .utils.solver.deflation import coarse_pattern, resolve_space
+        from .utils.solver.solver_api import LinearOperator
+
+        n = None
+        A_conc = None
+        if isinstance(A, LinearOperator):
+            n = int(A.shape[0])
+            A = A.bcoo
+        if A is not None:
+            n = int(A.shape[0])
+            if not isinstance(getattr(A, "data", A), jax.core.Tracer):
+                A_conc = A
+        Z = resolve_space(self.space, fem, n, who=repr(self))
+        with jax.ensure_compile_time_eval():
+            part, p = self._parts_of(A_conc, fem, n)
+            if self.parts is not None and A_conc is None:
+                raise TypeError(f"{self!r}: a partitioned coarse space needs the assembled operator.")
+            self._pattern = coarse_pattern(Z, part, p, A=A_conc)
+        if self._pattern.dropped:
+            logging.getLogger("jno").info(
+                f"{self!r}: {self._pattern.dropped} of {self._pattern.p * self._pattern.k} coarse directions carry "
+                "no vector (parts of eliminated Dirichlet rows only) and are dropped."
+            )
+        if A_conc is not None:
+            from .utils.solver.amg import _to_scipy_csr
+
+            S = _to_scipy_csr(A_conc)
+            d = abs(S - S.T)
+            self._symmetric = bool(d.max() <= 1e-12 * max(abs(S).max(), 1e-300)) if d.nnz else True
+        self._token = next(_COARSE_TOKENS)
+        return self
+
+    def prepare(self, fem):
+        if self._pattern is None and fem is not None:
+            A = _representative_operator(fem)
+            if A is not None:
+                self.build(A, fem)
+
+    def _state(self):
+        """The built pattern's arrays, for a compiled solve to take as arguments (``None`` until built)."""
+        pat = self._pattern
+        if pat is None:
+            return None
+        return {k: getattr(pat, k) for k in ("part", "null", "W", "crow", "erow", "ecol") if getattr(pat, k) is not None}
+
+    def _state_tag(self):
+        pat = self._pattern
+        return (pat.p, pat.k, pat.dropped, pat.nnz, pat.checksum, self._symmetric)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.deflation import coarse_apply, coarse_factor
+        from .utils.solver.solver_api import _STATE_OVERRIDE
+
+        if self._pattern is None:
+            self.build(ctx.A, getattr(ctx, "fem", None))
+        pat = self._pattern
+        bound = _STATE_OVERRIDE.get(id(self))
+        if bound is not None:  # a compiled solve hands in the arrays it was called with (`precond_state`)
+            pat = pat._replace(**bound)
+        if int(ctx.A.shape[0]) != pat.n:
+            raise ValueError(f"{self!r}: built for a system of {pat.n} unknowns, applied to one of {int(ctx.A.shape[0])}.")
+        try:
+            scale = jnp.max(jnp.abs(ctx.diag()))
+        except Exception:  # noqa: BLE001 -- an operator with no diagonal: the coarse matrix's own size stands in
+            scale = None
+        Einv = coarse_factor(pat, ctx.A.bcoo, mv=ctx.A.mv, scale=scale, who=repr(self))
+        fwd, t = coarse_apply(pat, Einv)
+        return PrecondApplier(fwd, None if self._symmetric else t)
+
+    def __repr__(self):
+        parts = self.parts
+        pr = repr(parts) if not isinstance(parts, _Spec) else "schwarz(...)"
+        return f"jno.precond.coarse({_space_repr(self.space)}, parts={pr})"
+
+
+@_reusable
+def coarse(space, *, parts=None, float32: bool = False) -> _Coarse:
+    """The **coarse-space correction** ``Q r = Z (Z^T A Z)^{-1} Z^T r`` for a subspace ``Z`` of the unknowns.
+
+    On its own it solves the problem exactly on ``span Z`` and does nothing elsewhere; combined with another
+    preconditioner ``M`` it removes the slow modes ``M`` cannot reach. The combination is written with the
+    spec algebra (Tang, Nabben, Vuik & Erlangga, *J. Sci. Comput.* 39 (2009) 340)::
+
+        Q = jno.precond.coarse([1], parts=64)
+        M = jno.precond.jacobi()
+        fem.solve(linear=jno.solve.cg(), precond=Q >> M >> Q)       # BNN: symmetric, the form for cg/minres
+        fem.solve(linear=jno.solve.fgmres(), precond=M >> Q)        # A-DEF2 (deflation): one coarse solve less
+        fem.solve(linear=jno.solve.cg(), precond=Q + M)             # additive coarse correction
+
+    Only BNN and the additive form are symmetric. A-DEF1/A-DEF2 are not, and under ``jno.solve.cg`` they run
+    flexible CG, which copes with a small asymmetry but not with this one -- measured on a high-contrast
+    diffusion problem, ``amg() >> Q`` took 364 flexible-CG iterations against 138 with ``fgmres`` and 150
+    for BNN under plain ``cg``. So: BNN with ``cg``, A-DEF with ``gmres``/``fgmres``.
+
+    ``space`` -- what ``Z`` is, as a value (it belongs to no domain and no problem; it is evaluated against
+    the problem the solve runs on):
+
+    * **formulas** in the domain's coordinates, one per column: ``[1]`` (a constant: Nicolaides, *SIAM J.
+      Numer. Anal.* 24(2), 1987), ``[(1, 0), (0, 1), (-y, x)]`` (2-D rigid-body modes, a tuple per vector
+      field), ``[1, x, y]``. On a problem with several fields say which one: ``{p: [1]}`` (zeros on the
+      others). Evaluated at the DOF nodes, so the problem's fields must be nodal Lagrange (anything else
+      raises). On a reduced system (periodic tie, slip, hanging nodes) the vectors are built on the full space
+      and restricted to the kept DOFs -- exact for a vector the reduced space contains;
+    * an ``(n, k)`` **array** on the system being solved (the reduced one, if reduced);
+    * an object with ``basis(ctx)`` (:mod:`jno.space`), or a callable ``ctx -> (n, k)``, resolved once.
+
+    ``parts`` -- how ``Z`` is localized: ``None`` (global: ``k`` coarse directions, needs only products with
+    the operator, so it works matrix-free), a whole number (METIS parts of the operator's graph: ``parts * k``
+    directions), a :func:`schwarz` spec built with ``coarse=False`` (its own partition, so the coarse space and
+    the local solves agree), or a list of **region names** (one part per region; a DOF on an interface belongs
+    to the first listed; every DOF in no listed region forms one more part). A partitioned space needs the
+    assembled operator. Eliminated Dirichlet rows are left out of every part.
+
+    A direction of ``Z`` the operator maps to zero is a **kernel** of the system, not a slow mode, and is
+    refused (a singular problem needs a gauge term, not a preconditioner); a direction with no vector at all (a
+    part of only Dirichlet rows) is dropped and logged. The kernel check needs double precision: with
+    ``float32=True`` such a direction is dropped instead.
+
+    Setup is host-side once (the space, the partition, the entry tables); ``Z^T A Z`` and its inverse are
+    rebuilt from the operator's values on every application set-up, inside a compiled solve too. The dense
+    coarse matrix is ``(parts * k)^2`` -- keep ``parts * k`` in the low thousands.
+    """
+    return _precision(_Coarse(space, parts), float32)
 
 
 def _dof_layout(fem, n):

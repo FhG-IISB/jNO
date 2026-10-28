@@ -279,6 +279,8 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `reuse=` (on every spec) | keep an expensive setup across solves: `True` once, `k` every k-th solve | Newton loops, transients and optimisation loops, where the operator barely changes between solves |
 | `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
+| `M1 >> M2` | **multiplicative**: `M1`, then `M2` on the residual it left | a coarse space with a smoother — deflation, two-level methods ([below](#coarse-spaces-and-deflation-jnoprecondcoarse)) |
+| `jno.precond.coarse(space, parts=…)` | the correction `Z (ZᵀAZ)⁻¹ Zᵀ` on a subspace `Z` you write down | a few slow modes another preconditioner cannot reach: stiff inclusions, rigid-body modes, constants per subdomain |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
 solver it is accelerating. Nothing else about the problem changes:
@@ -729,6 +731,75 @@ sparsity pattern poisons the factor with NaN rather than applying a stale one.
     The setup costs about one to two solves (101, 115, 530 ms there), so FSAI pays when the factor is
     **reused**: a constant-operator march, `reuse=True` across solves, several right-hand sides.
     `power=2` grows the setup steeply (7.1 s on the P2 case, for 32 iterations) — start with `power=1`.
+
+### Coarse spaces and deflation — `jno.precond.coarse()`
+
+A preconditioner like Jacobi or a Schwarz smoother acts locally, so the few modes that vary slowly across
+the whole problem are the ones it leaves: one per stiff inclusion in a high-contrast material, the
+rigid-body motions of an elastic body, the constant on each subdomain. A **coarse space** `Z` names them,
+and `coarse(Z)` is the operator `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r` that solves the problem exactly on `span Z`.
+
+The space is a **value**, written once and evaluated on whatever problem the solve runs on:
+
+| `space` | what it is |
+|---|---|
+| `[1]`, `[1, x, y]` | formulas in the domain's coordinates, one per column (`x, y` from `d.variable(...)`) |
+| `[(1, 0), (0, 1), (-y, x)]` | a tuple per vector field: here the 2-D rigid-body modes |
+| `{p: [1]}` | on a problem with several fields, the field it lives on (zeros elsewhere) |
+| an `(n, k)` array | vectors on the system being solved (the reduced one, if a tie reduces it) |
+| `ctx -> (n, k)` | computed once, when the solve sets up |
+
+`parts=` splits every vector over subdomains: a whole number (METIS parts), a list of region names, or a
+`schwarz(coarse=False)` spec, whose subdomains it then shares. `coarse` combines with another
+preconditioner `M` through the spec algebra (Tang, Nabben, Vuik & Erlangga, *J. Sci. Comput.* 39, 2009):
+
+| written | name | symmetric | Krylov method |
+|---|---|---|---|
+| `Q >> M >> Q` | BNN | yes | `cg` |
+| `Q + M` | additive coarse | yes | `cg` |
+| `M >> Q` | A-DEF2 (deflation) | no | `gmres` / `fgmres` |
+| `Q >> M` | A-DEF1 | no | `gmres` / `fgmres` |
+
+A non-symmetric combination under `cg` runs flexible CG, which handles a slight asymmetry but not
+A-DEF's: on a high-contrast problem `amg() >> Q` took 364 flexible-CG iterations, 138 with `fgmres`, and
+BNN took 150 under plain `cg`.
+
+```python
+R = jno.shape.rect
+d = (
+    R(0.20, 0.20, 0.30, 0.30).name("inc1").attach(k=1e6)
+  + R(0.60, 0.50, 0.70, 0.60).name("inc2").attach(k=1e6)
+  + R(0.40, 0.75, 0.50, 0.85).name("inc3").attach(k=1e6)
+  + R(0.00, 0.00, 1.00, 1.00).name("matrix").attach(k=1.0)
+).sized(0.02).domain()
+...
+Q = jno.precond.coarse([1], parts=["inc1", "inc2", "inc3"])     # one vector per inclusion
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jacobi() >> Q)
+```
+
+With Jacobi alone the CG iterations follow the contrast (226 at 1e2, 382 at 1e6); with one vector per
+inclusion they barely move (160, 192). Smoothed-aggregation AMG already resolves these modes on this
+problem, so there deflation adds nothing; the coarse space pays where the preconditioner is local.
+
+For elasticity the coarse space is the rigid-body modes, on the Schwarz subdomains:
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)
+fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+!!! warning "A kernel is not a slow mode"
+    A vector the operator maps to zero (the constant of a pure-Neumann problem) makes `ZᵀAZ` singular, and
+    `coarse` refuses it: that problem is singular, and the fix is a gauge term in the problem (pin a value,
+    a mean-value constraint), not a preconditioner. A vector that vanishes (a part made only of eliminated
+    Dirichlet rows) is dropped and logged.
+
+The space, the partition and the entry tables are set up once on the host; `ZᵀAZ` and its inverse follow
+the operator's values on every solve, inside a compiled solve, a Newton loop or a march. A global space
+(`parts=None`) needs only products with the operator, so it also works matrix-free; a partitioned one needs
+the assembled matrix. Formulas need nodal Lagrange fields (a Hermite, Morley, Argyris or edge-element field
+raises: give an array). The coarse matrix is dense, `(parts × k)²`.
 
 ### Overlapping Schwarz — `jno.precond.schwarz()`
 
