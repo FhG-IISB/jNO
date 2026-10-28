@@ -104,10 +104,11 @@ def metis_parts(G, iso, parts: int) -> np.ndarray:
     return part
 
 
-def coarse_pattern(Z, part, p: int, A=None) -> CoarsePattern:
+def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
     """Symbolic phase. ``Z`` ``(n, k)`` real, ``part`` ``(n,)`` in ``[0, p]`` (``p``: outside every part).
     With a CONCRETE assembled ``A`` the entry tables are built, so ``E`` comes from ``k^2`` streaming segment
-    sums over its entries; without it only a global space (``p = 1``) can be factored, from ``k`` products."""
+    sums over its entries; without it only a global space (``p = 1``) can be factored, from ``k`` products.
+    ``S``: ``A``'s CSR from :func:`operator_graph`, when the caller has it already."""
     Z = np.asarray(Z)
     if np.iscomplexobj(Z):
         raise ValueError("jno.precond.coarse: the space must be real (the operator may be complex).")
@@ -125,7 +126,8 @@ def coarse_pattern(Z, part, p: int, A=None) -> CoarsePattern:
         raise ValueError(
             "jno.precond.coarse() needs x64 for an assembled operator: its entry keys row*n + col overflow int32."
         )
-    S, _G, _iso = operator_graph(A)
+    if S is None:
+        S = operator_graph(A)[0]
     coo = S.tocoo()
     keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
     r, c = keys // n, keys % n

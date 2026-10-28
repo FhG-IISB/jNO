@@ -432,3 +432,18 @@ def test_an_fdm_vector_problem_gives_the_default_answer():
     Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=4)
     got = np.asarray(prob.solve(linear=jno.solve.gmres(tol=1e-11), precond=jno.precond.jacobi() >> Q))
     assert np.abs(got - ref).max() < 1e-8 * np.abs(ref).max()
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+def test_two_level_schwarz_is_the_coarse_space_around_the_one_level_method(restricted):
+    """`schwarz(coarse=Z)` is `Q >> S >> Q` (balanced) with `S = schwarz(coarse=False)` and `Q = coarse(Z,
+    parts=S)`, and `Q >> S` when restricted -- the same operator to rounding, on the same partition."""
+    fem, (x, y) = _cantilever(0.1)
+    rigid = [(1, 0), (0, 1), (-y, x)]
+    two = jno.precond.schwarz(parts=8, coarse=rigid, restricted=restricted)
+    S = jno.precond.schwarz(parts=8, coarse=False, restricted=restricted)
+    Q = jno.precond.coarse(rigid, parts=S)
+    B_two, _ = _matrix(two, fem)
+    B_alg, _ = _matrix(Q >> S if restricted else Q >> S >> Q, fem)
+    np.testing.assert_array_equal(np.asarray(two._pattern.part), np.asarray(S._pattern.part))
+    np.testing.assert_allclose(B_alg, B_two, rtol=1e-12, atol=1e-12 * np.abs(B_two).max())

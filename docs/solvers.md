@@ -274,8 +274,8 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.saddle(mass_weight=…, laplace_weight=…)` | the standard saddle recipe as **one call** | Stokes / Biot — the common case |
 | `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.fsai(power=…)` | factored sparse approximate inverse `M⁻¹ = GᵀG` — two sparse products, no triangular solves | **SPD only** — the rung between `jacobi` and multigrid, when the factor is reused ([below](#fsai-jnoprecondfsai)) |
-| `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `nullspace="rigid"` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
-| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace="rigid"` for elasticity; needs the optional `pyamg` |
+| `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `coarse=[(1, 0), (0, 1), (-y, x)]` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
+| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace=` the rigid-body modes for elasticity (a [space](#coarse-spaces-and-deflation-jnoprecondcoarse)); needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `reuse=` (on every spec) | keep an expensive setup across solves: `True` once, `k` every k-th solve | Newton loops, transients and optimisation loops, where the operator barely changes between solves |
 | `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
@@ -298,7 +298,8 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10),
           precond=jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30)))
 
 # reuse an expensive setup across solves: build once, pass the SAME spec every time
-M = jno.precond.amg(nullspace="rigid", reuse=True)   # rigid-body modes for a displacement field
+rigid = [(1, 0), (0, 1), (-y, x)]                    # rigid-body modes of a 2-D displacement field
+M = jno.precond.amg(nullspace=rigid, reuse=True)
 fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
 
 # three more with the same shape, each needing something the others do not:
@@ -335,8 +336,8 @@ reduced field by field. The block preconditioners split *that* operator: the sli
 reduced with the same field's `P`. So `block_diag`, `triangular`, `saddle` (mass, Cahouet–Chabard,
 `lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. The preconditioners
 that build a pattern once (`fsai`, `schwarz`) build it from the reduced operator, and
-`schwarz(nullspace="rigid")` builds its rigid-body modes on the full mesh and restricts them to the kept
-DOFs (a translation along a periodic direction restricts exactly). One case is refused
+a coarse space written as formulas (`schwarz(coarse=...)`, `coarse(...)`, `amg(nullspace=...)`) is evaluated
+on the full mesh and restricted to the kept DOFs (a translation along a periodic direction restricts exactly). One case is refused
 by name: a complex form solved as its fused real-equivalent `[Re; Im]` block. There a field is not one
 contiguous slice, so use a complex-native composition (a child such as `ams()`) or a whole-system
 preconditioner.
@@ -816,17 +817,18 @@ physics, so any FEM or FDM system qualifies. (This is not the multi-method coupl
    inverses. The results are added back, summing where subdomains overlap.
 4. **Coarse correction** (`coarse=True`, the default). One small global problem with a few unknowns per
    subdomain carries information across the whole domain in one step. Without it, the iteration count
-   grows with the number of parts; with it, it stays flat.
+   grows with the number of parts; with it, it stays flat. It is a [coarse space](#coarse-spaces-and-deflation-jnoprecondcoarse)
+   on the subdomains, applied as `Q >> S >> Q`: one constant per part by default, or any space you write.
 
 ```python
 fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz())
-fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(nullspace="rigid"))  # elasticity
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(coarse=[(1, 0), (0, 1), (-y, x)]))  # elasticity
 fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(), shard=4)          # 4 devices
 ```
 
 On `jno.fdm` it composes the same way, on the operator FDM assembles for the slots
 ([FDM solver slots](fdm.md#solver-slots-linear-and-precond)), including inside a `jno.core` training step
-and for vector unknowns with `nullspace="rigid"`:
+and for vector unknowns with a rigid-body coarse space:
 
 ```python
 jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
@@ -836,16 +838,15 @@ jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
 |---|---|
 | `parts` | number of subdomains; default ~256 unknowns each, rounded up to a multiple of the device count |
 | `overlap` | layers of neighbours each subdomain grows by |
-| `coarse` | two-level (default) or one-level |
+| `coarse` | `True` one constant per subdomain (Nicolaides 1987, the default); `False` one level; or a [space](#coarse-spaces-and-deflation-jnoprecondcoarse) split over the subdomains -- formulas such as the rigid-body modes `[(1, 0), (0, 1), (-y, x)]`, which elasticity needs, an `(n, k)` array, or a callable |
 | `restricted` | RAS (Cai & Sarkis 1999): usually fewer iterations but **non-symmetric** — `cg` then runs flexible CG |
-| `nullspace` | what the coarse space carries per subdomain: `None` one constant (Nicolaides 1987); `"rigid"` the rigid-body modes of a displacement field (translations + rotations), which elasticity needs; or an explicit `(n, k)` array |
 | `float32` | [single-precision application](#single-precision-inside-a-double-solve-float32true) |
 
 !!! measured "CG to 1e-8, two-level, RTX 3070 — iterations at 64 / 256 parts"
     | Problem | Iterations | Solve |
     |---|---|---|
     | 2-D Poisson, 11.8k | 50 / 43 | 32 / 24 ms |
-    | 2-D cantilever, `nullspace="rigid"` | 57 / 41 | 44 / 55 ms |
+    | 2-D cantilever, rigid-body coarse space | 57 / 41 | 44 / 55 ms |
     | 3-D Poisson, 18.9k | 37 / 34 | 130 / 63 ms |
 
     On the cantilever the coarse space decides the scaling: at 16 / 64 / 256 parts, one constant per part
@@ -918,7 +919,8 @@ two routes to the same root, a convergence study — ask Newton for it:
 `fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12))`.
 
 ```python
-fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace="rigid", reuse=True))  # forcing included
+rigid = [(1, 0), (0, 1), (-y, x)]
+fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace=rigid, reuse=True))  # forcing included
 ```
 
 ### Picard / lagged coefficients — `jno.lag`

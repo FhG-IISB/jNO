@@ -15,7 +15,8 @@ and the fused complex 2n block alike:
   (Dirichlet on the grown boundary -- the algebraic Schwarz subproblem);
 * all local problems are PADDED to one size and solved together (``vmap``): the same layout later shards
   across devices, one block of subdomains per device, which is what a compiled loop needs;
-* the coarse space (two-level) is Nicolaides': one constant per part, ``A_c = Z^T A Z``, a dense ``p x p``.
+* the coarse space (two-level) is any set of vectors split over the parts -- by default Nicolaides': one
+  constant per part -- built, factored and applied by :mod:`deflation` (``Q = Z (Z^T A Z)^{-1} Z^T``).
 
 Two phases, as for :mod:`fsai`: the symbolic one (partition, overlap, index tables) runs once on the host from a
 concrete operator; the numeric one (local matrices, their inverses, the coarse matrix) is pure JAX from the
@@ -24,7 +25,7 @@ operator's current values -- inside a compiled solve, a Newton loop or a time ma
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -51,10 +52,7 @@ class SchwarzPattern(NamedTuple):
         lcol: ``(p, L)`` local-matrix columns.
         lpos: ``(p, L)`` their positions in ``A``'s unique entries.
         part: ``(n,)`` owner of each unknown.
-        crow: ``(nnz,)`` coarse index ``part[r] * p + part[c]`` of each entry.
-        erow: ``(nnz,)`` row of each entry.
-        ecol: ``(nnz,)`` column of each entry.
-        null: ``(n, k)`` near-null-space vectors of the coarse space.
+        coarse: the two-level coarse space on these parts (a :class:`~.deflation.CoarsePattern`), or ``None``.
         diso: unknowns with no neighbours (eliminated rows), solved by their diagonal.
         dpos: position of their diagonal in ``A``'s unique entries.
     """
@@ -70,10 +68,7 @@ class SchwarzPattern(NamedTuple):
     lcol: jnp.ndarray  # (p, L) int32
     lpos: jnp.ndarray  # (p, L) int32
     part: jnp.ndarray  # (n,) int32 owner of each unknown
-    crow: jnp.ndarray  # (nnz,) int32 coarse index part[r] * p + part[c] of each unique entry
-    erow: jnp.ndarray  # (nnz,) int32 row of each unique entry
-    ecol: jnp.ndarray  # (nnz,) int32 column of each unique entry
-    null: jnp.ndarray  # (n, k) the near-null-space vectors the coarse space carries per part (k = 1: Nicolaides)
+    coarse: Any  # the coarse space on these parts (deflation.CoarsePattern), or None for one level
     diso: jnp.ndarray  # (q,) int32 the unknowns with no neighbours (eliminated Dirichlet rows): solved by their diagonal
     dpos: jnp.ndarray  # (q,) int32 position of their diagonal in A's sorted unique entries
 
@@ -100,32 +95,24 @@ def _partition(G, parts: int) -> np.ndarray:
     return np.asarray(cut[1], np.int64)
 
 
-def schwarz_pattern(A, *, parts: int, overlap: int = 1, nullspace=None) -> SchwarzPattern:
-    """Symbolic phase from a CONCRETE operator."""
+def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None) -> SchwarzPattern:
+    """Symbolic phase from a CONCRETE operator. ``coarse_space``: ``(n, k)`` vectors split over the parts for the
+    second level, or ``None`` for one level."""
     import scipy.sparse as sp
 
-    from .amg import _to_scipy_csr
+    from .deflation import coarse_pattern, metis_parts, operator_graph
     from .fsai import _checksum
 
     if not jax.config.jax_enable_x64:
         raise ValueError("jno.precond.schwarz() needs x64: its entry keys row*n + col overflow int32.")
-    S = _to_scipy_csr(A).astype(np.float64)
-    S.sum_duplicates()
+    S, G, iso = operator_graph(A)
     n = S.shape[0]
-    if S.shape != (n, n):
-        raise ValueError(f"jno.precond.schwarz(): the operator must be square, got {S.shape}.")
-    G = (abs(S) + abs(S).T).tocsr()
-    G.setdiag(0)
-    G.eliminate_zeros()
-    G.data[:] = 1.0
     # Unknowns with no neighbours (an eliminated Dirichlet row: 400 of 12k on a square) are 1x1 problems of their
     # own, solved exactly by their diagonal. Partitioned, they formed whole subdomains of identity rows (2 of 16
     # on a 514-unknown square) -- blocks that cost as much as any other and did nothing.
-    iso = np.diff(G.indptr) == 0
     core = np.nonzero(~iso)[0]
+    part = metis_parts(G, iso, parts)  # isolated unknowns: part id `parts`, out of range everywhere below
     parts = int(min(max(1, parts), max(1, core.size)))
-    part = np.full(n, parts, np.int64)  # isolated unknowns: part id `parts`, out of range everywhere below
-    part[core] = _partition(G[core][:, core], parts)
 
     member = sp.csr_matrix((np.ones(core.size), (core, part[core])), shape=(n, parts))
     for _ in range(int(overlap)):  # grow every part by one layer of graph neighbours
@@ -155,10 +142,7 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, nullspace=None) -> Schwa
     def stack(xs, fill):
         return np.stack([np.concatenate([x, np.full(L - x.size, fill)]) for x in xs])
 
-    ku = keys // n, keys % n
-    null = np.ones((n, 1)) if nullspace is None else np.asarray(nullspace, np.float64).reshape(n, -1)
-    null = np.where(iso[:, None], 0.0, null)  # the coarse space lives on the partitioned unknowns only
-    crow = np.where(iso[ku[0]] | iso[ku[1]], parts * parts, part[ku[0]] * parts + part[ku[1]])
+    coarse = None if coarse_space is None else coarse_pattern(coarse_space, part, parts, A=A, S=S)
     diso = np.nonzero(iso)[0]
     dpos = np.searchsorted(keys, diso.astype(np.int64) * n + diso)
     return SchwarzPattern(
@@ -173,10 +157,7 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, nullspace=None) -> Schwa
         jnp.asarray(stack(cols, 0), jnp.int32),
         jnp.asarray(stack(poss, keys.size), jnp.int32),  # padding entries read the zero slot
         jnp.asarray(part, jnp.int32),
-        jnp.asarray(crow, jnp.int32),
-        jnp.asarray(ku[0], jnp.int32),
-        jnp.asarray(ku[1], jnp.int32),
-        jnp.asarray(null),
+        coarse,
         jnp.asarray(diso, jnp.int32),
         jnp.asarray(dpos, jnp.int32),
     )
@@ -205,23 +186,13 @@ def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool, mesh=None):
     # submatrices, as well conditioned as the operator allows.
     local = jnp.linalg.inv(blk)
     dinv = 1.0 / vals[pat.dpos]  # a zero diagonal on an isolated row is a singular operator: inf -> NaN, loudly
-    if not coarse:
+    if not coarse or pat.coarse is None:
         return local, None, dinv
-    # A_c = Z^T A Z with Z = the near-null-space vectors restricted to each part (one column per part and
-    # vector). Entry by entry: A_c[(i,a), (j,b)] = sum over A's entries (r, c) with part(r) = i, part(c) = j of
-    # N[r,a] A_rc N[c,b] -- k^2 streaming segment sums over the entries, no (nnz x k^2) intermediate.
-    k = pat.null.shape[1]
-    N = pat.null.astype(vals.dtype)
-    Nr, Nc = N[pat.erow], N[pat.ecol]
-    blocks = [
-        [jax.ops.segment_sum(vals * Nr[:, a] * Nc[:, b], pat.crow, num_segments=pat.p * pat.p) for b in range(k)]
-        for a in range(k)
-    ]
-    Ac = jnp.stack([jnp.stack(row, -1) for row in blocks], -2)  # (p*p, k, k)
-    Ac = Ac.reshape(pat.p, pat.p, k, k).transpose(0, 2, 1, 3).reshape(pat.p * k, pat.p * k)
-    # pinv: a part whose modes are pinned by Dirichlet rows (or that has fewer unknowns than modes) makes A_c
-    # singular; the pseudo-inverse drops those directions instead of dividing by zero.
-    return local, jnp.linalg.pinv(Ac, hermitian=not jnp.iscomplexobj(Ac)), dinv
+    from .deflation import coarse_factor
+
+    # Q = Z (Z^T A Z)^{-1} Z^T on the parts; a part whose vectors vanish (only Dirichlet rows) drops out, a kernel
+    # of A inside the space is refused (deflation.coarse_factor).
+    return local, coarse_factor(pat.coarse, A, scale=jnp.max(jnp.abs(vals)), who="jno.precond.schwarz(coarse=...)"), dinv
 
 
 def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
@@ -230,7 +201,7 @@ def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
     MULTIPLICATIVELY after the coarse solve when ``mv`` (``v -> A v``) is given (the "balanced" hybrid, which
     converges faster than the purely additive sum)."""
     local, coarse, dinv = factors
-    n, p = pat.n, pat.p
+    n = pat.n
 
     def locals_(r):
         rl = jnp.take(r, pat.idx, mode="fill", fill_value=0)  # (p, m); padded slots read 0
@@ -241,15 +212,9 @@ def schwarz_apply(pat: SchwarzPattern, factors, *, restricted: bool, mv=None):
 
     if coarse is None:
         return locals_
+    from .deflation import coarse_apply
 
-    N = pat.null
-    k = N.shape[1]
-
-    def coarse_(r):
-        Nr = N.astype(r.dtype)
-        rc = jax.ops.segment_sum(Nr * r[:, None], pat.part, num_segments=p).reshape(-1)  # Z^T r, (p*k,)
-        xc = (coarse @ rc).reshape(p, k)
-        return jnp.sum(Nr * jnp.take(xc, pat.part, axis=0, mode="fill", fill_value=0), axis=1)  # Z x_c
+    coarse_ = coarse_apply(pat.coarse, coarse)[0]  # Z E^+ Z^T r
 
     if mv is None:
         return lambda r: coarse_(r) + locals_(r)
