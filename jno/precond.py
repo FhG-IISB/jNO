@@ -2406,13 +2406,13 @@ class _AMG(_Spec):
         self.nullspace = nullspace
         self._levels = None
 
-    def _near_null(self, fem, n):
+    def _near_null(self, fem, n, A=None):
         """The ``(n, k)`` near-null space handed to smoothed aggregation, or ``None`` for pyamg's constants."""
         if self.nullspace is None:
             return None
         from .utils.solver.deflation import resolve_space
 
-        return np.ascontiguousarray(resolve_space(self.nullspace, fem, n, who="jno.precond.amg(nullspace=...)"))
+        return np.ascontiguousarray(resolve_space(self.nullspace, fem, n, A=A, who="jno.precond.amg(nullspace=...)"))
 
     @property
     def traceable(self):  # only once the host-side pyamg setup has happened -- see the class docstring
@@ -2450,7 +2450,7 @@ class _AMG(_Spec):
             max_levels=self.max_levels,
             coarse_size=self.coarse_size,
             smoother_degree=self.smoother_degree,
-            near_null=self._near_null(fem, int(A.shape[0])),
+            near_null=self._near_null(fem, int(A.shape[0]), A),
         )
         return self
 
@@ -2475,7 +2475,7 @@ class _AMG(_Spec):
                 max_levels=self.max_levels,
                 coarse_size=self.coarse_size,
                 smoother_degree=self.smoother_degree,
-                near_null=self._near_null(getattr(ctx, "fem", None), int(A.shape[0])),
+                near_null=self._near_null(getattr(ctx, "fem", None), int(A.shape[0]), A),
             )
         cycles, A_op = self.cycles, ctx.A
 
@@ -3423,7 +3423,7 @@ class _Schwarz(_Spec):
         else:
             from .utils.solver.deflation import resolve_space
 
-            space = resolve_space(coarse, fem, n, who="jno.precond.schwarz(coarse=...)")
+            space = resolve_space(coarse, fem, n, A=A, who="jno.precond.schwarz(coarse=...)")
         # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
         # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
         with jax.ensure_compile_time_eval():
@@ -3621,7 +3621,7 @@ class _Coarse(_Spec):
             n = int(A.shape[0])
             if not isinstance(getattr(A, "data", A), jax.core.Tracer):
                 A_conc = A
-        Z = resolve_space(self.space, fem, n, who=repr(self))
+        Z = resolve_space(self.space, fem, n, A=A_conc, who=repr(self))
         with jax.ensure_compile_time_eval():
             part, p = self._parts_of(A_conc, fem, n)
             if self.parts is not None and A_conc is None:

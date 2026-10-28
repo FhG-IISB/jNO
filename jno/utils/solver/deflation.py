@@ -355,11 +355,12 @@ def _restrict(fem, Z_full, n, who) -> np.ndarray:
     return out
 
 
-def resolve_space(space, fem, n: int, ctx=None, *, who: str = "jno.precond.coarse") -> np.ndarray:
+def resolve_space(space, fem, n: int, ctx=None, *, A=None, who: str = "jno.precond.coarse") -> np.ndarray:
     """A space value as an ``(n, k)`` array on the solved space (size ``n``).
 
     ``space``: formulas (a list, or ``{field: [...]}``; needs the problem), an ``(n, k)`` array, an object
-    with ``basis(ctx)`` (``jno.space``), or a callable ``ctx -> (n, k)``."""
+    with ``basis(ctx)`` (:mod:`jno.space`), or a callable ``ctx -> (n, k)``. A computed space or a callable
+    sees ``ctx`` (or, when none is given, the problem, the size and the concrete operator ``A``)."""
     if _is_formula_space(space):
         if fem is None:
             raise ValueError(
@@ -372,10 +373,17 @@ def resolve_space(space, fem, n: int, ctx=None, *, who: str = "jno.precond.coars
         if red is None:
             return _formula_columns(fem, space, int(n), who)
         return _restrict(fem, _formula_columns(fem, space, int(fem.blocks[-1].stop), who), n, who)
+    if callable(getattr(space, "update", None)):
+        raise NotImplementedError(
+            f"{who}: this space has an `update` method, i.e. it changes from solve to solve (a recycled Krylov "
+            "space). Spaces are resolved once, at setup, so it would silently stay frozen; that kind is not "
+            "supported yet. Give a fixed space."
+        )
+    setup = ctx if ctx is not None else _SetupContext(fem, n, A)
     if hasattr(space, "basis") and callable(space.basis):
-        Z = space.basis(ctx if ctx is not None else _FemOnly(fem, n))
+        Z = space.basis(setup)
     elif callable(space) and not hasattr(space, "shape"):
-        Z = space(ctx if ctx is not None else _FemOnly(fem, n))
+        Z = space(setup)
     else:
         Z = space
     if isinstance(Z, jax.core.Tracer):
@@ -394,8 +402,9 @@ def resolve_space(space, fem, n: int, ctx=None, *, who: str = "jno.precond.coars
     return Z
 
 
-class _FemOnly:
-    """The context a space callable sees when resolved at setup time (``prepare``): the problem and the size."""
+class _SetupContext:
+    """What a computed space or a space callable sees when resolved at setup: the problem, the size and the
+    concrete operator (``None`` when the consumer was set up without one)."""
 
-    def __init__(self, fem, n):
-        self.fem, self.n, self.A = fem, int(n), None
+    def __init__(self, fem, n, A):
+        self.fem, self.n, self.A = fem, int(n), A

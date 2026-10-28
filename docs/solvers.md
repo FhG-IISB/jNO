@@ -748,7 +748,8 @@ The space is a **value**, written once and evaluated on whatever problem the sol
 | `[(1, 0), (0, 1), (-y, x)]` | a tuple per vector field: here the 2-D rigid-body modes |
 | `{p: [1]}` | on a problem with several fields, the field it lives on (zeros elsewhere) |
 | an `(n, k)` array | vectors on the system being solved (the reduced one, if a tie reduces it) |
-| `ctx -> (n, k)` | computed once, when the solve sets up |
+| `ctx -> (n, k)` | computed once, when the solve sets up (`ctx.fem`, `ctx.n`, `ctx.A`) |
+| `jno.space.eigvecs(k)` | the `k` lowest eigenvectors of the operator, by LOBPCG at setup -- the classical deflation space, worth it when the operator is reused |
 
 `parts=` splits every vector over subdomains: a whole number (METIS parts), a list of region names, or a
 `schwarz(coarse=False)` spec, whose subdomains it then shares. `coarse` combines with another

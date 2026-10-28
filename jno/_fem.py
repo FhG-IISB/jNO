@@ -4632,7 +4632,7 @@ class FEM:
                 )
             from .utils.solver.deflation import resolve_space
 
-            deflate = jnp.asarray(resolve_space(deflate, self, n_full, who="fem.eigs(deflate=...)"))
+            deflate = jnp.asarray(resolve_space(deflate, self, n_full, A=K, who="fem.eigs(deflate=...)"))
             if restrict is not None:
                 deflate = jax.vmap(restrict, in_axes=1, out_axes=1)(deflate)
         # the real-equivalent block doubles every complex mode, so ask for 2k and thin afterwards
