@@ -1194,7 +1194,18 @@ def contour(
     return _Contour(centre, radius, points, probes, rank, tol, maxiter, seed)
 
 
-def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precond=None, tol=None, maxiter=None, X0=None):
+def eigs(
+    *,
+    k: int = 6,
+    which: str = "smallest",
+    sigma=None,
+    linear=None,
+    precond=None,
+    tol=None,
+    maxiter=None,
+    X0=None,
+    deflate=None,
+):
     """Generalized **symmetric eigensolver** ``K x = λ M x`` (K symmetric, M SPD). Returns a callable
     ``(K, M=None) -> (λ, X)``: the ``k`` eigenvalues at the requested end (``which='smallest'`` /
     ``'largest'``) and their **M-orthonormal** eigenvectors (``Xᵀ M X = I``). ``M=None`` is the standard
@@ -1229,6 +1240,12 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
     ``ShiftInvertNotConverged`` (from :mod:`jno.utils.solver.eigen`, a ``RuntimeError``) instead -- for
     an exhausted budget, and for a shift on an eigenvalue whose inner factorization degenerates -- and
     NaN-poisons only under ``jit``/``vmap``, where nothing can be raised. jNO never fails silently.
+
+    ``deflate=Y`` (an ``(n, m)`` array) keeps the LOBPCG iteration M-orthogonal to ``span Y`` and so returns
+    the eigenpairs on its complement: with ``Y`` known eigenvectors -- a free body's rigid-body modes, the
+    constant of a Neumann problem -- the next ``k`` pairs instead of the known ones again (Knyazev 2001,
+    Sec. 4); with any other ``Y`` the constrained ones. It needs ``precond=`` (the LOBPCG path);
+    :meth:`FEM.eigs` also takes it as formulas.
 
     **Differentiable** on both paths: ``∂λ/∂θ`` for **simple** eigenvalues (degenerate/crossing
     eigenvalues make the derivative ill-defined — use the trace of the cluster). The dense path
@@ -1268,6 +1285,22 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
                 "so the dense reduction would run and silently ignore it. Pass precond= (e.g. "
                 "jno.precond.jacobi()), or drop X0=."
             )
+    if deflate is not None:
+        if sigma is not None:
+            raise NotImplementedError(
+                "jno.solve.eigs: deflate= runs on the LOBPCG path; the shift-invert path does not take it. Drop "
+                "sigma= (and pass precond=), or drop deflate=."
+            )
+        if precond is None:
+            raise ValueError(
+                "jno.solve.eigs: deflate= constrains the iterative (LOBPCG) block, but no precond= was given, so "
+                "the dense reduction would run and silently ignore it. Pass precond= (e.g. jno.precond.jacobi())."
+            )
+        if isinstance(deflate, (list, dict)) or callable(deflate):
+            raise TypeError(
+                "jno.solve.eigs(deflate=...) takes an (n, m) array; a space written as formulas is evaluated at a "
+                "problem's DOFs -- pass it to fem.eigs(deflate=...) instead."
+            )
     if precond is None and sigma is None and (tol is not None or maxiter is not None):
         raise ValueError(
             "jno.solve.eigs: tol=/maxiter= configure the iterative paths, but neither precond= nor "
@@ -1293,6 +1326,8 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
         # form and ROUTE on the answer: Arnoldi (complex spectrum) rather than a refusal. A traced
         # or unsized operator cannot be probed and keeps the historical symmetric assumption.
         if "nonsymmetric" in (_symmetry_verdict(K), _symmetry_verdict(M)):
+            if deflate is not None:
+                raise NotImplementedError("jno.solve.eigs: deflate= is not supported on the non-symmetric (Arnoldi) path.")
             if precond is not None:
                 raise ValueError(
                     "jno.solve.eigs: precond= is not used by the non-symmetric (Arnoldi) path -- its "
@@ -1320,7 +1355,7 @@ def eigs(*, k: int = 6, which: str = "smallest", sigma=None, linear=None, precon
 
         op = K if isinstance(K, LinearOperator) else LinearOperator(K)
         apply = materialize_precond(precond, PrecondContext(op))
-        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter, X0=X0)
+        lam, X, res = lobpcg_geneigh(K, M, k, which, precond=apply, tol=_tol, maxiter=_maxiter, X0=X0, Y=deflate)
         bad = res > _tol  # budget exhausted -> poison, never a quietly under-converged spectrum
         return jnp.where(bad, jnp.nan, lam), jnp.where(bad, jnp.nan, X)
 

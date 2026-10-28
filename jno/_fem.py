@@ -4521,6 +4521,7 @@ class FEM:
         maxiter=None,
         X0=None,
         contour=None,
+        deflate=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -4549,6 +4550,13 @@ class FEM:
         ``which``/``sigma``/``precond``/``X0``. A Bloch tie ``u(A) - c*u(B)`` among the terms (a band
         structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
         ``n``-space, and a complex ``X0`` warm-starts the next k-point.
+
+        ``deflate=`` (with ``precond=``) leaves a known subspace out: formulas in the domain's coordinates, an
+        ``(n, m)`` array on the full DOF space, or a callable -- the space values :func:`jno.precond.coarse`
+        takes. A free structure's rigid-body modes, ``deflate=[(1, 0), (0, 1), (-y, x)]``, then skip its zero
+        eigenvalues and the solve returns the first ``k`` elastic modes::
+
+            lam, X = K.eigs(mass=[rho * ui @ vi], k=6, precond=jno.precond.amg(), deflate=[(1, 0), (0, 1), (-y, x)])
         """
         self._refresh_attachments()
         if self._mode != "linear":
@@ -4562,6 +4570,7 @@ class FEM:
                     ("sigma", sigma),
                     ("precond", precond),
                     ("X0", X0),
+                    ("deflate", deflate),
                 )
                 if val is not None
             ]
@@ -4615,13 +4624,32 @@ class FEM:
             _W = jnp.asarray(X0)
             _W = _W[:, None] if _W.ndim == 1 else _W
             X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
+        if deflate is not None:
+            if _cn is not None:
+                raise NotImplementedError(
+                    "fem.eigs(deflate=...) on a complex (or Bloch-tied) pencil is not supported: the space would have "
+                    "to be lifted into the real-equivalent block. Drop deflate=."
+                )
+            from .utils.solver.deflation import resolve_space
+
+            deflate = jnp.asarray(resolve_space(deflate, self, n_full, who="fem.eigs(deflate=...)"))
+            if restrict is not None:
+                deflate = jax.vmap(restrict, in_axes=1, out_axes=1)(deflate)
         # the real-equivalent block doubles every complex mode, so ask for 2k and thin afterwards
         _k_solve = 2 * k if _cn is not None else k
         _finish = (
             (lambda lam, X: _thin_real_equivalent_pairs(lam, X, _cn)) if _cn is not None else (lambda lam, X: (lam, X))
         )
         solver = _solve.eigs(
-            k=_k_solve, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0
+            k=_k_solve,
+            which=which,
+            sigma=sigma,
+            linear=linear,
+            precond=precond,
+            tol=tol,
+            maxiter=maxiter,
+            X0=X0,
+            deflate=deflate,
         )
         if restrict is None:
             return _finish(*solver(K, M))

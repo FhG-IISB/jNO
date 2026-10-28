@@ -464,6 +464,16 @@ lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.jacobi())            # first
 lam2, X2 = K2.eigs(mass=mass, k=6, precond=jno.precond.jacobi(), X0=X)   # next point: warm
 ```
 
+**Leaving a known subspace out.** `deflate=` keeps LOBPCG M-orthogonal to a space -- written as formulas,
+an `(n, m)` array or a callable, the values [`jno.precond.coarse`](solvers.md#coarse-spaces-and-deflation-jnoprecondcoarse)
+takes. A free structure's rigid-body modes then skip its zero eigenvalues, and a Neumann problem's
+constant its first; with a `Y` that is not an invariant subspace the result is the constrained
+(Courant–Fischer) spectrum on its M-orthogonal complement. LOBPCG path only (`precond=`):
+
+```python
+lam, X = K.eigs(mass=mass, k=6, precond=jno.precond.jacobi(), deflate=[(1, 0), (0, 1), (-y, x)])
+```
+
 The Rayleigh–Ritz runs in the **M-inner product**, so an ordinary FEM form's consistent (non-lumped)
 mass matrix is handled directly, and `XᵀMX = I` holds on both paths. Eigenvalues are differentiable on
 both — for **simple** eigenvalues; a degenerate cluster makes `∂λ/∂θ` ill-defined either way (use the
