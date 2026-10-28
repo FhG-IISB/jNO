@@ -1373,13 +1373,15 @@ def logdet(A, *, samples: int = 32, order: int = 25, key=None):
     return _logdet(A, samples=samples, order=order, key=key)
 
 
-def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None, deflate=None):
     """Differentiable, matrix-free ``tr A`` (Hutchinson) or ``tr f(A)`` (``fun=``, Lanczos quadrature) —
     e.g. ``fun=lambda z: 1/z`` for ``tr(A⁻¹)`` (uncertainty / effective degrees of freedom). Optional
-    ``matfree``. See :func:`jno.utils.solver.matfun.trace`."""
+    ``matfree``. ``deflate=Z`` (an ``(n, m)`` array) takes ``tr(QᵀAQ)`` on ``span Z`` exactly and samples
+    only the rest -- with ``Z`` the dominant directions the variance drops (plain trace only). See
+    :func:`jno.utils.solver.matfun.trace`."""
     from .utils.solver.matfun import trace as _trace
 
-    return _trace(A, fun=fun, samples=samples, order=order, key=key)
+    return _trace(A, fun=fun, samples=samples, order=order, key=key, deflate=deflate)
 
 
 def applyfun(A, v, *, fun, order: int = 30, symmetric: bool = True):

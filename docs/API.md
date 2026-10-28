@@ -358,6 +358,7 @@ A, _ = jno.fem([ui * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0]
 
 jno.solve.logdet(A, samples=64)                          # log det A          — log-evidence
 jno.solve.trace(A, fun=lambda z: 1 / z, samples=64)      # tr(A⁻¹)            — effective DOFs
+jno.solve.trace(A, samples=16, deflate=Z)                # tr A, exact on span Z, sampled off it
 jno.solve.diagonal(A, fun=lambda z: 1 / z, samples=256)  # diag(A⁻¹) as a FIELD, plottable on the mesh
 jno.solve.applyfun(A, u0, fun=lambda z: jnp.exp(-dt * z))  # exp(-dt·A)·u₀    — one exact step
 ```
