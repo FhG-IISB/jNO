@@ -446,4 +446,4 @@ def test_two_level_schwarz_is_the_coarse_space_around_the_one_level_method(restr
     B_two, _ = _matrix(two, fem)
     B_alg, _ = _matrix(Q >> S if restricted else Q >> S >> Q, fem)
     np.testing.assert_array_equal(np.asarray(two._pattern.part), np.asarray(S._pattern.part))
-    np.testing.assert_allclose(B_alg, B_two, rtol=1e-12, atol=1e-12 * np.abs(B_two).max())
+    np.testing.assert_allclose(B_alg, B_two, rtol=1e-10, atol=1e-10 * np.abs(B_two).max())  # GPU summation order
