@@ -3626,7 +3626,8 @@ class _Coarse(_Spec):
             part, p = self._parts_of(A_conc, fem, n)
             if self.parts is not None and A_conc is None:
                 raise TypeError(f"{self!r}: a partitioned coarse space needs the assembled operator.")
-            self._pattern = coarse_pattern(Z, part, p, A=A_conc)
+            # a global space is factored from products with the operator, so it needs no entry tables
+            self._pattern = coarse_pattern(Z, part, p, A=A_conc if p > 1 else None)
         if self._pattern.dropped:
             logging.getLogger("jno").info(
                 f"{self!r}: {self._pattern.dropped} of {self._pattern.p * self._pattern.k} coarse directions carry "

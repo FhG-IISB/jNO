@@ -158,31 +158,35 @@ def _whitening(null, part, p):
 
 
 def _galerkin(pat: CoarsePattern, A, mv):
-    """``E = Z^T A Z`` as ``(p k, p k)``: from the entries when the pattern has tables, else ``k`` products."""
+    """``E = Z^T A Z`` as ``(p k, p k)``.
+
+    A global space (``p = 1``) takes ``k`` products with the operator, ``Z^T (A Z)``: ``O(nnz k + n k^2)``, and it
+    works matrix-free. A partitioned one is summed from the entries, one streaming segment sum per vector
+    (``(nnz, k)`` at a time, never ``(nnz, k^2)``), in a loop the compiler does not unroll -- ``k^2`` unrolled sums
+    made a 480-vector space take minutes to compile."""
     p, k = pat.p, pat.k
+    if p == 1 and mv is not None:
+        N = pat.null
+        AZ = jax.vmap(lambda z: mv(z.astype(N.dtype)), in_axes=1, out_axes=1)(N)
+        return N.T.astype(AZ.dtype) @ AZ
     if pat.crow is not None and A is not None and hasattr(A, "indices"):
         from .fsai import FsaiPattern, _keys_and_values
 
         _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
         N = pat.null.astype(jnp.result_type(vals.dtype, jnp.float32))
         Nr, Nc = N[pat.erow], N[pat.ecol]
-        # E[(i,a), (j,b)] = sum over entries (r, c) with part(r) = i, part(c) = j of N[r,a] A_rc N[c,b]:
-        # k^2 streaming segment sums, no (nnz x k^2) intermediate.
-        blocks = [
-            [jax.ops.segment_sum(vals * Nr[:, a] * Nc[:, b], pat.crow, num_segments=p * p) for b in range(k)]
-            for a in range(k)
-        ]
-        E = jnp.stack([jnp.stack(row, -1) for row in blocks], -2)  # (p*p, k, k)
-        return E.reshape(p, p, k, k).transpose(0, 2, 1, 3).reshape(p * k, p * k)
-    if p != 1 or mv is None:
-        raise TypeError(
-            "jno.precond.coarse(parts=...): a partitioned coarse space is built from the ASSEMBLED operator's "
-            "entries, and this solve only has a matvec. Use a global space (parts=None), which needs only "
-            "products with the operator, or an assembled solve path."
-        )
-    N = pat.null
-    AZ = jax.vmap(lambda z: mv(z.astype(N.dtype)), in_axes=1, out_axes=1)(N)
-    return N.T @ AZ
+
+        # E[(i,a), (j,b)] = sum over entries (r, c) with part(r) = i, part(c) = j of N[r,a] A_rc N[c,b]
+        def row(a):
+            return jax.ops.segment_sum((vals * Nr[:, a])[:, None] * Nc, pat.crow, num_segments=p * p)  # (p*p, k)
+
+        E = jax.lax.map(row, jnp.arange(k))  # (k, p*p, k)
+        return E.reshape(k, p, p, k).transpose(1, 0, 2, 3).reshape(p * k, p * k)
+    raise TypeError(
+        "jno.precond.coarse(parts=...): a partitioned coarse space is built from the ASSEMBLED operator's "
+        "entries, and this solve only has a matvec. Use a global space (parts=None), which needs only "
+        "products with the operator, or an assembled solve path."
+    )
 
 
 def _record_kernel(count, who):

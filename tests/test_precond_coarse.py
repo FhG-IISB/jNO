@@ -389,6 +389,23 @@ def test_a_built_coarse_space_compiles_and_reuses_its_program():
         np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-9 * np.abs(ref).max())
 
 
+def test_a_wide_global_space_compiles_quickly():
+    """Hundreds of global vectors (what GenEO collects over the subdomains): ``E = Z^T (A Z)`` from products.
+    Summed entry by entry with ``k^2`` unrolled segment sums, 480 vectors took minutes to compile."""
+    import time
+
+    fem, _ = _poisson(0.04)
+    n = fem._op[0].shape[0]
+    Z = np.random.default_rng(0).standard_normal((n, 300))
+    spec = jno.precond.jacobi() >> jno.precond.coarse(Z)
+    spec.prepare(fem)
+    assert spec.chain[1]._pattern.crow is None, "a global space needs no entry tables"
+    t0 = time.perf_counter()
+    got = np.asarray(fem.solve(linear=jno.solve.fgmres(tol=1e-11), precond=spec))
+    assert time.perf_counter() - t0 < 60.0
+    np.testing.assert_allclose(got, np.asarray(fem.solve()), rtol=1e-7, atol=1e-10)
+
+
 def test_a_single_precision_coarse_space_gives_the_default_answer():
     fem, (x, y) = _poisson(0.04)
     ref = np.asarray(fem.solve())
