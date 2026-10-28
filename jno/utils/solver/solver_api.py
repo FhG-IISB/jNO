@@ -1192,19 +1192,48 @@ def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:
     )
 
 
-def _iter_specs(spec):
-    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
-    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. Used to reach hooks
-    like ``refresh_from`` wherever they sit -- a solution-dependent Schur form typically lives one
-    level down, inside ``triangular``'s pressure pair."""
-    if spec is None:
-        return
-    yield spec
+def _spec_children(spec) -> list:
+    """The specs directly inside ``spec``, duck-typed: ``.spec`` is a wrapper (``reuse=``), ``.pairs`` a block
+    preconditioner's ``(field, spec)`` list, ``.children`` a combination's operands (``+``, ``@``, ``>>``)."""
+    out = []
     inner = getattr(spec, "spec", None)
     if inner is not None:
-        yield from _iter_specs(inner)
-    for pair in getattr(spec, "pairs", None) or ():
-        yield from _iter_specs(pair[1])
+        out.append(inner)
+    out.extend(p[1] if isinstance(p, tuple) else p for p in getattr(spec, "pairs", None) or ())
+    out.extend(getattr(spec, "children", None) or ())
+    return out
+
+
+def _is_leaf(spec) -> bool:
+    """A spec that is not a container (a wrapper, a block preconditioner or a combination)."""
+    return not _spec_children(spec)
+
+
+def _iter_specs(spec):
+    """Every spec in a (possibly nested) preconditioner tree (see :func:`_spec_children`). Used to reach
+    hooks like ``refresh_from`` wherever they sit -- a solution-dependent Schur form typically lives one
+    level down, inside ``triangular``'s pressure pair. A spec shared by several branches (``Q >> M >> Q``)
+    is yielded once, so its hook fires once."""
+    seen = set()
+
+    def walk(s):
+        if s is None or id(s) in seen:
+            return
+        seen.add(id(s))
+        yield s
+        for c in _spec_children(s):
+            yield from walk(c)
+
+    yield from walk(spec)
+
+
+def refresh_hooks(precond, sol, fem) -> None:
+    """Fire every leaf's ``refresh_from`` (the Picard lag) once, from the concrete solution ``sol``. Leaves
+    only: a combination's own ``refresh_from`` forwards to the same leaves and would fire them twice."""
+    for s in _iter_specs(precond):
+        hook = getattr(s, "refresh_from", None) if _is_leaf(s) else None
+        if hook is not None:
+            hook(sol, fem)
 
 
 def prepare_precond(spec: Any, fem: Any) -> None:
@@ -1641,10 +1670,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
         # the spec then raises its own loud error at materialization if it was never assembled.
         lin = inner
         if precond is not None and fem is not None and not isinstance(u0, jax.core.Tracer):
-            for s in _iter_specs(precond):
-                hook = getattr(s, "refresh_from", None)
-                if hook is not None:
-                    hook(u0, fem)
+            refresh_hooks(precond, u0, fem)
             # A spec whose setup needs a CONCRETE matrix (an unbuilt amg: pyamg; ilu: scipy) cannot set up
             # inside the loop; it is built ONCE, eagerly, from the tangent at the entry iterate. Everything
             # else keeps materializing per linearization, exactly as before.
@@ -1701,6 +1727,9 @@ def _uncached(spec):
     pairs = getattr(spec, "pairs", None)
     if pairs:
         return type(spec)([(f, _uncached(child)) for f, child in pairs])
+    children = getattr(spec, "children", None)
+    if children:
+        return spec._rebuilt([_uncached(c) for c in children])
     return spec
 
 
@@ -1722,15 +1751,9 @@ def _refresh_cadence(precond):
 
 
 def _specs_in(spec):
-    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
-    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. A tree is non-traceable
-    as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
-    yield spec
-    child = getattr(spec, "spec", None)
-    if child is not None:
-        yield from _specs_in(child)
-    for pair in getattr(spec, "pairs", ()) or ():
-        yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+    """Every spec in a (possibly nested) preconditioner tree (see :func:`_spec_children`). A tree is
+    non-traceable as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
+    yield from _iter_specs(spec)
 
 
 # ---- a built preconditioner's arrays as ARGUMENTS of a compiled solve -----------------------------------
@@ -1759,10 +1782,9 @@ def precond_state(precond):
             tag = getattr(s, "_state_tag", None)
             tags.append(tag() if callable(tag) else None)
             return
-        if getattr(s, "spec", None) is not None:
-            walk(s.spec)
-        for pr in getattr(s, "pairs", None) or ():
-            walk(pr[1] if isinstance(pr, tuple) else pr)
+        for c in _spec_children(s):
+            if not any(c is k for k in specs):  # a child shared by two branches (`Q >> M >> Q`) is one state
+                walk(c)
 
     if precond is not None:
         walk(precond)
@@ -1815,10 +1837,9 @@ def precond_compiles(spec) -> bool:
         child = getattr(s, "spec", None)
         if child is not None and getattr(s, "traceable", False):
             return True  # a frozen cache that has built: no setup left, whatever it wraps
-        pairs = getattr(s, "pairs", None) or ()
-        if child is None and not pairs:
+        if _is_leaf(s):
             return bool(getattr(s, "traceable", True))
-        return (child is None or ok(child)) and all(ok(p[1] if isinstance(p, tuple) else p) for p in pairs)
+        return all(ok(c) for c in _spec_children(s))
 
     return spec is None or ok(spec)
 
@@ -1926,7 +1947,7 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
 def _untraceable_leaves(precond):
     """``(leaves, any_untraceable)`` of a preconditioner tree. Only a LEAF decides whether a tree needs a
     concrete matrix: a block container (``triangular``, ``block_diag``) assembles nothing itself."""
-    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    leaves = [s for s in _specs_in(precond) if _is_leaf(s)]
     return leaves, not all(bool(getattr(s, "traceable", True)) for s in leaves)
 
 

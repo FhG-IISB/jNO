@@ -182,6 +182,11 @@ class _Spec:
         """``M v = M1(M2 v)`` -- applied right to left, as the operator product reads."""
         return _Product(self, other) if isinstance(other, _Spec) else NotImplemented
 
+    def __rshift__(self, other):
+        """``M1 >> M2`` -- multiplicative: ``z = M1 r``, then ``z += M2 (r - A z)``. With a coarse space
+        ``Q = jno.precond.coarse(Z)``, ``M >> Q`` is A-DEF2 deflation and ``Q >> M >> Q`` is BNN."""
+        return _Then(self, other) if isinstance(other, _Spec) else NotImplemented
+
 
 def _low_precision(dtype):
     """float64 -> float32, complex128 -> complex64; anything already single stays."""
@@ -223,7 +228,15 @@ def _precision(spec, float32):
 
 class _Combination(_Spec):
     """Shared plumbing for :class:`_Sum` / :class:`_Product`: both prepare and materialize every
-    operand against the SAME context, and differ only in how the appliers are combined."""
+    operand against the SAME context, and differ only in how the appliers are combined.
+
+    A combination is a spec like any other, so it answers every declaration from its children: it is
+    ``traceable`` (and compiles) when all of them are, its value ``key`` is built from theirs (with their
+    precision, which a child's own key leaves out), it distributes itself when all of them do, and its
+    applier is single-precision or non-symmetric when one of theirs is. ``children`` is what the spec-tree
+    walkers in :mod:`~jno.utils.solver.solver_api` descend through, so a hook on a child (``refresh_from``,
+    a built state, a ``reuse=k`` cadence) is reached exactly once, by the walk -- the combination forwards
+    none of them itself."""
 
     _OP = "?"
 
@@ -234,32 +247,74 @@ class _Combination(_Spec):
         self.left, self.right = left, right
 
     @property
+    def children(self):
+        return (self.left, self.right)
+
+    def _rebuilt(self, children):
+        """The same combination over other children (the walkers' ``_uncached``)."""
+        return _precision(type(self)(*children), self.float32)
+
+    @property
     def host_setup(self):
-        return bool(getattr(self.left, "host_setup", False) or getattr(self.right, "host_setup", False))
+        return any(bool(getattr(c, "host_setup", False)) for c in self.children)
+
+    @property
+    def traceable(self):
+        return all(bool(getattr(c, "traceable", False)) for c in self.children)
+
+    @property
+    def key(self):
+        keys = tuple((getattr(c, "key", None), bool(getattr(c, "float32", False))) for c in self.children)
+        return None if any(k is None for k, _ in keys) else (type(self), keys)
+
+    @property
+    def shardable(self):
+        return all(bool(getattr(c, "shardable", False)) for c in self.children)
+
+    @property
+    def complex_ok(self):
+        return all(bool(getattr(c, "complex_ok", False)) for c in self.children)
 
     def prepare(self, fem):
-        for side in (self.left, self.right):
+        for side in self.children:
             if hasattr(side, "prepare"):
                 side.prepare(fem)
 
-    def refresh_from(self, sol, fem):
-        """Forward the Picard lag to both operands.
+    @property
+    def refresh_from(self):
+        """Forward the Picard lag to every child that has one -- ``None`` when none does, so a combination
+        of plain specs still reads as holding no solution-dependent state (``precond_compiles``).
 
-        Without this a solution-dependent factor inside a composition -- `form(<callable>)`, or a
-        `pcd()` whose F_p tracks the iterate -- would be prepared once and then never updated, and the
-        composition would silently keep preconditioning with the coefficient from the first solve.
-        """
-        for side in (self.left, self.right):
-            if hasattr(side, "refresh_from"):
-                side.refresh_from(sol, fem)
+        Without this a solution-dependent factor inside a composition -- ``form(<callable>)``, or a
+        ``pcd()`` whose F_p tracks the iterate -- would be prepared once and then never updated. Inside
+        ``fem.solve`` the hooks are fired on the leaves by :func:`~jno.utils.solver.solver_api.refresh_hooks`,
+        once each; this property serves a direct call on the composition."""
+        from .utils.solver.solver_api import _is_leaf, _iter_specs
+
+        hooks = [s.refresh_from for s in _iter_specs(self) if _is_leaf(s) and getattr(s, "refresh_from", None)]
+        if not hooks:
+            return None
+
+        def refresh(sol, fem):
+            for hook in hooks:
+                hook(sol, fem)
+
+        return refresh
 
     def _appliers(self, ctx: PrecondContext):
         from .utils.solver.solver_api import materialize_precond
 
-        return materialize_precond(self.left, ctx), materialize_precond(self.right, ctx)
+        return tuple(materialize_precond(c, ctx) for c in self.children)
+
+    @staticmethod
+    def _combined(fwd, t, appliers, *, nonsymmetric=False):
+        """The combined applier, single-precision or non-symmetric when any child's is."""
+        out = PrecondApplier(fwd, t, low_precision=any(getattr(a, "low_precision", False) for a in appliers))
+        out.nonsymmetric = nonsymmetric or any(getattr(a, "nonsymmetric", False) for a in appliers)
+        return out
 
     def __repr__(self):
-        return f"({self.left!r} {self._OP} {self.right!r})"
+        return "(" + f" {self._OP} ".join(map(repr, self.children)) + ")"
 
 
 class _Sum(_Combination):
@@ -270,7 +325,7 @@ class _Sum(_Combination):
     def materialize(self, ctx: PrecondContext):
         a, b = self._appliers(ctx)
         at, bt = _applier_transpose(a), _applier_transpose(b)
-        return PrecondApplier(lambda v: a(v) + b(v), lambda v: at(v) + bt(v))
+        return self._combined(lambda v: a(v) + b(v), lambda v: at(v) + bt(v), (a, b))
 
 
 class _Product(_Combination):
@@ -280,9 +335,9 @@ class _Product(_Combination):
     spec and not a lambda: the reverse pass of a differentiable solve preconditions ``A^T`` and would
     otherwise run almost unpreconditioned.
 
-    Note the product of two symmetric factors is **not** symmetric, so drive the outer solve with
-    ``jno.solve.gmres()`` / ``fgmres()``, not ``cg``/``minres``. A short-recurrence method on a
-    non-symmetric preconditioner will simply fail to reach the residual gate, loudly.
+    Note the product of two symmetric factors is **not** symmetric, so the applier says so
+    (``nonsymmetric``): ``jno.solve.cg`` then runs flexible CG, which tolerates it, and ``minres`` (which
+    needs a symmetric positive-definite preconditioner) is still the wrong choice -- use ``gmres``/``fgmres``.
     """
 
     _OP = "@"
@@ -290,7 +345,70 @@ class _Product(_Combination):
     def materialize(self, ctx: PrecondContext):
         a, b = self._appliers(ctx)
         at, bt = _applier_transpose(a), _applier_transpose(b)
-        return PrecondApplier(lambda v: a(b(v)), lambda v: bt(at(v)))
+        return self._combined(lambda v: a(b(v)), lambda v: bt(at(v)), (a, b), nonsymmetric=True)
+
+
+class _Then(_Combination):
+    """``M1 >> M2 >> ...``: each correction applied in turn to the residual the previous ones left.
+
+    ``z = M1 r``, then ``z += M2 (r - A z)``, and so on -- multiplicative subspace correction, whose
+    error propagator is the product ``I - B A = ... (I - M2 A)(I - M1 A)`` (Xu, *SIAM Rev.* 34 (1992),
+    Sec. 3). It is how a coarse space and a smoother combine: with ``Q = jno.precond.coarse(Z)``,
+    ``Q >> M`` is A-DEF1, ``M >> Q`` A-DEF2 and ``Q >> M >> Q`` BNN (Tang, Nabben, Vuik & Erlangga,
+    *J. Sci. Comput.* 39 (2009) 340), and two-level Schwarz is ``Q >> schwarz(coarse=False) >> Q``.
+    Unlike ``@`` it re-applies the operator to the residual between the factors (one product per ``>>``).
+
+    A chain is kept flat (``a >> b >> c`` has three children). A child that appears more than once
+    (``Q >> M >> Q``) is materialized once. The transpose is the reversed chain of the children's
+    transposes on ``A^T``. The applier is symmetric (for a symmetric ``A``) when the chain reads the same
+    both ways and every child is symmetric -- BNN is, A-DEF1/A-DEF2 are not, and say so (``nonsymmetric``),
+    which switches ``jno.solve.cg`` to flexible CG.
+    """
+
+    _OP = ">>"
+
+    def __init__(self, *chain):
+        flat = []
+        for c in chain:
+            if not isinstance(c, _Spec):
+                raise TypeError(f"jno.precond: cannot combine a preconditioner spec with {type(c).__name__}.")
+            same_precision = not c.float32  # a float32 sub-chain keeps its own precision, so it stays one child
+            flat.extend(c.chain if isinstance(c, _Then) and same_precision else (c,))
+        self.chain = tuple(flat)
+
+    @property
+    def children(self):
+        return self.chain
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.solver_api import materialize_precond
+
+        built = {}
+        for c in self.chain:
+            if id(c) not in built:
+                built[id(c)] = materialize_precond(c, ctx)
+        aps = [built[id(c)] for c in self.chain]
+        ats = [_applier_transpose(a) for a in aps]
+        A = ctx.A
+
+        def fwd(r):
+            z = aps[0](r)
+            for a in aps[1:]:
+                z = z + a(r - A.mv(z))
+            return z
+
+        def t(r):
+            At = A.T
+            z = ats[-1](r)
+            for a in reversed(ats[:-1]):
+                z = z + a(r - At.mv(z))
+            return z
+
+        palindrome = all(x is y for x, y in zip(self.chain, reversed(self.chain)))
+        symmetric = palindrome and all(
+            getattr(a, "_t", None) is None and not getattr(a, "nonsymmetric", False) for a in aps
+        )
+        return self._combined(fwd, None if symmetric else t, aps, nonsymmetric=not symmetric)
 
 
 def _dense_mv(op, v):

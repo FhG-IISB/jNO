@@ -2688,13 +2688,12 @@ class _TraceFDM:
             LinearOperator,
             PrecondContext,
             _FrozenMarchPrecond,
-            _specs_in,
+            _untraceable_leaves,
             materialize_precond,
             prepare_precond,
         )
 
-        leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
-        if all(bool(getattr(s, "traceable", True)) for s in leaves):
+        if not _untraceable_leaves(precond)[1]:
             return precond
         prepare_precond(precond, self)
         return _FrozenMarchPrecond(
