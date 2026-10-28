@@ -147,9 +147,12 @@ def _whitening(null, part, p):
     """``W = G^{-1/2}`` per part, ``G = Z_i^T Z_i`` (host, once): a direction of ``G`` below ``NULL_RTOL`` of its
     part's largest carries no vector and gets a zero column; ``dropped`` counts them."""
     k = null.shape[1]
-    inside = part < p
     G = np.zeros((p, k, k))
-    np.add.at(G, part[inside], null[inside][:, :, None] * null[inside][:, None, :])
+    order = np.argsort(part, kind="stable")
+    bounds = np.searchsorted(part[order], np.arange(p + 1))
+    for i in range(p):  # Z_i^T Z_i per part: O(n k) memory, never the (n, k, k) outer products
+        Zi = null[order[bounds[i] : bounds[i + 1]]]
+        G[i] = Zi.T @ Zi
     g, V = np.linalg.eigh(G)
     gmax = np.max(g, axis=1, keepdims=True)
     keep = g > NULL_RTOL * np.maximum(gmax, np.finfo(float).tiny)
