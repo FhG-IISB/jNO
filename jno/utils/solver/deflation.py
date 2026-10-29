@@ -386,11 +386,9 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
         E, Wb = E[pat.cidx][:, pat.cidx], Wb[pat.cidx]
     Wb = Wb[:, pat.kidx]
     Et = Wb.T @ E @ Wb
-    U, s, Vh = jnp.linalg.svd(Et)
+    Etinv, s, Vh = _coarse_pinv(Et, jnp.maximum(KERNEL_RTOL, 64 * jnp.finfo(rdt).eps * p * k))
     smax = jnp.max(s)
-    cut = jnp.maximum(KERNEL_RTOL, 64 * jnp.finfo(rdt).eps * p * k) * smax
-    sinv = jnp.where(s > cut, 1.0 / jnp.where(s > cut, s, 1.0), 0.0)
-    Einv = Wb @ (Vh.conj().T * sinv[None, :]) @ U.conj().T @ Wb.T
+    Einv = Wb @ Etinv @ Wb.T
     if check and rdt == jnp.float64:
         ref = smax if scale is None else jnp.asarray(scale, rdt)
         if pat.Gt is None:  # parts partition the unknowns: Z W is orthonormal on the kept directions
@@ -403,6 +401,33 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
         elif int(kernel) > 0:
             raise ValueError(_kernel_message(int(kernel), who))
     return Einv
+
+
+def _coarse_pinv(Et, rtol):
+    """``(Et^+, s, Vh)``: the pseudo-inverse of the whitened coarse matrix, dropping the directions below ``rtol``
+    of the largest, its singular values and right singular vectors (rows of ``Vh``).
+
+    A Hermitian ``Et`` (to ``sqrt(eps)``: the rounding of the assembly) is decomposed by ``eigh``
+    (``s = |lambda|``), any other by the SVD -- on a GPU in float64 the SVD is 15-60x slower at a few hundred
+    directions. ``lax.cond`` decides from the values, so a symmetric operator whose tangent turns
+    non-symmetric later (Newton, a march) takes the SVD then, and never a symmetrized wrong inverse."""
+    rdt = jnp.finfo(Et.dtype).dtype
+
+    def inv(s):
+        cut = rtol * jnp.max(s)
+        return jnp.where(s > cut, 1.0 / jnp.where(s > cut, s, 1.0), 0.0)
+
+    def by_eigh(M):
+        lam, V = jnp.linalg.eigh(M)
+        s = jnp.abs(lam)
+        return (V * (inv(s) * jnp.sign(lam))[None, :]) @ V.conj().T, s, V.conj().T
+
+    def by_svd(M):
+        U, s, Vh = jnp.linalg.svd(M)
+        return (Vh.conj().T * inv(s)[None, :]) @ U.conj().T, s, Vh
+
+    hermitian = jnp.max(jnp.abs(Et - Et.conj().T)) <= jnp.sqrt(jnp.finfo(rdt).eps) * jnp.max(jnp.abs(Et))
+    return jax.lax.cond(hermitian, by_eigh, by_svd, Et)
 
 
 def _block_diag(W):

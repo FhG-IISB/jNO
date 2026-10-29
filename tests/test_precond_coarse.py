@@ -575,3 +575,31 @@ def test_a_sparse_space_split_over_parts_is_the_dense_one():
     B_dense, _ = _matrix(jno.precond.schwarz(parts=6, coarse=rigid), fem)
     B_sparse, _ = _matrix(jno.precond.schwarz(parts=6, coarse=Zs), fem)
     np.testing.assert_allclose(B_sparse, B_dense, rtol=1e-8, atol=1e-10 * np.abs(B_dense).max())
+
+
+@pytest.mark.parametrize("kind", ["spd", "indefinite", "nonsymmetric", "hermitian", "complex-symmetric", "singular"])
+def test_the_coarse_inverse_is_the_pseudo_inverse_whichever_decomposition_runs(kind):
+    """A Hermitian coarse matrix goes through ``eigh``, any other through the SVD; both give the pseudo-inverse.
+    A complex SYMMETRIC (non-Hermitian) matrix must not be taken for Hermitian."""
+    from jno.utils.solver.deflation import _coarse_pinv
+
+    rng = np.random.default_rng(1)
+    B = rng.standard_normal((40, 40))
+    C = B + 1j * rng.standard_normal((40, 40))
+    M = {
+        "spd": B @ B.T + 40 * np.eye(40),
+        "indefinite": B + B.T,
+        "nonsymmetric": B + 10 * np.eye(40),
+        "hermitian": C @ C.conj().T + 40 * np.eye(40),
+        "complex-symmetric": C + C.T,
+        "singular": B[:, :30] @ B[:, :30].T,
+    }[kind]
+    P, s, Vh = (np.asarray(a) for a in _coarse_pinv(jnp.asarray(M), 1e-12))
+    np.testing.assert_allclose(
+        P,
+        np.linalg.pinv(M, rcond=1e-10, hermitian=kind in ("spd", "indefinite", "hermitian", "singular")),
+        rtol=1e-8,
+        atol=1e-10 * np.abs(P).max(),
+    )
+    np.testing.assert_allclose(np.sort(s), np.sort(np.linalg.svd(M, compute_uv=False)), rtol=1e-8, atol=1e-10 * s.max())
+    np.testing.assert_allclose(np.linalg.norm(M @ Vh.conj().T, axis=0), s, rtol=1e-8, atol=1e-10 * s.max())
