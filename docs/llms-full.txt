@@ -513,6 +513,19 @@ extra), `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per
 `fem.blocks`); `reuse=True` / `reuse=k` on any of them keeps the setup across solves. Every constructor takes `float32=True`: the preconditioner is built
 and applied in single precision while the solve stays in double.
 
+**Coarse spaces** — `coarse(space, parts=)` is `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r`; the space is a VALUE, never a string:
+formulas (`[1]`, rigid modes `[(1, 0), (0, 1), (-y, x)]`, `{p: [1]}` per field), an `(n, k)` array, a sparse
+`(n, k)` matrix (vectors on overlapping subdomains), a callable `ctx -> Z`, or `jno.space.eigvecs(k)`. `parts=`
+is an int (METIS), region names, or a `schwarz(coarse=False)` spec to share its subdomains. Combine with `>>`:
+`Q >> M >> Q` (BNN, symmetric, `cg`), `M >> Q` (deflation, `gmres`/`fgmres`). `schwarz(coarse=<space>)` is the
+same thing built in. A space holding an exact kernel (pure-Neumann constant) raises: add a gauge term instead.
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)       # 2-D elasticity
+u = fem.solve(linear=jno.solve.cg(tol=1e-8), precond=Q >> S >> Q)
+```
+
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt
 spec re-runs pyamg's host-side setup every solve:
 
