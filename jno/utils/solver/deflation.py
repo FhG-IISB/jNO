@@ -496,6 +496,38 @@ def _require_nodal(fem, who):
         )
 
 
+def element_triplets(fem, u=None, *, who: str = "jno.space.geneo"):
+    """The operator's entries before they are summed, each tagged with its cell: ``(rows, cols, data, cell)``.
+
+    Summing every triplet gives the tangent at ``u`` (zeros by default) before Dirichlet elimination;
+    summing those of a SUBSET of cells gives the operator of that subset alone, with natural conditions where
+    it is cut -- the local Neumann matrix of GenEO (Spillane et al., Numer. Math. 126, 2014). A boundary
+    face's entries carry its parent cell. Rows and columns index the full finite-element space; the arrays
+    stay on the device.
+
+    Native Lagrange FEM, steady, real, unreduced only: anything else raises by name.
+    """
+    factory = getattr(fem, "_element_triplets_factory", None)
+    if factory is None:
+        raise ValueError(
+            f"{who}: needs each cell's element matrix, which only the native Lagrange FEM assembly of a steady "
+            "problem provides; this problem is "
+            + ("not a jno.fem problem (FDM or an assembled matrix)" if not hasattr(fem, "_mode") else f"'{fem._mode}'")
+            + " or uses non-nodal elements, or 1-D. Give the space as an (n, k) array instead."
+        )
+    _require_nodal(fem, who)
+    if getattr(fem, "_mode", None) not in ("linear", "nonlinear"):
+        raise ValueError(f"{who}: needs a steady, real problem; this one is '{fem._mode}'.")
+    from .solver_api import _fem_reductions
+
+    if _fem_reductions(fem):
+        raise NotImplementedError(
+            f"{who}: this problem is solved on a REDUCED space (periodic ties, slip or hanging nodes), whose "
+            "per-cell matrices are not assembled yet. Give the space as an (n, k) array instead."
+        )
+    return factory(u)
+
+
 def _eval_formula(expr, pts) -> np.ndarray:
     """A coordinate formula (or a number) at ``pts`` ``(N, dim)``, as ``(N,)``."""
     from ..._fem import _eval_value_node_at

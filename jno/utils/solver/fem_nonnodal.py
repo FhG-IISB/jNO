@@ -172,6 +172,7 @@ def assemble_fem_nonnodal(
     # the functional behind `fem.eval(F, u)` / `F.integrate(fem)` (steady forms publish it below); cleared
     # first so a functional left on the domain by an earlier assembly is never picked up for this one
     domain._fem_native_term_functional = None
+    domain._fem_native_element_triplets = None  # per-cell matrices: native Lagrange only
 
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "N2E", "P0", "DG", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):

@@ -4141,8 +4141,14 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None, *, diag=False):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False, elements=False):
             """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
+
+            With ``elements=True`` nothing is summed: it returns the raw triplets ``(rows, cols, data, cell)``,
+            each entry tagged with the cell it was integrated on (a boundary face's entries with its parent
+            cell). Summing them gives this tangent before Dirichlet elimination; summing a SUBSET of cells
+            gives the operator of that subset alone, with natural (Neumann) conditions on its cut -- what a
+            GenEO coarse space needs per subdomain (Spillane et al., Numer. Math. 126, 2014, sec. 3).
 
             The diagonal runs the same element loop and keeps, per element block, the entries whose global
             row and column coincide, scattered straight into one vector: no matrix, no sparsity plan, and a
@@ -4153,6 +4159,9 @@ def assemble_fem_native(
             # between rounds and the contact block's indices move with it.
             _idx_static, _plan, _blk_sizes = _pattern(args)
             _dacc = [None]
+            cell_l = []
+            if elements:  # raw, cell-tagged triplets: no plan, no compression
+                _idx_static, _plan = None, None
             if diag:  # no matrix: the plan and the raw pattern are not used at all
                 _idx_static, _plan = None, None
                 _dacc[0] = jnp.zeros((total,), dtype=u_flat.dtype)
@@ -4176,7 +4185,14 @@ def assemble_fem_native(
             local_all = u_flat[cad_d]  # (n_cell, n_local_all)
             pts_dyn = _apply_coord_params(pts_j, args)  # trainable coords -> differentiable geometry
 
-            def _emit(flat, rows_fn, cols_fn):
+            def _emit(flat, rows_fn, cols_fn, cells_fn=None):
+                if elements and cells_fn is None:
+                    raise NotImplementedError(
+                        "the per-cell element matrices are not available for a contact gap's nonlocal blocks: "
+                        "they couple faces across the gap, not one cell."
+                    )
+                if elements:
+                    cell_l.append(cells_fn())
                 if diag:
                     r, c = rows_fn(), cols_fn()
                     _dacc[0] = _dacc[0] + jax.ops.segment_sum(jnp.where(r == c, flat, 0.0), r, num_segments=total)
@@ -4243,6 +4259,7 @@ def assemble_fem_native(
                     Ke.reshape(-1),
                     lambda _K=Ke, _t=tfi: jnp.broadcast_to(cd_d[_t][:, :, None], _K.shape).reshape(-1),
                     lambda _K=Ke: jnp.broadcast_to(cad_d[:, None, :], _K.shape).reshape(-1),
+                    lambda _K=Ke: jnp.broadcast_to(jnp.arange(_K.shape[0])[:, None, None], _K.shape).reshape(-1),
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
@@ -4301,6 +4318,7 @@ def assemble_fem_native(
                         Kef.reshape(-1),
                         lambda _K=Kef, _t=btfi, _p=pcells: jnp.broadcast_to(cd_d[_t][_p][:, :, None], _K.shape).reshape(-1),
                         lambda _K=Kef, _f=fcols: jnp.broadcast_to(_f[:, None, :], _K.shape).reshape(-1),
+                        lambda _K=Kef, _p=pcells: jnp.broadcast_to(_p[:, None, None], _K.shape).reshape(-1),
                     )
 
                     if gslice:
@@ -4368,6 +4386,12 @@ def assemble_fem_native(
 
             if diag:
                 return _dacc[0]
+            if elements:
+                if not data_l:
+                    e = jnp.zeros((0,), jnp.int32)
+                    return e, e, jnp.zeros((0,), u_flat.dtype), e
+                cat = lambda xs, dt: jnp.concatenate(xs).astype(dt)  # noqa: E731
+                return cat(rows_l, jnp.int32), cat(cols_l, jnp.int32), jnp.concatenate(data_l), cat(cell_l, jnp.int32)
             if _plan is not None:
                 if _acc[0] is None:  # no terms -> empty operator
                     return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
@@ -5000,6 +5024,7 @@ def assemble_fem_native(
     # Cleared on every build, set by the steady route only: a transient build on a domain that earlier
     # hosted a steady one must not inherit THAT build's functional factory.
     domain._fem_native_term_functional = None
+    domain._fem_native_element_triplets = None
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
@@ -5528,6 +5553,11 @@ def assemble_fem_native(
     # `fem.eval` / `expr.integrate(fem)` is STEADY-only, so it is published here and cleared above.
     domain._fem_native_term_functional = _make_functional
     jacobian = _make_jacobian(volume_terms, boundary_terms)
+    # Cell-tagged element triplets of the steady tangent, at a state ``u`` (zeros by default); see
+    # ``jacobian(elements=True)``. Snapshotted onto the FEM in `_finalize`, like the functional factory.
+    domain._fem_native_element_triplets = lambda u=None: jacobian(
+        zeros if u is None else jnp.asarray(u), 0.0, None, elements=True
+    )
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
     # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual
