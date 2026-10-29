@@ -141,3 +141,5 @@ def test_the_block_factor_and_solve_alone_match_a_dense_solve():
     x = np.asarray(block_solve(plan, block_cholesky(plan, jnp.asarray(blocks)), jnp.asarray(b)))
     np.testing.assert_allclose(x.ravel(), np.linalg.solve(E, b.ravel()), rtol=1e-12, atol=1e-13)
     assert plan.nb < p * (p + 1) // 2  # nested dissection keeps the fill sparse
+    # separators are eliminated as supernodes: per-column, this grid's elimination tree is 21 levels deep
+    assert plan.nsuper < p and len(plan.levels) <= 2 * int(np.ceil(np.log2(p))) + 1

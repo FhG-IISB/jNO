@@ -848,7 +848,7 @@ raises: give an array). The coarse matrix `ZᵀAZ` has one row per kept directio
 2,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
 otherwise (GenEO's: a Cholesky on its kept directions). Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
 that meet through the operator) and factored by a sparse block Cholesky over the parts' graph, in a
-nested-dissection order. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'
+nested-dissection order, each separator eliminated as one dense supernode. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'
 vectors, which the dense path would drop.
 
 Tutorial: [Coarse spaces for Schwarz (layered elasticity)](tutorials/08-fem-and-varpinns/coarse-spaces-layered-elasticity.md)

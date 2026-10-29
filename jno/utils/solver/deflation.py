@@ -509,7 +509,9 @@ def _sparse_factor(pat: CoarsePattern, A, scale, check, who):
     Et = Et.at[:p].set(0.5 * (Et[:p] + jnp.swapaxes(Et[:p], 1, 2)))
     L = plan.factor(Et)
     if check and E.dtype == jnp.float64:
-        piv = jnp.diagonal(L[:p], axis1=1, axis2=2) ** 2
+        from .block_cholesky import block_diagonal
+
+        piv = block_diagonal(plan, L) ** 2
         ref = jnp.max(jnp.abs(jnp.diagonal(Et[:p], axis1=1, axis2=2))) if scale is None else jnp.asarray(scale, E.dtype)
         bad = jnp.sum(mask & ~(piv > KERNEL_RTOL * ref))
         if isinstance(bad, jax.core.Tracer):
@@ -658,7 +660,7 @@ def coarse_apply(pat: CoarsePattern, Einv):
             N = pat.null.astype(jnp.finfo(r.dtype).dtype)
             rr = r if pat.row is None else r[pat.row]
             rc = jax.ops.segment_sum(N * rr[:, None], pat.part, num_segments=p)  # Z^T r, (p, k)
-            W = pat.W.astype(L.dtype)
+            W = pat.W.astype(L[0][0].dtype)  # L: per level (dense diagonal factor, panel)
             xc = jnp.where(mask, pat.chol.solve(L, jnp.einsum("pka,pk->pa", W, rc)), 0.0)
             xc = jnp.einsum("pka,pa->pk", W, xc)
             y = jnp.sum(N * jnp.take(xc, pat.part, axis=0, mode="fill", fill_value=0), axis=1)
