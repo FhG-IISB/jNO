@@ -2,7 +2,8 @@
 
 ``Z`` is ``(n, k)`` vectors, optionally split over ``p`` parts: column ``a`` restricted to part ``i`` is its
 own coarse vector, so the coarse space has ``p * k`` directions while only ``(n, k)`` and the part labels are
-stored (never a dense ``n x (p k)``). ``p = 1`` is a global space (Nicolaides, SIAM J. Numer. Anal. 24(2),
+stored (never a dense ``n x (p k)``). A sparse ``Z`` keeps each group of columns on its own support, and the
+groups may overlap. ``p = 1`` is a global space (Nicolaides, SIAM J. Numer. Anal. 24(2),
 1987, for the per-part constants; Tang, Nabben, Vuik & Erlangga, J. Sci. Comput. 39 (2009) 340, for how the
 correction combines with another preconditioner -- ``jno.precond.coarse`` and ``>>``).
 
@@ -41,24 +42,42 @@ __all__ = [
 KERNEL_RTOL = 1e-12
 #: A direction of ``G = Z^T Z`` below this fraction of its part's largest carries no vector: dropped.
 NULL_RTOL = 1e-12
+#: Overlapping parts: a direction of the whitened Gram ``W^T Z^T Z W`` (its scale is 1) below this is a
+#: combination of other parts' vectors -- no new direction, so it is not a kernel either.
+DEP_RTOL = 1e-10
 
 
 class CoarsePattern(NamedTuple):
     """The symbolic phase of a coarse space.
 
+    The vectors are stored as PIECES: piece ``l`` is one unknown of one part, ``null[l]`` the part's ``k``
+    vectors there. A part's coarse vectors are the columns of its pieces, zero elsewhere. Without ``row`` the
+    pieces are the unknowns themselves, so the parts partition them; with ``row`` parts may overlap (a sparse
+    space: every group of vectors kept on its own support).
+
     Attributes:
         n: system size.
         p: number of parts (1: a global space).
-        k: vectors per part.
-        part: ``(n,)`` part of each unknown (``p`` for an unknown outside every part: an eliminated row).
-        null: ``(n, k)`` the vectors, zero outside the parts.
+        k: vectors per part (a part with fewer has zero columns, dropped).
+        part: ``(L,)`` part of each piece (``p``: outside every part -- an eliminated row).
+        null: ``(L, k)`` the vectors on the pieces.
         W: ``(p, k, k)`` the whitening ``G^{-1/2}`` per part, zero columns for the dropped directions.
-        dropped: directions with no vector (``G ~ 0``).
+        dropped: directions with no vector (``G ~ 0``), padding included.
+        row: ``(L,)`` the unknown of each piece, or ``None`` (piece ``l`` is unknown ``l``).
+        pad: zero columns that fill parts with fewer than ``k`` vectors (counted in ``dropped``).
+        dependent: directions that are combinations of other parts' vectors (overlapping parts only).
+        kidx: ``(K,)`` the kept whitened directions (of ``p k``): the coarse problem is factored on these only,
+            so padding and dropped directions cost nothing.
+        cidx: ``(K0,)`` the coarse coefficients that carry a vector (``None``: all ``p k``; else padding is out).
+        Gt: ``(K, K)`` the whitened Gram ``W^T Z^T Z W`` on the kept directions when parts overlap (``None``: they
+            do not, and it is the identity).
         nnz: unique entries of ``A`` (0 when the pattern has no entry tables: a matrix-free global space).
         checksum: identifies ``A``'s pattern (``None`` without entry tables).
-        crow: ``(nnz,)`` coarse block ``part[r] * p + part[c]`` of each entry (``p * p``: outside every part).
-        erow: ``(nnz,)`` row of each entry.
-        ecol: ``(nnz,)`` column of each entry.
+        erow, eent, epair: ``(T1,)`` one per (entry, piece on the entry's row): the piece, the entry, and the
+            (part, column) pair it adds to -- ``Z^T A`` is summed over these.
+        npair: number of (part, column) pairs.
+        qpair, qcol, crow: ``(T2,)`` one per (pair, piece on the pair's column): the pair, the piece, and the
+            coarse block ``i * p + j`` the product adds to.
     """
 
     n: int
@@ -68,11 +87,21 @@ class CoarsePattern(NamedTuple):
     null: jnp.ndarray
     W: jnp.ndarray
     dropped: int
+    row: Any = None
+    pad: int = 0
+    dependent: int = 0
+    kidx: Any = None
+    cidx: Any = None
+    Gt: Any = None
     nnz: int = 0
     checksum: Any = None
-    crow: Any = None
     erow: Any = None
-    ecol: Any = None
+    eent: Any = None
+    epair: Any = None
+    npair: int = 0
+    qpair: Any = None
+    qcol: Any = None
+    crow: Any = None
 
 
 def operator_graph(A):
@@ -105,21 +134,58 @@ def metis_parts(G, iso, parts: int) -> np.ndarray:
 
 
 def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
-    """Symbolic phase. ``Z`` ``(n, k)`` real, ``part`` ``(n,)`` in ``[0, p]`` (``p``: outside every part).
-    With a CONCRETE assembled ``A`` the entry tables are built, so ``E`` comes from ``k^2`` streaming segment
-    sums over its entries; without it only a global space (``p = 1``) can be factored, from ``k`` products.
-    ``S``: ``A``'s CSR from :func:`operator_graph`, when the caller has it already."""
-    Z = np.asarray(Z)
-    if np.iscomplexobj(Z):
-        raise ValueError("jno.precond.coarse: the space must be real (the operator may be complex).")
-    Z = Z.astype(np.float64).reshape(Z.shape[0], -1)
+    """Symbolic phase. ``part`` ``(n,)`` in ``[0, p]`` (``p``: outside every part).
+
+    ``Z`` dense ``(n, k)``: column ``a`` on part ``i`` is a coarse vector -- ``p * k`` directions from ``(n, k)``
+    numbers and the labels. ``Z`` sparse ``(n, K)`` (``scipy.sparse``): kept by its nonzeros. Every column, split
+    over the parts, joins the other columns with exactly its nonzero rows in one group, and the groups are the
+    parts of the pattern (they may overlap). The grouping sets the cost, never the result.
+
+    With a CONCRETE assembled ``A`` the entry tables are built, so ``E`` is summed from its entries; without them
+    only a single part can be factored, from ``k`` products. ``S``: ``A``'s CSR from :func:`operator_graph`."""
+    import scipy.sparse as sp
+
     part = np.asarray(part, np.int64)
-    n, k = Z.shape
-    null = np.where((part >= p)[:, None], 0.0, Z)
-    W, dropped = _whitening(null, part, int(p))
-    head = (n, int(p), k, jnp.asarray(part, jnp.int32), jnp.asarray(null), jnp.asarray(W), dropped)
+    n = int(part.size)
+    real = None  # (p, k) slots that carry a vector; None: all
+    if sp.issparse(Z):
+        row, part, null, p, real = _sparse_pieces(Z, part, int(p))
+    else:
+        Z = np.asarray(Z)
+        if np.iscomplexobj(Z):
+            raise ValueError("jno.precond.coarse: the space must be real (the operator may be complex).")
+        Z = Z.astype(np.float64).reshape(Z.shape[0], -1)
+        row = None
+        null = np.where((part >= p)[:, None], 0.0, Z)
+    k = null.shape[1]
+    W, keep = _whitening(null, part, int(p))
+    if real is not None:  # padding slots: no vector, so no weight (exactly, not to the eigensolver's rounding)
+        W = np.where(real[:, :, None], W, 0.0)
+    kidx = np.flatnonzero(keep)
+    pad = 0 if real is None else int(real.size - real.sum())
+    dropped = int(keep.size - kidx.size)
+    dependent, Gt = 0, None
+    if row is not None and np.bincount(row, minlength=n).max(initial=0) > 1:
+        Gt = _whitened_gram(row, part, null, W, n, int(p))[np.ix_(kidx, kidx)]
+        g = np.linalg.eigvalsh(Gt)
+        dependent = int(np.sum(g <= DEP_RTOL * max(g.max(initial=0.0), 1.0)))
+    head = dict(
+        n=n,
+        p=int(p),
+        k=k,
+        part=jnp.asarray(part, jnp.int32),
+        null=jnp.asarray(null),
+        W=jnp.asarray(W),
+        dropped=dropped,
+        row=None if row is None else jnp.asarray(row, jnp.int32),
+        pad=pad,
+        dependent=dependent,
+        kidx=jnp.asarray(kidx, jnp.int32),
+        cidx=None if real is None else jnp.asarray(np.flatnonzero(real), jnp.int32),
+        Gt=None if Gt is None else jnp.asarray(Gt),
+    )
     if A is None:
-        return CoarsePattern(*head)
+        return CoarsePattern(**head)
     from .fsai import _checksum
 
     if not jax.config.jax_enable_x64:
@@ -130,26 +196,59 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
         S = operator_graph(A)[0]
     coo = S.tocoo()
     keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
-    r, c = keys // n, keys % n
-    out = (part[r] >= p) | (part[c] >= p)
-    crow = np.where(out, p * p, part[r] * p + part[c])
-    return CoarsePattern(
-        *head,
-        int(keys.size),
-        tuple(int(v) for v in _checksum(keys, np)),
-        jnp.asarray(crow, jnp.int32),
-        jnp.asarray(r, jnp.int32),
-        jnp.asarray(c, jnp.int32),
-    )
+    tables = _entry_tables(keys // n, keys % n, row, part, n, int(p))
+    return CoarsePattern(**head, nnz=int(keys.size), checksum=tuple(int(v) for v in _checksum(keys, np)), **tables)
+
+
+def _sparse_pieces(Z, part, p):
+    """``(row, part, null, groups, real)`` of a sparse space: its columns split over the parts, grouped by
+    their nonzero rows; one piece per (group, row)."""
+    import scipy.sparse as sp
+
+    Z = sp.csc_matrix(Z)
+    if np.iscomplexobj(Z.data):
+        raise ValueError("jno.precond.coarse: the space must be real (the operator may be complex).")
+    Z.sum_duplicates()  # also sorts the rows of every column
+    n, K = Z.shape
+    r = Z.indices.astype(np.int64)
+    c = np.repeat(np.arange(K, dtype=np.int64), np.diff(Z.indptr))
+    v = Z.data.astype(np.float64)
+    keep = part[r] < p
+    r, c, v = r[keep], c[keep], v[keep]
+    if r.size == 0:
+        raise ValueError("jno.precond.coarse: the sparse space has no entry on the unknowns being solved for.")
+    piece_of_col = c * (p + 1) + part[r]  # column c on part part[r]
+    o = np.lexsort((r, piece_of_col))
+    r, v, piece_of_col = r[o], v[o], piece_of_col[o]
+    _cols, start, col = np.unique(piece_of_col, return_index=True, return_inverse=True)
+    bounds = np.append(start, r.size)
+    groups: dict = {}
+    gid = np.empty(start.size, np.int64)
+    slot = np.empty(start.size, np.int64)
+    for j in range(start.size):  # one pass over the columns: equal row sets share a group
+        g = groups.setdefault(r[bounds[j] : bounds[j + 1]].tobytes(), [len(groups), 0])
+        gid[j], slot[j] = g
+        g[1] += 1
+    counts = np.bincount(gid)
+    k = int(counts.max())
+    keys, piece = np.unique(gid[col] * n + r, return_inverse=True)  # pieces sorted by group, then row
+    null = np.zeros((keys.size, k))
+    null[piece, slot[col]] = v
+    real = np.arange(k)[None, :] < counts[:, None]  # (groups, k): the slots that hold a column
+    return keys % n, keys // n, null, int(counts.size), real
+
+
+def _part_bounds(part, p):
+    order = np.argsort(part, kind="stable")
+    return order, np.searchsorted(part[order], np.arange(p + 1))
 
 
 def _whitening(null, part, p):
     """``W = G^{-1/2}`` per part, ``G = Z_i^T Z_i`` (host, once): a direction of ``G`` below ``NULL_RTOL`` of its
-    part's largest carries no vector and gets a zero column; ``dropped`` counts them."""
+    part's largest carries no vector and gets a zero column. Returns ``W`` and the kept mask ``(p, k)``."""
     k = null.shape[1]
     G = np.zeros((p, k, k))
-    order = np.argsort(part, kind="stable")
-    bounds = np.searchsorted(part[order], np.arange(p + 1))
+    order, bounds = _part_bounds(part, p)
     for i in range(p):  # Z_i^T Z_i per part: O(n k) memory, never the (n, k, k) outer products
         Zi = null[order[bounds[i] : bounds[i + 1]]]
         G[i] = Zi.T @ Zi
@@ -157,19 +256,80 @@ def _whitening(null, part, p):
     gmax = np.max(g, axis=1, keepdims=True)
     keep = g > NULL_RTOL * np.maximum(gmax, np.finfo(float).tiny)
     W = V * np.where(keep, 1.0 / np.sqrt(np.where(keep, g, 1.0)), 0.0)[:, None, :]
-    return W, int(np.sum(~keep))
+    return W, keep
+
+
+def _whitened_gram(row, part, null, W, n, p):
+    """``W^T Z^T Z W`` ``(p k, p k)`` of overlapping parts (host, once; dense like ``E``). Its zero directions
+    are the dropped ones and the combinations of other parts' vectors."""
+    import scipy.sparse as sp
+
+    k = null.shape[1]
+    U = np.empty_like(null)
+    order, bounds = _part_bounds(part, p)
+    for i in range(p):
+        sel = order[bounds[i] : bounds[i + 1]]
+        U[sel] = null[sel] @ W[i]
+    cols = (part[:, None] * k + np.arange(k)).ravel()
+    Zw = sp.csr_matrix((U.ravel(), (np.repeat(row, k), cols)), shape=(n, p * k))
+    return (Zw.T @ Zw).toarray()
+
+
+def _entry_tables(r_e, c_e, row, part, n, p):
+    """The tables that sum ``E = (Z^T A) Z`` from ``A``'s entries ``(r_e, c_e)`` (sorted keys): first
+    ``Z^T A`` by (part, column), then times the pieces on that column. Partitioned (``row is None``) both have
+    about ``nnz`` and ``n`` rows; overlapping parts multiply them by the pieces per unknown."""
+    if row is None:
+        cnt = np.ones(n, np.int64)
+        order = np.arange(n)
+    else:
+        cnt = np.bincount(row, minlength=n)
+        order = np.argsort(row, kind="stable")
+    ptr = np.concatenate([[0], np.cumsum(cnt)])
+
+    def expand(unknowns):  # every (item, piece at the item's unknown)
+        m = cnt[unknowns]
+        item = np.repeat(np.arange(unknowns.size), m)
+        off = np.arange(item.size) - np.repeat(np.cumsum(m) - m, m)
+        return item, order[ptr[unknowns][item] + off]
+
+    eent, erow = expand(r_e)
+    inside = part[erow] < p
+    eent, erow = eent[inside], erow[inside]
+    pairs, epair = np.unique(part[erow] * n + c_e[eent], return_inverse=True)
+    qpair, qcol = expand(pairs % n)
+    inside = part[qcol] < p
+    qpair, qcol = qpair[inside], qcol[inside]
+    i32 = lambda a: jnp.asarray(a, jnp.int32)  # noqa: E731
+    return dict(
+        erow=i32(erow),
+        eent=i32(eent),
+        epair=i32(epair),
+        npair=int(pairs.size),
+        qpair=i32(qpair),
+        qcol=i32(qcol),
+        crow=i32((pairs // n)[qpair] * p + part[qcol]),
+    )
+
+
+def _dense_null(pat: CoarsePattern):
+    """``(n, k)`` vectors of a single-part pattern."""
+    if pat.row is None:
+        return pat.null
+    return jnp.zeros((pat.n, pat.k), pat.null.dtype).at[pat.row].add(pat.null)
 
 
 def _galerkin(pat: CoarsePattern, A, mv):
     """``E = Z^T A Z`` as ``(p k, p k)``.
 
     A global space (``p = 1``) takes ``k`` products with the operator, ``Z^T (A Z)``: ``O(nnz k + n k^2)``, and it
-    works matrix-free. A partitioned one is summed from the entries, one streaming segment sum per vector
-    (``(nnz, k)`` at a time, never ``(nnz, k^2)``), in a loop the compiler does not unroll -- ``k^2`` unrolled sums
-    made a 480-vector space take minutes to compile."""
+    works matrix-free. Several parts are summed from the entries, one vector at a time in a loop the compiler
+    does not unroll (``k^2`` unrolled sums made a 480-vector space take minutes to compile): row ``a`` of
+    ``Z^T A`` by (part, column), then times the pieces on each column -- ``O(k (T1 + T2 k))`` work and
+    ``O(T1 + T2 k)`` memory, ``T1 ~ nnz`` and ``T2 ~ n`` for a partition."""
     p, k = pat.p, pat.k
     if p == 1 and mv is not None:
-        N = pat.null
+        N = _dense_null(pat)
         AZ = jax.vmap(lambda z: mv(z.astype(N.dtype)), in_axes=1, out_axes=1)(N)
         return N.T.astype(AZ.dtype) @ AZ
     if pat.crow is not None and A is not None and hasattr(A, "indices"):
@@ -177,17 +337,19 @@ def _galerkin(pat: CoarsePattern, A, mv):
 
         _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
         N = pat.null.astype(jnp.result_type(vals.dtype, jnp.float32))
-        Nr, Nc = N[pat.erow], N[pat.ecol]
+        ve = vals[pat.eent]
+        Nq = N[pat.qcol]  # (T2, k)
 
-        # E[(i,a), (j,b)] = sum over entries (r, c) with part(r) = i, part(c) = j of N[r,a] A_rc N[c,b]
+        # E[(i,a), (j,b)] = sum_c (Z_ia^T A)_c Z_jb[c], with (Z_ia^T A)_c = sum_r Z_ia[r] A_rc
         def row(a):
-            return jax.ops.segment_sum((vals * Nr[:, a])[:, None] * Nc, pat.crow, num_segments=p * p)  # (p*p, k)
+            t = jax.ops.segment_sum(ve * N[pat.erow, a], pat.epair, num_segments=pat.npair)  # (npair,)
+            return jax.ops.segment_sum(t[pat.qpair][:, None] * Nq, pat.crow, num_segments=p * p)  # (p*p, k)
 
         E = jax.lax.map(row, jnp.arange(k))  # (k, p*p, k)
         return E.reshape(k, p, p, k).transpose(1, 0, 2, 3).reshape(p * k, p * k)
     raise TypeError(
-        "jno.precond.coarse(parts=...): a partitioned coarse space is built from the ASSEMBLED operator's "
-        "entries, and this solve only has a matvec. Use a global space (parts=None), which needs only "
+        "jno.precond.coarse: a partitioned or sparse coarse space is built from the ASSEMBLED operator's "
+        "entries, and this solve only has a matvec. Use a dense global space (parts=None), which needs only "
         "products with the operator, or an assembled solve path."
     )
 
@@ -208,15 +370,21 @@ def _kernel_message(count, who):
 
 
 def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: bool = True, who: str = "jno.precond.coarse"):
-    """Numeric phase (traceable): ``Einv = W (W^T E W)^+ W^T`` ``(p k, p k)``, ``E = Z^T A Z``.
+    """Numeric phase (traceable): ``Einv = W (W^T E W)^+ W^T``, ``E = Z^T A Z``, on the coefficients that carry a
+    vector (``cidx``; all ``p k`` without padding) and the kept whitened directions (``kidx``).
 
-    ``scale`` is the operator's size (its largest diagonal entry): a whitened direction -- a Rayleigh quotient
-    ``z^T A z / z^T z`` -- below ``KERNEL_RTOL * scale`` is a kernel. With ``check`` such a direction raises
-    (concrete values) or is recorded for the solve's gate to raise (traced values) -- double precision only."""
+    ``scale`` is the operator's size (its largest diagonal entry). A right singular direction ``c`` of
+    ``W^T E W`` is a kernel when its Rayleigh quotient ``s / |Z W c|^2`` is below ``KERNEL_RTOL * scale``
+    while ``Z W c`` is not zero (with overlapping parts a combination of other parts' vectors has ``s ~ 0``
+    too, and is no kernel). With ``check`` a kernel raises (concrete values) or is
+    recorded for the solve's gate to raise (traced values) -- double precision only."""
     p, k = pat.p, pat.k
     E = _galerkin(pat, A, mv)
     rdt = jnp.finfo(E.dtype).dtype  # the real dtype of E's precision
     Wb = _block_diag(pat.W.astype(rdt))
+    if pat.cidx is not None:
+        E, Wb = E[pat.cidx][:, pat.cidx], Wb[pat.cidx]
+    Wb = Wb[:, pat.kidx]
     Et = Wb.T @ E @ Wb
     U, s, Vh = jnp.linalg.svd(Et)
     smax = jnp.max(s)
@@ -225,7 +393,11 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
     Einv = Wb @ (Vh.conj().T * sinv[None, :]) @ U.conj().T @ Wb.T
     if check and rdt == jnp.float64:
         ref = smax if scale is None else jnp.asarray(scale, rdt)
-        kernel = jnp.sum(s <= KERNEL_RTOL * ref) - pat.dropped
+        if pat.Gt is None:  # parts partition the unknowns: Z W is orthonormal on the kept directions
+            kernel = jnp.sum(s < KERNEL_RTOL * ref)
+        else:  # |Z W c|^2 = c^H (W^T Z^T Z W) c
+            g = jnp.real(jnp.sum((Vh @ pat.Gt.astype(rdt)) * Vh.conj(), axis=1))
+            kernel = jnp.sum((g > DEP_RTOL) & (s < KERNEL_RTOL * ref * g))
         if isinstance(kernel, jax.core.Tracer):
             jax.lax.cond(kernel > 0, lambda c: jax.debug.callback(_record_kernel, c, who), lambda c: None, kernel)
         elif int(kernel) > 0:
@@ -248,9 +420,16 @@ def coarse_apply(pat: CoarsePattern, Einv):
 
     def through(M, r):
         N = pat.null.astype(jnp.finfo(r.dtype).dtype)  # the vectors in r's (real) precision
-        rc = jax.ops.segment_sum(N * r[:, None], pat.part, num_segments=p).reshape(-1)  # Z^T r, (p*k,)
-        xc = (M.astype(jnp.result_type(M.dtype, r.dtype)) @ rc).reshape(p, k)
-        return jnp.sum(N * jnp.take(xc, pat.part, axis=0, mode="fill", fill_value=0), axis=1).astype(r.dtype)
+        rr = r if pat.row is None else r[pat.row]
+        rc = jax.ops.segment_sum(N * rr[:, None], pat.part, num_segments=p).reshape(-1)  # Z^T r, (p*k,)
+        if pat.cidx is not None:
+            rc = rc[pat.cidx]
+        xc = M.astype(jnp.result_type(M.dtype, r.dtype)) @ rc
+        if pat.cidx is not None:
+            xc = jnp.zeros(p * k, xc.dtype).at[pat.cidx].set(xc)
+        xc = xc.reshape(p, k)
+        y = jnp.sum(N * jnp.take(xc, pat.part, axis=0, mode="fill", fill_value=0), axis=1)
+        return (y if pat.row is None else jax.ops.segment_sum(y, pat.row, num_segments=pat.n)).astype(r.dtype)
 
     return (lambda r: through(Einv, r)), (lambda r: through(Einv.T, r))
 
@@ -362,12 +541,14 @@ def _restrict(fem, Z_full, n, who) -> np.ndarray:
     return out
 
 
-def resolve_space(space, fem, n: int, ctx=None, *, A=None, who: str = "jno.precond.coarse") -> np.ndarray:
+def resolve_space(space, fem, n: int, ctx=None, *, A=None, sparse_ok: bool = False, who: str = "jno.precond.coarse"):
     """A space value as an ``(n, k)`` array on the solved space (size ``n``).
 
-    ``space``: formulas (a list, or ``{field: [...]}``; needs the problem), an ``(n, k)`` array, an object
-    with ``basis(ctx)`` (:mod:`jno.space`), or a callable ``ctx -> (n, k)``. A computed space or a callable
-    sees ``ctx`` (or, when none is given, the problem, the size and the concrete operator ``A``)."""
+    ``space``: formulas (a list, or ``{field: [...]}``; needs the problem), an ``(n, k)`` array, a sparse
+    ``(n, k)`` matrix (``scipy.sparse`` or a JAX ``BCOO``), an object with ``basis(ctx)`` (:mod:`jno.space`), or a
+    callable ``ctx -> (n, k)``. A computed space or a callable sees ``ctx`` (or, when none is given, the
+    problem, the size and the concrete operator ``A``). A sparse space comes back as a ``scipy.sparse`` CSC
+    matrix with ``sparse_ok`` (a consumer that keeps it sparse), else as a dense array."""
     if _is_formula_space(space):
         if fem is None:
             raise ValueError(
@@ -393,20 +574,47 @@ def resolve_space(space, fem, n: int, ctx=None, *, A=None, who: str = "jno.preco
         Z = space(setup)
     else:
         Z = space
-    if isinstance(Z, jax.core.Tracer):
+    if isinstance(Z, jax.core.Tracer) or isinstance(getattr(Z, "data", None), jax.core.Tracer):
         raise TypeError(f"{who}: the space must be concrete (it is set up once, outside the solve's trace).")
+    Zs = _as_scipy_sparse(Z)
+    if Zs is not None:
+        if Zs.shape[0] != int(n):
+            raise ValueError(_rows_message(who, Zs.shape, n))
+        if not np.all(np.isfinite(Zs.data)):
+            raise ValueError(f"{who}: the space has non-finite entries.")
+        return Zs if sparse_ok else Zs.toarray()
     Z = np.asarray(Z)
     if Z.ndim == 1:
         Z = Z[:, None]
     if Z.ndim != 2 or Z.shape[0] != int(n):
-        raise ValueError(
-            f"{who}: the space has shape {Z.shape}, but the operator being preconditioned has {int(n)} rows (a "
-            "periodic tie / slip / hanging nodes solve on the REDUCED system P^T A P). Give one row per unknown "
-            "of that system, or write the space as formulas."
-        )
+        raise ValueError(_rows_message(who, Z.shape, n))
     if not np.all(np.isfinite(Z)):
         raise ValueError(f"{who}: the space has non-finite entries.")
     return Z
+
+
+def _rows_message(who, shape, n):
+    return (
+        f"{who}: the space has shape {tuple(shape)}, but the operator being preconditioned has {int(n)} rows (a "
+        "periodic tie / slip / hanging nodes solve on the REDUCED system P^T A P). Give one row per unknown of "
+        "that system, or write the space as formulas."
+    )
+
+
+def _as_scipy_sparse(Z):
+    """A ``scipy.sparse`` or JAX ``BCOO`` matrix as ``scipy.sparse`` CSC; ``None`` for anything else."""
+    import scipy.sparse as sp
+
+    if sp.issparse(Z):
+        return sp.csc_matrix(Z)
+    from jax.experimental import sparse as jsparse
+
+    if isinstance(Z, jsparse.BCOO):
+        if Z.ndim != 2 or Z.n_batch or Z.n_dense:
+            raise ValueError("a sparse space must be a plain 2-D BCOO matrix (no batch or dense dimensions).")
+        idx = np.asarray(Z.indices)
+        return sp.csc_matrix((np.asarray(Z.data), (idx[:, 0], idx[:, 1])), shape=Z.shape)
+    return None
 
 
 class _SetupContext:

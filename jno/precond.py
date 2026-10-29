@@ -3423,7 +3423,7 @@ class _Schwarz(_Spec):
         else:
             from .utils.solver.deflation import resolve_space
 
-            space = resolve_space(coarse, fem, n, A=A, who="jno.precond.schwarz(coarse=...)")
+            space = resolve_space(coarse, fem, n, A=A, sparse_ok=True, who="jno.precond.schwarz(coarse=...)")
         # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
         # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
         with jax.ensure_compile_time_eval():
@@ -3486,7 +3486,8 @@ def _space_repr(space):
     if isinstance(space, list):
         return f"<{len(space)} formulas>"
     if hasattr(space, "shape"):
-        return f"<array {tuple(np.shape(space))}>"
+        sparse = not isinstance(space, np.ndarray) and (hasattr(space, "nnz") or hasattr(space, "nse"))
+        return f"<{'sparse' if sparse else 'array'} {tuple(space.shape)}>"
     return repr(space) if hasattr(space, "basis") else getattr(space, "__name__", type(space).__name__)
 
 
@@ -3621,18 +3622,23 @@ class _Coarse(_Spec):
             n = int(A.shape[0])
             if not isinstance(getattr(A, "data", A), jax.core.Tracer):
                 A_conc = A
-        Z = resolve_space(self.space, fem, n, A=A_conc, who=repr(self))
+        Z = resolve_space(self.space, fem, n, A=A_conc, sparse_ok=True, who=repr(self))
+        sparse = not isinstance(Z, np.ndarray)
         with jax.ensure_compile_time_eval():
             part, p = self._parts_of(A_conc, fem, n)
-            if self.parts is not None and A_conc is None:
-                raise TypeError(f"{self!r}: a partitioned coarse space needs the assembled operator.")
-            # a global space is factored from products with the operator, so it needs no entry tables
-            self._pattern = coarse_pattern(Z, part, p, A=A_conc if p > 1 else None)
-        if self._pattern.dropped:
-            logging.getLogger("jno").info(
-                f"{self!r}: {self._pattern.dropped} of {self._pattern.p * self._pattern.k} coarse directions carry "
-                "no vector (parts of eliminated Dirichlet rows only) and are dropped."
+            if (self.parts is not None or sparse) and A_conc is None:
+                raise TypeError(f"{self!r}: a partitioned or sparse coarse space needs the assembled operator.")
+            # a dense global space is factored from products with the operator, so it needs no entry tables
+            self._pattern = coarse_pattern(Z, part, p, A=A_conc if p > 1 or sparse else None)
+        pat = self._pattern
+        log = logging.getLogger("jno")
+        if pat.dropped > pat.pad:
+            log.info(
+                f"{self!r}: {pat.dropped - pat.pad} of {pat.p * pat.k - pat.pad} coarse directions carry no vector "
+                "(parts of eliminated Dirichlet rows only) and are dropped."
             )
+        if pat.dependent:
+            log.info(f"{self!r}: {pat.dependent} coarse directions are combinations of the others and are dropped.")
         if A_conc is not None:
             from .utils.solver.amg import _to_scipy_csr
 
@@ -3653,11 +3659,12 @@ class _Coarse(_Spec):
         pat = self._pattern
         if pat is None:
             return None
-        return {k: getattr(pat, k) for k in ("part", "null", "W", "crow", "erow", "ecol") if getattr(pat, k) is not None}
+        names = ("part", "null", "W", "row", "kidx", "cidx", "Gt", "erow", "eent", "epair", "qpair", "qcol", "crow")
+        return {k: getattr(pat, k) for k in names if getattr(pat, k) is not None}
 
     def _state_tag(self):
         pat = self._pattern
-        return (pat.p, pat.k, pat.dropped, pat.nnz, pat.checksum, self._symmetric)
+        return (pat.p, pat.k, pat.dropped, pat.pad, pat.nnz, pat.checksum, pat.npair, self._symmetric)
 
     def materialize(self, ctx: PrecondContext):
         from .utils.solver.deflation import coarse_apply, coarse_factor
@@ -3714,6 +3721,10 @@ def coarse(space, *, parts=None, float32: bool = False) -> _Coarse:
       raises). On a reduced system (periodic tie, slip, hanging nodes) the vectors are built on the full space
       and restricted to the kept DOFs -- exact for a vector the reduced space contains;
     * an ``(n, k)`` **array** on the system being solved (the reduced one, if reduced);
+    * a **sparse** ``(n, k)`` matrix (``scipy.sparse`` or a JAX ``BCOO``) for vectors that live on parts of the
+      domain, e.g. GenEO's per-subdomain eigenvectors: kept by their nonzeros, never as a dense array. Columns
+      with the same nonzero rows form one group, and groups may overlap; how they group sets the cost, not the
+      result. A column that is a combination of others is dropped (logged), not mistaken for a kernel;
     * an object with ``basis(ctx)`` (:mod:`jno.space`), or a callable ``ctx -> (n, k)``, resolved once.
 
     ``parts`` -- how ``Z`` is localized: ``None`` (global: ``k`` coarse directions, needs only products with

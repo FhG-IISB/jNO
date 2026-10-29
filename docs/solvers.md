@@ -748,6 +748,7 @@ The space is a **value**, written once and evaluated on whatever problem the sol
 | `[(1, 0), (0, 1), (-y, x)]` | a tuple per vector field: here the 2-D rigid-body modes |
 | `{p: [1]}` | on a problem with several fields, the field it lives on (zeros elsewhere) |
 | an `(n, k)` array | vectors on the system being solved (the reduced one, if a tie reduces it) |
+| a sparse `(n, k)` matrix | `scipy.sparse` or a JAX `BCOO`: vectors that live on parts of the domain (GenEO's per-subdomain eigenvectors), stored by their nonzeros. Columns with the same nonzero rows form a group; groups may overlap |
 | `ctx -> (n, k)` | computed once, when the solve sets up (`ctx.fem`, `ctx.n`, `ctx.A`) |
 | `jno.space.eigvecs(k)` | the `k` lowest eigenvectors of the operator, by LOBPCG at setup -- the classical deflation space, worth it when the operator is reused |
 

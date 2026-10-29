@@ -464,3 +464,114 @@ def test_two_level_schwarz_is_the_coarse_space_around_the_one_level_method(restr
     B_alg, _ = _matrix(Q >> S if restricted else Q >> S >> Q, fem)
     np.testing.assert_array_equal(np.asarray(two._pattern.part), np.asarray(S._pattern.part))
     np.testing.assert_allclose(B_alg, B_two, rtol=1e-10, atol=1e-10 * np.abs(B_two).max())  # GPU summation order
+
+
+# ======================================================================================
+# sparse spaces: vectors kept on their own support, the supports may overlap
+# ======================================================================================
+def _local_space(fem, parts=6, seed=0):
+    """GenEO-shaped vectors: 1-3 random vectors on each OVERLAPPING Schwarz subdomain, zero elsewhere."""
+    A = fem._op[0]
+    n = A.shape[0]
+    S = jno.precond.schwarz(parts=parts, coarse=False)
+    S.build(A, fem)
+    rng = np.random.default_rng(seed)
+    cols = []
+    for i, s in enumerate(np.asarray(S._pattern.idx)):
+        s = s[s < n]
+        for _ in range(1 + i % 3):
+            z = np.zeros(n)
+            z[s] = rng.uniform(0.5, 1.5, s.size)
+            cols.append(z)
+    return np.stack(cols, axis=1)
+
+
+def _projection(Z, A):
+    """``Z E^+ Z^T`` on the unknowns the solve keeps (eliminated rows out), ``E = Z^T A Z``."""
+    Z = np.where(_iso(A)[:, None], 0.0, Z)
+    return Z @ np.linalg.pinv(Z.T @ A @ Z, rcond=1e-10) @ Z.T
+
+
+def test_a_sparse_overlapping_space_is_the_dense_projection():
+    """Vectors on overlapping subdomains, given sparse: kept as one group per support (no dense ``(n, K)``),
+    and the operator is still ``Z E^{-1} Z^T``. A JAX BCOO is the same value."""
+    import scipy.sparse as sp
+    from jax.experimental import sparse as jsparse
+
+    fem, _ = _poisson()
+    Z = _local_space(fem)
+    spec = jno.precond.coarse(sp.csc_matrix(Z))
+    Q, A = _matrix(spec, fem)
+    pat = spec._pattern
+    assert pat.row is not None and np.bincount(np.asarray(pat.row)).max() > 1, "the subdomains overlap"
+    assert pat.p == 6 and pat.k == 3 and pat.pad == 6 and pat.dependent == 0
+    assert pat.null.size < Z.size / 2, "kept on the supports, not as a dense (n, K) array"
+    np.testing.assert_allclose(Q, _projection(Z, A), rtol=1e-8, atol=1e-11)
+    Qb, _ = _matrix(jno.precond.coarse(jsparse.BCOO.fromdense(jnp.asarray(Z))), fem)
+    np.testing.assert_allclose(Qb, Q, rtol=1e-12, atol=1e-14)
+
+
+def test_a_sparse_space_in_a_compiled_solve_matches_the_dense_one():
+    """BNN with the sparse and the dense form of the same space: the same iterations and the default answer,
+    twice (the second solve reuses the compiled program with the pattern's arrays as arguments)."""
+    import scipy.sparse as sp
+
+    fem, _ = _cantilever(0.1)
+    Z = _local_space(fem, parts=8)
+    S = jno.precond.schwarz(parts=8, coarse=False)
+    ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+    its = {}
+    for name, space in (("dense", Z), ("sparse", sp.csc_matrix(Z)), ("sparse again", sp.csc_matrix(Z))):
+        Q = jno.precond.coarse(space)
+        got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-11), precond=Q >> S >> Q))
+        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-7 * np.abs(ref).max())
+        its[name] = fem.stats["linear_iterations"]["total"]
+    assert its["dense"] == its["sparse"] == its["sparse again"], its
+
+
+def test_a_sparse_vector_that_combines_others_is_dropped_not_refused():
+    """A column equal to the sum of two others on other supports adds no direction: with overlapping parts
+    ``E`` is singular there, but ``Z c = 0`` too -- not a kernel. It is dropped and counted."""
+    import scipy.sparse as sp
+
+    fem, _ = _poisson()
+    Z = _local_space(fem)
+    Z = np.column_stack([Z, Z[:, 0] + Z[:, 3]])
+    spec = jno.precond.coarse(sp.csc_matrix(Z))
+    Q, A = _matrix(spec, fem)
+    assert spec._pattern.dependent == 1
+    np.testing.assert_allclose(Q, _projection(Z[:, :-1], A), rtol=1e-8, atol=1e-11)
+
+
+def test_a_kernel_in_a_sparse_overlapping_space_is_refused():
+    """Pure Neumann Poisson: two indicators that add up to the constant, plus a vector overlapping both."""
+    import scipy.sparse as sp
+
+    fem, (x, _y) = _poisson(dirichlet=False)
+    pts = np.asarray(fem.field_points[0])
+    left = (pts[:, 0] < 0.5).astype(float)
+    mid = np.where(np.abs(pts[:, 0] - 0.5) < 0.2, pts[:, 1], 0.0)
+    with pytest.raises(ValueError, match="KERNEL"):
+        _matrix(jno.precond.coarse(sp.csc_matrix(np.column_stack([left, 1.0 - left, mid]))), fem)
+
+
+def test_a_sparse_space_split_over_parts_is_the_dense_one():
+    """Rigid-body modes as a sparse matrix with ``parts=S``: each column split over the parts and grouped
+    by its nonzero rows (``(1, 0)`` and ``(0, 1)`` live on different DOFs) -- the same operator as the dense
+    form, as a coarse space and inside ``schwarz(coarse=...)``."""
+    import scipy.sparse as sp
+
+    from jno.utils.solver.deflation import resolve_space
+
+    fem, (x, y) = _cantilever(0.15)
+    rigid = [(1, 0), (0, 1), (-y, x)]
+    Zs = sp.csc_matrix(resolve_space(rigid, fem, fem._op[0].shape[0]))
+    S = jno.precond.schwarz(parts=6, coarse=False)
+    Q_dense, _ = _matrix(jno.precond.coarse(rigid, parts=S), fem)
+    spec = jno.precond.coarse(Zs, parts=S)
+    Q_sparse, _ = _matrix(spec, fem)
+    assert spec._pattern.p > 6, "the columns' different supports make several groups per part"
+    np.testing.assert_allclose(Q_sparse, Q_dense, rtol=1e-8, atol=1e-10 * np.abs(Q_dense).max())
+    B_dense, _ = _matrix(jno.precond.schwarz(parts=6, coarse=rigid), fem)
+    B_sparse, _ = _matrix(jno.precond.schwarz(parts=6, coarse=Zs), fem)
+    np.testing.assert_allclose(B_sparse, B_dense, rtol=1e-8, atol=1e-10 * np.abs(B_dense).max())
