@@ -42,6 +42,9 @@ __all__ = [
 KERNEL_RTOL = 1e-12
 #: A direction of ``G = Z^T Z`` below this fraction of its part's largest carries no vector: dropped.
 NULL_RTOL = 1e-12
+#: Above this many kept directions, a symmetric coarse matrix of several parts is factored by a sparse block
+#: Cholesky over the parts' graph (:mod:`block_cholesky`) instead of a dense eigendecomposition.
+SPARSE_MIN = 2000
 #: Overlapping parts: a direction of the whitened Gram ``W^T Z^T Z W`` (its scale is 1) below this is a
 #: combination of other parts' vectors -- no new direction, so it is not a kernel either.
 DEP_RTOL = 1e-10
@@ -78,6 +81,10 @@ class CoarsePattern(NamedTuple):
         npair: number of (part, column) pairs.
         qpair, qcol, crow: ``(T2,)`` one per (pair, piece on the pair's column): the pair, the piece, and the
             coarse block ``i * p + j`` the product adds to.
+        chol: the sparse block-Cholesky plan of ``E`` over the parts' graph (:mod:`block_cholesky`), or ``None``
+            for the dense factorization.
+        cblk: ``(T2,)`` with ``chol``: the stored block each product adds to (``chol.nb``: the upper triangle,
+            left out).
     """
 
     n: int
@@ -102,6 +109,8 @@ class CoarsePattern(NamedTuple):
     qpair: Any = None
     qcol: Any = None
     crow: Any = None
+    chol: Any = None
+    cblk: Any = None
 
 
 def operator_graph(A):
@@ -165,7 +174,10 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
     pad = 0 if real is None else int(real.size - real.sum())
     dropped = int(keep.size - kidx.size)
     dependent, Gt = 0, None
-    if row is not None and np.bincount(row, minlength=n).max(initial=0) > 1:
+    if A is not None and S is None:
+        S = operator_graph(A)[0]
+    sparse_E = A is not None and int(p) > 1 and kidx.size >= SPARSE_MIN and _is_symmetric(S)
+    if not sparse_E and row is not None and np.bincount(row, minlength=n).max(initial=0) > 1:
         Gt = _whitened_gram(row, part, null, W, n, int(p))[np.ix_(kidx, kidx)]
         g = np.linalg.eigvalsh(Gt)
         dependent = int(np.sum(g <= DEP_RTOL * max(g.max(initial=0.0), 1.0)))
@@ -192,12 +204,25 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
         raise ValueError(
             "jno.precond.coarse() needs x64 for an assembled operator: its entry keys row*n + col overflow int32."
         )
-    if S is None:
-        S = operator_graph(A)[0]
     coo = S.tocoo()
     keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
     tables = _entry_tables(keys // n, keys % n, row, part, n, int(p))
+    if sparse_E:  # the coarse matrix's block graph: which parts meet through the operator
+        from .block_cholesky import block_cholesky_plan
+
+        crow = np.asarray(tables["crow"], np.int64)
+        bi, bj = crow // int(p), crow % int(p)
+        plan = block_cholesky_plan(int(p), bi, bj)
+        tables.update(chol=plan, cblk=jnp.asarray(plan.slots(bi, bj), jnp.int32))
     return CoarsePattern(**head, nnz=int(keys.size), checksum=tuple(int(v) for v in _checksum(keys, np)), **tables)
+
+
+def _is_symmetric(S) -> bool:
+    """Whether the CSR operator ``S`` is real and symmetric (to rounding)."""
+    if np.iscomplexobj(S.data):
+        return False
+    d = abs(S - S.T)
+    return bool(d.max() <= 1e-12 * max(abs(S).max(), 1e-300)) if d.nnz else True
 
 
 def _sparse_pieces(Z, part, p):
@@ -354,6 +379,65 @@ def _galerkin(pat: CoarsePattern, A, mv):
     )
 
 
+def _galerkin_blocks(pat: CoarsePattern, A):
+    """``E``'s blocks in the sparse plan's slots, ``(nb, k, k)``: the sums of :func:`_galerkin`, each product added
+    to its stored block instead of a dense ``p x p`` grid (the upper triangle in elimination order is left out:
+    ``E`` is symmetric)."""
+    from .fsai import FsaiPattern, _keys_and_values
+
+    nb = pat.chol.nb
+    _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
+    N = pat.null.astype(jnp.result_type(vals.dtype, jnp.float32))
+    ve = vals[pat.eent]
+    Nq = N[pat.qcol]
+
+    def row(a):
+        t = jax.ops.segment_sum(ve * N[pat.erow, a], pat.epair, num_segments=pat.npair)
+        return jax.ops.segment_sum(t[pat.qpair][:, None] * Nq, pat.cblk, num_segments=nb + 1)[:nb]  # (nb, k)
+
+    return jnp.swapaxes(jax.lax.map(row, jnp.arange(pat.k)), 0, 1)  # (nb, k: a, k: b)
+
+
+def _sparse_factor(pat: CoarsePattern, A, scale, check, who):
+    """``(L, mask)``: the block Cholesky of the whitened ``W^T E W`` over the parts' graph. Directions that carry
+    no vector get a unit diagonal (their ``W`` columns are zero, so they add nothing). A pivot below
+    ``KERNEL_RTOL * scale`` (or not finite) is a direction ``E`` does not see: a kernel, or a vector that is a
+    combination of other parts' ones -- refused, since a Cholesky cannot drop it as the dense path does."""
+    plan, p, k = pat.chol, pat.p, pat.k
+    E = _galerkin_blocks(pat, A)
+    W = pat.W.astype(E.dtype)
+    bi, bj = jnp.asarray(plan.brow), jnp.asarray(plan.bcol)
+    Et = jnp.einsum("nka,nkl,nlb->nab", W[bi], E, W[bj])  # W_i^T E_ij W_j
+    mask = jnp.zeros(p * k, bool).at[pat.kidx].set(True).reshape(p, k)
+    eye = jnp.eye(k, dtype=E.dtype)
+    Et = Et.at[:p].add(jnp.where(mask, 0.0, 1.0)[:, :, None] * eye)  # slots 0..p-1 are the diagonal blocks
+    Et = Et.at[:p].set(0.5 * (Et[:p] + jnp.swapaxes(Et[:p], 1, 2)))
+    L = plan.factor(Et)
+    if check and E.dtype == jnp.float64:
+        piv = jnp.diagonal(L[:p], axis1=1, axis2=2) ** 2
+        ref = jnp.max(jnp.abs(jnp.diagonal(Et[:p], axis1=1, axis2=2))) if scale is None else jnp.asarray(scale, E.dtype)
+        bad = jnp.sum(mask & ~(piv > KERNEL_RTOL * ref))
+        if isinstance(bad, jax.core.Tracer):
+            jax.lax.cond(bad > 0, lambda c: jax.debug.callback(_record_sparse_kernel, c, who), lambda c: None, bad)
+        elif int(bad) > 0:
+            raise ValueError(_sparse_kernel_message(int(bad), who))
+    return L, mask
+
+
+def _sparse_kernel_message(count, who):
+    return (
+        _kernel_message(count, who)
+        + f" (Factored by the sparse block Cholesky, used above {SPARSE_MIN} directions, a direction that merely "
+        "repeats other parts' vectors is refused the same way: a Cholesky cannot drop it.)"
+    )
+
+
+def _record_sparse_kernel(count, who):
+    from .solver_api import _GATE_FAILURES
+
+    _GATE_FAILURES.append(_sparse_kernel_message(int(count), who))
+
+
 def _record_kernel(count, who):
     from .solver_api import _GATE_FAILURES
 
@@ -379,6 +463,8 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
     too, and is no kernel). With ``check`` a kernel raises (concrete values) or is
     recorded for the solve's gate to raise (traced values) -- double precision only."""
     p, k = pat.p, pat.k
+    if pat.chol is not None:
+        return _sparse_factor(pat, A, scale, check, who)
     E = _galerkin(pat, A, mv)
     rdt = jnp.finfo(E.dtype).dtype  # the real dtype of E's precision
     Wb = _block_diag(pat.W.astype(rdt))
@@ -442,6 +528,20 @@ def _block_diag(W):
 def coarse_apply(pat: CoarsePattern, Einv):
     """``(fwd, t)``: ``Q r = Z Einv Z^T r`` and its transpose ``Z Einv^T Z^T r``."""
     p, k = pat.p, pat.k
+    if pat.chol is not None:  # Einv is (L, mask): Q r = Z W (L L^T)^-1 W^T Z^T r, symmetric
+        L, mask = Einv
+
+        def sparse(r):
+            N = pat.null.astype(jnp.finfo(r.dtype).dtype)
+            rr = r if pat.row is None else r[pat.row]
+            rc = jax.ops.segment_sum(N * rr[:, None], pat.part, num_segments=p)  # Z^T r, (p, k)
+            W = pat.W.astype(L.dtype)
+            xc = jnp.where(mask, pat.chol.solve(L, jnp.einsum("pka,pk->pa", W, rc)), 0.0)
+            xc = jnp.einsum("pka,pa->pk", W, xc)
+            y = jnp.sum(N * jnp.take(xc, pat.part, axis=0, mode="fill", fill_value=0), axis=1)
+            return (y if pat.row is None else jax.ops.segment_sum(y, pat.row, num_segments=pat.n)).astype(r.dtype)
+
+        return sparse, sparse
 
     def through(M, r):
         N = pat.null.astype(jnp.finfo(r.dtype).dtype)  # the vectors in r's (real) precision

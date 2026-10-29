@@ -822,11 +822,15 @@ The space, the partition and the entry tables are set up once on the host; `Zᵀ
 the operator's values on every solve, inside a compiled solve, a Newton loop or a march. A global space
 (`parts=None`) needs only products with the operator, so it also works matrix-free; a partitioned one needs
 the assembled matrix. Formulas need nodal Lagrange fields (a Hermite, Morley, Argyris or edge-element field
-raises: give an array). The coarse matrix `ZᵀAZ` is dense, one row per kept direction (at most `parts × k`), and
-is factored by a symmetric eigendecomposition when it is Hermitian, an SVD otherwise.
+raises: give an array). The coarse matrix `ZᵀAZ` has one row per kept direction (at most `parts × k`). Up to
+2,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
+otherwise. Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
+that meet through the operator) and factored by a sparse block Cholesky over the parts' graph, in a
+nested-dissection order. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'
+vectors, which the dense path would drop.
 
 Tutorial: [Coarse spaces for Schwarz (layered elasticity)](tutorials/08-fem-and-varpinns/coarse-spaces-layered-elasticity.md)
--- rigid-body modes against one-level Schwarz over 4 to 64 subdomains, and the gap a stiffness jump leaves.
+-- rigid-body modes against one-level Schwarz over 4 to 64 subdomains, the gap a stiffness jump leaves, and GenEO.
 
 ### Overlapping Schwarz — `jno.precond.schwarz()`
 
