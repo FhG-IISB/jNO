@@ -1,5 +1,5 @@
 # --8<-- [start:code]
-"""Coarse spaces for two-level Schwarz: rigid-body modes, and where they stop being enough.
+"""Coarse spaces for two-level Schwarz: rigid-body modes, where they stop being enough, and GenEO.
 
 Plane-strain elasticity on a [0, 4] x [0, 1] block of four horizontal layers, clamped on the left, under
 its own weight, P1. The layers alternate between a stiff E = 1e4 and a soft E = 1e4 / contrast (nu = 0.3);
@@ -8,6 +8,8 @@ contrast = 1 is a homogeneous block. CG with overlapping Schwarz on METIS subdom
   one-level  S = schwarz(parts=p, coarse=False): local solves only; the count grows with the parts
   rigid      Q >> S >> Q with Q = coarse(rigid-body modes, parts=S): three vectors per subdomain, the
              near-kernel of every floating elastic piece (balancing Neumann-Neumann, BNN)
+  geneo      the same with Q = coarse(jno.space.geneo(), parts=S): per subdomain, the eigenvectors of a local
+             generalized eigenproblem below tau = 0.2 -- the rigid modes plus whatever else floats
 
 Every solve is checked against the sparse-direct answer. Two-level Schwarz with rigid modes: Toselli &
 Widlund, *Domain Decomposition Methods*, Springer 2005, ch. 8; the BNN form: Tang, Nabben, Vuik &
@@ -67,11 +69,13 @@ for contrast in CONTRASTS:
     for p in PARTS:
         S = jno.precond.schwarz(parts=p, coarse=False)
         Q = jno.precond.coarse(rigid, parts=S)  # the same vectors, cut to S's subdomains
+        G = jno.precond.coarse(jno.space.geneo(), parts=S)  # computed from S's subdomains
         its[contrast, "one-level", p] = cg_iterations(fem, S, ref)
         its[contrast, "rigid", p] = cg_iterations(fem, Q >> S >> Q, ref)
+        its[contrast, "geneo", p] = cg_iterations(fem, G >> S >> G, ref)
     solved[contrast] = fem, S
     print(f"contrast {contrast:g}  ({fem.dofs} dofs): CG iterations to 1e-8")
-    for name in ("one-level", "rigid"):
+    for name in ("one-level", "rigid", "geneo"):
         print(f"  {name:10s}" + "".join(f"  parts={p:<3d} {its[contrast, name, p]:4d}" for p in PARTS))
 
 # Rigid modes keep the count from growing with the parts; with a stiffness jump it stays higher
@@ -79,6 +83,10 @@ for c in CONTRASTS:
     assert its[c, "rigid", 64] < 0.6 * its[c, "one-level", 64]
 assert its[1, "rigid", 64] < 1.5 * its[1, "rigid", 4]
 assert its[1e4, "rigid", 64] > 2 * its[1, "rigid", 64]
+# GenEO closes the gap: the contrast costs (almost) nothing
+for p in PARTS:
+    assert its[1e4, "geneo", p] < 0.6 * its[1e4, "rigid", p]
+    assert its[1e4, "geneo", p] < 1.3 * its[1, "geneo", p]
 # --8<-- [end:code]
 
 # ---- figure: the 64 subdomains over the layers | CG iterations against the number of subdomains ----
@@ -108,17 +116,26 @@ ax[0].set_title("64 METIS subdomains (colours) cut across the layers (black line
 ax[0].set_aspect("equal")
 ax[0].set_axis_off()
 
-style = {"one-level": "--", "rigid": "-"}
+style = {"one-level": "--", "rigid": "-", "geneo": ":"}
 colour = {1: "#3b6fb6", 1e4: "#c0504d"}
 for c in CONTRASTS:
-    for name in ("one-level", "rigid"):
+    for name in ("one-level", "rigid", "geneo"):
         label = f"{name}, {'homogeneous' if c == 1 else f'contrast {c:g}'}"
-        ax[1].plot(PARTS, [its[c, name, p] for p in PARTS], style[name], marker="o", color=colour[c], label=label)
+        mk = {"geneo": "s"}.get(name, "o")  # GenEO's two curves lie on top of each other
+        ax[1].plot(
+            PARTS,
+            [its[c, name, p] for p in PARTS],
+            style[name],
+            marker=mk,
+            mfc="none" if c == 1 else None,
+            color=colour[c],
+            label=label,
+        )
 ax[1].set_xscale("log", base=2)
 ax[1].set_xticks(PARTS, [str(p) for p in PARTS])
 ax[1].set_xlabel("subdomains")
 ax[1].set_ylabel("CG iterations to 1e-8")
-ax[1].set_title("one-level Schwarz grows with the subdomains; rigid-body modes hold it, not the contrast gap")
+ax[1].set_title("one-level grows with the subdomains; rigid modes hold it but not the contrast; GenEO holds both")
 ax[1].legend(fontsize=8, frameon=False)
 ax[1].set_ylim(0, None)
 fig.tight_layout()

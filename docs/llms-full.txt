@@ -515,7 +515,8 @@ and applied in single precision while the solve stays in double.
 
 **Coarse spaces** — `coarse(space, parts=)` is `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r`; the space is a VALUE, never a string:
 formulas (`[1]`, rigid modes `[(1, 0), (0, 1), (-y, x)]`, `{p: [1]}` per field), an `(n, k)` array, a sparse
-`(n, k)` matrix (vectors on overlapping subdomains), a callable `ctx -> Z`, or `jno.space.eigvecs(k)`. `parts=`
+`(n, k)` matrix (vectors on overlapping subdomains), a callable `ctx -> Z`, `jno.space.eigvecs(k)`, or
+`jno.space.geneo(tau=0.2)` (GenEO per Schwarz subdomain, for coefficient jumps; needs `parts=schwarz(coarse=False)`). `parts=`
 is an int (METIS), region names, or a `schwarz(coarse=False)` spec to share its subdomains. Combine with `>>`:
 `Q >> M >> Q` (BNN, symmetric, `cg`), `M >> Q` (deflation, `gmres`/`fgmres`). `schwarz(coarse=<space>)` is the
 same thing built in. A space holding an exact kernel (pure-Neumann constant) raises: add a gauge term instead.
@@ -524,6 +525,8 @@ same thing built in. A space holding an exact kernel (pure-Neumann constant) rai
 S = jno.precond.schwarz(parts=64, coarse=False)
 Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)       # 2-D elasticity
 u = fem.solve(linear=jno.solve.cg(tol=1e-8), precond=Q >> S >> Q)
+G = jno.precond.coarse(jno.space.geneo(), parts=S)               # high contrast: GenEO
+u = fem.solve(linear=jno.solve.cg(tol=1e-8), precond=G >> S >> G)
 ```
 
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt

@@ -163,14 +163,20 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None) -> Sc
     )
 
 
-def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool, mesh=None):
-    """Numeric phase (traceable): the inverse of every local matrix and, two-level, of the coarse matrix."""
+def local_blocks(pat: SchwarzPattern, A):
+    """``(blk, vals)``: every part's local matrix ``R_i A R_i^T``, ``(p, m, m)`` with the identity on its padded
+    slots, and ``A``'s sorted unique entries (traceable)."""
     from .fsai import FsaiPattern, _keys_and_values
 
     _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
     ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype), jnp.ones((1,), vals.dtype)])
     blk = jnp.zeros((pat.p, pat.m, pat.m), vals.dtype)
-    blk = jax.vmap(lambda b, r, c, q: b.at[r, c].add(ext[q]))(blk, pat.lrow, pat.lcol, pat.lpos)
+    return jax.vmap(lambda b, r, c, q: b.at[r, c].add(ext[q]))(blk, pat.lrow, pat.lcol, pat.lpos), vals
+
+
+def schwarz_factor(pat: SchwarzPattern, A, *, coarse: bool, mesh=None):
+    """Numeric phase (traceable): the inverse of every local matrix and, two-level, of the coarse matrix."""
+    blk, vals = local_blocks(pat, A)
     if mesh is not None:
         # One block of subdomains per device: each builds, inverts and stores only its own (p/devices of
         # them), and the application's scatter-add of their results becomes one all-reduce.

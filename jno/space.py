@@ -9,7 +9,8 @@ consumer takes the same values -- :func:`jno.precond.coarse` (and ``schwarz(coar
   at the DOF nodes of the problem when the consumer sets up, so one value serves every problem on its domain;
 * an ``(n, k)`` **array** on the system being solved (the reduced one when a tie reduces it);
 * a **callable** ``ctx -> (n, k)``: ``ctx.fem`` the problem, ``ctx.n`` the size, ``ctx.A`` the operator;
-* a **computed space** from this module -- an object with ``basis(ctx) -> (n, k)``.
+* a **computed space** from this module -- an object with ``basis(ctx) -> (n, k)``: :func:`eigvecs` (the lowest
+  eigenvectors of the operator) or :func:`geneo` (GenEO, per Schwarz subdomain).
 
 A computed space is resolved once, when its consumer sets up (it is host work, outside the solve's trace). A
 space that changes from solve to solve -- a Krylov space recycled along a time march or a Newton loop -- is
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["eigvecs"]
+__all__ = ["eigvecs", "geneo"]
 
 
 class _EigVecs:
@@ -87,3 +88,74 @@ def eigvecs(k: int, *, tol: float = 1e-6, maxiter: int = 500) -> _EigVecs:
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or k < 1:
         raise ValueError(f"jno.space.eigvecs(k={k!r}): must be a positive int.")
     return _EigVecs(int(k), float(tol), int(maxiter))
+
+
+class _GenEO:
+    """GenEO vectors on a Schwarz preconditioner's subdomains; see :func:`geneo`."""
+
+    on_parts = True  # computed on the consumer's Schwarz subdomains; its columns keep their own supports
+
+    def __init__(self, tau, nev):
+        self.tau, self.nev = tau, nev
+        self.counts = None
+
+    def basis(self, ctx):
+        """The vectors, a sparse ``(n, K)``, from ``ctx.fem``'s element matrices on the subdomains ``ctx.schwarz``.
+
+        Args:
+            ctx: the setup context: ``ctx.fem`` the problem, ``ctx.A`` the concrete operator, ``ctx.schwarz``
+                the Schwarz pattern whose subdomains the eigenproblems are solved on.
+
+        Returns:
+            A ``scipy.sparse`` CSC ``(n, K)``; ``self.counts`` holds the number kept per subdomain.
+        """
+        from .utils.solver.geneo import geneo_space
+
+        pat = getattr(ctx, "schwarz", None)
+        if pat is None:
+            raise ValueError(
+                f"{self!r}: the vectors are computed per subdomain of an overlapping Schwarz preconditioner. Use "
+                f"jno.precond.coarse({self!r}, parts=jno.precond.schwarz(coarse=False)) or "
+                f"jno.precond.schwarz(coarse={self!r})."
+            )
+        Z, self.counts = geneo_space(ctx.fem, ctx.A, pat, self.tau, self.nev, who=repr(self))
+        return Z
+
+    def __repr__(self):
+        nev = "" if self.nev is None else f", nev={self.nev}"
+        return f"jno.space.geneo(tau={self.tau:g}{nev})"
+
+
+def geneo(tau: float = 0.2, *, nev=None) -> _GenEO:
+    """The **GenEO** coarse space: per overlapping Schwarz subdomain, the slow modes its local solve cannot fix.
+
+    For every subdomain ``i`` it solves the generalized eigenproblem ``A_i^N v = lambda D_i A_ii D_i v`` and keeps
+    the eigenvectors with ``lambda < tau`` as coarse vectors ``R_i^T D_i v`` (Spillane, Dolean, Hauret, Nataf,
+    Pechstein & Scheichl, Numer. Math. 126, 2014; Dolean, Jolivet & Nataf, *An Introduction to Domain
+    Decomposition Methods*, SIAM 2015, ch. 7). ``A_i^N`` is the operator assembled over the subdomain's own cells
+    (natural conditions on its cut), ``A_ii`` its block of the global operator, ``D_i`` the partition of unity.
+    The space adapts to the coefficients: a subdomain cut by a stiffness jump gets the extra near-free motions
+    that rigid-body modes miss, a homogeneous one only its rigid modes. Two-level Schwarz with it converges in a
+    number of iterations bounded independently of the subdomain count and the coefficient contrast (for an SPD
+    operator, with the bound set by ``tau``). ::
+
+        S = jno.precond.schwarz(parts=64, coarse=False)
+        Q = jno.precond.coarse(jno.space.geneo(), parts=S)
+        fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)     # or schwarz(parts=64, coarse=jno.space.geneo())
+
+    The eigenproblems are dense, batched over the subdomains on the device; computed once, when the
+    preconditioner sets up. Needs a steady, real, symmetric positive definite problem on native Lagrange
+    elements, unreduced (no periodic ties, slip or hanging nodes); anything else raises.
+
+    Args:
+        tau: keep the eigenvalues below it (between 0 and 1; larger keeps more vectors and converges faster).
+        nev: at most this many vectors per subdomain; ``None`` keeps every one below ``tau``.
+
+    Returns:
+        A space for ``jno.precond.coarse(..., parts=schwarz(coarse=False))`` or ``jno.precond.schwarz(coarse=)``.
+    """
+    if isinstance(tau, bool) or not isinstance(tau, (int, float, np.floating, np.integer)) or not tau > 0:
+        raise ValueError(f"jno.space.geneo(tau={tau!r}): must be a positive number.")
+    if nev is not None and (isinstance(nev, bool) or not isinstance(nev, (int, np.integer)) or nev < 1):
+        raise ValueError(f"jno.space.geneo(nev={nev!r}): must be a positive int or None.")
+    return _GenEO(float(tau), None if nev is None else int(nev))

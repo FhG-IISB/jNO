@@ -9,7 +9,8 @@ Overlapping Schwarz solves the problem on many small subdomains at once. Informa
 subdomain per iteration, so the CG iteration count grows with the number of subdomains. A **coarse space**
 fixes this. It names the few slowly varying modes that the local solves cannot reach, and solves for them
 globally at every iteration. This tutorial builds the coarse space for elasticity from its rigid-body
-modes. It then shows the one case they do not cover: a stiffness jump that cuts through the subdomains.
+modes. It then shows the one case they do not cover, a stiffness jump that cuts through the subdomains, and
+the coarse space that does: GenEO.
 
 The problem is plane-strain elasticity on a $4\times1$ block, clamped on the left and loaded by its own
 weight. It is made of four layers whose stiffness alternates between $E=10^4$ and $E=10^4/c$. A contrast
@@ -42,22 +43,31 @@ that vanishes entirely is dropped and logged.
   to three times the homogeneous one. A subdomain that straddles a soft layer has more nearly free
   motions than the three rigid ones: the stiff part can slide on the soft part. Those motions are the
   slow modes left over.
-- **The fix is a richer coarse space.** GenEO (Spillane et al., *Numer. Math.* 126, 2014) finds those
-  motions per subdomain from a local eigenproblem. `coarse(Z)` already takes such vectors as a
-  `scipy.sparse` or BCOO matrix whose columns live on overlapping subdomains, and keeps it sparse.
-  jNO does not compute the GenEO vectors for you yet: they need each subdomain's Neumann matrix,
-  which the assembled operator does not contain.
+- **GenEO closes the gap.** `jno.space.geneo()` (Spillane et al., *Numer. Math.* 126, 2014) finds those
+  motions per subdomain. It solves a local eigenproblem between the subdomain's own operator, assembled
+  over its cells with free edges where it is cut, and its block of the global operator, and keeps the
+  eigenvectors below `tau = 0.2`. It needs the Schwarz spec it is combined with, so it gets the same
+  subdomains:
+
+  ```python
+  G = jno.precond.coarse(jno.space.geneo(), parts=S)
+  fem.solve(linear=jno.solve.cg(tol=1e-8), precond=G >> S >> G)
+  ```
+
+  It takes 24, 40 and 39 iterations at contrast $10^4$, against 24, 41 and 37 for the homogeneous block.
+  The contrast no longer costs anything. In a homogeneous subdomain it keeps little more than the three
+  rigid modes; in one that straddles a soft layer it keeps the sliding motions too.
 - **Every solve is checked.** Each one is compared with the sparse-direct `lu` answer. The counts vary
   by a few iterations from run to run on a GPU, because the order of floating-point sums changes.
 
 ## Result
 
-![Top: the block's mesh coloured by the 64 METIS subdomains, with black lines at the layer interfaces; the subdomains cut across every interface. Bottom: CG iterations against 4, 16 and 64 subdomains for one-level Schwarz (dashed) and Schwarz with the rigid-body coarse space (solid), for the homogeneous block (blue) and contrast 1e4 (red).](/jNO/assets/coarse_spaces_layered_elasticity.png)
+![Top: the block's mesh coloured by the 64 METIS subdomains, with black lines at the layer interfaces; the subdomains cut across every interface. Bottom: CG iterations against 4, 16 and 64 subdomains for one-level Schwarz (dashed), Schwarz with the rigid-body coarse space (solid) and with GenEO (dotted, squares), for the homogeneous block (blue) and contrast 1e4 (red).](/jNO/assets/coarse_spaces_layered_elasticity.png)
 
 METIS cuts the block into compact subdomains with no regard for the layers (top), so most subdomains hold
 both materials. Without a coarse space the iterations grow steadily with the number of subdomains
 (dashed). The rigid-body modes flatten that growth for both materials (solid), but the high-contrast
-curve sits well above the homogeneous one.
+curve sits well above the homogeneous one. With GenEO (dotted, squares) the two materials lie on one curve.
 
 See [Coarse spaces and deflation](../../solvers.md#coarse-spaces-and-deflation-jnoprecondcoarse) for
 every form a space can take and every way to combine `coarse` with another preconditioner.

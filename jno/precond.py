@@ -3416,10 +3416,11 @@ class _Schwarz(_Spec):
             ndev = jax.device_count()
             parts = -(-max(1, -(-n // 256)) // ndev) * ndev
         coarse = self.coarse
+        on_parts = getattr(coarse, "on_parts", False)
         if coarse is True:
             space = np.ones((n, 1))  # one constant per part (Nicolaides), across every component
-        elif coarse is False:
-            space = None
+        elif coarse is False or on_parts:
+            space = None  # a space computed on the subdomains is resolved once they exist, below
         else:
             from .utils.solver.deflation import resolve_space
 
@@ -3428,6 +3429,14 @@ class _Schwarz(_Spec):
         # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
         with jax.ensure_compile_time_eval():
             pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, coarse_space=space)
+        if on_parts:
+            from .utils.solver.deflation import _SetupContext, coarse_pattern, resolve_space
+
+            Z = resolve_space(
+                coarse, fem, n, _SetupContext(fem, n, A, schwarz=pat), sparse_ok=True, who="jno.precond.schwarz(coarse=...)"
+            )
+            with jax.ensure_compile_time_eval():  # each column kept whole on its subdomain: one part
+                pat = pat._replace(coarse=coarse_pattern(Z, np.where(np.asarray(pat.part) < pat.p, 0, 1), 1, A=A))
         need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
         dev = jax.devices()[0]
         cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
@@ -3607,6 +3616,24 @@ class _Coarse(_Spec):
             "jno.precond.schwarz(coarse=False) spec (share its partition), or a list of region names."
         )
 
+    def _resolve_on_parts(self, A_conc, fem, n):
+        """``(Z, part, p)`` for a space computed on Schwarz subdomains (``jno.space.geneo``): built on the shared
+        Schwarz spec's pattern, and kept whole -- each column on its own subdomain, never split by owner."""
+        from .utils.solver.deflation import _SetupContext, resolve_space
+
+        if not isinstance(self.parts, _Schwarz):
+            raise ValueError(
+                f"{self!r}: {self.space!r} is computed on the subdomains of an overlapping Schwarz preconditioner, "
+                "so parts= must be that preconditioner: jno.precond.schwarz(coarse=False), the one it is combined with."
+            )
+        if A_conc is None:
+            raise TypeError(f"{self!r}: needs the assembled operator.")
+        with jax.ensure_compile_time_eval():
+            part_s, p_s = self._parts_of(A_conc, fem, n)
+        ctx = _SetupContext(fem, n, A_conc, schwarz=self.parts._pattern)
+        Z = resolve_space(self.space, fem, n, ctx, sparse_ok=True, who=repr(self))
+        return Z, np.where(np.asarray(part_s) < p_s, 0, 1), 1  # one part: every solved unknown; eliminated rows out
+
     def build(self, A, fem=None) -> "_Coarse":
         """Eager setup: the space resolved to numbers, the partition and the entry tables, from a CONCRETE
         operator (or, for a global space on a matrix-free solve, from its size alone)."""
@@ -3622,10 +3649,15 @@ class _Coarse(_Spec):
             n = int(A.shape[0])
             if not isinstance(getattr(A, "data", A), jax.core.Tracer):
                 A_conc = A
-        Z = resolve_space(self.space, fem, n, A=A_conc, sparse_ok=True, who=repr(self))
+        on_parts = getattr(self.space, "on_parts", False)
+        if on_parts:
+            Z, part, p = self._resolve_on_parts(A_conc, fem, n)
+        else:
+            Z = resolve_space(self.space, fem, n, A=A_conc, sparse_ok=True, who=repr(self))
         sparse = not isinstance(Z, np.ndarray)
         with jax.ensure_compile_time_eval():
-            part, p = self._parts_of(A_conc, fem, n)
+            if not on_parts:
+                part, p = self._parts_of(A_conc, fem, n)
             if (self.parts is not None or sparse) and A_conc is None:
                 raise TypeError(f"{self!r}: a partitioned or sparse coarse space needs the assembled operator.")
             # a dense global space is factored from products with the operator, so it needs no entry tables

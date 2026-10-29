@@ -751,6 +751,7 @@ The space is a **value**, written once and evaluated on whatever problem the sol
 | a sparse `(n, k)` matrix | `scipy.sparse` or a JAX `BCOO`: vectors that live on parts of the domain (GenEO's per-subdomain eigenvectors), stored by their nonzeros. Columns with the same nonzero rows form a group; groups may overlap |
 | `ctx -> (n, k)` | computed once, when the solve sets up (`ctx.fem`, `ctx.n`, `ctx.A`) |
 | `jno.space.eigvecs(k)` | the `k` lowest eigenvectors of the operator, by LOBPCG at setup -- the classical deflation space, worth it when the operator is reused |
+| `jno.space.geneo(tau=0.2)` | GenEO: per Schwarz subdomain, the eigenvectors of a local generalized eigenproblem below `tau`, from the subdomain's own cells (needs `parts=schwarz(coarse=False)`) |
 
 `parts=` splits every vector over subdomains: a whole number (METIS parts), a list of region names, or a
 `schwarz(coarse=False)` spec, whose subdomains it then shares. `coarse` combines with another
@@ -791,6 +792,25 @@ S = jno.precond.schwarz(parts=64, coarse=False)
 Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)
 fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
 ```
+
+Rigid-body modes stop the growth with the number of subdomains, but a stiffness jump that cuts through
+the subdomains still costs: a subdomain holding a stiff and a soft layer has more nearly free motions than
+the three rigid ones. **GenEO** (Spillane, Dolean, Hauret, Nataf, Pechstein & Scheichl, *Numer. Math.* 126,
+2014) finds them. For each overlapping subdomain it solves `A_i^N v = λ D_i A_ii D_i v`, where `A_i^N` is the
+operator assembled over the subdomain's own cells (natural conditions where it is cut) and `D_i` the
+partition of unity, and keeps the eigenvectors with `λ < tau` as coarse vectors:
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse(jno.space.geneo(), parts=S)       # or jno.precond.schwarz(parts=64, coarse=jno.space.geneo())
+fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+On a layered block with stiffness contrast 10⁴ it takes 24, 40 and 39 CG iterations at 4, 16 and 64
+subdomains, the same as the homogeneous block, where the rigid modes take 73, 134 and 112. The local
+eigenproblems are dense and batched over the subdomains on the device, solved once when the solve sets up.
+It needs a steady, real, symmetric positive definite problem on native Lagrange elements, not reduced by
+periodic ties, slip or hanging nodes; anything else raises.
 
 !!! warning "A kernel is not a slow mode"
     A vector the operator maps to zero (the constant of a pure-Neumann problem) makes `ZᵀAZ` singular, and

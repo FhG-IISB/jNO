@@ -675,8 +675,9 @@ def _as_scipy_sparse(Z):
 
 
 class _SetupContext:
-    """What a computed space or a space callable sees when resolved at setup: the problem, the size and the
-    concrete operator (``None`` when the consumer was set up without one)."""
+    """What a computed space or a space callable sees when resolved at setup: the problem, the size, the
+    concrete operator (``None`` when the consumer was set up without one) and, for a space computed per
+    subdomain, the consumer's Schwarz pattern (``None`` otherwise)."""
 
-    def __init__(self, fem, n, A):
-        self.fem, self.n, self.A = fem, int(n), A
+    def __init__(self, fem, n, A, schwarz=None):
+        self.fem, self.n, self.A, self.schwarz = fem, int(n), A, schwarz
