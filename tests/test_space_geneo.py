@@ -157,3 +157,51 @@ def test_what_geneo_cannot_serve_raises():
         jno.space.geneo(tau=0)
     with pytest.raises(ValueError, match="positive int"):
         jno.space.geneo(nev=0)
+
+
+def _cracked_pair(h=0.1):
+    """Two problems on ONE plate: intact, and with an AT2 damage band across it (stiffness 1e-6 in the crack)."""
+    d = R(0.0, 0.0, 1.0, 1.0).sized(h).domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    ε = lambda w: jno.np.symgrad(w, [x, y])  # noqa: E731
+    ddot = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    tr = jno.np.trace
+
+    def problem(g):
+        u, v = d.fem_symbols(value_shape=(2,))
+        u_, v_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
+        return jno.fem([g * (2.0 * ddot(ε(u_), ε(v_)) + 1.5 * tr(ε(u_)) * tr(ε(v_))) - 0.1 * v_[1], u(xb, yb) - (0.0, 0.0)])
+
+    damage = jno.np.exp(-jno.np.abs(y - 0.5) / 0.05)
+    return problem(1.0), problem((1.0 - damage) ** 2 + 1e-6)
+
+
+@pytest.mark.parametrize("traced", [False, True])
+def test_the_space_recomputed_from_another_operator_is_that_operators_space(traced):
+    from jno.utils.solver.deflation import coarse_apply, coarse_factor, element_triplets
+    from jno.utils.solver.geneo import geneo_values
+
+    intact, cracked = _cracked_pair()
+    old = jno.precond.coarse(jno.space.geneo(nev=6), parts=jno.precond.schwarz(parts=6, coarse=False))
+    new = jno.precond.coarse(jno.space.geneo(nev=6), parts=jno.precond.schwarz(parts=6, coarse=False))
+    old.prepare(intact)
+    new.prepare(cracked)
+    A = cracked._op[0]
+    spat = old.parts._pattern
+    np.testing.assert_array_equal(np.asarray(spat.part), np.asarray(new.parts._pattern.part))  # one structure
+
+    def recompute(A, vals):
+        return geneo_values(old._geneo, spat, A, vals)[:3]
+
+    vals = element_triplets(cracked)[2]
+    null, W, kmask = jax.jit(recompute)(A, vals) if traced else recompute(A, vals)
+    pat = old._pattern._replace(null=null, W=W, kmask=kmask)
+    assert int(np.asarray(pat.kmask).sum()) > int(np.asarray(old._pattern.kmask).sum())  # the crack adds modes
+
+    def Q(p):
+        fwd = coarse_apply(p, coarse_factor(p, A))[0]
+        return np.asarray(jax.vmap(fwd, in_axes=1, out_axes=1)(jnp.eye(A.shape[0])))
+
+    Q_new = Q(new._pattern)
+    np.testing.assert_allclose(Q(pat), Q_new, rtol=1e-9, atol=1e-9 * np.abs(Q_new).max())

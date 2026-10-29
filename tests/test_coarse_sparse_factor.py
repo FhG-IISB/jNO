@@ -100,7 +100,7 @@ def test_a_bnn_solve_on_the_sparse_factor_gives_the_answer_and_the_count(monkeyp
     monkeypatch.setattr(deflation, "SPARSE_MIN", 0)
     sol_s, its_s, G = run()
     pat = G._pattern
-    K = int(pat.kidx.size)
+    K = int(np.asarray(pat.kmask).sum())  # GenEO: a static structure, the kept directions masked
     assert pat.chol is not None
     assert pat.chol.nb * pat.k**2 < 0.5 * K**2  # stored blocks, not a K x K matrix
     assert abs(its_s - its_d) <= 1, (its_d, its_s)

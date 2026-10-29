@@ -8008,6 +8008,7 @@ def _fem_impl(
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
         fem_obj._element_triplets_factory = getattr(domain, "_fem_native_element_triplets", None)
+        fem_obj._structure_factory = getattr(domain, "_fem_native_structure", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         fem_obj._block_vecs = list(getattr(domain, "_fem_native_field_vecs", None) or ())
         fem_obj._block_constant = list(getattr(domain, "_fem_native_field_constant", None) or ())

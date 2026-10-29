@@ -36,10 +36,10 @@ that vanishes entirely is dropped and logged.
 
 ## What to notice
 
-- **One level grows; two levels don't.** For the homogeneous block, one-level Schwarz takes 55, 112
-  and 170 iterations at 4, 16 and 64 subdomains. With the rigid-body modes it takes 46, 56 and 44.
+- **One level grows; two levels don't.** For the homogeneous block, one-level Schwarz takes 55, 110
+  and 170 iterations at 4, 16 and 64 subdomains. With the rigid-body modes it takes 46, 56 and 45.
 - **The contrast leaves a gap that rigid modes cannot close.** At $c=10^4$ the rigid modes still stop
-  the growth (73, 134 and 114, against about 80, 195 and 310 for one level), but each count stays two
+  the growth (73, 136 and 110, against 80, 190 and 291 for one level), but each count stays two
   to three times the homogeneous one. A subdomain that straddles a soft layer has more nearly free
   motions than the three rigid ones: the stiff part can slide on the soft part. Those motions are the
   slow modes left over.
@@ -54,7 +54,7 @@ that vanishes entirely is dropped and logged.
   fem.solve(linear=jno.solve.cg(tol=1e-8), precond=G >> S >> G)
   ```
 
-  It takes 24, 40 and 39 iterations at contrast $10^4$, against 24, 41 and 37 for the homogeneous block.
+  It takes 26, 38 and 40 iterations at contrast $10^4$, against 23, 39 and 36 for the homogeneous block.
   The contrast no longer costs anything. In a homogeneous subdomain it keeps little more than the three
   rigid modes; in one that straddles a soft layer it keeps the sliding motions too.
 - **Every solve is checked.** Each one is compared with the sparse-direct `lu` answer. The counts vary

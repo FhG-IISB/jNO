@@ -806,11 +806,30 @@ Q = jno.precond.coarse(jno.space.geneo(), parts=S)       # or jno.precond.schwar
 fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
 ```
 
-On a layered block with stiffness contrast 10⁴ it takes 24, 40 and 39 CG iterations at 4, 16 and 64
-subdomains, the same as the homogeneous block, where the rigid modes take 73, 134 and 112. The local
-eigenproblems are dense and batched over the subdomains on the device, solved once when the solve sets up.
-It needs a steady, real, symmetric positive definite problem on native Lagrange elements, not reduced by
-periodic ties, slip or hanging nodes; anything else raises.
+On a layered block with stiffness contrast 10⁴ it takes 26, 38 and 40 CG iterations at 4, 16 and 64
+subdomains, about the same as the homogeneous block (23, 39, 36), where the rigid modes take 73, 136 and 110.
+The local eigenproblems are dense and batched over the subdomains on the device. It needs a steady, real,
+symmetric positive definite problem on native Lagrange elements, not reduced by periodic ties, slip or
+hanging nodes; anything else raises.
+
+By default the space is computed once, when the solve sets up; `ZᵀAZ` and the local solves still follow the
+operator. When the stiffness pattern itself moves -- a damage band opening, a design changing, a material
+yielding -- give the spec that holds it `reuse=k`:
+
+```python
+Q = jno.precond.coarse(jno.space.geneo(), parts=S, reuse=1)   # or jno.precond.schwarz(coarse=jno.space.geneo(), reuse=1)
+fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+`reuse=1` recomputes the space at every solve and, inside `jno.solve.newton()` or
+`jno.solve.staggered(direct=True)`, at every linearization, from the tangent and the iterate it was
+assembled at (a staggered block step leaves the other fields out). `reuse=k` recomputes it every k-th
+solve; inside one compiled loop, which cannot count solves, it raises. Such a space has a fixed number of
+columns per subdomain -- `nev`, by default twice what the setup's operator needs -- and masks the ones above
+`tau`, so only its values change and the recompute runs inside the compiled loop; a subdomain that uses all
+its columns is logged. On a plate whose damage band grows across it (stiffness 10⁻⁶ in the band), the
+intact plate's space took 54 iterations where the recomputed one took 40 (64 subdomains; 68 with rigid
+modes).
 
 !!! warning "A kernel is not a slow mode"
     A vector the operator maps to zero (the constant of a pure-Neumann problem) makes `ZᵀAZ` singular, and
@@ -819,12 +838,15 @@ periodic ties, slip or hanging nodes; anything else raises.
     Dirichlet rows) is dropped and logged.
 
 The space, the partition and the entry tables are set up once on the host; `ZᵀAZ` and its inverse follow
-the operator's values on every solve, inside a compiled solve, a Newton loop or a march. A global space
+the operator's values on every solve, inside a compiled solve, a Newton loop or a march. The tables are
+built on every entry the problem's assembly emits, so a spec set up on one operator also serves another of
+the same problem whose coefficients do not cancel where the first one's did (a uniform design, then a
+graded one). A global space
 (`parts=None`) needs only products with the operator, so it also works matrix-free; a partitioned one needs
 the assembled matrix. Formulas need nodal Lagrange fields (a Hermite, Morley, Argyris or edge-element field
 raises: give an array). The coarse matrix `ZᵀAZ` has one row per kept direction (at most `parts × k`). Up to
 2,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
-otherwise. Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
+otherwise (GenEO's: a Cholesky on its kept directions). Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
 that meet through the operator) and factored by a sparse block Cholesky over the parts' graph, in a
 nested-dissection order. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'
 vectors, which the dense path would drop.

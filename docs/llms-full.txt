@@ -516,7 +516,7 @@ and applied in single precision while the solve stays in double.
 **Coarse spaces** — `coarse(space, parts=)` is `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r`; the space is a VALUE, never a string:
 formulas (`[1]`, rigid modes `[(1, 0), (0, 1), (-y, x)]`, `{p: [1]}` per field), an `(n, k)` array, a sparse
 `(n, k)` matrix (vectors on overlapping subdomains), a callable `ctx -> Z`, `jno.space.eigvecs(k)`, or
-`jno.space.geneo(tau=0.2)` (GenEO per Schwarz subdomain, for coefficient jumps; needs `parts=schwarz(coarse=False)`). `parts=`
+`jno.space.geneo(tau=0.2)` (GenEO per Schwarz subdomain, for coefficient jumps; needs `parts=schwarz(coarse=False)`; `coarse(..., reuse=1)` recomputes it every solve and every Newton/staggered linearization, for a moving stiffness pattern). `parts=`
 is an int (METIS), region names, or a `schwarz(coarse=False)` spec to share its subdomains. Combine with `>>`:
 `Q >> M >> Q` (BNN, symmetric, `cg`), `M >> Q` (deflation, `gmres`/`fgmres`). `schwarz(coarse=<space>)` is the
 same thing built in. A space holding an exact kernel (pure-Neumann constant) raises: add a gauge term instead.

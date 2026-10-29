@@ -76,6 +76,8 @@ class CoarsePattern(NamedTuple):
             do not, and it is the identity).
         nnz: unique entries of ``A`` (0 when the pattern has no entry tables: a matrix-free global space).
         checksum: identifies ``A``'s pattern (``None`` without entry tables).
+        keys: ``(nnz,)`` its sorted keys ``row * n + col``: an operator's values are read at these
+            (:func:`~.fsai.pattern_values`).
         erow, eent, epair: ``(T1,)`` one per (entry, piece on the entry's row): the piece, the entry, and the
             (part, column) pair it adds to -- ``Z^T A`` is summed over these.
         npair: number of (part, column) pairs.
@@ -85,6 +87,9 @@ class CoarsePattern(NamedTuple):
             for the dense factorization.
         cblk: ``(T2,)`` with ``chol``: the stored block each product adds to (``chol.nb``: the upper triangle,
             left out).
+        kmask: ``(p, k)`` the kept whitened directions as a MASK, for a space whose values are recomputed
+            (:func:`static_pattern`; then ``kidx`` is ``None``): a masked direction gets a unit diagonal instead
+            of being compacted away, so the structure never depends on the values.
     """
 
     n: int
@@ -102,6 +107,7 @@ class CoarsePattern(NamedTuple):
     Gt: Any = None
     nnz: int = 0
     checksum: Any = None
+    keys: Any = None
     erow: Any = None
     eent: Any = None
     epair: Any = None
@@ -111,11 +117,18 @@ class CoarsePattern(NamedTuple):
     crow: Any = None
     chol: Any = None
     cblk: Any = None
+    kmask: Any = None
 
 
-def operator_graph(A):
+def operator_graph(A, extra=None):
     """``(S, G, iso)`` of a CONCRETE operator: ``S`` its CSR (float64, duplicates summed), ``G`` the symmetric
-    loop-free unit graph of ``|S| + |S|^T``, ``iso`` the unknowns with no neighbour (eliminated Dirichlet rows)."""
+    loop-free unit graph of ``|S| + |S|^T``, ``iso`` the unknowns with no neighbour (eliminated Dirichlet rows).
+
+    ``extra``: ``(rows, cols)`` the problem's STRUCTURAL entries (:func:`structural_entries`). Those between
+    unknowns that are not isolated join ``S`` as explicit zeros and ``G`` as edges, so a pattern built here
+    also fits an operator of the same problem whose coefficients do not cancel where this one's do."""
+    import scipy.sparse as sp
+
     from .amg import _to_scipy_csr
 
     S = _to_scipy_csr(A).astype(np.float64)
@@ -127,7 +140,41 @@ def operator_graph(A):
     G.setdiag(0)
     G.eliminate_zeros()
     G.data[:] = 1.0
-    return S, G, np.diff(G.indptr) == 0
+    iso = np.diff(G.indptr) == 0
+    if extra is not None:
+        r, c = (np.asarray(a, np.int64) for a in extra)
+        ok = (r < n) & (c < n)
+        r, c = r[ok], c[ok]
+        ok = ~iso[r] & ~iso[c]
+        r, c = r[ok], c[ok]
+        coo = S.tocoo()
+        S = sp.csr_matrix(
+            (np.concatenate([coo.data, np.zeros(r.size)]), (np.concatenate([coo.row, r]), np.concatenate([coo.col, c]))),
+            shape=(n, n),
+        )
+        S.sum_duplicates()  # keeps the explicit zeros
+        E = sp.csr_matrix((np.ones(r.size), (r, c)), shape=(n, n))
+        G = (G + E + E.T).tocsr()
+        G.setdiag(0)
+        G.eliminate_zeros()
+        G.data[:] = 1.0
+    return S, G, iso
+
+
+def structural_entries(fem, n: int):
+    """``(rows, cols)`` of every entry the problem's assembly emits, exact zeros included, on the ``n``-unknown
+    system being solved -- or ``None`` when the problem cannot say (not a native nodal FEM, transient, or a
+    reduced system whose numbering differs). See :func:`operator_graph`."""
+    factory = getattr(fem, "_structure_factory", None) if fem is not None else None
+    if factory is None or getattr(fem, "_mode", None) not in ("linear", "nonlinear"):
+        return None
+    from .solver_api import _fem_reductions
+
+    if _fem_reductions(fem) or int(getattr(fem, "dofs", -1)) != int(n):
+        return None
+    with jax.ensure_compile_time_eval():
+        idx = np.asarray(factory())
+    return idx[:, 0], idx[:, 1]
 
 
 def metis_parts(G, iso, parts: int) -> np.ndarray:
@@ -142,7 +189,7 @@ def metis_parts(G, iso, parts: int) -> np.ndarray:
     return part
 
 
-def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
+def coarse_pattern(Z, part, p: int, A=None, S=None, extra=None) -> CoarsePattern:
     """Symbolic phase. ``part`` ``(n,)`` in ``[0, p]`` (``p``: outside every part).
 
     ``Z`` dense ``(n, k)``: column ``a`` on part ``i`` is a coarse vector -- ``p * k`` directions from ``(n, k)``
@@ -151,7 +198,8 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
     parts of the pattern (they may overlap). The grouping sets the cost, never the result.
 
     With a CONCRETE assembled ``A`` the entry tables are built, so ``E`` is summed from its entries; without them
-    only a single part can be factored, from ``k`` products. ``S``: ``A``'s CSR from :func:`operator_graph`."""
+    only a single part can be factored, from ``k`` products. ``S``: ``A``'s CSR from :func:`operator_graph`;
+    ``extra``: the problem's structural entries, for it (:func:`structural_entries`)."""
     import scipy.sparse as sp
 
     part = np.asarray(part, np.int64)
@@ -175,7 +223,7 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
     dropped = int(keep.size - kidx.size)
     dependent, Gt = 0, None
     if A is not None and S is None:
-        S = operator_graph(A)[0]
+        S = operator_graph(A, extra)[0]
     sparse_E = A is not None and int(p) > 1 and kidx.size >= SPARSE_MIN and _is_symmetric(S)
     if not sparse_E and row is not None and np.bincount(row, minlength=n).max(initial=0) > 1:
         Gt = _whitened_gram(row, part, null, W, n, int(p))[np.ix_(kidx, kidx)]
@@ -214,7 +262,54 @@ def coarse_pattern(Z, part, p: int, A=None, S=None) -> CoarsePattern:
         bi, bj = crow // int(p), crow % int(p)
         plan = block_cholesky_plan(int(p), bi, bj)
         tables.update(chol=plan, cblk=jnp.asarray(plan.slots(bi, bj), jnp.int32))
-    return CoarsePattern(**head, nnz=int(keys.size), checksum=tuple(int(v) for v in _checksum(keys, np)), **tables)
+    return CoarsePattern(
+        **head, nnz=int(keys.size), checksum=tuple(int(v) for v in _checksum(keys, np)), keys=jnp.asarray(keys), **tables
+    )
+
+
+def static_pattern(row, part, p: int, k: int, A, extra=None) -> CoarsePattern:
+    """Symbolic phase of a space whose VALUES are computed later, possibly inside a trace (GenEO following the
+    operator): pieces ``(row, part)``, ``k`` columns per part, zero values and an empty mask. The structure --
+    entry tables, and above ``SPARSE_MIN`` directions of a symmetric operator the block-Cholesky plan -- is fixed by
+    the pieces alone; :func:`coarse_factor` then factors by Cholesky on the masked directions (dense below the
+    threshold), never by a pseudo-inverse whose cut would depend on the values."""
+    from .fsai import _checksum
+
+    if not jax.config.jax_enable_x64:
+        raise ValueError("jno.precond.coarse() needs x64 for an assembled operator: its entry keys overflow int32.")
+    row, part = np.asarray(row, np.int64), np.asarray(part, np.int64)
+    S = operator_graph(A, extra)[0]
+    n = S.shape[0]
+    if not _is_symmetric(S):
+        raise ValueError(
+            "jno.precond.coarse: a coarse space recomputed from the operator is factored by Cholesky, which needs a "
+            "symmetric positive definite operator; this one is not symmetric."
+        )
+    coo = S.tocoo()
+    keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
+    tables = _entry_tables(keys // n, keys % n, row, part, n, int(p))
+    if int(p) * int(k) >= SPARSE_MIN and int(p) > 1:
+        from .block_cholesky import block_cholesky_plan
+
+        crow = np.asarray(tables["crow"], np.int64)
+        bi, bj = crow // int(p), crow % int(p)
+        plan = block_cholesky_plan(int(p), bi, bj)
+        tables.update(chol=plan, cblk=jnp.asarray(plan.slots(bi, bj), jnp.int32))
+    return CoarsePattern(
+        n=n,
+        p=int(p),
+        k=int(k),
+        part=jnp.asarray(part, jnp.int32),
+        null=jnp.zeros((row.size, int(k))),
+        W=jnp.zeros((int(p), int(k), int(k))),
+        dropped=0,
+        row=jnp.asarray(row, jnp.int32),
+        nnz=int(keys.size),
+        checksum=tuple(int(v) for v in _checksum(keys, np)),
+        keys=jnp.asarray(keys),
+        kmask=jnp.zeros((int(p), int(k)), bool),
+        **tables,
+    )
 
 
 def _is_symmetric(S) -> bool:
@@ -358,9 +453,9 @@ def _galerkin(pat: CoarsePattern, A, mv):
         AZ = jax.vmap(lambda z: mv(z.astype(N.dtype)), in_axes=1, out_axes=1)(N)
         return N.T.astype(AZ.dtype) @ AZ
     if pat.crow is not None and A is not None and hasattr(A, "indices"):
-        from .fsai import FsaiPattern, _keys_and_values
+        from .fsai import pattern_values
 
-        _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
+        vals = pattern_values(pat.keys, A, pat.n)
         N = pat.null.astype(jnp.result_type(vals.dtype, jnp.float32))
         ve = vals[pat.eent]
         Nq = N[pat.qcol]  # (T2, k)
@@ -383,10 +478,10 @@ def _galerkin_blocks(pat: CoarsePattern, A):
     """``E``'s blocks in the sparse plan's slots, ``(nb, k, k)``: the sums of :func:`_galerkin`, each product added
     to its stored block instead of a dense ``p x p`` grid (the upper triangle in elimination order is left out:
     ``E`` is symmetric)."""
-    from .fsai import FsaiPattern, _keys_and_values
+    from .fsai import pattern_values
 
     nb = pat.chol.nb
-    _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
+    vals = pattern_values(pat.keys, A, pat.n)
     N = pat.null.astype(jnp.result_type(vals.dtype, jnp.float32))
     ve = vals[pat.eent]
     Nq = N[pat.qcol]
@@ -408,7 +503,7 @@ def _sparse_factor(pat: CoarsePattern, A, scale, check, who):
     W = pat.W.astype(E.dtype)
     bi, bj = jnp.asarray(plan.brow), jnp.asarray(plan.bcol)
     Et = jnp.einsum("nka,nkl,nlb->nab", W[bi], E, W[bj])  # W_i^T E_ij W_j
-    mask = jnp.zeros(p * k, bool).at[pat.kidx].set(True).reshape(p, k)
+    mask = pat.kmask if pat.kmask is not None else jnp.zeros(p * k, bool).at[pat.kidx].set(True).reshape(p, k)
     eye = jnp.eye(k, dtype=E.dtype)
     Et = Et.at[:p].add(jnp.where(mask, 0.0, 1.0)[:, :, None] * eye)  # slots 0..p-1 are the diagonal blocks
     Et = Et.at[:p].set(0.5 * (Et[:p] + jnp.swapaxes(Et[:p], 1, 2)))
@@ -427,8 +522,9 @@ def _sparse_factor(pat: CoarsePattern, A, scale, check, who):
 def _sparse_kernel_message(count, who):
     return (
         _kernel_message(count, who)
-        + f" (Factored by the sparse block Cholesky, used above {SPARSE_MIN} directions, a direction that merely "
-        "repeats other parts' vectors is refused the same way: a Cholesky cannot drop it.)"
+        + f" (Factored by Cholesky -- the sparse block one above {SPARSE_MIN} directions, and always for a space "
+        "recomputed from the operator -- a direction that merely repeats other parts' vectors is refused the same "
+        "way: a Cholesky cannot drop it.)"
     )
 
 
@@ -465,6 +561,8 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
     p, k = pat.p, pat.k
     if pat.chol is not None:
         return _sparse_factor(pat, A, scale, check, who)
+    if pat.kmask is not None:
+        return _masked_factor(pat, A, mv, scale, check, who)
     E = _galerkin(pat, A, mv)
     rdt = jnp.finfo(E.dtype).dtype  # the real dtype of E's precision
     Wb = _block_diag(pat.W.astype(rdt))
@@ -487,6 +585,31 @@ def coarse_factor(pat: CoarsePattern, A=None, *, mv=None, scale=None, check: boo
         elif int(kernel) > 0:
             raise ValueError(_kernel_message(int(kernel), who))
     return Einv
+
+
+def _masked_factor(pat: CoarsePattern, A, mv, scale, check, who):
+    """``Einv = W (W^T E W)^-1 W^T`` on the masked directions of a static pattern, densely by Cholesky (below
+    ``SPARSE_MIN``): a masked direction gets a unit diagonal and a zero row in ``Einv``. The pivot check is the
+    sparse factor's."""
+    E = _galerkin(pat, A, mv)
+    rdt = jnp.finfo(E.dtype).dtype
+    Wb = _block_diag(pat.W.astype(rdt))
+    m = pat.kmask.reshape(-1)
+    Et = Wb.T @ E @ Wb
+    Et = jnp.where(m[:, None] & m[None, :], Et, 0.0) + jnp.diag(jnp.where(m, 0.0, 1.0)).astype(Et.dtype)
+    L = jnp.linalg.cholesky(0.5 * (Et + Et.T))
+    if check and rdt == jnp.float64:
+        piv = jnp.diagonal(L) ** 2
+        ref = jnp.max(jnp.abs(jnp.diagonal(Et))) if scale is None else jnp.asarray(scale, rdt)
+        bad = jnp.sum(m & ~(piv > KERNEL_RTOL * ref))
+        if isinstance(bad, jax.core.Tracer):
+            jax.lax.cond(bad > 0, lambda c: jax.debug.callback(_record_sparse_kernel, c, who), lambda c: None, bad)
+        elif int(bad) > 0:
+            raise ValueError(_sparse_kernel_message(int(bad), who))
+    from jax.scipy.linalg import cho_solve
+
+    Etinv = cho_solve((L, True), jnp.diag(m.astype(Et.dtype)))  # zero columns on the masked directions
+    return Wb @ (Etinv * m[:, None]) @ Wb.T
 
 
 def _coarse_pinv(Et, rtol):

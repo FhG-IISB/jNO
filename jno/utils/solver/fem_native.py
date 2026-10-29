@@ -5025,6 +5025,7 @@ def assemble_fem_native(
     # hosted a steady one must not inherit THAT build's functional factory.
     domain._fem_native_term_functional = None
     domain._fem_native_element_triplets = None
+    domain._fem_native_structure = None
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
@@ -5558,6 +5559,10 @@ def assemble_fem_native(
     domain._fem_native_element_triplets = lambda u=None: jacobian(
         zeros if u is None else jnp.asarray(u), 0.0, None, elements=True
     )
+    # The tangent's STRUCTURAL pattern: every (row, col) the assembly emits, exact zeros included. A concrete
+    # operator drops the entries a coefficient cancels exactly; a preconditioner pattern built on this one
+    # fits every operator of the problem.
+    domain._fem_native_structure = lambda: jacobian(zeros, 0.0, None).indices
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
     # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual

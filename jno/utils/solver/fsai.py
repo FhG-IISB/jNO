@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["FsaiPattern", "fsai_pattern", "fsai_factor", "fsai_apply", "g_indices"]
+__all__ = ["FsaiPattern", "fsai_pattern", "fsai_factor", "fsai_apply", "g_indices", "pattern_values"]
 
 #: Local-block entries gathered per ``lax.map`` batch in the numeric phase: a MEMORY bound (8 bytes each,
 #: 32 MB), not a speed knob -- it keeps the ``rows x w x w`` gather from growing with the mesh.
@@ -126,6 +126,22 @@ def _keys_and_values(pat: FsaiPattern, A):
     for got, want in zip(_checksum(keys, jnp), pat.checksum):
         same = same & (got == want)
     return keys, jnp.where(same, vals, jnp.nan)
+
+
+def pattern_values(keys, A, n: int):
+    """``A``'s summed values at a pattern's sorted keys ``row*n + col`` (traceable): a key ``A`` does not store
+    reads 0, so an operator that dropped an exact zero (a coupling a constant coefficient cancels) still fits
+    the pattern built where it did not. A NONZERO entry of ``A`` outside the pattern poisons every value with
+    NaN -- the tables were built for another matrix and the solve must fail loudly, not drop it."""
+    nk = keys.shape[0]
+    r, c = A.indices[:, 0].astype(jnp.int64), A.indices[:, 1].astype(jnp.int64)
+    in_range = (r >= 0) & (r < n) & (c >= 0) & (c < n)  # sum_duplicates pads out of range with zeros
+    tk = r * n + c
+    pos = jnp.clip(jnp.searchsorted(keys, tk), 0, nk - 1)
+    hit = in_range & (keys[pos] == tk)
+    vals = jax.ops.segment_sum(jnp.where(hit, A.data, 0.0), pos, num_segments=nk)
+    stray = jnp.any(in_range & ~hit & (A.data != 0))
+    return jnp.where(stray, jnp.nan, vals)
 
 
 def g_indices(pat: FsaiPattern):

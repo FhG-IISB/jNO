@@ -372,6 +372,29 @@ _GATE_SUSPENDED = False
 _RECORD_SUSPENDED = False
 
 
+# The point a Newton driver assembled the tangent it is solving at -- read by a preconditioner whose setup needs
+# more than the tangent's values (GenEO's per-cell matrices: `jno.space.geneo` under `reuse=1`). Set around ONE
+# linear solve, while it is traced, and reset after, so no iterate outlives the solve it belongs to.
+_LINEARIZATION = __import__("contextvars").ContextVar("jno_linearization", default=None)
+
+
+@contextlib.contextmanager
+def linearized_at(u, frozen=None):
+    """Mark the linear solve(s) inside as solving the tangent assembled at ``u``. ``frozen``: ``(n,)`` bool, the
+    unknowns this solve holds fixed (the other blocks of a staggered step: identity rows in the tangent)."""
+    token = _LINEARIZATION.set((u, frozen))
+    try:
+        yield
+    finally:
+        _LINEARIZATION.reset(token)
+
+
+def current_linearization():
+    """``(u, frozen)`` set by :func:`linearized_at` around the solve being built, or ``None`` (a linear problem's
+    solve, or a driver that does not say: a lagged tangent, a matrix-free step)."""
+    return _LINEARIZATION.get()
+
+
 @contextlib.contextmanager
 def gate_suspended(*, record=False):
     """Run a solver call ungated: a preconditioner application, inexact by design. ``record=True`` for a

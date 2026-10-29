@@ -19,6 +19,8 @@ not supported yet: an object with an ``update`` method is refused rather than si
 
 from __future__ import annotations
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 __all__ = ["eigvecs", "geneo"]
@@ -111,6 +113,35 @@ class _GenEO:
         """
         from .utils.solver.geneo import geneo_space
 
+        pat = self._schwarz_of(ctx)
+        Z, self.counts = geneo_space(ctx.fem, ctx.A, pat, self.tau, self.nev, who=repr(self))
+        return Z
+
+    def static_setup(self, ctx, *, extra=None, headroom: bool = False):
+        """``(plan, pattern)``: the space with a STATIC structure -- ``nev`` columns on every subdomain, the ones
+        above ``tau`` masked -- and its values at ``ctx.A``. The coarse pattern's structure depends on the Schwarz
+        pattern alone, so the values can be recomputed from a later operator, inside a compiled solve too
+        (:func:`~jno.utils.solver.geneo.geneo_values`). ``extra``: the problem's structural entries; ``headroom``:
+        size ``nev=None`` for an operator that changes (twice the count found now)."""
+        import logging
+
+        from .utils.solver.deflation import static_pattern
+        from .utils.solver.geneo import geneo_pieces, geneo_plan, geneo_values
+
+        pat = self._schwarz_of(ctx)
+        plan, _w, _V, vals = geneo_plan(ctx.fem, ctx.A, pat, self.tau, self.nev, headroom=headroom, who=repr(self))
+        row, part = geneo_pieces(plan, pat)
+        cpat = static_pattern(row, part, pat.p, plan.nev, ctx.A, extra)
+        with jax.ensure_compile_time_eval():
+            null, W, kmask, counts = geneo_values(plan, pat, ctx.A, jnp.asarray(vals))
+        self.counts = np.asarray(counts)
+        logging.getLogger("jno").info(
+            f"{self!r}: {int(self.counts.sum())} coarse vectors on {pat.p} subdomains ({self.counts.min()}-"
+            f"{self.counts.max()} per subdomain, room for {plan.nev})."
+        )
+        return plan, cpat._replace(null=null, W=W, kmask=kmask)
+
+    def _schwarz_of(self, ctx):
         pat = getattr(ctx, "schwarz", None)
         if pat is None:
             raise ValueError(
@@ -118,8 +149,7 @@ class _GenEO:
                 f"jno.precond.coarse({self!r}, parts=jno.precond.schwarz(coarse=False)) or "
                 f"jno.precond.schwarz(coarse={self!r})."
             )
-        Z, self.counts = geneo_space(ctx.fem, ctx.A, pat, self.tau, self.nev, who=repr(self))
-        return Z
+        return pat
 
     def __repr__(self):
         nev = "" if self.nev is None else f", nev={self.nev}"
@@ -144,12 +174,16 @@ def geneo(tau: float = 0.2, *, nev=None) -> _GenEO:
         fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)     # or schwarz(parts=64, coarse=jno.space.geneo())
 
     The eigenproblems are dense, batched over the subdomains on the device; computed once, when the
-    preconditioner sets up. Needs a steady, real, symmetric positive definite problem on native Lagrange
+    preconditioner sets up -- or, with ``reuse=k`` on the spec that holds it (``coarse(..., reuse=1)``,
+    ``schwarz(coarse=geneo(), reuse=1)``), recomputed every k-th solve, and with ``reuse=1`` at every
+    linearization inside ``jno.solve.newton()`` and ``staggered(direct=True)``, for a stiffness pattern that
+    moves (a crack, a design, yielding). Needs a steady, real, symmetric positive definite problem on native Lagrange
     elements, unreduced (no periodic ties, slip or hanging nodes); anything else raises.
 
     Args:
         tau: keep the eigenvalues below it (between 0 and 1; larger keeps more vectors and converges faster).
-        nev: at most this many vectors per subdomain; ``None`` keeps every one below ``tau``.
+        nev: at most this many vectors per subdomain; ``None`` keeps every one below ``tau`` (under ``reuse=k``:
+            room for twice the count the setup's operator needs; a subdomain that fills it is logged).
 
     Returns:
         A space for ``jno.precond.coarse(..., parts=schwarz(coarse=False))`` or ``jno.precond.schwarz(coarse=)``.

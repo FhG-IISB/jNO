@@ -55,6 +55,7 @@ class SchwarzPattern(NamedTuple):
         coarse: the two-level coarse space on these parts (a :class:`~.deflation.CoarsePattern`), or ``None``.
         diso: unknowns with no neighbours (eliminated rows), solved by their diagonal.
         dpos: position of their diagonal in ``A``'s unique entries.
+        keys: ``A``'s sorted keys ``row * n + col`` (:func:`~.fsai.pattern_values` reads an operator at these).
     """
 
     n: int
@@ -71,6 +72,7 @@ class SchwarzPattern(NamedTuple):
     coarse: Any  # the coarse space on these parts (deflation.CoarsePattern), or None for one level
     diso: jnp.ndarray  # (q,) int32 the unknowns with no neighbours (eliminated Dirichlet rows): solved by their diagonal
     dpos: jnp.ndarray  # (q,) int32 position of their diagonal in A's sorted unique entries
+    keys: Any = None  # (nnz,) A's sorted keys row * n + col: an operator's values are read at these
 
 
 def _partition(G, parts: int) -> np.ndarray:
@@ -95,9 +97,11 @@ def _partition(G, parts: int) -> np.ndarray:
     return np.asarray(cut[1], np.int64)
 
 
-def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None) -> SchwarzPattern:
+def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None, extra=None) -> SchwarzPattern:
     """Symbolic phase from a CONCRETE operator. ``coarse_space``: ``(n, k)`` vectors split over the parts for the
-    second level, or ``None`` for one level."""
+    second level, or ``None`` for one level. ``extra``: the problem's structural entries
+    (:func:`~.deflation.structural_entries`), so the pattern also fits an operator of the same problem whose
+    coefficients do not cancel where ``A``'s do."""
     import scipy.sparse as sp
 
     from .deflation import coarse_pattern, metis_parts, operator_graph
@@ -105,7 +109,7 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None) -> Sc
 
     if not jax.config.jax_enable_x64:
         raise ValueError("jno.precond.schwarz() needs x64: its entry keys row*n + col overflow int32.")
-    S, G, iso = operator_graph(A)
+    S, G, iso = operator_graph(A, extra)
     n = S.shape[0]
     # Unknowns with no neighbours (an eliminated Dirichlet row: 400 of 12k on a square) are 1x1 problems of their
     # own, solved exactly by their diagonal. Partitioned, they formed whole subdomains of identity rows (2 of 16
@@ -160,15 +164,16 @@ def schwarz_pattern(A, *, parts: int, overlap: int = 1, coarse_space=None) -> Sc
         coarse,
         jnp.asarray(diso, jnp.int32),
         jnp.asarray(dpos, jnp.int32),
+        jnp.asarray(keys),
     )
 
 
 def local_blocks(pat: SchwarzPattern, A):
     """``(blk, vals)``: every part's local matrix ``R_i A R_i^T``, ``(p, m, m)`` with the identity on its padded
     slots, and ``A``'s sorted unique entries (traceable)."""
-    from .fsai import FsaiPattern, _keys_and_values
+    from .fsai import pattern_values
 
-    _keys, vals = _keys_and_values(FsaiPattern(pat.n, pat.nnz, pat.checksum, [], 1), A)
+    vals = pattern_values(pat.keys, A, pat.n)
     ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype), jnp.ones((1,), vals.dtype)])
     blk = jnp.zeros((pat.p, pat.m, pat.m), vals.dtype)
     return jax.vmap(lambda b, r, c, q: b.at[r, c].add(ext[q]))(blk, pat.lrow, pat.lcol, pat.lpos), vals

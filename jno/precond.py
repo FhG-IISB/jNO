@@ -73,6 +73,11 @@ def _reusing(spec, reuse):
     if reuse is True:
         return _Cached(spec, False)
     if isinstance(reuse, (int, np.integer)) and not isinstance(reuse, bool) and int(reuse) >= 1:
+        if getattr(spec, "_can_follow", False):
+            # a space computed from the operator (GenEO) is RECOMPUTED on the cadence by the spec itself, inside a
+            # compiled loop too: its structure is static, only its values move (see `_follow_space`)
+            spec._follow = int(reuse)
+            return spec
         return _Cached(spec, int(reuse))
     raise ValueError(
         f"jno.precond: reuse={reuse!r} means nothing here. Use reuse=False (rebuild the setup every solve, the "
@@ -3387,10 +3392,16 @@ class _Schwarz(_Spec):
     def __init__(self, parts, overlap, coarse, restricted):
         self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
         self._pattern = None
+        self._geneo = None  # a space computed per subdomain: its host plan (geneo.GeneoPlan)
+        self._follow, self._nmat, self._last = None, 0, None  # reuse=k on such a space (see `_follow_space`)
 
     @property
-    def traceable(self):
-        return self._pattern is not None
+    def _can_follow(self):
+        return bool(getattr(self.coarse, "on_parts", False))
+
+    @property
+    def traceable(self):  # a space recomputed every k > 1 solves keeps its count on the host
+        return self._pattern is not None and (self._follow is None or self._follow == 1)
 
     @property
     def host_setup(self):  # the partition reads a concrete operator's graph on the host
@@ -3427,16 +3438,19 @@ class _Schwarz(_Spec):
             space = resolve_space(coarse, fem, n, A=A, sparse_ok=True, who="jno.precond.schwarz(coarse=...)")
         # Host-side, and CONCRETE even when asked from inside a trace (a jno.core step preparing the solve): a
         # dtype conversion there would be staged, and the cached index tables would be that trace's tracers.
-        with jax.ensure_compile_time_eval():
-            pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, coarse_space=space)
-        if on_parts:
-            from .utils.solver.deflation import _SetupContext, coarse_pattern, resolve_space
+        from .utils.solver.deflation import structural_entries
 
-            Z = resolve_space(
-                coarse, fem, n, _SetupContext(fem, n, A, schwarz=pat), sparse_ok=True, who="jno.precond.schwarz(coarse=...)"
+        extra = structural_entries(fem, n)
+        with jax.ensure_compile_time_eval():
+            pat = schwarz_pattern(A, parts=parts, overlap=self.overlap, coarse_space=space, extra=extra)
+        if on_parts:
+            from .utils.solver.deflation import _SetupContext
+
+            # a static structure (nev columns per subdomain, masked), each column whole on its own subdomain
+            self._geneo, cpat = coarse.static_setup(
+                _SetupContext(fem, n, A, schwarz=pat), extra=extra, headroom=self._follow is not None
             )
-            with jax.ensure_compile_time_eval():  # each column kept whole on its subdomain: one part
-                pat = pat._replace(coarse=coarse_pattern(Z, np.where(np.asarray(pat.part) < pat.p, 0, 1), 1, A=A))
+            pat = pat._replace(coarse=cpat)
         need = pat.p * pat.m * pat.m * jnp.dtype(A.dtype).itemsize
         dev = jax.devices()[0]
         cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
@@ -3471,9 +3485,12 @@ class _Schwarz(_Spec):
                     "eagerly: spec = jno.precond.schwarz(); spec.build(fem.A)."
                 )
             self.build(A, ctx.fem)
-        two_level = self._pattern.coarse is not None
-        factors = schwarz_factor(self._pattern, A, coarse=two_level, mesh=getattr(ctx, "mesh", None))
-        fwd = schwarz_apply(self._pattern, factors, restricted=self.restricted, mv=ctx.A.mv if two_level else None)
+        pat = self._pattern
+        two_level = pat.coarse is not None
+        if self._follow is not None and self._geneo is not None:
+            pat = pat._replace(coarse=_follow_space(self, ctx, pat, pat.coarse, repr(self)))
+        factors = schwarz_factor(pat, A, coarse=two_level, mesh=getattr(ctx, "mesh", None))
+        fwd = schwarz_apply(pat, factors, restricted=self.restricted, mv=ctx.A.mv if two_level else None)
         applier = PrecondApplier(fwd)
         applier.nonsymmetric = self.restricted
         return applier
@@ -3555,6 +3572,71 @@ def _region_parts(fem, regions, n, iso):
     return remap[part], p
 
 
+def _follow_space(spec, ctx, spat, cpat, who):
+    """The coarse pattern ``cpat`` with the values this materialization uses, for a spec under ``reuse=k`` whose
+    space is computed from the operator (GenEO; its structure is static, see ``static_setup``).
+
+    Concrete solves are counted: the setup's values serve the first, and every k-th after it recomputes them from
+    the operator it is handed and the problem's element matrices; the ones between keep the last. Inside a
+    compiled loop (a Newton or staggered step, a compiled solve) there is no count to keep, so ``reuse=1``
+    recomputes at every linearization -- at the iterate the driver assembled the tangent at
+    (:func:`~jno.utils.solver.solver_api.current_linearization`) -- and ``k > 1`` raises."""
+    from .utils.solver import geneo as _geneo
+    from .utils.solver.deflation import element_triplets
+    from .utils.solver.solver_api import current_linearization
+
+    A = ctx.A.bcoo
+    k = int(spec._follow)
+    traced = any(isinstance(v, jax.core.Tracer) for v in (A.data, A.indices))
+    if traced and k > 1:
+        raise NotImplementedError(
+            f"{who} with reuse={k}: the coarse space is recomputed every {k}-th solve, but this solve runs inside "
+            "one compiled loop (a Newton or staggered iteration, a compiled solve), where no count of solves can be "
+            "kept -- it would recompute at every step or never. Use reuse=1 (recompute at every linearization) or "
+            "leave reuse out (the setup's space; the coarse matrix still follows the operator)."
+        )
+    if not traced:
+        i = spec._nmat
+        spec._nmat += 1
+        if i % k or i == 0:  # the setup's values serve the first solve; the last recompute the ones between
+            return cpat if spec._last is None else spec._last
+    fem = getattr(ctx, "fem", None)
+    if fem is None:
+        raise ValueError(f"{who} with reuse={k}: recomputing the space needs the problem; solve through fem.solve.")
+    lin = current_linearization()
+    u, frozen = (None, None) if lin is None else lin
+    if u is None and getattr(fem, "_mode", None) == "nonlinear":
+        raise NotImplementedError(
+            f"{who} with reuse={k}: the space is recomputed from the element matrices at the iterate the tangent "
+            "was assembled at, and this nonlinear solve does not say which one (a lagged tangent, "
+            "newton(reuse=True), or a matrix-free step). Use jno.solve.newton() or staggered(direct=True)."
+        )
+    vals = element_triplets(fem, u, who=who)[2]
+    null, W, kmask, counts = _geneo.geneo_values(spec._geneo, spat, A, vals, frozen)
+    _warn_saturated(counts, spec._geneo.nev, who)
+    out = cpat._replace(null=null, W=W, kmask=kmask)
+    if not traced:
+        spec._last = out
+    return out
+
+
+def _warn_saturated(counts, nev, who):
+    """Log (once per call site) when a subdomain uses every column it has: the space may be cut short there."""
+
+    def warn(c):
+        if int(c) > 0:
+            logging.getLogger("jno").warning(
+                f"{who}: {int(c)} subdomain(s) have all {nev} columns below tau, so the space may be cut short "
+                f"there (slower, never wrong). Give a larger nev=."
+            )
+
+    full = jnp.sum(counts >= nev)
+    if isinstance(full, jax.core.Tracer):
+        jax.lax.cond(full > 0, lambda c: jax.debug.callback(warn, c), lambda c: None, full)
+    else:
+        warn(full)
+
+
 class _Coarse(_Spec):
     """Spec for a coarse-space correction; see :func:`coarse`."""
 
@@ -3563,12 +3645,18 @@ class _Coarse(_Spec):
     def __init__(self, space, parts):
         self.space, self.parts = space, parts
         self._pattern = None
+        self._geneo = None  # a space computed per subdomain: its host plan (geneo.GeneoPlan)
+        self._follow, self._nmat, self._last = None, 0, None  # reuse=k on such a space (see `_follow_space`)
         self._token = None
         self._symmetric = False
 
     @property
-    def traceable(self):
-        return self._pattern is not None
+    def traceable(self):  # a space recomputed every k > 1 solves keeps its count on the host
+        return self._pattern is not None and (self._follow is None or self._follow == 1)
+
+    @property
+    def _can_follow(self):
+        return bool(getattr(self.space, "on_parts", False))
 
     @property
     def host_setup(self):  # resolving the space and partitioning read concrete values on the host
@@ -3580,12 +3668,12 @@ class _Coarse(_Spec):
 
     def _parts_of(self, A_conc, fem, n):
         """``(part, p, iso)`` for this spec's ``parts``."""
-        from .utils.solver.deflation import metis_parts, operator_graph
+        from .utils.solver.deflation import metis_parts, operator_graph, structural_entries
 
         iso = np.zeros(int(n), bool)
         G = None
         if A_conc is not None:
-            _S, G, iso = operator_graph(A_conc)
+            _S, G, iso = operator_graph(A_conc, structural_entries(fem, n))
         parts = self.parts
         if parts is None:
             return np.where(iso, 1, 0), 1
@@ -3617,9 +3705,10 @@ class _Coarse(_Spec):
         )
 
     def _resolve_on_parts(self, A_conc, fem, n):
-        """``(Z, part, p)`` for a space computed on Schwarz subdomains (``jno.space.geneo``): built on the shared
-        Schwarz spec's pattern, and kept whole -- each column on its own subdomain, never split by owner."""
-        from .utils.solver.deflation import _SetupContext, resolve_space
+        """``(plan, pattern)`` for a space computed on Schwarz subdomains (``jno.space.geneo``): built on the shared
+        Schwarz spec's pattern with a static structure, each column whole on its own subdomain, never split by
+        owner."""
+        from .utils.solver.deflation import _SetupContext, structural_entries
 
         if not isinstance(self.parts, _Schwarz):
             raise ValueError(
@@ -3631,13 +3720,12 @@ class _Coarse(_Spec):
         with jax.ensure_compile_time_eval():
             part_s, p_s = self._parts_of(A_conc, fem, n)
         ctx = _SetupContext(fem, n, A_conc, schwarz=self.parts._pattern)
-        Z = resolve_space(self.space, fem, n, ctx, sparse_ok=True, who=repr(self))
-        return Z, np.where(np.asarray(part_s) < p_s, 0, 1), 1  # one part: every solved unknown; eliminated rows out
+        return self.space.static_setup(ctx, extra=structural_entries(fem, n), headroom=self._follow is not None)
 
     def build(self, A, fem=None) -> "_Coarse":
         """Eager setup: the space resolved to numbers, the partition and the entry tables, from a CONCRETE
         operator (or, for a global space on a matrix-free solve, from its size alone)."""
-        from .utils.solver.deflation import coarse_pattern, resolve_space
+        from .utils.solver.deflation import coarse_pattern, resolve_space, structural_entries
         from .utils.solver.solver_api import LinearOperator
 
         n = None
@@ -3651,17 +3739,18 @@ class _Coarse(_Spec):
                 A_conc = A
         on_parts = getattr(self.space, "on_parts", False)
         if on_parts:
-            Z, part, p = self._resolve_on_parts(A_conc, fem, n)
+            self._geneo, self._pattern = self._resolve_on_parts(A_conc, fem, n)
         else:
             Z = resolve_space(self.space, fem, n, A=A_conc, sparse_ok=True, who=repr(self))
-        sparse = not isinstance(Z, np.ndarray)
-        with jax.ensure_compile_time_eval():
-            if not on_parts:
+            sparse = not isinstance(Z, np.ndarray)
+            with jax.ensure_compile_time_eval():
                 part, p = self._parts_of(A_conc, fem, n)
-            if (self.parts is not None or sparse) and A_conc is None:
-                raise TypeError(f"{self!r}: a partitioned or sparse coarse space needs the assembled operator.")
-            # a dense global space is factored from products with the operator, so it needs no entry tables
-            self._pattern = coarse_pattern(Z, part, p, A=A_conc if p > 1 or sparse else None)
+                if (self.parts is not None or sparse) and A_conc is None:
+                    raise TypeError(f"{self!r}: a partitioned or sparse coarse space needs the assembled operator.")
+                # a dense global space is factored from products with the operator, so it needs no entry tables
+                A_tab = A_conc if p > 1 or sparse else None
+                extra = None if A_tab is None else structural_entries(fem, n)
+                self._pattern = coarse_pattern(Z, part, p, A=A_tab, extra=extra)
         pat = self._pattern
         log = logging.getLogger("jno")
         if pat.dropped > pat.pad:
@@ -3691,7 +3780,9 @@ class _Coarse(_Spec):
         pat = self._pattern
         if pat is None:
             return None
-        names = ("part", "null", "W", "row", "kidx", "cidx", "Gt", "erow", "eent", "epair", "qpair", "qcol", "crow")
+        names = (
+            "part", "null", "W", "row", "kidx", "cidx", "Gt", "keys", "kmask", "erow", "eent", "epair", "qpair", "qcol", "crow",
+        )  # fmt: skip
         return {k: getattr(pat, k) for k in names if getattr(pat, k) is not None}
 
     def _state_tag(self):
@@ -3710,6 +3801,8 @@ class _Coarse(_Spec):
             pat = pat._replace(**bound)
         if int(ctx.A.shape[0]) != pat.n:
             raise ValueError(f"{self!r}: built for a system of {pat.n} unknowns, applied to one of {int(ctx.A.shape[0])}.")
+        if self._follow is not None and self._geneo is not None:
+            pat = _follow_space(self, ctx, self.parts._pattern, pat, repr(self))
         try:
             scale = jnp.max(jnp.abs(ctx.diag()))
         except Exception:  # noqa: BLE001 -- an operator with no diagonal: the coarse matrix's own size stands in

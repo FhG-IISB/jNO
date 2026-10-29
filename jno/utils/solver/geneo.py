@@ -19,12 +19,13 @@ from __future__ import annotations
 
 import functools
 import logging
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["neumann_tables", "geneo_space"]
+__all__ = ["neumann_tables", "geneo_space", "GeneoPlan", "geneo_plan", "geneo_values"]
 
 
 def neumann_tables(pat, rows, cols, cells):
@@ -178,3 +179,123 @@ def geneo_space(fem, A, pat, tau: float, nev, *, who: str = "jno.space.geneo"):
         f"{counts.mean():.1f})."
     )
     return Z, counts
+
+
+# --- a space with a STATIC structure: the same code sets it up once and follows the operator ---------------------
+# Every subdomain contributes `nev` columns on its own free rows, whatever the eigenvalues turn out to be; the ones
+# above `tau` are masked, never compacted away on the host. The structure -- the pieces, the coarse matrix's entry
+# tables and its block-Cholesky plan -- is then fixed by the Schwarz pattern and `nev` alone, and only the values
+# move, so they can be recomputed from the current operator inside a compiled solve (a Newton step, a load step).
+
+
+class GeneoPlan(NamedTuple):
+    """The host part of a static-structure GenEO space (:func:`geneo_plan`).
+
+    Attributes:
+        tau: the eigenvalue threshold.
+        nev: columns per subdomain (static).
+        nrow, ncol, npos: ``(p, L)`` the Neumann tables (:func:`neumann_tables`).
+        D: ``(p, m)`` the partition of unity on the subdomains' slots (1 on padding).
+        pad: ``(p, m)`` 1 on the padded slots.
+        valid: ``(p, m)`` numpy, the real slots: the pieces of the coarse pattern, subdomain by subdomain.
+        n_triplets: entries of the element-triplet arrays the tables index (a check).
+        who: the name in messages.
+    """
+
+    tau: float
+    nev: int
+    nrow: Any
+    ncol: Any
+    npos: Any
+    D: Any
+    pad: Any
+    valid: Any
+    n_triplets: int
+    who: str
+
+
+def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str = "jno.space.geneo"):
+    """``(plan, w, V, vals)``: the host part of a static-structure GenEO space on the Schwarz pattern ``pat``, and
+    the first eigenpairs ``(p, nev)`` / ``(p, m, nev)`` from the element triplets' values ``vals`` at zero.
+
+    ``nev=None`` sizes the columns from these first eigenvalues: the largest count below ``tau`` -- doubled with
+    ``headroom``, for a space that follows a changing operator and may need more later (a crack opening, a
+    design becoming void). A given ``nev`` is the cap either way."""
+    from .deflation import element_triplets
+    from .schwarz import local_blocks
+
+    if fem is None:
+        raise ValueError(f"{who}: needs the problem (its element matrices); use it through fem.solve(precond=...).")
+    rows, cols, vals, cells = element_triplets(fem, who=who)
+    n, p, m = pat.n, pat.p, pat.m
+    if int(jnp.max(rows)) >= n or int(jnp.max(cols)) >= n:
+        raise ValueError(f"{who}: the element matrices live on a larger space than the {n}-unknown operator.")
+    item = jnp.dtype(vals.dtype).itemsize
+    need = 6 * p * m * m * item
+    dev = jax.devices()[0]
+    cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
+    if cap and need > 0.5 * cap:
+        raise ValueError(
+            f"{who}: {p} local eigenproblems of size {m} need about {need / 2**30:.1f} GiB on the device, over half "
+            "of its memory. Use more Schwarz parts (smaller subdomains) or overlap=1."
+        )
+    with jax.ensure_compile_time_eval():
+        nrow, ncol, npos = neumann_tables(pat, rows, cols, cells)
+        blk, _ = local_blocks(pat, A)
+    idx = np.asarray(pat.idx)
+    valid = idx < n
+    mult = np.bincount(idx[valid], minlength=n).astype(np.float64)
+    D = jnp.asarray(np.where(valid, 1.0 / np.maximum(mult[np.minimum(idx, n - 1)], 1.0), 1.0), blk.dtype)
+    pad = jnp.asarray(~valid, blk.dtype)
+    first = m if nev is None else min(int(nev), m)
+    w, V = _local_eigs(blk, nrow, ncol, npos, jnp.asarray(vals), D, pad, tau=float(tau), nev=first)
+    w = np.asarray(w)
+    if not (np.all(np.isfinite(w)) and np.all(np.isfinite(np.asarray(V)))):
+        raise ValueError(
+            f"{who}: a local eigenproblem failed (non-finite values). GenEO needs a symmetric positive definite "
+            "operator: its subdomain blocks are factored by Cholesky."
+        )
+    count = int((w < tau).sum(axis=1).max(initial=0))
+    if count == 0:
+        raise ValueError(f"{who}: no subdomain has an eigenvalue below tau={tau:g}, so the space is empty. Raise tau.")
+    k = first if nev is not None else min(m, 2 * count if headroom else count)
+    plan = GeneoPlan(float(tau), int(k), nrow, ncol, npos, D, pad, valid, int(rows.shape[0]), who)
+    return plan, jnp.asarray(w[:, :k]), V[:, :, :k], vals
+
+
+def geneo_pieces(plan: GeneoPlan, pat):
+    """``(row, part)`` of the coarse pattern's pieces: every free slot of every subdomain, subdomain by subdomain."""
+    idx = np.asarray(pat.idx)
+    return idx[plan.valid], np.repeat(np.arange(pat.p), plan.valid.sum(axis=1))
+
+
+def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
+    """``(null, W, kmask, counts)`` of the space at the operator ``A`` and the element-triplet values ``vals``
+    (traceable): the pieces' values ``(L, nev)``, the whitening ``(p, nev, nev)``, the kept directions
+    ``(p, nev)`` and the eigenvalues below ``tau`` per subdomain.
+
+    ``frozen`` ``(n,)`` bool: unknowns held fixed in this solve (the other fields of a staggered block step); they
+    are padding to the eigenproblems, so no vector lives on them."""
+    from .schwarz import local_blocks
+
+    blk, _ = local_blocks(pat, A)
+    pad = plan.pad
+    if frozen is not None:
+        fz = jnp.take(jnp.asarray(frozen), pat.idx, mode="fill", fill_value=True)
+        pad = jnp.maximum(pad, fz.astype(pad.dtype))
+    if int(vals.shape[0]) != plan.n_triplets:
+        raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
+    w, V = _local_eigs(
+        blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev
+    )
+    sel = w < plan.tau
+    V = V * (sel[:, None, :] & (pad < 0.5)[:, :, None])
+    null = V[plan.valid]  # (L, nev), subdomain by subdomain: the pieces of geneo_pieces
+    G = jnp.einsum("pmk,pml->pkl", V, V)  # Z_i^T Z_i per subdomain
+    g, U = jnp.linalg.eigh(0.5 * (G + jnp.swapaxes(G, 1, 2)))
+    from .deflation import NULL_RTOL
+
+    gmax = jnp.max(g, axis=1, keepdims=True)
+    kmask = g > NULL_RTOL * jnp.maximum(gmax, jnp.finfo(g.dtype).tiny)
+    W = U * jnp.where(kmask, 1.0 / jnp.sqrt(jnp.where(kmask, g, 1.0)), 0.0)[:, None, :]
+    return null, W, kmask, jnp.sum(sel, axis=1)
