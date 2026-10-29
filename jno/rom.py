@@ -1,359 +1,299 @@
-"""Reduced-order modelling for families of linear FEM problems: POD bases, geometry-mapped bases, and an
-energy-controlled Galerkin solve with Krylov enrichment.
+"""``jno.rom`` — reduced-order models for a family of linear SPD problems on one mesh.
 
-The setting: many SPD systems ``A(p) u = B(p)`` on ONE fixed mesh (a design sweep, a surrogate, an inverse loop),
-where only a few scalar outputs are needed -- typically the compliance / energy matrix ``C = B^T A^-1 B`` (for a
-magnetostatic problem with unit currents this is the inductance matrix, for elasticity the stiffness seen by the
-loads). ``fem.solve(basis=U)`` already reduces ONE solve onto a given basis; this module covers the loop around it:
+A design sweep, a surrogate or an inverse loop solves ``A(p) u = B(p)`` for many parameters ``p`` on ONE mesh and
+usually needs only a few outputs, the energy matrix ``C = B^T A^-1 B`` above all (the inductance matrix of a
+magnetostatic problem with unit currents, the compliance of an elastic one). Offline, full solves of a set of
+designs are compressed into a basis; online, every new design is solved on that basis::
 
-    S          = rom.unit_energy(U_snap, B_snap)          # snapshots scaled to unit energy  u / sqrt(b.u)
-    V, sv      = rom.pod(S, k=128)                       # proper orthogonal decomposition (thin SVD)
-    G          = rom.Galerkin(V)                         # per-basis set-up (device arrays)
-    r          = G.bind(A, B).solve(tol=1e-4)            # per design: reduced solve + adaptive enrichment
-    r.C, r.n_enrich, r.increment                         # B^T u_h, Krylov steps used, last relative increase
+    S = jno.rom.unit_energy(U, B)                      # snapshots u / sqrt(b . u)
+    W, sv = jno.rom.pod(S, k=512)                       # proper orthogonal decomposition
+    rom = jno.rom.galerkin(W, enrich=8, gate=3e-3)      # a pytree: pass it into jit / vmap as an argument
+    r = rom(A, B)                                       # A (n, n) BCOO from jno.fem, B (n, r)
+    r.C, r.eta, r.enriched                              # energy matrix, error indicator, enrichment used
+    u = rom.lift(r, w)                                  # the field for load weights w
 
-Why it is reliable (and when it is not): for SPD ``A`` the Galerkin solution is the energy-optimal one in the span,
-so ``diag(C_h)`` is a LOWER bound that increases monotonically as the span grows. ``solve(tol=...)`` exploits this:
-it adds Jacobi-preconditioned residual directions ``D^-1 (B - A u_h)`` (one per right-hand side) -- a POD-deflated,
-CG-type iteration -- and stops when ``diag(C_h)`` rises by less than ``tol`` (relative) over ``window`` steps. A
-familiar design stops after a few steps; an unfamiliar one (a parameter regime or geometry the snapshots never saw)
-keeps enriching towards the full solution instead of returning a plausible wrong answer. The stopping test is on
-the quantity of interest, not on the residual: a POD answer can have a large full-system residual (the
-``fem.solve(basis=)`` check would reject it) while its energy is already correct to 1e-4.
+For an SPD ``A`` the Galerkin answer is the best one in the span measured in energy, so ``diag(C)`` is a LOWER
+bound of the exact value and its error is quadratic in the field error. The indicator
+``eta = max_i sqrt(r_i^T D^-1 r_i / C_ii)`` (residual ``r = B - A u_h``, ``D`` the diagonal of ``A``) estimates
+the relative energy error. When it exceeds ``gate``, the span is enriched by Jacobi-preconditioned residual
+directions of the current answer and re-solved, which recovers parameters the snapshots never covered. The
+background is the reduced-basis literature (Quarteroni, Manzoni & Negri, *Reduced Basis Methods for Partial
+Differential Equations*, Springer 2016) and the snapshot POD (Sirovich, Q. Appl. Math. 45, 1987).
 
-Geometry changes on a fixed mesh: ``LandmarkMap`` (separable, monotone, piecewise-linear stretch through landmark
-coordinates) + :func:`jno.utils.solver.fem_adapt.interpolation_matrix` give sparse ``pull``/``push`` matrices that
-move snapshots onto a reference configuration and the reference modes back (``mapped_basis``), so one basis serves
-geometries that were never in the snapshots.
+Everything is JAX and runs on the default device. Precision is JAX's: enable ``jax_enable_x64``, a reduced system of
+a few hundred modes is ill-conditioned in float32. For ONE solve on a given basis without error control,
+``fem.solve(basis=W)`` is the shorter route; this module is the loop around many solves.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+import warnings
+from typing import NamedTuple, Sequence
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["unit_energy", "pod", "orthonormal_union", "LandmarkMap", "map_matrix", "Galerkin", "ReducedResult"]
+__all__ = ["unit_energy", "pod", "galerkin", "Galerkin", "Reduced"]
 
 
-# ------------------------------------------------------------------------------------------------------- snapshots
-def unit_energy(U, B):
-    """Scale snapshot fields to unit energy: columns ``u_j / sqrt(b_j . u_j)``.
+def unit_energy(U: jax.Array, B: jax.Array) -> jax.Array:
+    """Scale snapshot fields to unit energy, ``u_j / sqrt(b_j . u_j)``.
 
-    ``U`` (n, m) solutions, ``B`` (n, m) their right-hand sides (or (n,) / (m, n) -- matched by shape). Large and
-    small responses then weigh equally in the POD, which is what a relative error target on the energy needs."""
-    U = np.asarray(U, np.float64)
-    B = np.asarray(B, np.float64)
+    Large and small responses then weigh equally in the POD, which is what a relative error target on the energy
+    needs. Traceable; the SPD check below runs only on concrete values.
+
+    Args:
+        U: ``(n, m)`` solutions (or one ``(n,)`` solution).
+        B: Their right-hand sides, ``(n, m)`` or ``(m, n)``.
+
+    Returns:
+        ``(n, m)`` scaled snapshots.
+
+    Raises:
+        ValueError: ``b . u <= 0`` for a snapshot (``A`` not SPD, or a zero right-hand side).
+    """
+    U, B = jnp.asarray(U), jnp.asarray(B)
     if U.ndim == 1:
-        return U / np.sqrt(float(B.ravel() @ U))
+        return U / jnp.sqrt(B.ravel() @ U)
     if B.shape != U.shape and B.T.shape == U.shape:
         B = B.T
-    e = np.einsum("nm,nm->m", B, U)
-    if np.any(e <= 0):
-        raise ValueError("unit_energy: b.u <= 0 for some snapshot (A not SPD, or zero right-hand side).")
-    return U / np.sqrt(e)
+    e = jnp.einsum("nm,nm->m", B, U)
+    if not isinstance(e, jax.core.Tracer) and bool(jnp.any(e <= 0)):
+        raise ValueError("jno.rom.unit_energy: b . u <= 0 for a snapshot (A not SPD, or a zero right-hand side).")
+    return U / jnp.sqrt(e)
 
 
-def pod(S, k: Optional[int] = None, *, energy: Optional[float] = None, device: bool = True):
-    """Proper orthogonal decomposition of a snapshot matrix ``S`` (n, m): thin SVD, float64.
+def _svd(S):
+    """Thin SVD on the default device; on the CPU device when that fails (e.g. GPU memory held elsewhere)."""
+    try:
+        Phi, sv, _ = jnp.linalg.svd(jnp.asarray(S), full_matrices=False)
+        return Phi, sv
+    except Exception as e:
+        cpu = jax.devices("cpu")[0]
+        warnings.warn(
+            f"jno.rom.pod: the SVD on {jax.devices()[0].platform} failed ({type(e).__name__}); using the CPU.", stacklevel=3
+        )
+        with jax.default_device(cpu):
+            Phi, sv, _ = jnp.linalg.svd(jax.device_put(jnp.asarray(S), cpu), full_matrices=False)
+        return Phi, sv
 
-    Returns ``(V, sv)``: the leading modes (n, k) (orthonormal columns, ordered by energy) and ALL singular values.
-    ``k`` modes, or the fewest modes capturing ``1 - energy`` of ``sum(sv**2)`` (``energy=1e-8`` keeps 1 - 1e-8).
-    ``device=True`` runs ``jax.numpy.linalg.svd`` (GPU when present), else numpy. For snapshot sets too large for a
-    dense SVD use the matrix-free :func:`jno.solve.svd` (Golub-Kahan) instead."""
-    if device:
-        import jax
-        import jax.numpy as jnp
 
-        jax.config.update("jax_enable_x64", True)
-        Phi, sv, _ = jnp.linalg.svd(jnp.asarray(np.asarray(S, np.float64)), full_matrices=False)
-        Phi, sv = np.asarray(Phi), np.asarray(sv)
-    else:
-        Phi, sv, _ = np.linalg.svd(np.asarray(S, np.float64), full_matrices=False)
+def _keep(sv, energy):
+    """Fewest modes whose singular values carry all but ``energy`` of the total."""
+    cum = jnp.cumsum(sv**2) / jnp.sum(sv**2)
+    return int(jnp.searchsorted(cum, 1.0 - energy)) + 1
+
+
+def pod(
+    S: jax.Array | Sequence[jax.Array],
+    k: int | None = None,
+    *,
+    energy: float | None = None,
+    block_energy: float = 1e-14,
+    block_max: int = 1200,
+) -> tuple[jax.Array, jax.Array]:
+    """Proper orthogonal decomposition of a snapshot matrix: its leading left singular vectors.
+
+    A LIST of snapshot blocks (one per design family, say) is compressed block by block first, each to the modes
+    carrying all but ``block_energy`` of its energy (at most ``block_max``), and the POD of
+    ``[Phi_1 Sigma_1, Phi_2 Sigma_2, ...]`` then gives the modes of the whole set without one SVD of all
+    snapshots. The result equals the SVD of the concatenation up to the dropped energy.
+
+    The SVD is ``jax.numpy.linalg.svd`` on the default device (the CPU if that fails), in the working precision:
+    enable ``jax_enable_x64``, the trailing singular values of a POD sit far below float32 round-off. The number of
+    modes depends on the data, so ``pod`` itself is not traced. For snapshot sets too large for a dense SVD,
+    :func:`jno.solve.svd` gives the leading modes matrix-free.
+
+    Args:
+        S: ``(n, m)`` snapshots, or a list of ``(n, m_i)`` blocks.
+        k: Modes kept (all by default).
+        energy: Instead of ``k``: keep the fewest modes that capture ``1 - energy`` of ``sum(sv**2)``.
+        block_energy: Energy dropped per block (list input only).
+        block_max: Most modes kept per block (list input only).
+
+    Returns:
+        ``(W, sv)``: the ``(n, k)`` orthonormal modes ordered by energy, and every singular value.
+    """
+    if isinstance(S, (list, tuple)):
+        red = []
+        for Sb in S:
+            Phi, sv = _svd(Sb)
+            kb = min(_keep(sv, block_energy), sv.shape[0], block_max)
+            red.append(Phi[:, :kb] * sv[:kb])
+        S = jnp.concatenate(red, 1)
+    Phi, sv = _svd(S)
     if energy is not None:
-        cum = np.cumsum(sv**2) / np.sum(sv**2)
-        k = int(np.searchsorted(cum, 1.0 - energy) + 1)
-    k = len(sv) if k is None else min(int(k), len(sv))
+        k = _keep(sv, energy)
+    k = sv.shape[0] if k is None else min(int(k), sv.shape[0])
     return Phi[:, :k], sv
 
 
-def orthonormal_union(*bases, interleave: bool = True):
-    """Orthonormal basis of the span of several bases (n, k_i): QR of their concatenation.
+class Reduced(NamedTuple):
+    """The reduced answer of :class:`Galerkin` (a pytree, so it passes through ``jit`` and ``vmap``)."""
 
-    ``interleave=True`` orders the columns v1_1, v2_1, v1_2, v2_2, ... before the QR, so the first 2j columns of the
-    result span the first j modes of each basis (nested truncation stays meaningful)."""
-    bases = [np.asarray(b, np.float64) for b in bases]
-    if interleave and len({b.shape[1] for b in bases}) == 1:
-        W = np.stack(bases, 2).reshape(bases[0].shape[0], -1)
-    else:
-        W = np.concatenate(bases, 1)
-    return np.linalg.qr(W)[0]
-
-
-# -------------------------------------------------------------------------------------------------- geometry maps
-class LandmarkMap:
-    """Separable, monotone, piecewise-linear map ``x' = f_x(x), y' = f_y(y) (, z' = f_z(z))``.
-
-    ``src`` and ``dst`` are per-axis increasing knot sequences (same length per axis): ``src[a][i] -> dst[a][i]``,
-    linear in between, constant extension outside. Used to stretch one geometry onto another through matching
-    landmarks (interfaces, gap positions, winding edges) while the mesh stays fixed. ``inverse()`` swaps them."""
-
-    def __init__(self, src: Sequence[Sequence[float]], dst: Sequence[Sequence[float]]):
-        self.src = [np.asarray(s, np.float64) for s in src]
-        self.dst = [np.asarray(d, np.float64) for d in dst]
-        for s, d in zip(self.src, self.dst):
-            if s.shape != d.shape or np.any(np.diff(s) <= 0) or np.any(np.diff(d) <= 0):
-                raise ValueError("LandmarkMap: knots must be strictly increasing and pairwise of equal length.")
-
-    def __call__(self, points):
-        P = np.asarray(points, np.float64)
-        out = P.copy()
-        for a, (s, d) in enumerate(zip(self.src, self.dst)):
-            out[:, a] = np.interp(P[:, a], s, d)
-        return out
-
-    def inverse(self) -> "LandmarkMap":
-        return LandmarkMap(self.dst, self.src)
-
-
-def map_matrix(domain: Any, F, *, fill: Any = "nearest", tol: float = 1e-9, k: int = 32):
-    """Sparse ``P`` with ``(P @ u)[i] = u(F(x_i))`` on the mesh nodes ``x_i``: composition of a nodal P1 field with
-    a point map ``F`` (e.g. a :class:`LandmarkMap`). ``P @ U`` maps a whole block of fields.
-
-    With ``F = M`` mapping reference -> physical, ``map_matrix(d, M)`` PULLS a physical field back to the
-    reference configuration (``u o M``), and ``map_matrix(d, M.inverse())`` PUSHES a reference field forward."""
-    from .utils.solver.fem_adapt import interpolation_matrix
-
-    if isinstance(domain, (tuple, list)):
-        pts = np.asarray(domain[0], np.float64)
-        dim = np.asarray(domain[1]).shape[1] - 1
-    else:
-        dim = int(domain.dimension)
-        mesh = domain.built_mesh if hasattr(domain, "built_mesh") else domain.mesh
-        pts = np.asarray(mesh.points, np.float64)
-    pts = pts[:, :dim]
-    lo, hi = pts.min(0), pts.max(0)
-    Q = np.clip(F(pts), lo, hi)
-    return interpolation_matrix(domain, Q, fill=fill, tol=tol, k=k)
-
-
-# ------------------------------------------------------------------------------------------------ Galerkin solve
-@dataclass
-class ReducedResult:
-    C: np.ndarray  # (r, r) B^T u_h: the reduced compliance / energy matrix (lower bound on the diagonal)
-    coeffs: Any  # (m + enrich, r) coefficients in the (enriched) basis
-    n_enrich: int  # Krylov enrichment steps used (fields added per right-hand side)
-    increment: float  # last relative increase of diag(C) over the stopping window (nan for fixed enrichment)
-    basis: Any = None  # the enriched basis (device array), for lifting: u_h = basis @ coeffs
-
-    def fields(self):
-        """Lift to the full space: u_h (n, r)."""
-        return np.asarray(self.basis @ self.coeffs)
-
-
-def _to_bcoo(A, n):
-    import jax.numpy as jnp
-    from jax.experimental import sparse as jsp
-
-    if isinstance(A, jsp.BCOO):
-        return jsp.BCOO((jnp.asarray(A.data, jnp.float64), jnp.asarray(A.indices)), shape=(n, n))
-    try:
-        import scipy.sparse as sp
-
-        if sp.issparse(A):
-            return jsp.BCOO.from_scipy_sparse(sp.coo_matrix(A, dtype=np.float64))
-    except ImportError:
-        pass
-    if hasattr(A, "todense") or hasattr(A, "shape"):
-        return jsp.BCOO.fromdense(jnp.asarray(np.asarray(A, np.float64)))
-    raise TypeError(f"Galerkin.bind: unsupported matrix type {type(A).__name__}")
+    C: jax.Array
+    """``(r, r)`` energy matrix ``B^T u_h``; its diagonal is a lower bound of the exact one."""
+    c: jax.Array
+    """``(m + enrich * r, r)`` coefficients in the span ``[W | Z_1 ... Z_enrich]``."""
+    Z: jax.Array
+    """``(enrich, n, r)`` enrichment directions (zeros when the enrichment did not run)."""
+    eta: jax.Array
+    """Error indicator of the plain POD answer: the relative energy error is about ``eta**2``."""
+    enriched: jax.Array
+    """Whether the enrichment ran."""
+    dC: jax.Array
+    """``max_i |C_ii / C0_ii - 1|``: how much the enrichment changed the diagonal of the plain answer ``C0``."""
 
 
 def _diagonal(A):
-    import jax.numpy as jnp
-
     idx, data = A.indices, A.data
     return jnp.zeros(A.shape[0], data.dtype).at[idx[:, 0]].add(jnp.where(idx[:, 0] == idx[:, 1], data, 0.0))
 
 
+def _enrich(A, B, dinv, W, AW, G, R, k, f32, r0):
+    """``k`` residual steps on top of ``W``, unrolled. ``W`` and ``A W`` are only read; the new directions are
+    kept as separate ``(n, r)`` blocks, orthonormal among themselves (the reduced system stays SPD)."""
+    lo = jnp.float32 if f32 else W.dtype
+    AWl, Bl, dl = AW.astype(lo), B.astype(lo), dinv.astype(lo)
+    m, r = W.shape[1], B.shape[1]
+    Q, Ql, AQl = [], [], []
+    c = jnp.linalg.solve(G, R)
+    for j in range(k):
+        if j == 0:
+            Z = r0.astype(lo)
+        else:
+            cl = c.astype(lo)
+            Z = Bl - AWl @ cl[:m]
+            for i, AQi in enumerate(AQl):
+                Z = Z - AQi @ cl[m + i * r : m + (i + 1) * r]
+        Z = dl[:, None] * Z
+        for _ in range(2):  # twice: one Gram-Schmidt pass loses orthogonality in float32
+            for Qi in Ql:
+                Z = Z - Qi @ (Qi.T @ Z)
+        Z = jnp.linalg.qr(Z)[0]
+        Z64 = Z.astype(W.dtype)
+        AZ = A @ Z64
+        col = jnp.concatenate([W.T @ AZ] + [Qi.T @ AZ for Qi in Q], 0)
+        G = jnp.block([[G, col], [col.T, Z64.T @ AZ]])
+        R = jnp.concatenate([R, Z64.T @ B], 0)
+        Q.append(Z64)
+        Ql.append(Z)
+        AQl.append(AZ.astype(lo))
+        c = jnp.linalg.solve(G, R)
+    return R.T @ c, c, jnp.stack(Q)
+
+
+@jax.tree_util.register_pytree_node_class
 class Galerkin:
-    """Galerkin reduction on a fixed orthonormal basis ``W`` (n, m), float64 on the default JAX device.
+    """Galerkin projection onto a fixed orthonormal basis, with gated residual enrichment. Build it with
+    :func:`galerkin`.
 
-    ``bind(A, B)`` forms ``A W``, ``W^T A W``, ``W^T B`` once per operator (one sparse mat-mat product);
-    ``solve(...)`` then costs dense m x m work plus one sparse mat-vec block per enrichment step. Bases are
-    nested: ``solve(m=...)`` uses the first m columns."""
+    A call costs one sparse product ``A W``, dense ``m x m`` algebra and, when it enriches, one sparse product
+    with an ``(n, r)`` block per step. The object is a pytree whose basis is a leaf: pass it into a jitted or
+    vmapped function as an ARGUMENT, so ``W`` is data rather than a constant compiled into the program.
+    """
 
-    def __init__(self, W):
-        import jax
-        import jax.numpy as jnp
+    def __init__(self, W, *, enrich: int = 0, gate: float | None = None, float32: bool = True, free=None):
+        self.W = jnp.asarray(W)
+        self.free = None if free is None else jnp.asarray(free, bool)
+        self.enrich, self.gate, self.float32 = int(enrich), gate, bool(float32)
 
-        jax.config.update("jax_enable_x64", True)
-        self.jnp = jnp
-        self.W = jnp.asarray(np.asarray(W, np.float64))
-        self.n, self.m = self.W.shape
+    def tree_flatten(self):
+        return (self.W, self.free), (self.enrich, self.gate, self.float32)
 
-    def bind(self, A, B):
-        """``A`` (n, n) SPD: jax BCOO (as assembled by ``jno.fem``), scipy sparse or dense. ``B`` (n, r) or (r, n)."""
-        jnp = self.jnp
-        self.A = _to_bcoo(A, self.n)
-        B = jnp.asarray(np.asarray(B, np.float64))
-        self.B = B if B.shape[0] == self.n else B.T
-        self.AW = self.A @ self.W
-        self.G = self.W.T @ self.AW
-        self.R = self.W.T @ self.B
-        self.dinv = 1.0 / _diagonal(self.A)
-        return self
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        obj = object.__new__(cls)
+        obj.W, obj.free = children
+        obj.enrich, obj.gate, obj.float32 = aux
+        return obj
 
-    def solve(
-        self,
-        m: Optional[int] = None,
-        *,
-        enrich: Optional[int] = None,
-        tol: Optional[float] = 1e-4,
-        k_max: int = 64,
-        window: int = 2,
-        jit: bool = False,
-    ) -> ReducedResult:
-        """Reduced solve on the first ``m`` basis columns.
+    @property
+    def m(self) -> int:
+        """Number of basis vectors."""
+        return self.W.shape[1]
 
-        ``enrich=k``: exactly k Jacobi-Krylov blocks ``D^-1 (B - A u_h), D^-1 A (...), ...`` (fixed cost).
-        Otherwise (default) error-controlled: add ``D^-1 (B - A u_h)`` of the CURRENT reduced answer, orthonormalised
-        against the span, re-solve, and stop when ``max_i (C_ii - C_ii[-window]) / C_ii < tol`` or after ``k_max``
-        steps. ``tol=None`` with ``enrich=None`` is the plain Galerkin answer.
+    def __call__(self, A: jax.Array, B: jax.Array) -> Reduced:
+        """Solve one system on the basis.
 
-        ``jit=True`` runs the error-controlled loop as ONE compiled ``lax.while_loop`` on fixed-size buffers
-        (``m + k_max * r`` columns, unused ones masked): no per-step dispatch or host sync, no recompilation when the
-        basis grows, but every step works on the padded size. Same answer as the eager loop (default) to round-off;
-        which is faster depends on the device (padding costs on CPU, dispatch costs on GPU) -- measure."""
-        jnp = self.jnp
-        m = m or self.m
-        if jit and not enrich and tol is not None:
-            C, c, k, q, W = _adaptive(
-                self.A,
-                self.B,
-                self.dinv,
-                self.W[:, :m],
-                self.AW[:, :m],
-                self.G[:m, :m],
-                self.R[:m],
-                float(tol),
-                int(k_max),
-                int(window),
-            )
-            k = int(k)
-            return ReducedResult(np.asarray(C), c[: m + k * self.B.shape[1]], k, float(q), W[:, : m + k * self.B.shape[1]])
-        W, AW, G, R = self.W[:, :m], self.AW[:, :m], self.G[:m, :m], self.R[:m]
-        if enrich:
-            Z = self.dinv[:, None] * (self.B - AW @ jnp.linalg.solve(G, R))
-            blocks = []
-            for _ in range(int(enrich)):
-                blocks.append(Z)
-                Z = self.dinv[:, None] * (self.A @ Z)
-            K = jnp.linalg.qr(jnp.concatenate([W] + blocks, 1))[0][:, m:]
-            AK = self.A @ K
-            G = jnp.block([[G, AW.T @ K], [K.T @ AW, K.T @ AK]])
-            R = jnp.concatenate([R, K.T @ self.B], 0)
-            c = jnp.linalg.solve(G, R)
-            return ReducedResult(np.asarray(R.T @ c), c, int(enrich), float("nan"), jnp.concatenate([W, K], 1))
-        hist, k = [], 0
-        while True:
-            c = jnp.linalg.solve(G, R)
-            C = np.asarray(R.T @ c)
-            hist.append(np.diag(C).copy())
-            q = float(np.max((hist[-1] - hist[-1 - window]) / hist[-1])) if len(hist) > window else np.inf
-            if tol is None or q < tol or k >= k_max:
-                return ReducedResult(C, c, k, q if tol is not None else float("nan"), W)
-            Z = self.dinv[:, None] * (self.B - AW @ c)
-            for _ in range(2):  # re-orthogonalise against the span, twice
-                Z = Z - W @ (W.T @ Z)
-            Z = jnp.linalg.qr(Z)[0]
-            AZ = self.A @ Z
-            G = jnp.block([[G, AW.T @ Z], [Z.T @ AW, Z.T @ AZ]])
-            R = jnp.concatenate([R, Z.T @ self.B], 0)
-            W, AW = jnp.concatenate([W, Z], 1), jnp.concatenate([AW, AZ], 1)
-            k += 1
+        Args:
+            A: ``(n, n)`` SPD operator as a ``jax.experimental.sparse.BCOO`` (what ``jno.fem`` assembles).
+            B: ``(n, r)`` right-hand sides. Rows outside ``free`` are ignored.
+
+        Returns:
+            The :class:`Reduced` answer.
+        """
+        W = self.W
+        B = jnp.asarray(B, W.dtype)
+        if self.free is not None:
+            B = jnp.where(self.free[:, None], B, 0.0)
+        AW = A @ W
+        G0, R0 = W.T @ AW, W.T @ B
+        c0 = jnp.linalg.solve(G0, R0)
+        C0 = R0.T @ c0
+        d = _diagonal(A)
+        ok = d > 0 if self.free is None else self.free & (d > 0)
+        dinv = jnp.where(ok, 1.0 / jnp.where(d > 0, d, 1.0), 0.0)
+        r0 = B - AW @ c0
+        eta = jnp.sqrt(jnp.max(jnp.sum(dinv[:, None] * r0**2, 0) / jnp.diag(C0)))
+        k, n, r = self.enrich, W.shape[0], B.shape[1]
+        if not k:
+            return Reduced(C0, c0, jnp.zeros((0, n, r), W.dtype), eta, jnp.asarray(False), jnp.zeros((), W.dtype))
+
+        def enriched(_):
+            return _enrich(A, B, dinv, W, AW, G0, R0, k, self.float32, r0)
+
+        def plain(_):
+            return C0, jnp.concatenate([c0, jnp.zeros((k * r, r), c0.dtype)], 0), jnp.zeros((k, n, r), c0.dtype)
+
+        if self.gate is None:
+            on = jnp.asarray(True)
+            C, c, Z = enriched(None)
+        else:
+            on = eta > self.gate
+            C, c, Z = jax.lax.cond(on, enriched, plain, None)
+        return Reduced(C, c, Z, eta, on, jnp.max(jnp.abs(jnp.diag(C) / jnp.diag(C0) - 1)))
+
+    def lift(self, res: Reduced, w: jax.Array | None = None) -> jax.Array:
+        """The reduced field on the full mesh.
+
+        Args:
+            res: A :class:`Reduced` answer of this object.
+            w: ``(r,)`` load weights; ``None`` lifts every right-hand side.
+
+        Returns:
+            ``u_h w`` as an ``(n,)`` array, or ``u_h`` as ``(n, r)``.
+        """
+        c = res.c if w is None else res.c @ w
+        u = self.W @ c[: self.m]
+        k = res.Z.shape[0]
+        if k:
+            cz = c[self.m :].reshape((k, res.Z.shape[2]) + c.shape[1:])
+            u = u + jnp.einsum("knr,kr...->n...", res.Z, cz)
+        return u
 
 
-def _adaptive_impl(A, B, dinv, W0, AW0, G0, R0, tol, k_max, window):
-    """Error-controlled enrichment on fixed-size buffers (see Galerkin.solve). Column block j >= 0 of the enrichment
-    lives at m + j r ... m + (j+1) r; blocks not yet filled are zero in W, AW, G, R, with 1 on the diagonal of G so the
-    padded system stays regular (their coefficients are exactly 0)."""
-    import jax
-    import jax.numpy as jnp
+def galerkin(
+    W: jax.Array | np.ndarray,
+    *,
+    enrich: int = 0,
+    gate: float | None = None,
+    float32: bool = True,
+    free: jax.Array | np.ndarray | None = None,
+) -> Galerkin:
+    """Galerkin reduction of SPD systems onto the basis ``W``.
 
-    n, m = W0.shape
-    r = B.shape[1]
-    P = m + k_max * r
-    W = jnp.zeros((n, P), W0.dtype).at[:, :m].set(W0)
-    AW = jnp.zeros((n, P), W0.dtype).at[:, :m].set(AW0)
-    G = jnp.zeros((P, P), W0.dtype).at[:m, :m].set(G0)
-    R = jnp.zeros((P, r), W0.dtype).at[:m].set(R0)
-    hist = jnp.zeros((k_max + 1, r), W0.dtype)
-    used0 = jnp.arange(P) < m
+    Args:
+        W: ``(n, m)`` orthonormal basis, e.g. from :func:`pod`.
+        enrich: Residual-enrichment steps per call; 0 is the plain POD answer.
+        gate: Enrich only when the indicator ``eta`` of the plain answer exceeds it; ``None`` always enriches.
+            Inside ``vmap`` both branches run, since ``jax.lax.cond`` becomes a select there.
+        float32: Build the enrichment directions in single precision. The reduced system stays in the working
+            precision, so the answer is still the exact Galerkin answer on the (slightly different) span.
+        free: ``(n,)`` bool mask of the unconstrained DOFs; rows of essential conditions are ignored.
 
-    def reduced(G, R, used):
-        Gp = jnp.where(used[:, None] & used[None, :], G, 0.0) + jnp.diag(jnp.where(used, 0.0, 1.0))
-        c = jnp.linalg.solve(Gp, R)
-        return c, R.T @ c
-
-    def cond(st):
-        return ~st["done"]
-
-    def body(st):
-        k, W, AW, G, R, hist, used = st["k"], st["W"], st["AW"], st["G"], st["R"], st["hist"], st["used"]
-        c, C = reduced(G, R, used)
-        d = jnp.diag(C)
-        hist = hist.at[k].set(d)
-        prev = hist[jnp.maximum(k - window, 0)]
-        q = jnp.where(k >= window, jnp.max((d - prev) / d), jnp.inf)
-        done = (q < tol) | (k >= k_max)
-
-        def enrich(args):
-            W, AW, G, R, used = args
-            Z = dinv[:, None] * (B - AW @ c)
-            for _ in range(2):
-                Z = Z - W @ (W.T @ Z)
-            Z = jnp.linalg.qr(Z)[0]
-            AZ = A @ Z
-            s0 = m + k * r
-            W = jax.lax.dynamic_update_slice(W, Z, (0, s0))
-            col = AW.T @ Z  # (P, r): couplings with the existing span
-            G = jax.lax.dynamic_update_slice(G, col, (0, s0))
-            G = jax.lax.dynamic_update_slice(G, col.T, (s0, 0))
-            G = jax.lax.dynamic_update_slice(G, Z.T @ AZ, (s0, s0))
-            AW = jax.lax.dynamic_update_slice(AW, AZ, (0, s0))
-            R = jax.lax.dynamic_update_slice(R, Z.T @ B, (s0, 0))
-            used = used | ((jnp.arange(P) >= s0) & (jnp.arange(P) < s0 + r))
-            return W, AW, G, R, used
-
-        W, AW, G, R, used = jax.lax.cond(done, lambda a: a, enrich, (W, AW, G, R, used))
-        return dict(k=jnp.where(done, k, k + 1), W=W, AW=AW, G=G, R=R, hist=hist, used=used, done=done, C=C, c=c, q=q)
-
-    st = dict(
-        k=jnp.asarray(0),
-        W=W,
-        AW=AW,
-        G=G,
-        R=R,
-        hist=hist,
-        used=used0,
-        done=jnp.asarray(False),
-        C=jnp.zeros((r, r), W0.dtype),
-        c=jnp.zeros((P, r), W0.dtype),
-        q=jnp.asarray(jnp.inf, W0.dtype),
-    )
-    st = jax.lax.while_loop(cond, body, st)
-    return st["C"], st["c"], st["k"], st["q"], st["W"]
-
-
-_ADAPTIVE_JIT = None
-
-
-def _adaptive(A, B, dinv, W0, AW0, G0, R0, tol, k_max, window):
-    global _ADAPTIVE_JIT
-    if _ADAPTIVE_JIT is None:
-        import jax
-
-        _ADAPTIVE_JIT = jax.jit(_adaptive_impl, static_argnames=("k_max", "window"))
-    return _ADAPTIVE_JIT(A, B, dinv, W0, AW0, G0, R0, tol, k_max=k_max, window=window)
+    Returns:
+        A :class:`Galerkin`, called as ``rom(A, B)``.
+    """
+    return Galerkin(W, enrich=enrich, gate=gate, float32=float32, free=free)

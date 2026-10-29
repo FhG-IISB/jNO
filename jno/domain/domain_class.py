@@ -2448,6 +2448,26 @@ class domain(MeshIOMixin):
         mask[np.asarray(cd[block])[membership[name]].ravel()] = True
         return mask
 
+    def coordinate_parameters(self) -> dict:
+        """The mesh coordinates made design variables by ``.trainable()``, by parameter name.
+
+        ``x.trainable(name="x_nodes")`` turns one coordinate of the vertices of ``x``'s region into a parameter.
+        A compiled operator takes its value by that name, ``fem.operator.evaluate({"x_nodes": P[ids, axis]})``;
+        this says which vertices and which axis each name carries, so moved coordinates can be passed in::
+
+            ids, axis = d.coordinate_parameters()["x_nodes"]
+
+        Coordinates that a parametric ``jno.shape`` stretches follow its parameters and are not listed.
+
+        Returns:
+            ``{name: (ids, axis)}``: the ``(k,)`` vertex ids into ``mesh.points`` and the axis (0 = x, 1 = y, 2 = z).
+        """
+        return {
+            str(e["name"]): (np.asarray(e["ids"]), int(e["axis"]))
+            for e in self.__dict__.get("_trainable_coords", ())
+            if not str(e["name"]).startswith("__shape_stretch_")
+        }
+
     def tag_node_mask(self, tag, points, *, closure: bool = False):
         """Boolean mask of which ``points`` belong to ``tag`` -- the float64-safe resolution.
 
