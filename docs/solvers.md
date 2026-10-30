@@ -832,9 +832,12 @@ assembled at (a staggered block step leaves the other fields out). `reuse=k` rec
 solve; inside one compiled loop, which cannot count solves, it raises. Such a space has a fixed number of
 columns per subdomain -- `nev`, by default twice what the setup's operator needs -- and masks the ones above
 `tau`, so only its values change and the recompute runs inside the compiled loop; a subdomain that uses all
-its columns is logged. On a plate whose damage band grows across it (stiffness 10⁻⁶ in the band), the
-intact plate's space took 54 iterations where the recomputed one took 40 (64 subdomains; 68 with rigid
-modes).
+its columns is logged. It pays only when a piece of the body comes loose. On a plate pulled by a load with a free top
+and a prescribed damage band across it (stiffness 10⁻⁶ in the band), the intact plate's space took 54 iterations
+where the recomputed one took 40 (64 subdomains; 68 with rigid modes). On the phase-field notched plate, held by
+displacements at both ends, the space of the first step lost nothing: 1375 iterations over the 44 block solves of
+the load path against 1374 recomputed, and 4444 at one level. Recomputing is one batch of local eigenproblems per
+linearization, so measure before paying for it.
 
 !!! warning "A kernel is not a slow mode"
     A vector the operator maps to zero (the constant of a pure-Neumann problem) makes `ZᵀAZ` singular, and

@@ -39,7 +39,7 @@ that vanishes entirely is dropped and logged.
 - **One level grows; two levels don't.** For the homogeneous block, one-level Schwarz takes 55, 110
   and 170 iterations at 4, 16 and 64 subdomains. With the rigid-body modes it takes 46, 56 and 45.
 - **The contrast leaves a gap that rigid modes cannot close.** At $c=10^4$ the rigid modes still stop
-  the growth (73, 136 and 110, against 80, 190 and 291 for one level), but each count stays two
+  the growth (73, 136 and 110, against 80, 195 and 292 for one level), but each count stays two
   to three times the homogeneous one. A subdomain that straddles a soft layer has more nearly free
   motions than the three rigid ones: the stiff part can slide on the soft part. Those motions are the
   slow modes left over.
