@@ -28,17 +28,20 @@ import numpy as np
 __all__ = ["neumann_tables", "geneo_space", "GeneoPlan", "geneo_plan", "geneo_values"]
 
 
-def neumann_tables(pat, rows, cols, cells):
+def neumann_tables(pat, rows, cols, cells, held=None):
     """``(nrow, ncol, npos)``, each ``(p, L)``: every entry of every subdomain's Neumann matrix as a local
     (row, column) and its position in the triplet arrays (``len(rows)``: a zero slot, for padding).
 
     A cell lies inside subdomain ``i`` when all its free unknowns do (``pat.part < pat.p``; the eliminated
-    Dirichlet rows belong to no subdomain, and their entries are left out)."""
+    Dirichlet rows belong to no subdomain, and their entries are left out; ``held``, ``(n,)`` bool: unknowns left
+    out the same way, though they sit in a subdomain)."""
     import scipy.sparse as sp
 
     n, p, m = pat.n, pat.p, pat.m
     idx = np.asarray(pat.idx, np.int64)
     free = np.asarray(pat.part) < p
+    if held is not None:
+        free = free & ~held
     rows, cols, cells = (np.asarray(a, np.int64) for a in (rows, cols, cells))
     T = rows.size
     ncell = int(cells.max()) + 1 if T else 0
@@ -93,9 +96,10 @@ def _local_eigs(blk, nrow, ncol, npos, vals, D, pad, *, tau, nev):
     ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype)])
     AN = jax.vmap(lambda r, c, q: jnp.zeros((m, m), vals.dtype).at[r, c].add(ext[q]))(nrow, ncol, npos)
     eye = jnp.eye(m, dtype=vals.dtype)
-    AN = AN + (2.0 * tau + 1.0) * pad[:, :, None] * eye
+    keep = (1.0 - pad)[:, :, None] * (1.0 - pad)[:, None, :]  # a padded row and column couple to nothing
+    AN = keep * AN + (2.0 * tau + 1.0) * pad[:, :, None] * eye
     AN = 0.5 * (AN + jnp.swapaxes(AN, 1, 2))
-    B = D[:, :, None] * blk * D[:, None, :]
+    B = keep * (D[:, :, None] * blk * D[:, None, :]) + pad[:, :, None] * eye
     B = 0.5 * (B + jnp.swapaxes(B, 1, 2))
     Lc = jnp.linalg.cholesky(B)
     X = solve_triangular(Lc, AN, lower=True)  # L^-1 A^N
@@ -188,6 +192,95 @@ def geneo_space(fem, A, pat, tau: float, nev, *, who: str = "jno.space.geneo"):
 # move, so they can be recomputed from the current operator inside a compiled solve (a Newton step, a load step).
 
 
+class EdgeSplit(NamedTuple):
+    """A symmetric diagonally dominant operator as pseudo-cells (:func:`edge_split`), ready for :func:`neumann_tables`.
+
+    Attributes:
+        n: unknowns.
+        rows, cols, cells: the triplets' structure: four per edge, then one per unknown (its diagonal excess).
+        keys: ``A``'s sorted keys.
+        ei, ej: ``(e,)`` the edges' ends.
+        pij, pji, dpos: positions of ``(i, j)``, ``(j, i)`` and the diagonal in ``keys`` (``keys.size``: not stored).
+    """
+
+    n: int
+    rows: Any
+    cols: Any
+    cells: Any
+    keys: Any
+    ei: Any
+    ej: Any
+    pij: Any
+    pji: Any
+    dpos: Any
+
+
+def edge_split(S):
+    """The splitting of a symmetric diagonally dominant CSR ``S``, or ``None`` when it is not one (on the rows that
+    are not eliminated; to rounding):
+
+        ``A = sum_{i<j} |a_ij| (e_i + s_ij e_j)(e_i + s_ij e_j)^T + diag(d)``, ``d_i = a_ii - sum_j |a_ij| >= 0``.
+
+    Each term is positive semi-definite, so the terms with both ends in a subdomain make a local matrix ``A_i`` with
+    ``0 <= A_i <= A`` -- what GenEO's Neumann matrix is for -- from the operator alone: each edge is a "cell" of two
+    unknowns. On a diffusion operator it measures the same as the cells of the mesh (iterations and space size,
+    plans/deflation-probes/edge_split_geneo_probe.txt). The fully algebraic splitting of Al Daas & Jolivet (SISC 44(4),
+    2022), for any SPD matrix, keeps 65 % of the unknowns on layered elasticity, so it is not used."""
+    from .deflation import row_eliminated, symmetric_on_free
+
+    if not symmetric_on_free(S):
+        return None
+    n = S.shape[0]
+    coo = S.tocoo()
+    held = row_eliminated(S)
+    scale = float(np.abs(coo.data).max(initial=0.0))
+    off = (coo.row != coo.col) & ~held[coo.row] & ~held[coo.col]
+    excess = S.diagonal() - np.bincount(coo.row[off], np.abs(coo.data[off]), minlength=n)
+    if np.any(excess[~held] < -1e-12 * scale):
+        return None
+    keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
+    up = coo.row < coo.col
+    lo = coo.row > coo.col
+    pairs = np.unique(
+        np.concatenate(
+            [np.asarray(coo.row[up], np.int64) * n + coo.col[up], np.asarray(coo.col[lo], np.int64) * n + coo.row[lo]]
+        )
+    )
+    ei, ej = pairs // n, pairs % n
+
+    def at(k):
+        pos = np.minimum(np.searchsorted(keys, k), keys.size - 1)
+        return np.where(keys[pos] == k, pos, keys.size)
+
+    e = ei.size
+    i32 = lambda a: jnp.asarray(a, jnp.int32)  # noqa: E731
+    return EdgeSplit(
+        n,
+        np.concatenate([np.stack([ei, ej, ei, ej], axis=1).ravel(), np.arange(n)]),
+        np.concatenate([np.stack([ei, ej, ej, ei], axis=1).ravel(), np.arange(n)]),
+        np.concatenate([np.repeat(np.arange(e), 4), e + np.arange(n)]),
+        jnp.asarray(keys),
+        i32(ei),
+        i32(ej),
+        i32(at(ei * n + ej)),
+        i32(at(ej * n + ei)),
+        i32(at(np.arange(n, dtype=np.int64) * n + np.arange(n))),
+    )
+
+
+def edge_values(edges: EdgeSplit, A):
+    """The pseudo-cells' values at the operator ``A`` (traceable), in the order of ``edges.rows``."""
+    from .fsai import pattern_values
+
+    vals = pattern_values(edges.keys, A, edges.n)
+    ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype)])
+    a = 0.5 * (ext[edges.pij] + ext[edges.pji])
+    aa = jnp.abs(a)
+    d = ext[edges.dpos] - jax.ops.segment_sum(aa, edges.ei, num_segments=edges.n)
+    d = d - jax.ops.segment_sum(aa, edges.ej, num_segments=edges.n)
+    return jnp.concatenate([jnp.stack([aa, aa, a, a], axis=1).reshape(-1), d])
+
+
 class GeneoPlan(NamedTuple):
     """The host part of a static-structure GenEO space (:func:`geneo_plan`).
 
@@ -203,6 +296,7 @@ class GeneoPlan(NamedTuple):
         src, w: on a reduced system (periodic ties, slip, hanging nodes): the reduced triplets are
             ``vals[src] * w`` (:func:`~.deflation.triplet_map`); ``None`` otherwise.
         prolong: on a reduced system, ``(rows, cols, data, n_full)`` of ``P``: the full iterate is ``P u``.
+        edges: no cells to sum: the operator's own edges (:class:`EdgeSplit`), read from ``A`` each time.
     """
 
     tau: float
@@ -218,6 +312,7 @@ class GeneoPlan(NamedTuple):
     src: Any = None
     w: Any = None
     prolong: Any = None
+    edges: Any = None
 
 
 def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str = "jno.space.geneo"):
@@ -227,15 +322,27 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     ``nev=None`` sizes the columns from these first eigenvalues: the largest count below ``tau`` -- doubled with
     ``headroom``, for a space that follows a changing operator and may need more later (a crack opening, a
     design becoming void). A given ``nev`` is the cap either way."""
-    from .deflation import element_triplets, solved_map, triplet_map
+    from .deflation import element_triplets, operator_graph, row_eliminated, solved_map, triplet_map
     from .schwarz import local_blocks
 
-    if fem is None:
-        raise ValueError(f"{who}: needs the problem (its element matrices); use it through fem.solve(precond=...).")
-    rows, cols, vals, cells = element_triplets(fem, who=who, reduced_ok=True)
-    raw, n_raw = vals, int(rows.shape[0])
     n, p, m = pat.n, pat.p, pat.m
-    P = solved_map(fem, n, who)
+    edges = None
+    try:
+        rows, cols, vals, cells = element_triplets(fem, who=who, reduced_ok=True)
+        P = solved_map(fem, n, who)
+    except (ValueError, NotImplementedError) as no_cells:
+        # No cells to sum: FDM, non-nodal elements, an assembled matrix. A symmetric diagonally dominant operator
+        # still splits exactly, into its own edges (see `edge_split`).
+        with jax.ensure_compile_time_eval():
+            edges = edge_split(operator_graph(A)[0])
+        if edges is None:
+            raise ValueError(
+                f"{no_cells} ({who} can also work from the operator alone, when it is symmetric and diagonally "
+                "dominant; this one is not.)"
+            ) from no_cells
+        rows, cols, cells = edges.rows, edges.cols, edges.cells
+        vals, P = edge_values(edges, A), None
+    raw, n_raw = (None, 0) if edges is not None else (vals, int(rows.shape[0]))
     src = tw = prolong = None
     if P is not None:  # a reduced system: each cell's entries carried onto it, P^T K_e P
         with jax.ensure_compile_time_eval():
@@ -257,13 +364,16 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
             "of its memory. Use more Schwarz parts (smaller subdomains) or overlap=1."
         )
     with jax.ensure_compile_time_eval():
-        nrow, ncol, npos = neumann_tables(pat, rows, cols, cells)
+        # a prescribed row of a march's tangent is eliminated by row only, its column stays: its increment is zero
+        # whatever the column holds, so the unknown is left out of the eigenproblems and the coarse vectors
+        held = row_eliminated(operator_graph(A)[0])
+        nrow, ncol, npos = neumann_tables(pat, rows, cols, cells, held=held)
         blk, _ = local_blocks(pat, A)
     idx = np.asarray(pat.idx)
     valid = idx < n
     mult = np.bincount(idx[valid], minlength=n).astype(np.float64)
     D = jnp.asarray(np.where(valid, 1.0 / np.maximum(mult[np.minimum(idx, n - 1)], 1.0), 1.0), blk.dtype)
-    pad = jnp.asarray(~valid, blk.dtype)
+    pad = jnp.asarray(~valid | held[np.minimum(idx, n - 1)], blk.dtype)
     first = m if nev is None else min(int(nev), m)
     w, V = _local_eigs(blk, nrow, ncol, npos, jnp.asarray(vals), D, pad, tau=float(tau), nev=first)
     w = np.asarray(w)
@@ -273,10 +383,10 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
             "operator: its subdomain blocks are factored by Cholesky."
         )
     count = int((w < tau).sum(axis=1).max(initial=0))
-    if count == 0:
-        raise ValueError(f"{who}: no subdomain has an eigenvalue below tau={tau:g}, so the space is empty. Raise tau.")
-    k = first if nev is not None else min(m, 2 * count if headroom else count)
-    plan = GeneoPlan(float(tau), int(k), nrow, ncol, npos, D, pad, valid, n_raw, who, src, tw, prolong)
+    if count == 0:  # the local solves already reach everything (a short time step): no correction is needed
+        logging.getLogger("jno").info(f"{who}: no subdomain has an eigenvalue below tau={tau:g}: the space is empty.")
+    k = first if nev is not None else max(1, min(m, 2 * count if headroom else count))
+    plan = GeneoPlan(float(tau), int(k), nrow, ncol, npos, D, pad, valid, n_raw, who, src, tw, prolong, edges)
     return plan, jnp.asarray(w[:, :k]), V[:, :, :k], raw
 
 
@@ -300,10 +410,13 @@ def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
     if frozen is not None:
         fz = jnp.take(jnp.asarray(frozen), pat.idx, mode="fill", fill_value=True)
         pad = jnp.maximum(pad, fz.astype(pad.dtype))
-    if int(vals.shape[0]) != plan.n_triplets:
-        raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
-    if plan.src is not None:
-        vals = vals[plan.src] * plan.w.astype(vals.dtype)
+    if plan.edges is not None:
+        vals = edge_values(plan.edges, A)
+    else:
+        if int(vals.shape[0]) != plan.n_triplets:
+            raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
+        if plan.src is not None:
+            vals = vals[plan.src] * plan.w.astype(vals.dtype)
     w, V = _local_eigs(
         blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev
     )

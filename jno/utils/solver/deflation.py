@@ -166,7 +166,7 @@ def structural_entries(fem, n: int):
     system being solved -- or ``None`` when the problem cannot say (not a native nodal FEM, transient, or a
     reduced system whose numbering differs). See :func:`operator_graph`."""
     factory = getattr(fem, "_structure_factory", None) if fem is not None else None
-    if factory is None or getattr(fem, "_mode", None) not in ("linear", "nonlinear"):
+    if factory is None or getattr(fem, "_mode", None) not in ("linear", "nonlinear", "transient"):
         return None
     try:
         P = solved_map(fem, n)
@@ -333,7 +333,7 @@ def static_pattern(row, part, p: int, k: int, A, extra=None) -> CoarsePattern:
     row, part = np.asarray(row, np.int64), np.asarray(part, np.int64)
     S = operator_graph(A, extra)[0]
     n = S.shape[0]
-    if not _is_symmetric(S):
+    if not symmetric_on_free(S):
         raise ValueError(
             "jno.precond.coarse: a coarse space recomputed from the operator is factored by Cholesky, which needs a "
             "symmetric positive definite operator; this one is not symmetric."
@@ -363,6 +363,21 @@ def static_pattern(row, part, p: int, k: int, A, extra=None) -> CoarsePattern:
         kmask=jnp.zeros((int(p), int(k)), bool),
         **tables,
     )
+
+
+def row_eliminated(S) -> np.ndarray:
+    """``(n,)`` bool: the rows of the CSR ``S`` with nothing off the diagonal (eliminated rows, whose column may
+    remain: a march's tangent keeps it)."""
+    coo = S.tocoo()
+    off = (coo.row != coo.col) & (coo.data != 0)
+    return np.bincount(coo.row[off], minlength=S.shape[0]) == 0
+
+
+def symmetric_on_free(S) -> bool:
+    """Whether ``S`` is symmetric on the unknowns whose row is not eliminated (:func:`row_eliminated`): their
+    increment is zero, so a column left behind by a one-sided elimination acts on nothing."""
+    keep = np.flatnonzero(~row_eliminated(S))
+    return _is_symmetric(S[keep][:, keep])
 
 
 def _is_symmetric(S) -> bool:
@@ -775,7 +790,8 @@ def _require_nodal(fem, who):
 
 
 def element_triplets(fem, u=None, *, who: str = "jno.space.geneo", reduced_ok: bool = False):
-    """The operator's entries before they are summed, each tagged with its cell: ``(rows, cols, data, cell)``.
+    """The operator's entries before they are summed, each tagged with its cell: ``(rows, cols, data, cell)``, on
+    native FEM of any element (Lagrange, Morley, Argyris, edge elements).
 
     Summing every triplet gives the tangent at ``u`` (zeros by default) before Dirichlet elimination;
     summing those of a SUBSET of cells gives the operator of that subset alone, with natural conditions where
@@ -783,19 +799,21 @@ def element_triplets(fem, u=None, *, who: str = "jno.space.geneo", reduced_ok: b
     face's entries carry its parent cell. Rows and columns index the full finite-element space; the arrays
     stay on the device.
 
-    Native Lagrange FEM, steady and real only: anything else raises by name. On a problem solved on a REDUCED
+    Real only: anything else raises by name. A march's are its step operator's
+    (:func:`_step_triplets`). On a problem solved on a REDUCED
     space (periodic ties, slip, hanging nodes) the triplets are still the full space's, ``u`` too; only with
     ``reduced_ok`` (a caller that carries them over with :func:`triplet_map`), else it raises.
     """
+    if getattr(fem, "_mode", None) == "transient":
+        return _step_triplets(fem, u, who, reduced_ok)
     factory = getattr(fem, "_element_triplets_factory", None)
     if factory is None:
         raise ValueError(
-            f"{who}: needs each cell's element matrix, which only the native Lagrange FEM assembly of a steady "
-            "problem provides; this problem is "
+            f"{who}: needs each cell's element matrix, which only the native FEM assembly of a real problem "
+            "provides; this problem is "
             + ("not a jno.fem problem (FDM or an assembled matrix)" if not hasattr(fem, "_mode") else f"'{fem._mode}'")
-            + " or uses non-nodal elements, or 1-D. Give the space as an (n, k) array instead."
+            + ", complex, or 1-D. Give the space as an (n, k) array instead."
         )
-    _require_nodal(fem, who)
     if getattr(fem, "_mode", None) not in ("linear", "nonlinear"):
         raise ValueError(f"{who}: needs a steady, real problem; this one is '{fem._mode}'.")
     from .solver_api import _fem_reductions
@@ -806,6 +824,51 @@ def element_triplets(fem, u=None, *, who: str = "jno.space.geneo", reduced_ok: b
             "per-cell matrices are the full space's. Give the space as an (n, k) array instead."
         )
     return factory(u)
+
+
+def setup_operator(fem, A):
+    """The operator a space computed from the cells is set up against: ``A``, except on a march built outside a
+    step (``spec.prepare(fem)``), where ``A`` is the representative pattern (``M`` and ``A`` side by side) and the
+    cells combine as the block's own ``M + theta dt A``."""
+    from .solver_api import _add_step_operator, current_step_form
+
+    block = getattr(fem, "_op", None)
+    if getattr(fem, "_mode", None) != "transient" or current_step_form() is not None or getattr(block, "A", None) is None:
+        return A
+    from ...precond import _on_solved_space
+
+    s = float((getattr(block, "metadata", None) or {}).get("theta", 1.0)) * float(block.dt or 0.0)
+    return _on_solved_space(fem, _add_step_operator(block.M, block.A, s))
+
+
+def _step_triplets(fem, u, who, reduced_ok):
+    """The cells of a march's step operator ``a M + b J(u, t)``: the mass's entries, then the tangent's, with the
+    combination the step being solved declares (:func:`~.solver_api.step_form`; the block's own ``theta dt`` outside
+    a step)."""
+    from .solver_api import _fem_reductions, current_step_form
+
+    factory = getattr(fem, "_step_triplets_factory", None)
+    block = getattr(fem, "_op", None)
+    if factory is None or getattr(block, "mass_fn", None) is not None:
+        raise ValueError(
+            f"{who}: needs each cell's element matrix, and this march has none to give: non-nodal elements, 1-D, or "
+            "a mass that changes (a runtime coefficient, c(u)). Give the space as an (n, k) array instead."
+        )
+    _require_nodal(fem, who)
+    if _fem_reductions(fem) and not reduced_ok:
+        raise NotImplementedError(f"{who}: this march runs on a REDUCED space; its per-cell matrices are the full space's.")
+    form = current_step_form()
+    if form is None:
+        meta = getattr(block, "metadata", None) or {}
+        form = (1.0, float(meta.get("theta", 1.0)) * float(getattr(block, "dt", None) or 0.0), float(meta.get("t0", 0.0)))
+    a, b, t = form
+    (rm, cm, vm, lm), (rj, cj, vj, lj) = factory(u, t)
+    return (
+        jnp.concatenate([rm, rj]),
+        jnp.concatenate([cm, cj]),
+        jnp.concatenate([a * vm, b * vj]),
+        jnp.concatenate([lm, lj]),
+    )
 
 
 def _eval_formula(expr, pts) -> np.ndarray:

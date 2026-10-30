@@ -3600,18 +3600,28 @@ def _follow_space(spec, ctx, spat, cpat, who):
         spec._nmat += 1
         if i % k or i == 0:  # the setup's values serve the first solve; the last recompute the ones between
             return cpat if spec._last is None else spec._last
+    plan = spec._geneo
     fem = getattr(ctx, "fem", None)
-    if fem is None:
+    if fem is None and plan.edges is None:
         raise ValueError(f"{who} with reuse={k}: recomputing the space needs the problem; solve through fem.solve.")
     lin = current_linearization()
     u, frozen = (None, None) if lin is None else lin
-    if u is None and getattr(fem, "_mode", None) == "nonlinear":
+    if plan.edges is not None:  # read from the operator it is handed: no cells, no iterate
+        null, W, kmask, counts = _geneo.geneo_values(plan, spat, A, None, frozen)
+        _warn_saturated(counts, plan.nev, who)
+        out = cpat._replace(null=null, W=W, kmask=kmask)
+        if not traced:
+            spec._last = out
+        return out
+    nonlinear = getattr(fem, "_mode", None) == "nonlinear" or bool(
+        getattr(getattr(fem, "_op", None), "is_nonlinear", bool)()
+    )
+    if u is None and nonlinear:
         raise NotImplementedError(
             f"{who} with reuse={k}: the space is recomputed from the element matrices at the iterate the tangent "
             "was assembled at, and this nonlinear solve does not say which one (a lagged tangent, "
             "newton(reuse=True), or a matrix-free step). Use jno.solve.newton() or staggered(direct=True)."
         )
-    plan = spec._geneo
     if u is not None and plan.prolong is not None:  # a reduced iterate: the cells read the full one, P u
         pr, pc, pd, n_full = plan.prolong
         u = jax.ops.segment_sum(pd.astype(u.dtype) * u[pc], pr, num_segments=n_full)
@@ -3770,6 +3780,10 @@ class _Coarse(_Spec):
             S = _to_scipy_csr(A_conc)
             d = abs(S - S.T)
             self._symmetric = bool(d.max() <= 1e-12 * max(abs(S).max(), 1e-300)) if d.nnz else True
+            if self._geneo is not None:  # factored by Cholesky on the free unknowns; see `symmetric_on_free`
+                from .utils.solver.deflation import symmetric_on_free
+
+                self._symmetric = symmetric_on_free(S)
         self._token = next(_COARSE_TOKENS)
         return self
 

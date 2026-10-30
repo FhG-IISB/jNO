@@ -808,9 +808,14 @@ fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
 
 On a layered block with stiffness contrast 10⁴ it takes 26, 38 and 40 CG iterations at 4, 16 and 64
 subdomains, about the same as the homogeneous block (23, 39, 36), where the rigid modes take 73, 136 and 110.
-The local eigenproblems are dense and batched over the subdomains on the device. It needs a steady, real,
-symmetric positive definite problem on native Lagrange elements; on a system reduced by periodic ties, slip
-or hanging nodes each cell's matrix is carried over as `Pᵀ K_e P`. Anything else (a Bloch phase included) raises.
+The local eigenproblems are dense and batched over the subdomains on the device. It needs a real, symmetric
+positive definite problem on native FEM of any element (a Morley plate with rigidity contrast 10⁴ goes from 238
+iterations at one level to 37 over 64 subdomains), or else a symmetric diagonally dominant operator (FDM
+diffusion, say), whose edges stand in for the cells and which measures the same on a layered problem. On a
+system reduced by periodic ties, slip or hanging nodes each cell's matrix is carried over as `Pᵀ K_e P`, and on
+a march the cells combine as the step operator does (`M + θΔt A`; a mass that changes, or a Bloch phase, raises).
+A short step needs less of it: on layered diffusion at contrast 10⁴ it keeps 54 vectors at a long step, where it
+halves the iterations, 5 at `Δt = 10⁻³`, where the local solves are already enough, and none at `Δt = 10⁻⁷`.
 
 By default the space is computed once, when the solve sets up; `ZᵀAZ` and the local solves still follow the
 operator. When the stiffness pattern itself moves -- a damage band opening, a design changing, a material
@@ -821,8 +826,8 @@ Q = jno.precond.coarse(jno.space.geneo(), parts=S, reuse=1)   # or jno.precond.s
 fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(), precond=Q >> S >> Q)
 ```
 
-`reuse=1` recomputes the space at every solve and, inside `jno.solve.newton()` or
-`jno.solve.staggered(direct=True)`, at every linearization, from the tangent and the iterate it was
+`reuse=1` recomputes the space at every solve and, inside `jno.solve.newton()`,
+`jno.solve.staggered(direct=True)` or a nonlinear march's Newton steps, at every linearization, from the tangent and the iterate it was
 assembled at (a staggered block step leaves the other fields out). `reuse=k` recomputes it every k-th
 solve; inside one compiled loop, which cannot count solves, it raises. Such a space has a fixed number of
 columns per subdomain -- `nev`, by default twice what the setup's operator needs -- and masks the ones above

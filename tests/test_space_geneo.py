@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import scipy.linalg as sla
 import scipy.sparse as sp
+from jax.experimental import sparse as jsparse
 
 import jno
 from jno.utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
@@ -297,3 +298,151 @@ def test_geneo_on_a_periodic_tie_holds_the_contrast():
     S = jno.precond.schwarz(parts=16, coarse=False)
     Q = jno.precond.coarse(jno.space.geneo(), parts=S)
     assert two < 0.5 * one and two <= 1.3 * _iterations(homogeneous, Q >> S >> Q, href), (one, two)
+
+
+def test_a_diagonally_dominant_operator_splits_into_its_edges():
+    from jno.utils.solver.deflation import operator_graph
+    from jno.utils.solver.geneo import edge_split, edge_values
+
+    rng = np.random.default_rng(0)
+    n = 40
+    B = sp.random(n, n, density=0.15, random_state=rng, format="csr")
+    B = B + B.T
+    B.data[rng.random(B.data.size) < 0.3] *= -1.0
+    B = sp.csr_matrix(0.5 * (B + B.T))
+    B.setdiag(0.0)
+    B.eliminate_zeros()
+    A = (B + sp.diags(np.abs(B).sum(axis=1).A1 + rng.random(n))).tocoo()
+    Aj = jsparse.BCOO((jnp.asarray(A.data), jnp.asarray(np.stack([A.row, A.col], 1))), shape=(n, n))
+    e = edge_split(operator_graph(Aj)[0])
+    v = np.asarray(jax.jit(lambda M: edge_values(e, M))(Aj))
+    K = sp.coo_matrix((v, (e.rows, e.cols)), shape=(n, n)).toarray()
+    np.testing.assert_allclose(K, A.toarray(), rtol=1e-12, atol=1e-12)  # the terms sum to the operator
+    sub = np.arange(n // 2)  # the terms inside a subset: 0 <= A_i <= A
+    inside = np.isin(e.rows, sub) & np.isin(e.cols, sub)
+    both = np.bincount(e.cells[inside], minlength=e.cells.max() + 1)[e.cells]
+    full = np.bincount(e.cells, minlength=e.cells.max() + 1)[e.cells]
+    keep = both == full
+    Ai = sp.coo_matrix((v[keep], (e.rows[keep], e.cols[keep])), shape=(n, n)).toarray()
+    assert np.linalg.eigvalsh(Ai).min() > -1e-10 and np.linalg.eigvalsh(A.toarray() - Ai).min() > -1e-10
+
+
+def test_an_operator_that_is_not_diagonally_dominant_has_no_edges():
+    from jno.utils.solver.deflation import operator_graph
+    from jno.utils.solver.geneo import edge_split
+
+    fem, _ = _layered(1, h=0.25)
+    assert edge_split(operator_graph(fem._op[0])[0]) is None  # elasticity
+
+
+def test_geneo_on_fdm_works_from_the_operators_edges(monkeypatch):
+    import scipy.sparse.linalg as spla
+
+    import jno.jnp_ops as jnn
+    from jno.precond import _Schwarz
+
+    captured = {}
+    real = _Schwarz.materialize
+
+    def capture(self, ctx):
+        captured["A"] = ctx.A.bcoo
+        return real(self, ctx)
+
+    monkeypatch.setattr(_Schwarz, "materialize", capture)
+
+    d = jno.domain(R(0.0, 0.0, 1.0, 1.0, size=0.02).structured())
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    prob = jno.fdm([-(ui.d2(x) + ui.d2(y)) - f, u(xb, yb) - 0.0])
+    ref = np.asarray(prob.solve())
+    S = jno.precond.schwarz(parts=16, coarse=False)
+    G = jno.space.geneo()
+    Q = jno.precond.coarse(G, parts=S)
+    M = Q >> S >> Q
+    sol = np.asarray(prob.solve(linear=jno.solve.cg(tol=1e-10, maxiter=2000), precond=M))
+    np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())
+    assert G.counts.max() >= 1
+
+    A = captured["A"] if not isinstance(captured["A"].data, jax.core.Tracer) else prob._representative_operator()
+    n = int(A.shape[0])
+    ctx = PrecondContext(LinearOperator(A), prob)
+    eye = jnp.eye(n)
+    apply = lambda spec: np.asarray(jax.vmap(materialize_precond(spec, ctx), in_axes=1, out_axes=1)(eye))  # noqa: E731
+    Ad, b = sp.csr_matrix(np.asarray(A.todense())), np.asarray(jax.random.normal(jax.random.PRNGKey(0), (n,)))
+
+    def count(B):  # scipy's CG on the assembled operator: FDM records no iteration count
+        its = []
+        M_ = spla.LinearOperator((n, n), matvec=lambda r: B @ r)
+        _x, info = spla.cg(Ad, b, M=M_, rtol=1e-8, maxiter=2000, callback=lambda _x: its.append(1))
+        assert info == 0
+        return len(its)
+
+    assert count(apply(M)) < 0.7 * count(apply(S))
+
+
+def test_without_cells_or_edges_geneo_says_so():
+    fem, _ = _layered(1, h=0.25)  # elasticity: not diagonally dominant; handed over as a bare matrix
+    S = jno.precond.schwarz(parts=4, coarse=False)
+    with pytest.raises(ValueError, match="diagonally dominant"):
+        jno.precond.coarse(jno.space.geneo(), parts=S).build(fem._op[0], None)
+
+
+def _plate(space, contrast, h):
+    """A plate in bending on four strips of rigidity 1 and 1/contrast, simply supported, under a uniform load."""
+    soft = 1.0 / contrast
+    d = (
+        (
+            R(0, 0.00, 1, 0.25).name("s0").attach(D=1.0)
+            + R(0, 0.25, 1, 0.50).name("s1").attach(D=soft)
+            + R(0, 0.50, 1, 0.75).name("s2").attach(D=1.0)
+            + R(0, 0.75, 1, 1.00).name("s3").attach(D=soft)
+        )
+        .sized(h)
+        .domain()
+    )
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    w, phi = d.fem_symbols(space=space)
+    wi, pi_ = w.bind(x=x, y=y), phi.bind(x=x, y=y)
+    H = lambda f: jno.np.hessian(f, [x, y])  # noqa: E731
+    return jno.fem([d.D * jno.np.inner(H(wi), H(pi_), 2) - pi_, w(xb, yb) - 0.0])
+
+
+@pytest.mark.parametrize("space", ["Morley", "Argyris"])
+def test_the_cells_of_a_non_nodal_element_sum_to_the_operator(space):
+    from jno.utils.solver.deflation import element_triplets
+
+    fem = _plate(space, 1e3, 0.25)
+    A = fem._op[0]
+    n = int(A.shape[0])
+    r, c, v, _cell = (np.asarray(a) for a in element_triplets(fem))
+    K = sp.coo_matrix((v, (r, c)), shape=(n, n)).toarray()
+    Ad = np.asarray(A.todense())
+    free = np.abs(Ad - np.diag(np.diag(Ad))).sum(axis=1) > 0
+    np.testing.assert_allclose(K[np.ix_(free, free)], Ad[np.ix_(free, free)], rtol=1e-10, atol=1e-10 * np.abs(Ad).max())
+
+
+def test_geneo_on_a_morley_plate_holds_the_contrast():
+    fem = _plate("Morley", 1e4, 0.03)
+    ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+
+    def count(make):
+        M = make()
+        np.testing.assert_allclose(
+            np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-8, maxiter=4000), precond=M)),
+            ref,
+            rtol=0,
+            atol=1e-4 * np.abs(ref).max(),
+        )
+        return fem.stats["linear_iterations"]["total"]
+
+    def bnn():
+        S = jno.precond.schwarz(parts=16, coarse=False)
+        Q = jno.precond.coarse(jno.space.geneo(), parts=S)
+        return Q >> S >> Q
+
+    one, two = count(lambda: jno.precond.schwarz(parts=16, coarse=False)), count(bnn)
+    assert two < 0.5 * one, (one, two)

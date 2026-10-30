@@ -5025,6 +5025,7 @@ def assemble_fem_native(
     # hosted a steady one must not inherit THAT build's functional factory.
     domain._fem_native_term_functional = None
     domain._fem_native_element_triplets = None
+    domain._fem_native_step_triplets = None
     domain._fem_native_structure = None
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
@@ -5247,6 +5248,15 @@ def assemble_fem_native(
         _nonlinear_mass = (not _parametric_mass) and any(
             _is_obviously_nonlinear_in_unknown(domain, mt) for mt in mass_terms
         )
+        if not (_parametric_mass or _nonlinear_mass):
+            # A march's cells, per field of the step operator: the mass's and the spatial tangent's (at a state
+            # and a time); `deflation.element_triplets` combines them as the step does. A mass that changes
+            # (a runtime coefficient, c(u)) has no fixed cell matrices, so it stays None.
+            domain._fem_native_step_triplets = lambda u=None, t=0.0: (
+                _mass_jac(zeros, 0.0, None, elements=True),
+                spatial_jac(zeros if u is None else jnp.asarray(u), t, None, elements=True),
+            )
+            domain._fem_native_structure = lambda: jnp.concatenate([_mass_jac(zeros).indices, spatial_jac(zeros).indices])
         prev_state_slices: List[Tuple[int, int, int, int]] = []  # (frozen_id, dof_start, dof_stop, n_components)
         mass_res_bc = mass_jac_bc = None
         if _nonlinear_mass:

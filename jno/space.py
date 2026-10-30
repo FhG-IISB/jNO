@@ -125,15 +125,16 @@ class _GenEO:
         size ``nev=None`` for an operator that changes (twice the count found now)."""
         import logging
 
-        from .utils.solver.deflation import static_pattern
+        from .utils.solver.deflation import setup_operator, static_pattern
         from .utils.solver.geneo import geneo_pieces, geneo_plan, geneo_values
 
         pat = self._schwarz_of(ctx)
-        plan, _w, _V, vals = geneo_plan(ctx.fem, ctx.A, pat, self.tau, self.nev, headroom=headroom, who=repr(self))
+        A = setup_operator(ctx.fem, ctx.A)
+        plan, _w, _V, vals = geneo_plan(ctx.fem, A, pat, self.tau, self.nev, headroom=headroom, who=repr(self))
         row, part = geneo_pieces(plan, pat)
         cpat = static_pattern(row, part, pat.p, plan.nev, ctx.A, extra)
         with jax.ensure_compile_time_eval():
-            null, W, kmask, counts = geneo_values(plan, pat, ctx.A, jnp.asarray(vals))
+            null, W, kmask, counts = geneo_values(plan, pat, A, None if vals is None else jnp.asarray(vals))
         self.counts = np.asarray(counts)
         logging.getLogger("jno").info(
             f"{self!r}: {int(self.counts.sum())} coarse vectors on {pat.p} subdomains ({self.counts.min()}-"
@@ -177,9 +178,12 @@ def geneo(tau: float = 0.2, *, nev=None) -> _GenEO:
     preconditioner sets up -- or, with ``reuse=k`` on the spec that holds it (``coarse(..., reuse=1)``,
     ``schwarz(coarse=geneo(), reuse=1)``), recomputed every k-th solve, and with ``reuse=1`` at every
     linearization inside ``jno.solve.newton()`` and ``staggered(direct=True)``, for a stiffness pattern that
-    moves (a crack, a design, yielding). Needs a steady, real, symmetric positive definite problem on native Lagrange
-    elements; a periodic tie, slip or hanging nodes are fine (a real ``P``: each cell's matrix is carried over as
-    ``P^T K_e P``); anything else raises.
+    moves (a crack, a design, yielding). Needs a real, symmetric positive definite problem, on native FEM of any element or
+    else with a symmetric diagonally dominant operator (FDM diffusion, say: its edges stand in for the cells). A
+    periodic tie, slip or hanging nodes are fine (a real ``P``: each cell's matrix is carried over as
+    ``P^T K_e P``), and so is a march (the cells combine as the step operator does; its mass must not change). No
+    eigenvalue below ``tau`` -- a very short time step -- gives an empty space and no correction. Anything else
+    raises.
 
     Args:
         tau: keep the eigenvalues below it (between 0 and 1; larger keeps more vectors and converges faster).

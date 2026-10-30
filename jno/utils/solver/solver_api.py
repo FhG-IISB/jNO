@@ -389,6 +389,36 @@ def linearized_at(u, frozen=None):
         _LINEARIZATION.reset(token)
 
 
+# The step operator a march is solving, as `a M + b J` at time `t`: what a preconditioner reading per-cell matrices
+# has to combine them into. Set around the step's solves while they are traced, like `linearized_at`.
+_STEP_FORM = __import__("contextvars").ContextVar("jno_step_form", default=None)
+
+
+@contextlib.contextmanager
+def step_form(a, b, t=0.0):
+    """Mark the solves inside as being on the step operator ``a M + b J(u, t)`` of a transient block."""
+    token = _STEP_FORM.set((a, b, t))
+    try:
+        yield
+    finally:
+        _STEP_FORM.reset(token)
+
+
+def current_step_form():
+    """``(a, b, t)`` set by :func:`step_form`, or ``None`` (not inside a march's step)."""
+    return _STEP_FORM.get()
+
+
+def _build_step_spaces(precond, fem, A_step, a, b, t, u=None):
+    """Set up the spaces computed from the operator (GenEO) on the step operator itself: its cell matrices combine
+    as ``a M + b J`` at this state, and a build from the representative pattern (``M`` and ``A`` merely side by side)
+    would measure them against a different matrix."""
+    for s in _specs_in(precond):
+        if getattr(s, "_can_follow", False) and getattr(s, "_pattern", None) is None:
+            with step_form(a, b, t), linearized_at(u):
+                s.build(A_step, fem)
+
+
 def current_linearization():
     """``(u, frozen)`` set by :func:`linearized_at` around the solve being built, or ``None`` (a linear problem's
     solve, or a driver that does not say: a lagged tangent, a matrix-free step)."""
@@ -1964,6 +1994,11 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
         return _frozen_at(precond, fem, A_rep, name, leaves)
     M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, scale)
+    _build_step_spaces(precond, fem, A_rep, 1.0, scale, t0, at)
+    if all(getattr(s, "_follow", None) == 1 for s in _specs_in(precond) if getattr(s, "_can_follow", False)):
+        leaves, untraceable = _untraceable_leaves(precond)
+        if not untraceable:  # built now, and recomputed at every Newton step of the scan: nothing to freeze
+            return precond
     return _frozen_at(precond, fem, A_rep, name, leaves)
 
 
@@ -2241,7 +2276,9 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
                 # wasted solve. An explicit `nonlinear=` keeps exactly what it asked for.
                 from ... import solve as _solve_ns
 
-                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=True)
+                # (A space that follows the tangent reads the iterate it was assembled at: no lagged tangent.)
+                keep = not any(getattr(s, "_follow", None) for s in _specs_in(precond)) if precond is not None else True
+                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=keep)
             return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
         # nonlinear block: it takes the linear step solve composed below, not a Newton driver.
@@ -2267,7 +2304,14 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         solver = _solve_ns.bicgstab()
     else:
         solver = linear
+    _constant_operator = (
+        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
+    )
+    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
     if precond is not None:
+        if _constant_operator:
+            _t0 = float((block.metadata or {}).get("t0", 0.0))
+            _build_step_spaces(precond, fem, _add_step_operator(block.M, block.A, _default_scale), 1.0, _default_scale, _t0)
         prepare_precond(precond, fem)
 
     # Constant-operator fast path: one step matrix, one preconditioner, reused by every step -- and
@@ -2277,10 +2321,6 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     _static: dict = {}
     # ...and a constant MASS: a `mass_fn` re-assembles M per step, and a prebuilt `block.M + kA` would then
     # disagree with the right-hand side the step forms from it -- a different system, solved silently.
-    _constant_operator = (
-        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
-    )
-    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
         A, scale = block.A, key
@@ -2290,7 +2330,8 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
             alg = _algebraic_rows(block.M, block.M.shape[0], block.M.dtype)
             A, scale = _row_scaled(A, alg.astype(block.M.dtype)), float(block.dt)
         op = LinearOperator(_add_step_operator(block.M, A, scale))
-        _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
+        with step_form(1.0, scale, float((block.metadata or {}).get("t0", 0.0))):
+            _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
 
     if _constant_operator:
         # EAGERLY, outside any trace: an AMG/ILU setup needs a concrete matrix, and `step_solve` runs

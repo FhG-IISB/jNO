@@ -574,7 +574,11 @@ class SemidiscreteTimeBlock:
                         J = self.jacobian(wn, t_next, args)
                         return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                    wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                    from .solver_api import step_form
+
+                    # theta on the rows with mass; a zero-mass row (a prescribed one: outside every subdomain) takes 1
+                    with step_form(1.0 / dt, thn, t_next):
+                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
                     return _verdict(G, u, wn, report, _box.get("norms"))
                 return _verdict(G, u, nonlinear_solve(G, u), report)
             # default Newton: on the assembled step tangent M/dt + J when the assembler provides J

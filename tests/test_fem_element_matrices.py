@@ -108,13 +108,6 @@ def test_two_fields():
 
 
 def test_what_it_cannot_serve_raises():
-    d = R(0.0, 0.0, 1.0, 1.0, size=0.3).domain(time=(0.0, 0.1, 3))
-    x, y, t = d.variable("interior", split=True)
-    u, w = d.fem_symbols()
-    ui, wi = u.bind(x=x, y=y, t=t), w.bind(x=x, y=y, t=t)
-    transient = jno.fem([ui.t * wi + ui.x * wi.x + ui.y * wi.y, u(*d.variable("initial", split=True)) - 0.0])
-    with pytest.raises(ValueError, match="steady"):
-        element_triplets(transient)
     with pytest.raises(ValueError, match="element matrix"):
         element_triplets(object())
 
