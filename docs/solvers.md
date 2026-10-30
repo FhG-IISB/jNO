@@ -845,7 +845,7 @@ graded one). A global space
 (`parts=None`) needs only products with the operator, so it also works matrix-free; a partitioned one needs
 the assembled matrix. Formulas need nodal Lagrange fields (a Hermite, Morley, Argyris or edge-element field
 raises: give an array). The coarse matrix `ZᵀAZ` has one row per kept direction (at most `parts × k`). Up to
-2,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
+1,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
 otherwise (GenEO's: a Cholesky on its kept directions). Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
 that meet through the operator) and factored by a sparse block Cholesky over the parts' graph, in a
 nested-dissection order, each separator eliminated as one dense supernode. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'

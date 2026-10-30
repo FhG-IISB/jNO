@@ -201,8 +201,10 @@ def _blocks(dense, a, b, k):
 
 def block_cholesky(plan: BlockCholeskyPlan, blocks):
     """Numeric phase (traceable): ``E``'s lower blocks ``(nb, k, k)`` in the plan's slots (fill slots zero) to the
-    factor: per level, ``(LD, P)`` -- each supernode's dense diagonal factor ``(c, w k, w k)`` and its panel below
-    ``(c, r k, w k)``. A block that is not positive definite gives NaN -- the caller checks :func:`block_diagonal`."""
+    factor: per level, ``(LD, P)`` -- the INVERSE of each supernode's dense diagonal factor ``(c, w k, w k)`` and its
+    panel below ``(c, r k, w k)``. An application is then batched matrix-vector products, where batched triangular
+    solves are among the slowest kernels a GPU runs (as for the local solves in :mod:`schwarz`). A block that is not
+    positive definite gives NaN -- the caller checks :func:`block_diagonal`."""
     k = blocks.shape[-1]
     Lb = jnp.concatenate([blocks, jnp.zeros((1, k, k), blocks.dtype)])  # slot nb: a zero block
     out = []
@@ -214,19 +216,20 @@ def block_cholesky(plan: BlockCholeskyPlan, blocks):
         D = D + jnp.repeat(lev.dpad.astype(D.dtype), k, axis=1)[:, :, None] * jnp.eye(w * k, dtype=D.dtype)
         LD = jnp.linalg.cholesky(D)
         P = _t(solve_triangular(LD, _t(_dense(Lb, lev.pslot)), lower=True))  # A_RS L_D^-T
-        out.append((LD, P))
+        out.append((solve_triangular(LD, jnp.broadcast_to(jnp.eye(w * k, dtype=LD.dtype), LD.shape), lower=True), P))
         Pr = P.reshape(c * r, k, w * k)  # panel rows, one block row each
         Lb = Lb.at[lev.tgt].add(-(Pr[lev.src1] @ _t(Pr[lev.src2])), mode="drop")
     return tuple(out)
 
 
 def block_diagonal(plan: BlockCholeskyPlan, L):
-    """``(p, k)`` the diagonal of the factor, per block row: the pivots are its squares."""
+    """``(p, k)`` the diagonal of ``L``, per block row, read off the stored inverses (its reciprocals): the
+    pivots are its squares."""
     k = L[0][0].shape[-1] // plan.levels[0].dslot.shape[1]
     d = jnp.zeros((plan.p + 1, k), L[0][0].dtype)
     for lev, (LD, _P) in zip(plan.levels, L):
         c, w = lev.cols.shape
-        d = d.at[lev.cols.reshape(-1)].set(jnp.diagonal(LD, axis1=1, axis2=2).reshape(c * w, k), mode="drop")
+        d = d.at[lev.cols.reshape(-1)].set(1.0 / jnp.diagonal(LD, axis1=1, axis2=2).reshape(c * w, k), mode="drop")
     return d[: plan.p]
 
 
@@ -236,13 +239,13 @@ def block_solve(plan: BlockCholeskyPlan, L, b):
     x = jnp.concatenate([b, jnp.zeros((1, k), b.dtype)])  # row p: padding
     for lev, (LD, P) in zip(plan.levels, L):
         c, w = lev.cols.shape
-        y = solve_triangular(LD, x[lev.cols].reshape(c, w * k, 1), lower=True)  # (c, w k, 1)
+        y = LD @ x[lev.cols].reshape(c, w * k, 1)  # (c, w k, 1)
         x = x.at[lev.cols].set(y.reshape(c, w, k))
         x = x.at[lev.rows].add(-(P @ y).reshape(c, -1, k))
         x = x.at[plan.p].set(0.0)  # what the padding collected
     for lev, (LD, P) in zip(reversed(plan.levels), reversed(L)):
         c, w = lev.cols.shape
         s = x[lev.cols].reshape(c, w * k, 1) - _t(P) @ x[lev.rows].reshape(c, -1, 1)
-        x = x.at[lev.cols].set(solve_triangular(_t(LD), s, lower=False).reshape(c, w, k))
+        x = x.at[lev.cols].set((_t(LD) @ s).reshape(c, w, k))
         x = x.at[plan.p].set(0.0)
     return x[: plan.p]

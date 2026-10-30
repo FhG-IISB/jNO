@@ -44,7 +44,7 @@ KERNEL_RTOL = 1e-12
 NULL_RTOL = 1e-12
 #: Above this many kept directions, a symmetric coarse matrix of several parts is factored by a sparse block
 #: Cholesky over the parts' graph (:mod:`block_cholesky`) instead of a dense eigendecomposition.
-SPARSE_MIN = 2000
+SPARSE_MIN = 1000
 #: Overlapping parts: a direction of the whitened Gram ``W^T Z^T Z W`` (its scale is 1) below this is a
 #: combination of other parts' vectors -- no new direction, so it is not a kernel either.
 DEP_RTOL = 1e-10
