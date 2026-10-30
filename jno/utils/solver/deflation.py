@@ -172,8 +172,10 @@ def structural_entries(fem, n: int):
         P = solved_map(fem, n)
     except (ValueError, NotImplementedError):
         return None
+    if getattr(getattr(fem, "_op", None), "runtime_parameter_exprs", None):
+        return None  # no values for the parameters yet; the pattern is the operator's own
     with jax.ensure_compile_time_eval():
-        idx = np.asarray(factory())
+        idx = np.asarray(factory(idle_args(getattr(fem, "_op", None))))
     if P is None:
         return idx[:, 0], idx[:, 1]
     r, c, _src, _w = triplet_map(P, idx[:, 0], idx[:, 1])
@@ -823,7 +825,19 @@ def element_triplets(fem, u=None, *, who: str = "jno.space.geneo", reduced_ok: b
             f"{who}: this problem is solved on a REDUCED space (periodic ties, slip or hanging nodes); its "
             "per-cell matrices are the full space's. Give the space as an (n, k) array instead."
         )
-    return factory(u)
+    from .solver_api import current_tangent_args
+
+    given = current_tangent_args()
+    if given is None:
+        op = getattr(fem, "_op", None)
+        if getattr(op, "runtime_parameter_exprs", None):
+            raise NotImplementedError(
+                f"{who}: this problem has runtime parameters, and a space set up before they have values has no "
+                "cells to read. Set it up inside the solve, or give the space as an (n, k) array."
+            )
+        given = (idle_args(op), 0.0)
+    args, t = given
+    return factory(u, t, args)
 
 
 def setup_operator(fem, A):
@@ -839,6 +853,20 @@ def setup_operator(fem, A):
 
     s = float((getattr(block, "metadata", None) or {}).get("theta", 1.0)) * float(block.dt or 0.0)
     return _on_solved_space(fem, _add_step_operator(block.M, block.A, s))
+
+
+def idle_args(op):
+    """The arguments of a tangent before a march has started: every history buffer zero. ``None`` when it has none."""
+    specs = getattr(op, "history_specs", None) or {}
+    surf = getattr(op, "surface_history_specs", None) or {}
+    if not specs and not surf:
+        return None
+    dtype = jax.dtypes.canonicalize_dtype(float)
+    return {
+        "__history__": {k: jnp.zeros(s["shape"], dtype) for k, s in specs.items()},
+        "__surface_history__": {k: jnp.zeros(s["shape"], dtype) for k, s in surf.items()},
+        "__loadpath__": {},
+    }
 
 
 def _step_triplets(fem, u, who, reduced_ok):

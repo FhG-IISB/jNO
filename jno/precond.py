@@ -3348,8 +3348,10 @@ def _representative_operator(fem):
         return _on_solved_space(fem, both)
     jac, size = getattr(op, "jacobian", None), getattr(op, "size", None)
     if callable(jac) and size is not None:
+        from .utils.solver.deflation import idle_args
+
         try:
-            J = jac(jnp.zeros((int(size),)), {})
+            J = jac(jnp.zeros((int(size),)), idle_args(op) or {})  # a march's tangent reads its history: all zero here
         except TypeError:
             return None  # a parametric / transient signature this probe does not know; build on first use
         return _on_solved_space(fem, J) if hasattr(J, "todense") else None

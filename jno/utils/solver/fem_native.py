@@ -5256,7 +5256,9 @@ def assemble_fem_native(
                 _mass_jac(zeros, 0.0, None, elements=True),
                 spatial_jac(zeros if u is None else jnp.asarray(u), t, None, elements=True),
             )
-            domain._fem_native_structure = lambda: jnp.concatenate([_mass_jac(zeros).indices, spatial_jac(zeros).indices])
+            domain._fem_native_structure = lambda args=None: jnp.concatenate(
+                [_mass_jac(zeros).indices, spatial_jac(zeros, 0.0, args).indices]
+            )
         prev_state_slices: List[Tuple[int, int, int, int]] = []  # (frozen_id, dof_start, dof_stop, n_components)
         mass_res_bc = mass_jac_bc = None
         if _nonlinear_mass:
@@ -5566,13 +5568,13 @@ def assemble_fem_native(
     jacobian = _make_jacobian(volume_terms, boundary_terms)
     # Cell-tagged element triplets of the steady tangent, at a state ``u`` (zeros by default); see
     # ``jacobian(elements=True)``. Snapshotted onto the FEM in `_finalize`, like the functional factory.
-    domain._fem_native_element_triplets = lambda u=None: jacobian(
-        zeros if u is None else jnp.asarray(u), 0.0, None, elements=True
+    domain._fem_native_element_triplets = lambda u=None, t=0.0, args=None: jacobian(
+        zeros if u is None else jnp.asarray(u), t, args, elements=True
     )
     # The tangent's STRUCTURAL pattern: every (row, col) the assembly emits, exact zeros included. A concrete
     # operator drops the entries a coefficient cancels exactly; a preconditioner pattern built on this one
     # fits every operator of the problem.
-    domain._fem_native_structure = lambda: jacobian(zeros, 0.0, None).indices
+    domain._fem_native_structure = lambda args=None: jacobian(zeros, 0.0, args).indices
     nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
     # Linear in the unknown, whatever routes it through Newton below (step history does; a box constraint or
     # a derived field makes the residual itself nonlinear, so those clear it). Newton on such a residual

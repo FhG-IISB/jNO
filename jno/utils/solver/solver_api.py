@@ -419,6 +419,26 @@ def _build_step_spaces(precond, fem, A_step, a, b, t, u=None):
                 s.build(A_step, fem)
 
 
+# The arguments the tangent being solved was assembled with: a march's history buffers and load level, a parametric
+# solve's values. Set around the driver's solves; a preconditioner that assembles its own cells needs the same ones.
+_TANGENT_ARGS = __import__("contextvars").ContextVar("jno_tangent_args", default=None)
+
+
+@contextlib.contextmanager
+def tangent_args(args, t=0.0):
+    """Mark the solves inside as being on a tangent assembled with ``args`` at time or load level ``t``."""
+    token = _TANGENT_ARGS.set((args, t))
+    try:
+        yield
+    finally:
+        _TANGENT_ARGS.reset(token)
+
+
+def current_tangent_args():
+    """``(args, t)`` set by :func:`tangent_args`, or ``None``."""
+    return _TANGENT_ARGS.get()
+
+
 def current_linearization():
     """``(u, frozen)`` set by :func:`linearized_at` around the solve being built, or ``None`` (a linear problem's
     solve, or a driver that does not say: a lagged tangent, a matrix-free step)."""

@@ -5891,7 +5891,10 @@ class FemResidualOperator:
                 res_l, jac_l, _gap = lift(u_start, args)
                 u_start = jax.lax.stop_gradient(call(res_l, u_start, jac_l))
             jac = self._jacobian_handle(args) if self.jacobian is not None else None
-            return call(lambda u: self.residual(u, args), u_start, jac)
+            from ..utils.solver.solver_api import tangent_args
+
+            with tangent_args(args):
+                return call(lambda u: self.residual(u, args), u_start, jac)
 
         def _solve(*values):
             return _drive(solve_fn, u0, dict(zip(names, values)))

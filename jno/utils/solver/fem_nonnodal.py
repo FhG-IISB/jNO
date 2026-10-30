@@ -2203,8 +2203,10 @@ def assemble_fem_nonnodal(
 
     _assemble_sparse_A = _make_sparse_assembler(volume_terms, with_gsurf=True)
     if not _cx_form:  # the steady operator's cells (see `deflation.element_triplets`) and its structural pattern
-        domain._fem_native_element_triplets = lambda u=None: _assemble_sparse_A(None, u_flat=u, elements=True)
-        domain._fem_native_structure = lambda: _assemble_sparse_A(None).indices
+        domain._fem_native_element_triplets = lambda u=None, t=0.0, args=None: _assemble_sparse_A(
+            args, u_flat=u, elements=True
+        )
+        domain._fem_native_structure = lambda args=None: _assemble_sparse_A(args).indices
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):

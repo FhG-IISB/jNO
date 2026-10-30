@@ -191,3 +191,89 @@ def test_the_space_follows_the_tangent_on_a_periodic_tie(monkeypatch):
     sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=_bnn(1)).fn())
     assert any(seen), "the space was never recomputed from a traced tangent"
     np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())
+
+
+def _fracture(h=0.15, steps=3):
+    """Second-order phase-field fracture of a notched plate: a load-path march with a history state, as in the
+    tutorial, so its tangent reads the march's buffers."""
+    n = jno.np
+    E, nu = 210.0, 0.3
+    lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    Gc, ell, eta = 2.7e-3, 0.3, 1e-6
+    dom = (R(0.0, 0.0, 1.0, 1.0, size=h) - R(-0.01, 0.49, 0.5, 0.51, size=h)).domain(tau=(0.0, 1.0, steps))
+    dom.tag("bot", lambda x, y: y < 1e-9)
+    dom.tag("top", lambda x, y: y > 1 - 1e-9)
+    co, cb, ct = (dom.variable(r, split=True) for r in ("interior", "bot", "top"))
+    X = [co[0], co[1]]
+    u, phi = dom.fem_symbols(value_shape=(2,))
+    dm, q = dom.fem_symbols()
+    Hs, _ = dom.fem_symbols(value_shape=())
+    eps = lambda w: n.sym(n.grad(w, X))  # noqa: E731
+    e_u = eps(u)
+    tr_u = n.trace(e_u)
+    dev = e_u - tr_u / 2 * n.identity(2)
+    psi_p = 0.5 * (lam + mu) * n.maximum(tr_u, 0.0) ** 2 + mu * n.inner(dev, dev, 2)
+    psi_m = 0.5 * (lam + mu) * n.minimum(tr_u, 0.0) ** 2
+    sigma = n.diff(((1.0 - dm) ** 2 + eta) * psi_p + psi_m, e_u)
+    fem = jno.fem(
+        [
+            n.inner(sigma, eps(phi), 2),
+            (Gc / ell) * dm * q + Gc * ell * n.inner(n.grad(dm, X), n.grad(q, X), 1) - 2.0 * (1.0 - dm) * Hs.i(-1) * q,
+            Hs.evolves(n.maximum(Hs.i(-1), psi_p)),
+            u(*cb)[0] - 0.0,
+            u(*cb)[1] - 0.0,
+            u(*ct)[0] - 0.0,
+            u(*ct)[1] - 2e-2 * ct[-1],
+        ]
+    )
+    return fem, jno.solve.staggered([u, dm], direct=True, max_sweeps=100, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize("reuse", [None, 1], ids=["once", "follow"])
+def test_geneo_on_a_fracture_march_reads_the_marchs_history(reuse, monkeypatch):
+    from jno.utils.solver import geneo
+
+    fem, alt = _fracture()
+    ref = np.asarray(fem.solve(nonlinear=alt, linear=jno.solve.lu()))
+    seen = []
+    real = geneo.geneo_values
+
+    def spy(plan, pat, A, vals, frozen=None):
+        seen.append((isinstance(vals, jax.core.Tracer), frozen is not None))
+        return real(plan, pat, A, vals, frozen)
+
+    monkeypatch.setattr(geneo, "geneo_values", spy)
+    fem, alt = _fracture()
+    sol = np.asarray(fem.solve(nonlinear=alt, linear=jno.solve.cg(tol=1e-9, maxiter=2000), precond=_bnn(reuse)))
+    if reuse:
+        assert any(t and f for t, f in seen), "no block step recomputed the space from a traced tangent"
+    else:
+        assert not any(t for t, _f in seen), "the space was to be computed once"
+    np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())
+
+
+def test_one_level_schwarz_sets_up_on_a_march_with_history():
+    fem, alt = _fracture()
+    ref = np.asarray(fem.solve(nonlinear=alt, linear=jno.solve.lu()))
+    fem, alt = _fracture()
+    sol = np.asarray(
+        fem.solve(
+            nonlinear=alt, linear=jno.solve.cg(tol=1e-9, maxiter=2000), precond=jno.precond.schwarz(parts=6, coarse=False)
+        )
+    )
+    np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())
+
+
+def test_a_design_parameter_with_no_values_yet_is_refused_by_name():
+    d, (x, y), (xb, yb) = _plate(0.2)
+    _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+    rho = jno.np.parameter(s, name="rho")
+    ε = lambda w: jno.np.symgrad(w, [x, y])  # noqa: E731
+    u, v = d.fem_symbols(value_shape=(2,))
+    u_, v_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([(1e-3 + rho**3) * jno.np.inner(ε(u_), ε(v_), n_contract=2) - 0.1 * v_[1], u(xb, yb) - (0.0, 0.0)])
+    ncells = int(np.asarray(d.mesh.cells_dict["triangle"]).shape[0])
+    A = fem._op.evaluate({"rho": jnp.full((ncells,), 0.5)})[0]
+    S = jno.precond.schwarz(parts=4, coarse=False)
+    with pytest.raises(ValueError, match="runtime parameters"):
+        jno.precond.coarse(jno.space.geneo(), parts=S).build(A, fem)
