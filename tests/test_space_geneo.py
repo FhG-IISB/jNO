@@ -268,7 +268,21 @@ def _slip_wedge(h=0.2):
     )
 
 
-@pytest.mark.parametrize("make", [lambda: _periodic_layers(1e4, n=8), _slip_wedge], ids=["tie", "slip"])
+def _hanging_nodes():
+    """Poisson on a quad grid refined in its middle: the hanging nodes make a P with weights 1/2."""
+    from jno.utils.solver.fem_refine import refine_domain
+
+    d = refine_domain(R(0, 0, 1, 1).quad().structured(n=4).domain(compute_mesh_connectivity=False), [5, 6, 9, 10])
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, v = d.fem_symbols()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    return jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
+
+
+@pytest.mark.parametrize(
+    "make", [lambda: _periodic_layers(1e4, n=8), _slip_wedge, _hanging_nodes], ids=["tie", "slip", "hanging"]
+)
 def test_on_a_reduced_system_the_cells_are_carried_onto_it(make):
     from jno.precond import _representative_operator
     from jno.utils.solver.deflation import element_triplets, solved_map, triplet_map
