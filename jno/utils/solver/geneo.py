@@ -198,8 +198,11 @@ class GeneoPlan(NamedTuple):
         D: ``(p, m)`` the partition of unity on the subdomains' slots (1 on padding).
         pad: ``(p, m)`` 1 on the padded slots.
         valid: ``(p, m)`` numpy, the real slots: the pieces of the coarse pattern, subdomain by subdomain.
-        n_triplets: entries of the element-triplet arrays the tables index (a check).
+        n_triplets: entries of the RAW element-triplet arrays (a check).
         who: the name in messages.
+        src, w: on a reduced system (periodic ties, slip, hanging nodes): the reduced triplets are
+            ``vals[src] * w`` (:func:`~.deflation.triplet_map`); ``None`` otherwise.
+        prolong: on a reduced system, ``(rows, cols, data, n_full)`` of ``P``: the full iterate is ``P u``.
     """
 
     tau: float
@@ -212,6 +215,9 @@ class GeneoPlan(NamedTuple):
     valid: Any
     n_triplets: int
     who: str
+    src: Any = None
+    w: Any = None
+    prolong: Any = None
 
 
 def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str = "jno.space.geneo"):
@@ -221,13 +227,24 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     ``nev=None`` sizes the columns from these first eigenvalues: the largest count below ``tau`` -- doubled with
     ``headroom``, for a space that follows a changing operator and may need more later (a crack opening, a
     design becoming void). A given ``nev`` is the cap either way."""
-    from .deflation import element_triplets
+    from .deflation import element_triplets, solved_map, triplet_map
     from .schwarz import local_blocks
 
     if fem is None:
         raise ValueError(f"{who}: needs the problem (its element matrices); use it through fem.solve(precond=...).")
-    rows, cols, vals, cells = element_triplets(fem, who=who)
+    rows, cols, vals, cells = element_triplets(fem, who=who, reduced_ok=True)
+    raw, n_raw = vals, int(rows.shape[0])
     n, p, m = pat.n, pat.p, pat.m
+    P = solved_map(fem, n, who)
+    src = tw = prolong = None
+    if P is not None:  # a reduced system: each cell's entries carried onto it, P^T K_e P
+        with jax.ensure_compile_time_eval():
+            r, c, cl = (np.asarray(a) for a in (rows, cols, cells))
+        r, c, src_np, w_np = triplet_map(P, r, c)
+        src, tw = jnp.asarray(src_np, jnp.int32), jnp.asarray(w_np, vals.dtype)
+        rows, cols, cells, vals = jnp.asarray(r), jnp.asarray(c), jnp.asarray(cl[src_np]), vals[src] * tw
+        Pc = P.tocoo()
+        prolong = (jnp.asarray(Pc.row, jnp.int32), jnp.asarray(Pc.col, jnp.int32), jnp.asarray(Pc.data), P.shape[0])
     if int(jnp.max(rows)) >= n or int(jnp.max(cols)) >= n:
         raise ValueError(f"{who}: the element matrices live on a larger space than the {n}-unknown operator.")
     item = jnp.dtype(vals.dtype).itemsize
@@ -259,8 +276,8 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     if count == 0:
         raise ValueError(f"{who}: no subdomain has an eigenvalue below tau={tau:g}, so the space is empty. Raise tau.")
     k = first if nev is not None else min(m, 2 * count if headroom else count)
-    plan = GeneoPlan(float(tau), int(k), nrow, ncol, npos, D, pad, valid, int(rows.shape[0]), who)
-    return plan, jnp.asarray(w[:, :k]), V[:, :, :k], vals
+    plan = GeneoPlan(float(tau), int(k), nrow, ncol, npos, D, pad, valid, n_raw, who, src, tw, prolong)
+    return plan, jnp.asarray(w[:, :k]), V[:, :, :k], raw
 
 
 def geneo_pieces(plan: GeneoPlan, pat):
@@ -285,6 +302,8 @@ def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
         pad = jnp.maximum(pad, fz.astype(pad.dtype))
     if int(vals.shape[0]) != plan.n_triplets:
         raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
+    if plan.src is not None:
+        vals = vals[plan.src] * plan.w.astype(vals.dtype)
     w, V = _local_eigs(
         blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev
     )

@@ -809,8 +809,8 @@ fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
 On a layered block with stiffness contrast 10⁴ it takes 26, 38 and 40 CG iterations at 4, 16 and 64
 subdomains, about the same as the homogeneous block (23, 39, 36), where the rigid modes take 73, 136 and 110.
 The local eigenproblems are dense and batched over the subdomains on the device. It needs a steady, real,
-symmetric positive definite problem on native Lagrange elements, not reduced by periodic ties, slip or
-hanging nodes; anything else raises.
+symmetric positive definite problem on native Lagrange elements; on a system reduced by periodic ties, slip
+or hanging nodes each cell's matrix is carried over as `Pᵀ K_e P`. Anything else (a Bloch phase included) raises.
 
 By default the space is computed once, when the solve sets up; `ZᵀAZ` and the local solves still follow the
 operator. When the stiffness pattern itself moves -- a damage band opening, a design changing, a material

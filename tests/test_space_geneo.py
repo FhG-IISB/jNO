@@ -205,3 +205,95 @@ def test_the_space_recomputed_from_another_operator_is_that_operators_space(trac
 
     Q_new = Q(new._pattern)
     np.testing.assert_allclose(Q(pat), Q_new, rtol=1e-9, atol=1e-9 * np.abs(Q_new).max())
+
+
+def _periodic_layers(contrast, n=24):
+    """Elasticity on a 2 x 1 strip of four horizontal layers (E alternating 1 and 1/contrast), periodic in x (the
+    left face tied to the right one), clamped at the bottom: the solve runs on the REDUCED system P^T A P."""
+    eps = 1e-9
+    soft = 1.0 / contrast
+    d = (
+        (
+            R(0, 0.00, 2, 0.25).name("l0").attach(E=1.0)
+            + R(0, 0.25, 2, 0.50).name("l1").attach(E=soft)
+            + R(0, 0.50, 2, 0.75).name("l2").attach(E=1.0)
+            + R(0, 0.75, 2, 1.00).name("l3").attach(E=soft)
+        )
+        .sized(1.0 / n)
+        .domain()
+    )
+    d.tag("left", lambda x, y: x < eps)
+    d.tag("right", lambda x, y: x > 2 - eps)
+    d.tag("bot", lambda x, y: (y < eps) & (x > eps))
+    x, y, _ = d.variable("interior", split=True)
+    u, v = d.fem_symbols(value_shape=(2,))
+    u_, v_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    ε = lambda w: jno.np.symgrad(w, [x, y])  # noqa: E731
+    ddot = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    tr = jno.np.trace
+    xb, yb, _ = d.variable("bot", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    lam, mu = d.E * 0.3 / (1.3 * 0.4), d.E / 2.6
+    return jno.fem(
+        [
+            2 * mu * ddot(ε(u_), ε(v_)) + lam * tr(ε(u_)) * tr(ε(v_)) - 0.1 * v_[1] - 0.05 * v_[0] * jno.np.sin(np.pi * x),
+            u(xb, yb) - (0.0, 0.0),
+            u(xl, yl) - u(xr, yr),
+        ]
+    )
+
+
+def _slip_wedge(h=0.2):
+    """Elasticity on a plate with a clamped edge and a slanted wall under the exact elimination of n.u = 0, whose P
+    has real weights (not a selection, unlike a tie)."""
+    d = jno.shape.polygon([(0.0, 0.0), (2.0, 0.0), (3.0, 1.0), (0.0, 1.0)]).sized(h).domain()
+    d.tag("clamp", lambda x, y: x < 1e-9)
+    d.tag("wall", lambda x, y: (np.abs(y - (x - 2.0)) < 1e-9) & (y > 1e-9) & (y < 1 - 1e-9))
+    x, y, _ = d.variable("interior", split=True)
+    u, v = d.fem_symbols(value_shape=(2,))
+    u_, v_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    ε = lambda w: jno.np.symgrad(w, [x, y])  # noqa: E731
+    ddot = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    xc, yc, _ = d.variable("clamp", split=True)
+    c = d.variable("wall", normals=True, split=True)
+    us = u(c[0], c[1])
+    return jno.fem(
+        [
+            2.0 * ddot(ε(u_), ε(v_)) + jno.np.trace(ε(u_)) * jno.np.trace(ε(v_)) - 0.1 * v_[1],
+            u(xc, yc) - (0.0, 0.0),
+            c[-2] * us[0] + c[-1] * us[1] - 0.0,
+        ]
+    )
+
+
+@pytest.mark.parametrize("make", [lambda: _periodic_layers(1e4, n=8), _slip_wedge], ids=["tie", "slip"])
+def test_on_a_reduced_system_the_cells_are_carried_onto_it(make):
+    from jno.precond import _representative_operator
+    from jno.utils.solver.deflation import element_triplets, solved_map, triplet_map
+
+    fem = make()
+    A = _representative_operator(fem)
+    n = int(A.shape[0])
+    assert n < fem.dofs  # the reduction removed unknowns
+    r, c, v, _cell = (np.asarray(a) for a in element_triplets(fem, reduced_ok=True))
+    rr, cc, src, w = triplet_map(solved_map(fem, n), r, c)
+    K = sp.coo_matrix((v[src] * w, (rr, cc)), shape=(n, n)).toarray()
+    Ad = np.asarray(A.todense())
+    free = np.abs(Ad).sum(axis=1) != np.abs(np.diag(Ad))  # rows with couplings: not eliminated
+    np.testing.assert_allclose(K[np.ix_(free, free)], Ad[np.ix_(free, free)], rtol=1e-10, atol=1e-10 * np.abs(Ad).max())
+
+
+def test_geneo_on_a_periodic_tie_holds_the_contrast():
+    fem = _periodic_layers(1e4)
+    ref = np.asarray(fem.solve(linear=jno.solve.lu()))
+    S = jno.precond.schwarz(parts=16, coarse=False)
+    one = _iterations(fem, S, ref)
+    S = jno.precond.schwarz(parts=16, coarse=False)
+    Q = jno.precond.coarse(jno.space.geneo(), parts=S)
+    two = _iterations(fem, Q >> S >> Q, ref)
+    homogeneous = _periodic_layers(1)
+    href = np.asarray(homogeneous.solve(linear=jno.solve.lu()))
+    S = jno.precond.schwarz(parts=16, coarse=False)
+    Q = jno.precond.coarse(jno.space.geneo(), parts=S)
+    assert two < 0.5 * one and two <= 1.3 * _iterations(homogeneous, Q >> S >> Q, href), (one, two)

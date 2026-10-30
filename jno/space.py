@@ -178,7 +178,8 @@ def geneo(tau: float = 0.2, *, nev=None) -> _GenEO:
     ``schwarz(coarse=geneo(), reuse=1)``), recomputed every k-th solve, and with ``reuse=1`` at every
     linearization inside ``jno.solve.newton()`` and ``staggered(direct=True)``, for a stiffness pattern that
     moves (a crack, a design, yielding). Needs a steady, real, symmetric positive definite problem on native Lagrange
-    elements, unreduced (no periodic ties, slip or hanging nodes); anything else raises.
+    elements; a periodic tie, slip or hanging nodes are fine (a real ``P``: each cell's matrix is carried over as
+    ``P^T K_e P``); anything else raises.
 
     Args:
         tau: keep the eigenvalues below it (between 0 and 1; larger keeps more vectors and converges faster).

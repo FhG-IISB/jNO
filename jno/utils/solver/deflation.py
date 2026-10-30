@@ -168,13 +168,66 @@ def structural_entries(fem, n: int):
     factory = getattr(fem, "_structure_factory", None) if fem is not None else None
     if factory is None or getattr(fem, "_mode", None) not in ("linear", "nonlinear"):
         return None
-    from .solver_api import _fem_reductions
-
-    if _fem_reductions(fem) or int(getattr(fem, "dofs", -1)) != int(n):
+    try:
+        P = solved_map(fem, n)
+    except (ValueError, NotImplementedError):
         return None
     with jax.ensure_compile_time_eval():
         idx = np.asarray(factory())
-    return idx[:, 0], idx[:, 1]
+    if P is None:
+        return idx[:, 0], idx[:, 1]
+    r, c, _src, _w = triplet_map(P, idx[:, 0], idx[:, 1])
+    return r, c
+
+
+def solved_map(fem, n: int, who: str = "jno.precond"):
+    """``None`` when ``fem``'s own unknowns are the ``n`` being solved for; else the reduction ``P`` (a
+    ``scipy.sparse`` CSR, full x ``n``) of the periodic tie, slip or hanging nodes the solve runs on,
+    ``u = P u_red``. A complex ``P`` (a Bloch phase) raises: these spaces are real."""
+    import scipy.sparse as sp
+
+    if int(getattr(fem, "dofs", -1)) == int(n):
+        return None
+    from .fem_utils import _periodic_blocks
+    from .solver_api import _matching_reduction
+
+    per = _matching_reduction(fem, int(n))
+    if per is None:
+        raise ValueError(f"{who}: the system being solved has {int(n)} unknowns, which is not a reduction of this problem.")
+    blocks, off_f, off_r = _periodic_blocks(per)
+    rows, cols, data = [], [], []
+    with jax.ensure_compile_time_eval():
+        for i, b in enumerate(blocks):
+            P = b["P"]
+            if hasattr(P, "indices"):
+                idx, val = np.asarray(P.indices), np.asarray(P.data)
+                r, c = idx[:, 0], idx[:, 1]
+            else:
+                Pd = np.asarray(P)
+                r, c = np.nonzero(Pd)
+                val = Pd[r, c]
+            rows.append(r + int(off_f[i]))
+            cols.append(c + int(off_r[i]))
+            data.append(val)
+    data = np.concatenate(data)
+    if np.iscomplexobj(data) and np.any(data.imag != 0):
+        raise NotImplementedError(f"{who}: a complex reduction (a Bloch phase) is not supported here; the space is real.")
+    return sp.csr_matrix((data.real, (np.concatenate(rows), np.concatenate(cols))), shape=(int(off_f[-1]), int(off_r[-1])))
+
+
+def triplet_map(P, rows, cols):
+    """``(rows_r, cols_r, src, w)``: full-space triplets ``(rows, cols)`` carried onto the reduced space of ``P``
+    (``P^T K P``, entry by entry): every output entry is triplet ``src`` times weight ``w`` -- host tables, so
+    the values can be mapped inside a trace (``vals[src] * w``). A cell's entries stay that cell's."""
+    rows, cols = np.asarray(rows, np.int64), np.asarray(cols, np.int64)
+    cnt = np.diff(P.indptr)
+    m = cnt[rows] * cnt[cols]
+    t = np.repeat(np.arange(rows.size), m)
+    off = np.arange(int(m.sum())) - np.repeat(np.cumsum(m) - m, m)
+    pc = cnt[cols][t]
+    ir = P.indptr[rows[t]] + off // pc
+    ic = P.indptr[cols[t]] + off % pc
+    return P.indices[ir].astype(np.int64), P.indices[ic].astype(np.int64), t, P.data[ir] * P.data[ic]
 
 
 def metis_parts(G, iso, parts: int) -> np.ndarray:
@@ -721,7 +774,7 @@ def _require_nodal(fem, who):
         )
 
 
-def element_triplets(fem, u=None, *, who: str = "jno.space.geneo"):
+def element_triplets(fem, u=None, *, who: str = "jno.space.geneo", reduced_ok: bool = False):
     """The operator's entries before they are summed, each tagged with its cell: ``(rows, cols, data, cell)``.
 
     Summing every triplet gives the tangent at ``u`` (zeros by default) before Dirichlet elimination;
@@ -730,7 +783,9 @@ def element_triplets(fem, u=None, *, who: str = "jno.space.geneo"):
     face's entries carry its parent cell. Rows and columns index the full finite-element space; the arrays
     stay on the device.
 
-    Native Lagrange FEM, steady, real, unreduced only: anything else raises by name.
+    Native Lagrange FEM, steady and real only: anything else raises by name. On a problem solved on a REDUCED
+    space (periodic ties, slip, hanging nodes) the triplets are still the full space's, ``u`` too; only with
+    ``reduced_ok`` (a caller that carries them over with :func:`triplet_map`), else it raises.
     """
     factory = getattr(fem, "_element_triplets_factory", None)
     if factory is None:
@@ -745,10 +800,10 @@ def element_triplets(fem, u=None, *, who: str = "jno.space.geneo"):
         raise ValueError(f"{who}: needs a steady, real problem; this one is '{fem._mode}'.")
     from .solver_api import _fem_reductions
 
-    if _fem_reductions(fem):
+    if _fem_reductions(fem) and not reduced_ok:
         raise NotImplementedError(
-            f"{who}: this problem is solved on a REDUCED space (periodic ties, slip or hanging nodes), whose "
-            "per-cell matrices are not assembled yet. Give the space as an (n, k) array instead."
+            f"{who}: this problem is solved on a REDUCED space (periodic ties, slip or hanging nodes); its "
+            "per-cell matrices are the full space's. Give the space as an (n, k) array instead."
         )
     return factory(u)
 

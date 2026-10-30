@@ -3611,8 +3611,12 @@ def _follow_space(spec, ctx, spat, cpat, who):
             "was assembled at, and this nonlinear solve does not say which one (a lagged tangent, "
             "newton(reuse=True), or a matrix-free step). Use jno.solve.newton() or staggered(direct=True)."
         )
-    vals = element_triplets(fem, u, who=who)[2]
-    null, W, kmask, counts = _geneo.geneo_values(spec._geneo, spat, A, vals, frozen)
+    plan = spec._geneo
+    if u is not None and plan.prolong is not None:  # a reduced iterate: the cells read the full one, P u
+        pr, pc, pd, n_full = plan.prolong
+        u = jax.ops.segment_sum(pd.astype(u.dtype) * u[pc], pr, num_segments=n_full)
+    vals = element_triplets(fem, u, who=who, reduced_ok=True)[2]
+    null, W, kmask, counts = _geneo.geneo_values(plan, spat, A, vals, frozen)
     _warn_saturated(counts, spec._geneo.nev, who)
     out = cpat._replace(null=null, W=W, kmask=kmask)
     if not traced:

@@ -155,3 +155,39 @@ def test_a_staggered_block_step_holds_the_other_block_out(monkeypatch):
     nc = fem.dofs // 3
     assert {nc, 2 * nc} <= {h for h in held if h is not None}, held
     np.testing.assert_allclose(sol, ref, rtol=1e-6, atol=1e-8 * np.abs(ref).max())
+
+
+def test_the_space_follows_the_tangent_on_a_periodic_tie(monkeypatch):
+    from jno.utils.solver import geneo
+
+    eps = 1e-9
+    d = R(0.0, 0.0, 2.0, 1.0).sized(0.12).domain()
+    d.tag("l", lambda x, y: x < eps)
+    d.tag("r", lambda x, y: x > 2.0 - eps)
+    d.tag("b", lambda x, y: (y < eps) & (x > eps))
+    x, y, _ = d.variable("interior", split=True)
+    ε = lambda w: jno.np.symgrad(w, [x, y])  # noqa: E731
+    ddot = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
+    u, v = d.fem_symbols(value_shape=(2,))
+    u_, v_ = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    shear = 2.0 + 2e4 * ddot(ε(u_), ε(u_))
+    fem = jno.fem(
+        [
+            shear * ddot(ε(u_), ε(v_)) + 1.5 * jno.np.trace(ε(u_)) * jno.np.trace(ε(v_)) - 0.1 * v_[1],
+            u(*d.variable("b", split=True)[:2]) - (0.0, 0.0),
+            u(*d.variable("l", split=True)[:2]) - u(*d.variable("r", split=True)[:2]),
+        ]
+    )
+    # a periodic nonlinear solve is a lazy node (it flows into crux); `.fn()` evaluates it
+    ref = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.lu()).fn())
+    seen = []
+    real = geneo.geneo_values
+
+    def spy(plan, pat, A, vals, frozen=None):
+        seen.append(isinstance(vals, jax.core.Tracer))
+        return real(plan, pat, A, vals, frozen)
+
+    monkeypatch.setattr(geneo, "geneo_values", spy)
+    sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=_bnn(1)).fn())
+    assert any(seen), "the space was never recomputed from a traced tangent"
+    np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())
