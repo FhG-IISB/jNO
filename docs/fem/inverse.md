@@ -58,7 +58,7 @@ recovered = crux.eval([k])                                # the array (do not in
 
 `fem.solve(solve_fn)` lets you choose the solver, but every problem ships with a differentiable
 default (no external dependency): the steady linear default is Jacobi-preconditioned BiCGStab on the
-sparse operator, with a sparse-direct factorisation (`jno.solve.lu()`, JAX `spsolve`) one slot away; the
+sparse operator, with a sparse-direct factorisation (`jno.solve.lu()`: cuDSS on a GPU that has it, else JAX `spsolve`) one slot away; the
 nonlinear default is Newton on the assembled tangent with Jacobi-BiCGStab inner solves (matrix-free
 Newton-Krylov where there is no assembled tangent), and the transient default backward-Euler over those.
 All are implicit-diff, so `crux.solve` recovers parameters through them.

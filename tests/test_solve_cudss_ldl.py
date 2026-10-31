@@ -110,3 +110,34 @@ def test_integrate_with_the_cudss_solver_takes_the_ldl_path(monkeypatch):
         vals.append(float(np.asarray(crux.eval([F])).reshape(-1)[0]))
     assert calls, "the LDL^T path was not taken"
     np.testing.assert_allclose(vals[0], vals[1], rtol=1e-9)
+
+
+def test_the_values_of_the_factors_are_not_factored_again():
+    """a factor call with the values the slot's factors came from runs no factorisation (a constant operator solved
+    again: a march's steps, a frozen solve inside an optimisation step); other values do, and every answer is right"""
+    n = 60
+    i = np.arange(n)
+    rows = np.concatenate([i, i[:-1], i[1:]])
+    cols = np.concatenate([i, i[1:], i[:-1]])
+    plan = cs.plan(rows, cols, n)
+    rng = np.random.default_rng(2)
+    off = rng.normal(size=n - 1)
+    vals = np.concatenate([4.0 + rng.uniform(size=n), off, off])
+    dense = np.zeros((n, n))
+    dense[rows, cols] = vals
+    f = jax.jit(lambda v, b: cs.solve(plan, v, b))
+    v = jnp.asarray(vals)
+    for k in range(4):  # one factorisation for four programs on the same values
+        b = jnp.asarray(rng.normal(size=n))
+        np.testing.assert_allclose(np.asarray(f(v, b)), np.linalg.solve(dense, np.asarray(b)), rtol=1e-10, atol=1e-12)
+    assert plan.stats()["factorisations"] == 1
+    for k in range(1, 4):  # new values: a factorisation each
+        b = jnp.asarray(rng.normal(size=n))
+        np.testing.assert_allclose(
+            np.asarray(f(v * (1 + 0.1 * k), b)),
+            np.linalg.solve(dense * (1 + 0.1 * k), np.asarray(b)),
+            rtol=1e-10,
+            atol=1e-12,
+        )
+    assert plan.stats()["factorisations"] == 4
+    plan.release()
