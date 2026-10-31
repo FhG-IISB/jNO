@@ -46,6 +46,7 @@ import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
 
+from ..sets import unique_values
 from .fem_1d import (
     _apply_dirichlet_projected,
     _apply_dirichlet_symmetric,
@@ -412,7 +413,7 @@ def _region_node_ids_from_cells(domain, region: str, cells: np.ndarray) -> Any:
 
     def _nodes(r):
         m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
-        return np.unique(cells[m > 0]) if m.shape[0] == cells.shape[0] else None
+        return unique_values(cells[m > 0]) if m.shape[0] == cells.shape[0] else None
 
     if region in src:
         return _nodes(region)
@@ -2058,7 +2059,7 @@ def assemble_fem_native(
             # interface is interior), or the numbering differs -- fall through rather than silently
             # selecting nothing, which would drop the term without a word.
             if _hit:
-                return np.unique(np.asarray(_hit, dtype=np.int32))
+                return unique_values(np.asarray(_hit, dtype=np.int32))
         _owner = (getattr(domain, "_tag_regions", {}) or {}).get(region)
         _pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
         if _owner is not None and _pred is not None:
@@ -2066,7 +2067,7 @@ def assemble_fem_native(
             # does it -- NOT `_region_node_ids`, whose location function intersects with the "boundary"
             # region, and a non-conforming interface is deliberately kept out of that region. Going
             # through it here selected nothing at all on the very interface the tag names.
-            _bn = np.unique(np.asarray(conn.face_nodes).reshape(-1))
+            _bn = unique_values(np.asarray(conn.face_nodes).reshape(-1))
             _co = np.asarray(pts_p1)[_bn]
             _hit_p = np.asarray(_pred(*(_co[:, i] for i in range(dim))), dtype=bool).reshape(-1)
             _rnodes = {int(x) for x in _bn[_hit_p]}
@@ -2319,7 +2320,7 @@ def assemble_fem_native(
             _mains = _main if isinstance(_main, tuple) else (_main,)
             _selfc = _secondary in _mains  # self-contact: a surface searching against itself
             _sf = np.asarray(_region_faces(_secondary), dtype=np.int32)
-            _mfaces = np.unique(np.concatenate([np.asarray(_region_faces(m), dtype=np.int32) for m in _mains]))
+            _mfaces = unique_values(np.concatenate([np.asarray(_region_faces(m), dtype=np.int32) for m in _mains]))
             _mf = np.asarray(conn.face_nodes, dtype=np.int64)[_mfaces]
             if _sf.size == 0 or _mf.size == 0:
                 raise ValueError(
@@ -4501,7 +4502,7 @@ def assemble_fem_native(
         outer = np.asarray(bf)[~on_iface[verts].all(axis=1)]
         if outer.size == 0:  # every boundary facet is an interface -> nothing to pin; leave as-is
             return bnodes
-        return np.intersect1d(bnodes, np.unique(outer.reshape(-1)))
+        return np.intersect1d(bnodes, unique_values(outer.reshape(-1)))
 
     def _boundary_node_ids(fidx: int, region: str) -> List[int]:
         """Boundary DOF-node ids of ``region`` for field ``fidx``, in the padded layout.
@@ -4607,7 +4608,7 @@ def assemble_fem_native(
 
             # n_v from the DIMENSION, not from the column count: an order-3 edge also has 4 columns
             bf = drop_covered_facets(np.asarray(bf), _hang, n_v=2 if dim == 2 else 4)
-        bnodes = np.unique(np.asarray(bf).reshape(-1))
+        bnodes = unique_values(np.asarray(bf).reshape(-1))
         if region == "boundary":
             bnodes = _drop_interface_only_nodes(np.asarray(bf), bnodes, pts_all)
         if region != "boundary":

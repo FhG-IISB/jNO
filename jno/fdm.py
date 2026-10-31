@@ -72,6 +72,7 @@ from . import precond as jno_precond
 from . import solve as _solve
 from .differential_operators import DifferentialOperators as _D
 from .trace_evaluator import fd_grid
+from .utils.sets import unique_values
 
 __all__ = ["fdm", "laplacian", "gradient"]
 
@@ -1067,7 +1068,7 @@ class _TraceFDM:
             dist, nodes = cKDTree(np.asarray(self._pts)).query(pts)
             extent = float(np.ptp(np.asarray(self._pts), axis=0).max())
             if len(pts) and np.all(dist <= _rtol() * extent):  # relative to the domain's size, not 1e-9
-                return np.unique(nodes).astype(int)
+                return unique_values(nodes).astype(int)
         # An unknown tag used to fall through to the WHOLE boundary: `p(xg, yg) - 0` on a
         # `domain.point_region` pinned p on every wall node, and a lid-driven cavity came out 0.016 off
         # Ghia et al. instead of 0.0019 — plausible, and wrong. Refused instead.
@@ -2914,7 +2915,7 @@ class _TraceFDM:
             import jax
 
             with jax.ensure_compile_time_eval():
-                cached = np.unique(
+                cached = unique_values(
                     np.concatenate([np.asarray(r[1], dtype=int) for r in self._dirichlet_rows()] or [np.zeros(0, int)])
                 )
             self._dirichlet_node_cache = cached
@@ -2933,7 +2934,7 @@ class _TraceFDM:
 
             with jax.ensure_compile_time_eval():
                 parts = [b * self._N + np.asarray(idx, dtype=int) for b, idx, _v in self._dirichlet_rows()]
-            cached = np.unique(np.concatenate(parts)) if parts else np.zeros(0, int)
+            cached = unique_values(np.concatenate(parts)) if parts else np.zeros(0, int)
             self._dirichlet_dof_cache = cached
         return cached
 

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .utils.sets import unique_values
+
 
 def _region_mask(pts, geom):
     """Boolean mask of points ``pts`` inside a region ``geom`` (nodes or element centroids). A
@@ -48,7 +50,7 @@ def _element_partition(pts, tris, geom0):
     ``([nodes0, nodes1], gamma)`` where ``gamma`` = the interface nodes shared by both element sets."""
     cent = pts[tris].mean(1)
     in0 = _region_mask(cent, geom0)
-    nodes0, nodes1 = np.unique(tris[in0]), np.unique(tris[~in0])
+    nodes0, nodes1 = unique_values(tris[in0]), unique_values(tris[~in0])
     gamma = np.intersect1d(nodes0, nodes1)
     return [nodes0, nodes1], gamma
 

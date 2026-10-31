@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..utils.sets import unique_values
 from . import parametric as _par
 from .primitives import Box, Cylinder, Disk, Line, Polygon, Rect, Sphere, _to3
 
@@ -1856,7 +1857,7 @@ def _edge_multiplicity(facets):
     k = facets.shape[1]
     pairs = np.concatenate([facets[:, [i, (i + 1) % k]] for i in range(k)], axis=0)
     _e, counts = np.unique(np.sort(pairs, axis=1), axis=0, return_counts=True)
-    return {int(m): int((counts == m).sum()) for m in np.unique(counts)}
+    return {int(m): int((counts == m).sum()) for m in unique_values(counts)}
 
 
 def _tessellate(shape) -> BoundaryMesh:

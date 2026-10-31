@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
+from ..sets import unique_values
+
 # ---------------------------------------------------------------------
 # Solver-agnostic semidiscrete block returned by weak.assemble(...)
 # ---------------------------------------------------------------------
@@ -831,7 +833,7 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
         hi = t0 + (done + k) * dt
         lo_ok = ts >= lo - tol if not out else ts > lo + tol
         sel = ts[lo_ok & (ts <= hi + tol)]
-        sub = _np.unique(_np.concatenate([sel, _np.asarray([hi])]))
+        sub = unique_values(_np.concatenate([sel, _np.asarray([hi])]))
         # state0_fn would re-form the INITIAL state from args and undo the carry, so it goes with it.
         chunk = dataclasses.replace(block, t0=lo, t1=hi, state0=state, state0_fn=None)
         lin_s, nonlin_s = compose(chunk, state)
@@ -1390,7 +1392,7 @@ def _needed_steps(grid_np, save):
     on_grid = grid_np[lo] == s
     past_end = s >= grid_np[n]
     need = np.concatenate([lo[on_grid & ~past_end], hi[~on_grid | past_end], lo[~on_grid & ~past_end]])
-    return np.unique(need[need >= 1])
+    return unique_values(need[need >= 1])
 
 
 def _frame_chunks(n_steps, needed, budget_frames):

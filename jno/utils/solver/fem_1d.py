@@ -62,6 +62,7 @@ import numpy as np
 from jax.experimental import sparse as jsp
 from jax.flatten_util import ravel_pytree
 
+from ..sets import unique_values
 from .fem_utils import (
     _eval_integrand,
     bcoo_eliminate_dirichlet,
@@ -171,7 +172,7 @@ def _region_node_ids(domain: Any, region: str) -> List[int]:
     if vol is not None:
         m = np.asarray(_cell_region_mask(domain, region)).reshape(-1)
         if m.shape[0] == np.asarray(vol).shape[0]:
-            return list(np.unique(np.asarray(vol)[m > 0]))
+            return list(unique_values(np.asarray(vol)[m > 0]))
     raise ValueError(
         f"jno.fem: region {region!r} has neither a location predicate nor cells on this mesh, so its "
         "nodes cannot be determined. Name a `domain.tag` region or a `shape.regions` body."

@@ -21,6 +21,7 @@ from ..trace import (
 )
 from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
+from ..utils.sets import unique_values
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
 from .mesh_utils import VOLUME_BLOCKS_BY_DIM, mesh_cell_region_membership
@@ -3132,7 +3133,7 @@ class domain(MeshIOMixin):
         def key(a):
             return np.round(np.asarray(a)[..., :dim] / q).astype(np.int64)
 
-        own = {tuple(r) for r in key(pts[np.unique(vol[m > 0])]).reshape(-1, dim)}
+        own = {tuple(r) for r in key(pts[unique_values(vol[m > 0])]).reshape(-1, dim)}
         ek = key(ents)
         return np.array([all(tuple(v) in own for v in f) for f in ek], dtype=bool)
 

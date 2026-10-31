@@ -104,6 +104,7 @@ from .integration_operators import IntegrationOperators
 from .utils import get_logger
 from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
 from .utils.schemes import resolve_scheme, scheme_family
+from .utils.sets import unique_values
 
 
 def _uniform_grid_spec(domain, n_values: int):
@@ -3151,7 +3152,7 @@ class TraceEvaluator:
                     np.add.at(vols, tris[:, 0], share)
                     np.add.at(vols, tris[:, 1], share)
                     np.add.at(vols, tris[:, 2], share)
-                    reg_indices = np.unique(tris.flatten()).astype(int)
+                    reg_indices = unique_values(tris.flatten()).astype(int)
                     region_pts_np = points_arr[reg_indices]
                     weights_np = vols[reg_indices]
                 else:

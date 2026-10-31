@@ -29,6 +29,8 @@ from typing import Any
 
 import numpy as np
 
+from .utils.sets import unique_values
+
 __all__ = ["Info", "info"]
 
 _RULE = "─"
@@ -584,7 +586,7 @@ def _info_fem(f, deep: bool) -> Info:
             n = int(f.dofs)
             nz = np.abs(dat) > 0
             rows_i, cols_i, vals = idx[nz, 0], idx[nz, 1], dat[nz]
-            empty = n - len(np.unique(rows_i))
+            empty = n - len(unique_values(rows_i))
             op.append(("empty rows", f"{_fmt_n(empty)}" + ("  ← SINGULAR: those dofs sit in no equation" if empty else "")))
             # A vs A^T by matching (i,j) against (j,i) on a sorted key -- O(nnz log nnz), no fill.
             k1 = rows_i.astype(np.int64) * n + cols_i
