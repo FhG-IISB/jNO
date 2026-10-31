@@ -817,6 +817,12 @@ a march the cells combine as the step operator does (`M + θΔt A`; a mass that 
 A short step needs less of it: on layered diffusion at contrast 10⁴ it keeps 54 vectors at a long step, where it
 halves the iterations, 5 at `Δt = 10⁻³`, where the local solves are already enough, and none at `Δt = 10⁻⁷`.
 
+In 3-D the iterations hold too, with a larger space. On a layered P1 block at contrast 10⁴, from 7,344 to 42,192
+unknowns and 16 to 128 subdomains, it takes 43 to 51 iterations where the rigid modes take 101 to 158, keeping up
+to 16 % of the unknowns as coarse vectors. It matters less as subdomains shrink below the layers: at 512 subdomains
+on 42,192 unknowns the rigid modes take 57. The eigenproblems are dense, so they run in chunks that fit the device;
+when the coarse matrix is what runs out of memory, cap it with `nev=` (`nev=24` at 256 subdomains: 66 iterations).
+
 By default the space is computed once, when the solve sets up; `ZᵀAZ` and the local solves still follow the
 operator. When the stiffness pattern itself moves -- a damage band opening, a design changing, a material
 yielding -- give the spec that holds it `reuse=k`:

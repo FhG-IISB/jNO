@@ -109,6 +109,38 @@ def test_the_local_eigenproblems_are_scipys():
         np.testing.assert_allclose(w[i], lam, rtol=1e-7, atol=1e-10)
         assert np.abs(V[i][~valid[i]]).max(initial=0.0) == 0.0  # padding carries nothing
 
+    # in chunks, the same eigenpairs: a chunk of 4 leaves a remainder of 2
+    for batch in (1, 4):
+        wb, Vb = _local_eigs(
+            local_blocks(pat, A)[0],
+            *neumann_tables(pat, r, c, cell),
+            jnp.asarray(v),
+            jnp.asarray(D),
+            jnp.asarray(~valid, float),
+            tau=0.2,
+            nev=nev,
+            batch=batch,
+        )
+        np.testing.assert_allclose(np.asarray(wb), w, rtol=1e-10, atol=1e-12)
+        for i in range(p):  # the rigid modes share an eigenvalue, so compare what they span, not the vectors
+            keep = w[i] < 0.2
+            ours, theirs = np.asarray(Vb)[i][:, keep], V[i][:, keep]
+            np.testing.assert_allclose(ours @ ours.T, theirs @ theirs.T, atol=1e-7 * max(1.0, np.abs(theirs).max() ** 2))
+
+
+def test_the_local_eigenproblems_run_in_chunks_that_fit_the_device():
+    from jno.utils.solver.geneo import EIG_WORK, _eig_batch
+
+    GiB = 2**30
+    assert _eig_batch(512, 400, 8, None, "G") == 512  # no limit to respect (CPU)
+    b = _eig_batch(128, 936, 8, 6 * GiB, "G")  # all at once takes 13 GiB of temporaries: it was out of memory
+    assert 1 <= b < 128 and b * EIG_WORK * 936**2 * 8 <= 1.5 * GiB
+    assert _eig_batch(4, 100, 8, 6 * GiB, "G") == 4  # small enough for one batch
+    with pytest.raises(ValueError, match="more Schwarz parts"):
+        _eig_batch(1024, 936, 8, 6 * GiB, "G")  # what stays on the device across the chunks does not fit
+    with pytest.raises(ValueError, match="more Schwarz parts"):
+        _eig_batch(2, 8000, 8, 6 * GiB, "G")  # not even one of them fits
+
 
 @pytest.mark.parametrize("parts", [16, 64])
 def test_geneo_holds_the_iterations_across_a_stiffness_jump_where_rigid_modes_do_not(parts):

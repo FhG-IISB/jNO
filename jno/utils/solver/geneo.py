@@ -85,28 +85,59 @@ def neumann_tables(pat, rows, cols, cells, held=None):
     return jnp.asarray(nrow, jnp.int32), jnp.asarray(ncol, jnp.int32), jnp.asarray(npos, jnp.int32)
 
 
-@functools.partial(jax.jit, static_argnames=("tau", "nev"))
-def _local_eigs(blk, nrow, ncol, npos, vals, D, pad, *, tau, nev):
-    """The ``nev`` lowest eigenpairs of ``A_i^N v = lambda D_i A_ii D_i v`` for every subdomain at once, and the
-    coarse-vector entries ``D_i v``. Padded slots get ``A^N = B = `` a multiple of the identity with its
-    eigenvalue above ``tau``, so they are never selected."""
+# Temporaries of one local eigenproblem, solver workspace included, in units of its m x m matrix. Measured on the GPU:
+# about 15 at 128 subdomains of 537 and 64 of 828.
+EIG_WORK = 16
+
+
+def _eig_batch(p, m, item, cap, who):
+    """How many of the ``p`` local eigenproblems of size ``m`` to run at once on a device of ``cap`` bytes (``None``:
+    no limit known, all of them), so that their temporaries take at most a quarter of it. Raises when what stays on
+    the device across the chunks (the local blocks, the eigenvectors), or a single eigenproblem, cannot fit."""
+    if not cap:
+        return p
+    need = max(3 * p, EIG_WORK) * m * m * item
+    if need > 0.5 * cap:
+        raise ValueError(
+            f"{who}: {p} local eigenproblems of size {m} need about {need / 2**30:.1f} GiB on the device, over half "
+            "of its memory. Use more Schwarz parts (smaller subdomains) or overlap=1."
+        )
+    return int(np.clip(cap // (4 * EIG_WORK * m * m * item), 1, p))
+
+
+def _device_limit():
+    dev = jax.devices()[0]
+    return (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
+
+
+@functools.partial(jax.jit, static_argnames=("tau", "nev", "batch"))
+def _local_eigs(blk, nrow, ncol, npos, vals, D, pad, *, tau, nev, batch=None):
+    """The ``nev`` lowest eigenpairs of ``A_i^N v = lambda D_i A_ii D_i v`` for every subdomain, ``batch`` at a time
+    (``None``: all at once), and the coarse-vector entries ``D_i v``. Padded slots get ``A^N = B = `` a multiple of
+    the identity with its eigenvalue above ``tau``, so they are never selected."""
     from jax.scipy.linalg import solve_triangular
 
     p, m, _ = blk.shape
     ext = jnp.concatenate([vals, jnp.zeros((1,), vals.dtype)])
-    AN = jax.vmap(lambda r, c, q: jnp.zeros((m, m), vals.dtype).at[r, c].add(ext[q]))(nrow, ncol, npos)
     eye = jnp.eye(m, dtype=vals.dtype)
-    keep = (1.0 - pad)[:, :, None] * (1.0 - pad)[:, None, :]  # a padded row and column couple to nothing
-    AN = keep * AN + (2.0 * tau + 1.0) * pad[:, :, None] * eye
-    AN = 0.5 * (AN + jnp.swapaxes(AN, 1, 2))
-    B = keep * (D[:, :, None] * blk * D[:, None, :]) + pad[:, :, None] * eye
-    B = 0.5 * (B + jnp.swapaxes(B, 1, 2))
-    Lc = jnp.linalg.cholesky(B)
-    X = solve_triangular(Lc, AN, lower=True)  # L^-1 A^N
-    Cm = solve_triangular(Lc, jnp.swapaxes(X, 1, 2), lower=True)  # L^-1 A^N L^-T
-    w, W = jnp.linalg.eigh(0.5 * (Cm + jnp.swapaxes(Cm, 1, 2)))
-    V = solve_triangular(jnp.swapaxes(Lc, 1, 2), W[:, :, :nev], lower=False)  # L^-T w: B-orthonormal
-    return w[:, :nev], D[:, :, None] * V
+
+    def one(args):
+        blk, r, c, q, D, pad = args
+        AN = jnp.zeros((m, m), vals.dtype).at[r, c].add(ext[q])
+        keep = (1.0 - pad)[:, None] * (1.0 - pad)[None, :]  # a padded row and column couple to nothing
+        AN = keep * AN + (2.0 * tau + 1.0) * pad[:, None] * eye
+        AN = 0.5 * (AN + AN.T)
+        B = keep * (D[:, None] * blk * D[None, :]) + pad[:, None] * eye
+        B = 0.5 * (B + B.T)
+        Lc = jnp.linalg.cholesky(B)
+        X = solve_triangular(Lc, AN, lower=True)  # L^-1 A^N
+        Cm = solve_triangular(Lc, X.T, lower=True)  # L^-1 A^N L^-T
+        w, W = jnp.linalg.eigh(0.5 * (Cm + Cm.T))
+        V = solve_triangular(Lc.T, W[:, :nev], lower=False)  # L^-T w: B-orthonormal
+        return w[:nev], D[:, None] * V
+
+    args = (blk, nrow, ncol, npos, D, pad)
+    return jax.vmap(one)(args) if batch is None or batch >= p else jax.lax.map(one, args, batch_size=batch)
 
 
 def geneo_space(fem, A, pat, tau: float, nev, *, who: str = "jno.space.geneo"):
@@ -135,15 +166,7 @@ def geneo_space(fem, A, pat, tau: float, nev, *, who: str = "jno.space.geneo"):
     if int(jnp.max(rows)) >= n or int(jnp.max(cols)) >= n:
         raise ValueError(f"{who}: the element matrices live on a larger space than the {n}-unknown operator.")
     nev = m if nev is None else min(int(nev), m)
-    item = jnp.dtype(vals.dtype).itemsize
-    need = 6 * p * m * m * item
-    dev = jax.devices()[0]
-    cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
-    if cap and need > 0.5 * cap:
-        raise ValueError(
-            f"{who}: {p} local eigenproblems of size {m} need about {need / 2**30:.1f} GiB on the device, over half "
-            "of its memory. Use more Schwarz parts (smaller subdomains) or overlap=1."
-        )
+    batch = _eig_batch(p, m, jnp.dtype(vals.dtype).itemsize, _device_limit(), who)
     with jax.ensure_compile_time_eval():
         nrow, ncol, npos = neumann_tables(pat, rows, cols, cells)
         blk, _ = local_blocks(pat, A)
@@ -161,6 +184,7 @@ def geneo_space(fem, A, pat, tau: float, nev, *, who: str = "jno.space.geneo"):
         jnp.asarray(~valid, blk.dtype),
         tau=float(tau),
         nev=nev,
+        batch=batch,
     )
     w, V = np.asarray(w), np.asarray(V)
     if not (np.all(np.isfinite(w)) and np.all(np.isfinite(V))):
@@ -223,9 +247,9 @@ def edge_split(S):
 
     Each term is positive semi-definite, so the terms with both ends in a subdomain make a local matrix ``A_i`` with
     ``0 <= A_i <= A`` -- what GenEO's Neumann matrix is for -- from the operator alone: each edge is a "cell" of two
-    unknowns. On a diffusion operator it measures the same as the cells of the mesh (iterations and space size,
-    plans/deflation-probes/edge_split_geneo_probe.txt). The fully algebraic splitting of Al Daas & Jolivet (SISC 44(4),
-    2022), for any SPD matrix, keeps 65 % of the unknowns on layered elasticity, so it is not used."""
+    unknowns. On a diffusion operator it measures the same as the cells of the mesh (iterations and space size). The
+    fully algebraic splitting of Al Daas & Jolivet (SISC 44(4), 2022), for any SPD matrix, keeps 65 % of the unknowns
+    on layered elasticity, so it is not used."""
     from .deflation import row_eliminated, symmetric_on_free
 
     if not symmetric_on_free(S):
@@ -354,15 +378,7 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
         prolong = (jnp.asarray(Pc.row, jnp.int32), jnp.asarray(Pc.col, jnp.int32), jnp.asarray(Pc.data), P.shape[0])
     if int(jnp.max(rows)) >= n or int(jnp.max(cols)) >= n:
         raise ValueError(f"{who}: the element matrices live on a larger space than the {n}-unknown operator.")
-    item = jnp.dtype(vals.dtype).itemsize
-    need = 6 * p * m * m * item
-    dev = jax.devices()[0]
-    cap = (dev.memory_stats() or {}).get("bytes_limit") if hasattr(dev, "memory_stats") else None
-    if cap and need > 0.5 * cap:
-        raise ValueError(
-            f"{who}: {p} local eigenproblems of size {m} need about {need / 2**30:.1f} GiB on the device, over half "
-            "of its memory. Use more Schwarz parts (smaller subdomains) or overlap=1."
-        )
+    batch = _eig_batch(p, m, jnp.dtype(vals.dtype).itemsize, _device_limit(), who)
     with jax.ensure_compile_time_eval():
         # a prescribed row of a march's tangent is eliminated by row only, its column stays: its increment is zero
         # whatever the column holds, so the unknown is left out of the eigenproblems and the coarse vectors
@@ -375,7 +391,7 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     D = jnp.asarray(np.where(valid, 1.0 / np.maximum(mult[np.minimum(idx, n - 1)], 1.0), 1.0), blk.dtype)
     pad = jnp.asarray(~valid | held[np.minimum(idx, n - 1)], blk.dtype)
     first = m if nev is None else min(int(nev), m)
-    w, V = _local_eigs(blk, nrow, ncol, npos, jnp.asarray(vals), D, pad, tau=float(tau), nev=first)
+    w, V = _local_eigs(blk, nrow, ncol, npos, jnp.asarray(vals), D, pad, tau=float(tau), nev=first, batch=batch)
     w = np.asarray(w)
     if not (np.all(np.isfinite(w)) and np.all(np.isfinite(np.asarray(V)))):
         raise ValueError(
@@ -417,8 +433,9 @@ def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
             raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
         if plan.src is not None:
             vals = vals[plan.src] * plan.w.astype(vals.dtype)
+    batch = _eig_batch(pat.p, pat.m, jnp.dtype(blk.dtype).itemsize, _device_limit(), plan.who)
     w, V = _local_eigs(
-        blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev
+        blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev, batch=batch
     )
     sel = w < plan.tau
     V = V * (sel[:, None, :] & (pad < 0.5)[:, :, None])
