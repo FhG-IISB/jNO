@@ -113,9 +113,7 @@ def penalty(residual, *, mu: float, every: int, name: str | None = None, equalit
     added to the loss.
     """
     from .. import np as jnp_ops
-    from ..jnp_ops import _unary
-
-    _stop_gradient = _unary(jax.lax.stop_gradient)
+    from ..jnp_ops import _unary_call
 
     mu, every = float(mu), int(every)
     if not mu > 0.0:
@@ -134,5 +132,5 @@ def penalty(residual, *, mu: float, every: int, name: str | None = None, equalit
         psi = (jnp_ops.maximum(lam + m * c, 0.0) ** 2 - lam**2) / (2.0 * m)
     # Zero in value and in every gradient but its own, which is c: the multiplier update reads the
     # constraint from there, unclipped, whatever the sign of lam + mu c.
-    psi = psi + (probe - _stop_gradient(probe)) * c
+    psi = psi + (probe - _unary_call(jax.lax.stop_gradient, probe)) * c
     return state, psi
