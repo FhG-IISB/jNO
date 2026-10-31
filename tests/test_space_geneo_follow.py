@@ -13,6 +13,8 @@ answer is the direct solve's; a cadence a single compiled loop cannot honour rai
 
 from __future__ import annotations
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -112,6 +114,19 @@ def test_the_space_follows_the_tangent_inside_newton(monkeypatch):
     sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=_bnn(1)))
     assert any(seen), "the space was never recomputed from a traced tangent"
     np.testing.assert_allclose(sol, ref, rtol=0, atol=1e-6 * np.abs(ref).max())  # both within Newton's tolerance
+
+
+def test_a_saturated_space_says_so_once_not_at_every_newton_step(monkeypatch):
+    d, X, B = _plate()
+    fem = _elasticity(d, X, B, 1.0, nonlinear=True)
+    said = []
+    monkeypatch.setattr(logging.getLogger("jno"), "warning", lambda msg, *a, **k: said.append(msg))
+    S = jno.precond.schwarz(parts=6, coarse=False)
+    Q = jno.precond.coarse(jno.space.geneo(nev=1), parts=S, reuse=1)  # one column per subdomain: every one is full
+    jax.block_until_ready(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=Q >> S >> Q))
+    jax.effects_barrier()
+    assert fem.stats["nonlinear"]["steps"] > 1, "needs more than one recompute to mean anything"
+    assert sum("Give a larger nev=" in m for m in said) == 1
 
 
 def test_a_cadence_one_compiled_loop_cannot_honour_raises():

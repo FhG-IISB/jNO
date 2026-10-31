@@ -3395,7 +3395,12 @@ class _Schwarz(_Spec):
         self.parts, self.overlap, self.coarse, self.restricted = parts, overlap, coarse, restricted
         self._pattern = None
         self._geneo = None  # a space computed per subdomain: its host plan (geneo.GeneoPlan)
-        self._follow, self._nmat, self._last = None, 0, None  # reuse=k on such a space (see `_follow_space`)
+        self._follow, self._nmat, self._last, self._warned = (
+            None,
+            0,
+            None,
+            False,
+        )  # reuse=k on such a space (see `_follow_space`)
 
     @property
     def _can_follow(self):
@@ -3610,7 +3615,7 @@ def _follow_space(spec, ctx, spat, cpat, who):
     u, frozen = (None, None) if lin is None else lin
     if plan.edges is not None:  # read from the operator it is handed: no cells, no iterate
         null, W, kmask, counts = _geneo.geneo_values(plan, spat, A, None, frozen)
-        _warn_saturated(counts, plan.nev, who)
+        _warn_saturated(spec, counts, who)
         out = cpat._replace(null=null, W=W, kmask=kmask)
         if not traced:
             spec._last = out
@@ -3629,18 +3634,20 @@ def _follow_space(spec, ctx, spat, cpat, who):
         u = jax.ops.segment_sum(pd.astype(u.dtype) * u[pc], pr, num_segments=n_full)
     vals = element_triplets(fem, u, who=who, reduced_ok=True)[2]
     null, W, kmask, counts = _geneo.geneo_values(plan, spat, A, vals, frozen)
-    _warn_saturated(counts, spec._geneo.nev, who)
+    _warn_saturated(spec, counts, who)
     out = cpat._replace(null=null, W=W, kmask=kmask)
     if not traced:
         spec._last = out
     return out
 
 
-def _warn_saturated(counts, nev, who):
-    """Log (once per call site) when a subdomain uses every column it has: the space may be cut short there."""
+def _warn_saturated(spec, counts, who):
+    """Log once per spec when a subdomain uses every column it has: the space may be cut short there."""
+    nev = spec._geneo.nev
 
     def warn(c):
-        if int(c) > 0:
+        if int(c) > 0 and not spec._warned:
+            spec._warned = True
             logging.getLogger("jno").warning(
                 f"{who}: {int(c)} subdomain(s) have all {nev} columns below tau, so the space may be cut short "
                 f"there (slower, never wrong). Give a larger nev=."
@@ -3662,7 +3669,12 @@ class _Coarse(_Spec):
         self.space, self.parts = space, parts
         self._pattern = None
         self._geneo = None  # a space computed per subdomain: its host plan (geneo.GeneoPlan)
-        self._follow, self._nmat, self._last = None, 0, None  # reuse=k on such a space (see `_follow_space`)
+        self._follow, self._nmat, self._last, self._warned = (
+            None,
+            0,
+            None,
+            False,
+        )  # reuse=k on such a space (see `_follow_space`)
         self._token = None
         self._symmetric = False
 
