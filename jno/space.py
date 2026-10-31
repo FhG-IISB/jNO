@@ -41,7 +41,6 @@ class _EigVecs:
         Returns:
             The ``(n, k)`` eigenvectors, orthonormal.
         """
-        import jax.numpy as jnp
 
         from . import precond as _precond
         from .utils.solver.eigen import lobpcg_geneigh
@@ -130,11 +129,11 @@ class _GenEO:
 
         pat = self._schwarz_of(ctx)
         A = setup_operator(ctx.fem, ctx.A)
-        plan, _w, _V, vals = geneo_plan(ctx.fem, A, pat, self.tau, self.nev, headroom=headroom, who=repr(self))
+        plan, w, V, vals = geneo_plan(ctx.fem, A, pat, self.tau, self.nev, headroom=headroom, who=repr(self))
         row, part = geneo_pieces(plan, pat)
         cpat = static_pattern(row, part, pat.p, plan.nev, ctx.A, extra)
         with jax.ensure_compile_time_eval():
-            null, W, kmask, counts = geneo_values(plan, pat, A, None if vals is None else jnp.asarray(vals))
+            null, W, kmask, counts = geneo_values(plan, pat, A, vals, eigs=(w, V))
         self.counts = np.asarray(counts)
         logging.getLogger("jno").info(
             f"{self!r}: {int(self.counts.sum())} coarse vectors on {pat.p} subdomains ({self.counts.min()}-"

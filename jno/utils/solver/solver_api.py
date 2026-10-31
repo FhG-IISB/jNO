@@ -410,11 +410,13 @@ def current_step_form():
 
 
 def _build_step_spaces(precond, fem, A_step, a, b, t, u=None):
-    """Set up the spaces computed from the operator (GenEO) on the step operator itself: its cell matrices combine
-    as ``a M + b J`` at this state, and a build from the representative pattern (``M`` and ``A`` merely side by side)
-    would measure them against a different matrix."""
+    """Set up the spaces computed from the operator (GenEO, ``jno.space.eigvecs``, a callable) on the step operator
+    itself: GenEO's cell matrices combine as ``a M + b J`` at this state, and a build from the representative pattern
+    (``M`` and ``A`` merely side by side) would measure them against a different matrix."""
     for s in _specs_in(precond):
-        if getattr(s, "_can_follow", False) and getattr(s, "_pattern", None) is None:
+        space = getattr(s, "space", getattr(s, "coarse", None))
+        computed = callable(space) or hasattr(space, "basis") or getattr(s, "_can_follow", False)
+        if computed and getattr(s, "_pattern", None) is None:
             with step_form(a, b, t), linearized_at(u):
                 s.build(A_step, fem)
 
@@ -1969,6 +1971,14 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     """
     if precond is None:
         return None
+    cadence = next((s._follow for s in _specs_in(precond) if (getattr(s, "_follow", None) or 1) > 1), None)
+    if cadence is not None:
+        raise NotImplementedError(
+            f"fem.solve(precond=jno.precond.<spec>(reuse={cadence})): a nonlinear march runs as one compiled loop, "
+            "where no count of solves can be kept, so a recompute every "
+            f"{cadence} solves would never fire. Use reuse=1 (recompute at every linearization) or leave reuse out "
+            "(the setup's space; the coarse matrix still follows the operator)."
+        )
     # ``state`` is the state to linearise about. The block's own ``state0`` is the INITIAL condition,
     # which for a melt pool is cold and fully solid -- Carman-Kozeny ~1e13, PSPG tau ~1e-9, a stiffness
     # 1e6x its molten value -- so a setup frozen there describes an operator the march leaves behind.

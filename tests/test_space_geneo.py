@@ -10,6 +10,8 @@ refusals.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -140,6 +142,33 @@ def test_the_local_eigenproblems_run_in_chunks_that_fit_the_device():
         _eig_batch(1024, 936, 8, 6 * GiB, "G")  # what stays on the device across the chunks does not fit
     with pytest.raises(ValueError, match="more Schwarz parts"):
         _eig_batch(2, 8000, 8, 6 * GiB, "G")  # not even one of them fits
+
+
+def test_a_cell_reaching_outside_the_subdomain_is_not_inside_it():
+    """A facet term couples a cell to its neighbour's unknowns: a column there has no local slot."""
+    from jno.utils.solver.geneo import neumann_tables
+
+    n, p = 4, 2
+    pat = SimpleNamespace(n=n, p=p, m=3, idx=np.array([[0, 1, 2], [2, 3, n]]), part=np.array([0, 0, 1, 1]))
+    rows = np.array([0, 0, 1, 1, 1])
+    cols = np.array([0, 1, 0, 1, 3])  # the last entry, in cell 1, reads unknown 3: outside subdomain 0
+    cells = np.array([0, 0, 0, 1, 1])
+    nrow, ncol, npos = (np.asarray(a) for a in neumann_tables(pat, rows, cols, cells))
+    assert sorted(int(q) for q in npos[0] if q < rows.size) == [0, 1, 2]  # only cell 0 is inside subdomain 0
+    assert not (npos[1] < rows.size).any()
+
+
+def test_setup_solves_each_local_eigenproblem_once(monkeypatch):
+    from jno.utils.solver import geneo
+
+    fem = _layered(1e3)[0]
+    calls = []
+    real = geneo._local_eigs
+    monkeypatch.setattr(geneo, "_local_eigs", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    S = jno.precond.schwarz(parts=8, coarse=False)
+    Q = jno.precond.coarse(jno.space.geneo(), parts=S, reuse=1)
+    Q.prepare(fem)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("parts", [16, 64])

@@ -45,8 +45,9 @@ def neumann_tables(pat, rows, cols, cells, held=None):
     rows, cols, cells = (np.asarray(a, np.int64) for a in (rows, cols, cells))
     T = rows.size
     ncell = int(cells.max()) + 1 if T else 0
-    fr = free[rows]
-    C = sp.csr_matrix((np.ones(int(fr.sum())), (cells[fr], rows[fr])), shape=(ncell, n))
+    fr, fc = free[rows], free[cols]  # columns too: a facet term reaches its neighbour's unknowns
+    cu = np.concatenate([rows[fr], cols[fc]])
+    C = sp.csr_matrix((np.ones(cu.size), (np.concatenate([cells[fr], cells[fc]]), cu)), shape=(ncell, n))
     C.sum_duplicates()
     C.data[:] = 1.0  # cell -> its free unknowns
     nfree = np.asarray(C.sum(axis=1)).ravel()
@@ -341,19 +342,24 @@ class GeneoPlan(NamedTuple):
 
 def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str = "jno.space.geneo"):
     """``(plan, w, V, vals)``: the host part of a static-structure GenEO space on the Schwarz pattern ``pat``, and
-    the first eigenpairs ``(p, nev)`` / ``(p, m, nev)`` from the element triplets' values ``vals`` at zero.
+    the first eigenpairs ``(p, nev)`` / ``(p, m, nev)`` from the element triplets' values ``vals``, at the state
+    ``A`` was assembled at (:func:`~.solver_api.linearized_at`; zero by default).
 
     ``nev=None`` sizes the columns from these first eigenvalues: the largest count below ``tau`` -- doubled with
     ``headroom``, for a space that follows a changing operator and may need more later (a crack opening, a
     design becoming void). A given ``nev`` is the cap either way."""
     from .deflation import element_triplets, operator_graph, row_eliminated, solved_map, triplet_map
     from .schwarz import local_blocks
+    from .solver_api import current_linearization
 
     n, p, m = pat.n, pat.p, pat.m
     edges = None
+    u = (current_linearization() or (None, None))[0]
     try:
-        rows, cols, vals, cells = element_triplets(fem, who=who, reduced_ok=True)
         P = solved_map(fem, n, who)
+        if u is not None and P is not None:  # a reduced iterate: the cells read the full one
+            u = jnp.asarray(P @ np.asarray(u))
+        rows, cols, vals, cells = element_triplets(fem, u, who=who, reduced_ok=True)
     except (ValueError, NotImplementedError) as no_cells:
         # No cells to sum: FDM, non-nodal elements, an assembled matrix. A symmetric diagonally dominant operator
         # still splits exactly, into its own edges (see `edge_split`).
@@ -393,11 +399,8 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     first = m if nev is None else min(int(nev), m)
     w, V = _local_eigs(blk, nrow, ncol, npos, jnp.asarray(vals), D, pad, tau=float(tau), nev=first, batch=batch)
     w = np.asarray(w)
-    if not (np.all(np.isfinite(w)) and np.all(np.isfinite(np.asarray(V)))):
-        raise ValueError(
-            f"{who}: a local eigenproblem failed (non-finite values). GenEO needs a symmetric positive definite "
-            "operator: its subdomain blocks are factored by Cholesky."
-        )
+    if not (np.all(np.isfinite(w)) and bool(jnp.all(jnp.isfinite(V)))):
+        raise ValueError(_not_spd(who))
     count = int((w < tau).sum(axis=1).max(initial=0))
     if count == 0:  # the local solves already reach everything (a short time step): no correction is needed
         logging.getLogger("jno").info(f"{who}: no subdomain has an eigenvalue below tau={tau:g}: the space is empty.")
@@ -406,19 +409,34 @@ def geneo_plan(fem, A, pat, tau: float, nev, *, headroom: bool = False, who: str
     return plan, jnp.asarray(w[:, :k]), V[:, :, :k], raw
 
 
+def _not_spd(who):
+    return (
+        f"{who}: a local eigenproblem failed (non-finite values). GenEO needs a symmetric positive definite "
+        "operator: its subdomain blocks are factored by Cholesky."
+    )
+
+
+def _record_not_spd(who):
+    from .solver_api import _GATE_FAILURES
+
+    _GATE_FAILURES.append(_not_spd(who))
+
+
 def geneo_pieces(plan: GeneoPlan, pat):
     """``(row, part)`` of the coarse pattern's pieces: every free slot of every subdomain, subdomain by subdomain."""
     idx = np.asarray(pat.idx)
     return idx[plan.valid], np.repeat(np.arange(pat.p), plan.valid.sum(axis=1))
 
 
-def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
+def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None, eigs=None):
     """``(null, W, kmask, counts)`` of the space at the operator ``A`` and the element-triplet values ``vals``
     (traceable): the pieces' values ``(L, nev)``, the whitening ``(p, nev, nev)``, the kept directions
     ``(p, nev)`` and the eigenvalues below ``tau`` per subdomain.
 
     ``frozen`` ``(n,)`` bool: unknowns held fixed in this solve (the other fields of a staggered block step); they
-    are padding to the eigenproblems, so no vector lives on them."""
+    are padding to the eigenproblems, so no vector lives on them. ``eigs``: the eigenpairs when they are already
+    known at this ``A`` and ``vals`` (:func:`geneo_plan`'s). An operator its local solves cannot factor raises, or
+    under a trace is recorded for the solve's gate to raise."""
     from .schwarz import local_blocks
 
     blk, _ = local_blocks(pat, A)
@@ -426,17 +444,34 @@ def geneo_values(plan: GeneoPlan, pat, A, vals, frozen=None):
     if frozen is not None:
         fz = jnp.take(jnp.asarray(frozen), pat.idx, mode="fill", fill_value=True)
         pad = jnp.maximum(pad, fz.astype(pad.dtype))
-    if plan.edges is not None:
-        vals = edge_values(plan.edges, A)
+    if eigs is not None:
+        w, V = eigs
     else:
-        if int(vals.shape[0]) != plan.n_triplets:
-            raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
-        if plan.src is not None:
-            vals = vals[plan.src] * plan.w.astype(vals.dtype)
-    batch = _eig_batch(pat.p, pat.m, jnp.dtype(blk.dtype).itemsize, _device_limit(), plan.who)
-    w, V = _local_eigs(
-        blk, plan.nrow, plan.ncol, plan.npos, vals, plan.D.astype(blk.dtype), pad, tau=plan.tau, nev=plan.nev, batch=batch
-    )
+        if plan.edges is not None:
+            vals = edge_values(plan.edges, A)
+        else:
+            if int(vals.shape[0]) != plan.n_triplets:
+                raise ValueError(f"{plan.who}: the element matrices changed shape since the space was set up.")
+            if plan.src is not None:
+                vals = vals[plan.src] * plan.w.astype(vals.dtype)
+        batch = _eig_batch(pat.p, pat.m, jnp.dtype(blk.dtype).itemsize, _device_limit(), plan.who)
+        w, V = _local_eigs(
+            blk,
+            plan.nrow,
+            plan.ncol,
+            plan.npos,
+            vals,
+            plan.D.astype(blk.dtype),
+            pad,
+            tau=plan.tau,
+            nev=plan.nev,
+            batch=batch,
+        )
+    failed = ~jnp.all(jnp.isfinite(w))
+    if isinstance(failed, jax.core.Tracer):
+        jax.lax.cond(failed, lambda: jax.debug.callback(_record_not_spd, plan.who), lambda: None)
+    elif failed:
+        raise ValueError(_not_spd(plan.who))
     sel = w < plan.tau
     V = V * (sel[:, None, :] & (pad < 0.5)[:, :, None])
     null = V[plan.valid]  # (L, nev), subdomain by subdomain: the pieces of geneo_pieces

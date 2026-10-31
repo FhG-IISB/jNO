@@ -19,9 +19,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import sparse as jsparse
 
 import jno
-from jno.utils.solver.solver_api import LinearOperator, PrecondContext, materialize_precond
+from jno.utils.solver.solver_api import _GATE_FAILURES, LinearOperator, PrecondContext, materialize_precond
 
 pytest.importorskip("pymetis", reason="Schwarz subdomains use METIS: the [metis] extra")
 
@@ -106,9 +107,9 @@ def test_the_space_follows_the_tangent_inside_newton(monkeypatch):
     seen = []
     real = geneo.geneo_values
 
-    def spy(plan, pat, A, vals, frozen=None):
+    def spy(plan, pat, A, vals, frozen=None, **kw):
         seen.append(isinstance(vals, jax.core.Tracer))
-        return real(plan, pat, A, vals, frozen)
+        return real(plan, pat, A, vals, frozen, **kw)
 
     monkeypatch.setattr(geneo, "geneo_values", spy)
     sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=_bnn(1)))
@@ -127,6 +128,30 @@ def test_a_saturated_space_says_so_once_not_at_every_newton_step(monkeypatch):
     jax.effects_barrier()
     assert fem.stats["nonlinear"]["steps"] > 1, "needs more than one recompute to mean anything"
     assert sum("Give a larger nev=" in m for m in said) == 1
+
+
+def test_an_indefinite_tangent_at_a_recompute_is_named():
+    """Setup refuses an operator it cannot factor; so must a recompute, or NaN spreads through the coarse level with
+    no direction counted as bad."""
+    d, X, B = _plate()
+    fem = _elasticity(d, X, B, 1.0)
+    S = jno.precond.schwarz(parts=6, coarse=False)
+    Q = jno.precond.coarse(jno.space.geneo(nev=6), parts=S, reuse=1)
+    M = Q >> S >> Q
+    _matrix(M, fem)
+    A = fem._op[0]
+    with pytest.raises(ValueError, match="symmetric positive definite"):
+        materialize_precond(M, PrecondContext(LinearOperator(-1.0 * A), fem))
+
+    def traced(data):  # inside a compiled loop it cannot raise: the solve's gate does
+        At = jsparse.BCOO((data, A.indices), shape=A.shape)
+        return materialize_precond(M, PrecondContext(LinearOperator(At), fem))(jnp.ones(A.shape[0]))
+
+    _GATE_FAILURES.clear()
+    jax.block_until_ready(jax.jit(traced)(-A.data))
+    jax.effects_barrier()
+    assert any("symmetric positive definite" in m for m in _GATE_FAILURES)
+    _GATE_FAILURES.clear()
 
 
 def test_a_cadence_one_compiled_loop_cannot_honour_raises():
@@ -159,9 +184,9 @@ def test_a_staggered_block_step_holds_the_other_block_out(monkeypatch):
     held = []
     real = geneo.geneo_values
 
-    def spy(plan, pat, A, vals, fz=None):
+    def spy(plan, pat, A, vals, fz=None, **kw):
         held.append(None if fz is None else int(np.asarray(fz).sum()))
-        return real(plan, pat, A, vals, fz)
+        return real(plan, pat, A, vals, fz, **kw)
 
     monkeypatch.setattr(geneo, "geneo_values", spy)
     sol = np.asarray(fem.solve(nonlinear=alt, linear=jno.solve.cg(tol=1e-11), precond=_bnn(1)))
@@ -198,9 +223,9 @@ def test_the_space_follows_the_tangent_on_a_periodic_tie(monkeypatch):
     seen = []
     real = geneo.geneo_values
 
-    def spy(plan, pat, A, vals, frozen=None):
+    def spy(plan, pat, A, vals, frozen=None, **kw):
         seen.append(isinstance(vals, jax.core.Tracer))
-        return real(plan, pat, A, vals, frozen)
+        return real(plan, pat, A, vals, frozen, **kw)
 
     monkeypatch.setattr(geneo, "geneo_values", spy)
     sol = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(tol=1e-10), precond=_bnn(1)).fn())
@@ -253,9 +278,9 @@ def test_geneo_on_a_fracture_march_reads_the_marchs_history(reuse, monkeypatch):
     seen = []
     real = geneo.geneo_values
 
-    def spy(plan, pat, A, vals, frozen=None):
+    def spy(plan, pat, A, vals, frozen=None, **kw):
         seen.append((isinstance(vals, jax.core.Tracer), frozen is not None))
-        return real(plan, pat, A, vals, frozen)
+        return real(plan, pat, A, vals, frozen, **kw)
 
     monkeypatch.setattr(geneo, "geneo_values", spy)
     fem, alt = _fracture()

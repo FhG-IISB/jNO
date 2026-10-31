@@ -131,7 +131,8 @@ def operator_graph(A, extra=None):
 
     from .amg import _to_scipy_csr
 
-    S = _to_scipy_csr(A).astype(np.float64)
+    S = _to_scipy_csr(A)
+    S = S.astype(np.complex128 if np.iscomplexobj(S.data) else np.float64)  # complex stays: `_is_symmetric` reads it
     S.sum_duplicates()
     n = S.shape[0]
     if S.shape != (n, n):
@@ -881,6 +882,11 @@ def _step_triplets(fem, u, who, reduced_ok):
         raise ValueError(
             f"{who}: needs each cell's element matrix, and this march has none to give: non-nodal elements, 1-D, or "
             "a mass that changes (a runtime coefficient, c(u)). Give the space as an (n, k) array instead."
+        )
+    if getattr(block, "runtime_parameter_exprs", None):
+        raise NotImplementedError(
+            f"{who}: this march has runtime parameters, and its cells are read without their values, so they would "
+            "be another operator's. Give the space as an (n, k) array instead."
         )
     _require_nodal(fem, who)
     if _fem_reductions(fem) and not reduced_ok:

@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import scipy.sparse as sp
 
 import jno
 from jno.utils.solver import deflation
@@ -143,3 +144,15 @@ def test_the_block_factor_and_solve_alone_match_a_dense_solve():
     assert plan.nb < p * (p + 1) // 2  # nested dissection keeps the fill sparse
     # separators are eliminated as supernodes: per-column, this grid's elimination tree is 21 levels deep
     assert plan.nsuper < p and len(plan.levels) <= 2 * int(np.ceil(np.log2(p))) + 1
+
+
+def test_a_complex_operator_never_reaches_the_cholesky_factor(monkeypatch):
+    """Its real part may be symmetric, but the factor assumes a real symmetric E."""
+    monkeypatch.setattr(deflation, "SPARSE_MIN", 0)
+    n = 40
+    B = sp.random(n, n, density=0.2, random_state=1, format="csr")
+    A = sp.csr_matrix(B + B.T + 10 * sp.identity(n)) + 1j * sp.random(n, n, density=0.2, random_state=2, format="csr")
+    part = np.arange(n) * 4 // n
+    real_part = deflation.coarse_pattern(np.ones((n, 1)), part, 4, A.real.tocsr())
+    assert real_part.chol is not None, "the sparse factor is what this test keeps complex operators out of"
+    assert deflation.coarse_pattern(np.ones((n, 1)), part, 4, A).chol is None
