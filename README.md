@@ -167,6 +167,44 @@ Nothing selects a mode: `fem.solve()` reads the time derivative and the nonlinea
 </details>
 
 <details>
+<summary><strong>Domain decomposition</strong>: GenEO finds the coarse space that a stiffness contrast needs</summary>
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)
+import jno
+
+R, NU = jno.shape.rect, 0.3
+d = (R(0, 0.00, 4, 0.25).name("stiff0").attach(E=1e4)    # four layers, stiffness contrast 10⁴
+     + R(0, 0.25, 4, 0.50).name("soft0").attach(E=1.0)
+     + R(0, 0.50, 4, 0.75).name("stiff1").attach(E=1e4)
+     + R(0, 0.75, 4, 1.00).name("soft1").attach(E=1.0)).sized(0.05).domain()
+x, y, _ = d.variable("interior", split=True)
+xl, yl, _ = d.variable("left", split=True)               # clamped on the left
+u = d.unknown.vector(2); v = u.test()
+
+eps = lambda w: jno.np.symgrad(w, [x, y])
+ddot, tr = lambda a, b: jno.np.inner(a, b, n_contract=2), jno.np.trace
+lam, mu = d.E * NU / ((1 + NU) * (1 - 2 * NU)), d.E / (2 * (1 + NU))
+fem = jno.fem([2 * mu * ddot(eps(u), eps(v)) + lam * tr(eps(u)) * tr(eps(v)) + 0.1 * v[1],   # under its own weight
+               u(xl, yl) - (0.0, 0.0)])
+
+S = jno.precond.schwarz(parts=64, coarse=False)          # local solves on 64 METIS subdomains
+rigid = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)   # the modes you can write down
+geneo = jno.precond.coarse(jno.space.geneo(), parts=S)   # the ones you can't, from local eigenproblems
+for M in (S, rigid >> S >> rigid, geneo >> S >> geneo):
+    fem.solve(linear=jno.solve.cg(tol=1e-8, maxiter=5000), precond=M)
+    print(fem.stats["linear_iterations"]["total"])       # 291, 110, 40 CG iterations
+```
+
+A preconditioner is a value you compose: `Q >> S >> Q` applies the coarse correction around the local
+solves. GenEO keeps the count close to that of a homogeneous block; it needs a symmetric positive
+definite problem (and `[fem]`, for METIS). The [coarse-space tutorial](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/coarse-spaces-layered-elasticity/)
+follows the count over the number of subdomains.
+
+</details>
+
+<details>
 <summary><strong>Electromagnetics</strong>: resonant modes of a 3-D cavity with Nédélec edge elements</summary>
 
 ```python
@@ -323,7 +361,7 @@ fine-tuning plug into the same `jno.core`.
 | [FDM](https://fhg-iisb.github.io/jNO/fdm/) | strong form on structured and unstructured grids, 2-D and 3-D, geometric multigrid | stable |
 | [RCWA](https://fhg-iisb.github.io/jNO/rcwa/) | vector Maxwell, anisotropic media, diffraction orders, Jones readout | stable |
 | [PEEC](https://fhg-iisb.github.io/jNO/peec/) | partial-element equivalent circuits: inductance and resistance of conductor layouts, DC to MHz | beta |
-| [Solvers](https://fhg-iisb.github.io/jNO/solvers/) | sparse LU (SuperLU, PARDISO, cuDSS), Krylov, AMG, AMS, Schwarz; Newton; eigenproblems (LOBPCG, shift-invert, Arnoldi) | stable |
+| [Solvers](https://fhg-iisb.github.io/jNO/solvers/) | sparse LU (SuperLU, PARDISO, cuDSS), Krylov, AMG, AMS, Schwarz with coarse spaces (GenEO); Newton; eigenproblems (LOBPCG, shift-invert, Arnoldi) | stable |
 | [Time integration](https://fhg-iisb.github.io/jNO/solvers/) | θ-method, BDF2, SDIRK, Rosenbrock, exponential, adaptive steps | stable |
 | [Inverse & design](https://fhg-iisb.github.io/jNO/inverse-problems/) | gradients through any solve: coefficients, fields, geometry, topology optimisation (MMA) | stable |
 | [Geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) | CSG via gmsh-OCC, multi-material regions, signed distance, mesh import | stable |
