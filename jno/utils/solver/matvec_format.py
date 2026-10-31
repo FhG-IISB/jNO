@@ -24,7 +24,6 @@ import time
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 _FORMATS = ("auto", "csr", "coo")
 _FORMAT = "auto"
@@ -77,7 +76,17 @@ def _is_concrete(A) -> bool:
     return not any(isinstance(x, jax.core.Tracer) for x in (A.data, A.indices))
 
 
-def csr_parts(A):
+def has_padding(A) -> bool:
+    """Whether a BCOO holds out-of-bound (padding) entries; ``True`` for traced indices, where it cannot be ruled out.
+
+    Asked on the device, not read back, which would take a staging buffer as large as the indices. Concrete even in a trace."""
+    if isinstance(A.indices, jax.core.Tracer):
+        return True
+    with jax.ensure_compile_time_eval():
+        return not bool(jnp.all((A.indices >= 0) & (A.indices < jnp.asarray(A.shape, A.indices.dtype))))
+
+
+def csr_parts(A, padded=None):
     """``(data, indices, indptr)`` of ``A`` (a 2-D BCOO) as CSR, ready for cuSPARSE.
 
     Handles what jNO's operators can contain: duplicates (CSR products sum them, like BCOO), unsorted
@@ -93,21 +102,21 @@ def csr_parts(A):
     """
     n, m = A.shape
     r, c, d = A.indices[:, 0], A.indices[:, 1], A.data
-    valid = (r >= 0) & (r < n) & (c >= 0) & (c < m)
-    if isinstance(A.indices, jax.core.Tracer):
-        ghost = True  # traced indices: padding cannot be ruled out
-    else:  # read the concrete pattern with NumPy -- a jnp op here would be staged when called inside a trace
-        idx = np.asarray(A.indices)
-        ghost = not bool(((idx[:, 0] >= 0) & (idx[:, 0] < n) & (idx[:, 1] >= 0) & (idx[:, 1] < m)).all())
-    d = jnp.where(valid, d, jnp.zeros((), d.dtype))
-    r = jnp.where(valid, r, n).astype(jnp.int32)  # the ghost row sorts after every real one
-    c = jnp.where(valid, c, m).astype(jnp.int32)
+    ghost = has_padding(A) if padded is None else padded
+    if ghost:
+        valid = (r >= 0) & (r < n) & (c >= 0) & (c < m)
+        d = jnp.where(valid, d, jnp.zeros((), d.dtype))
+        r = jnp.where(valid, r, n)  # the ghost row sorts after every real one
+        c = jnp.where(valid, c, m)
+    # with no padding, an operator's arrays are used as they are: its values are the CSR values, one buffer, and at 10 M
+    # entries the masked copies of all three and their indices took the card from 0.22 to 0.65 GB for the first solve
+    # as JAX arrays: an assembled tangent carries its indices as NumPy arrays, which cannot take the traced `order`
+    r, c = jnp.asarray(r, jnp.int32), jnp.asarray(c, jnp.int32)
     if not getattr(A, "indices_sorted", False):
         order = jnp.argsort(r, stable=True)
         r, c, d = r[order], c[order], d[order]
     rows = n + 1 if ghost else n
-    indptr = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(jnp.bincount(r, length=rows)).astype(jnp.int32)])
-    return d, c, indptr
+    return d, c, jnp.searchsorted(r, jnp.arange(rows + 1, dtype=jnp.int32)).astype(jnp.int32)
 
 
 def csr_matvec(parts, shape, transpose=False):
@@ -168,6 +177,23 @@ def _time_products(mv, v):
     return best / _PRODUCTS_PER_TIMING
 
 
+def _device_limit():
+    """Bytes of the device's pool, or ``None`` (a CPU exposes no such limit)."""
+    try:
+        return jax.local_devices()[0].memory_stats().get("bytes_limit")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _measuring_costs_too_much(A) -> bool:
+    """Timing both formats holds about 40 bytes per entry on the device on top of the operator: the two formats and COO's
+    temporaries. On a large operator that costs more than the answer is worth, and the answer is known. RTX 3070, float64,
+    Laplacians and elasticity, P1 and P2, CSR against COO: from 1 M entries CSR won every case, by 1.2x at 2 M and 1.9-3.2x
+    from 10 M, with the lower peak of the two; below 300 k COO wins, and there memory is no issue."""
+    limit = _device_limit()
+    return limit is not None and int(A.nse) * 40 > 0.05 * limit
+
+
 def choose(A, *, log: bool = True) -> str:
     """``"csr"`` or ``"coo"`` for the 2-D BCOO ``A`` -- the override, else the measured faster one."""
     if _FORMAT != "auto":
@@ -178,6 +204,14 @@ def choose(A, *, log: bool = True) -> str:
     from ..logger import get_logger
     from .linear import _split_coo_matvec
 
+    if _measuring_costs_too_much(A):
+        if log:
+            get_logger().info(
+                f"jNO sparse operator {int(A.shape[0]):,}x{int(A.shape[1]):,} ({int(A.nse):,} nnz, {key[4]}): CSR, not "
+                "measured at this size. Override with jno.setup(matvec_format=...)."
+            )
+        _DECISIONS[key] = "csr"
+        return "csr"
     real = _is_concrete(A)
     try:
         with jax.ensure_compile_time_eval():
