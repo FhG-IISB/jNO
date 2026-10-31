@@ -770,6 +770,10 @@ These were found by running code, not by reading. (Earlier revisions of this fil
 pages that contradicted the measurements; those pages have since been fixed — the API facts below
 remain the part worth keeping loaded.)
 
+**Batched `jnp.linalg` on the CPU (Schwarz, GenEO setup) is far slower with OpenBLAS's default threads** in jNO's pixi
+environment, whose OpenBLAS is the OpenMP build. Run with `OMP_NUM_THREADS=1 MKL_NUM_THREADS=$(nproc)`;
+`OPENBLAS_NUM_THREADS` is ignored. Not the default: one thread slows a single large dense matrix.
+
 **Removed API — these raise `AttributeError` and appear all over older examples:**
 
 | Stale | Current |

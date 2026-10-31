@@ -908,6 +908,11 @@ jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
 | `restricted` | RAS (Cai & Sarkis 1999): usually fewer iterations but **non-symmetric** — `cg` then runs flexible CG |
 | `float32` | [single-precision application](#single-precision-inside-a-double-solve-float32true) |
 
+!!! note "On the CPU, set `OMP_NUM_THREADS=1` for this setup"
+    In jNO's pixi environment the batched factorizations of a Schwarz or GenEO setup run far slower on the CPU with
+    OpenBLAS's default threads. The cause and the cost of the setting are in
+    [Troubleshooting](troubleshooting.md#schwarz-or-geneo-setup-is-very-slow-on-the-cpu).
+
 !!! measured "CG to 1e-8, two-level, RTX 3070 — iterations at 64 / 256 parts"
     | Problem | Iterations | Solve |
     |---|---|---|
