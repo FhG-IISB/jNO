@@ -126,6 +126,25 @@ adaptive moving mesh, and it cannot be combined with differentiating the march. 
 holds it (RSS, live JAX buffers by shape, Python heap, `domain.context`). See
 [a march that survives being killed](fem/geometry.md#a-march-that-survives-being-killed-checkpoint).
 
+## Schwarz or GenEO setup is very slow on the CPU
+
+Each setup factorizes a batch of small dense matrices (`jnp.linalg.inv`, `cholesky`, `eigh`). In jNO's pixi
+environment, which uses the OpenMP build of OpenBLAS, the threads of a batched LAPACK call on the CPU spend most of
+their time waiting on each other. Any batched `jnp.linalg` call in your own code pays the same. Give OpenBLAS one
+thread, before Python starts:
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=$(nproc) python my_problem.py
+```
+
+- It has to be `OMP_NUM_THREADS`: this build ignores `OPENBLAS_NUM_THREADS`.
+- It is not the default because one thread slows a single large dense matrix, through NumPy, SciPy or `jax.numpy`.
+  Use it for runs dominated by batches of small matrices.
+- MKL PARDISO obeys `OMP_NUM_THREADS` too, so `lu(backend="pardiso")` needs `MKL_NUM_THREADS` to keep its threads. SuperLU
+  is unaffected.
+- A GPU run's factorizations do not go through OpenBLAS. A pip install brings a different OpenBLAS, which has not been
+  checked.
+
 ## Where the message is not enough
 
 `fem.stats` reports what the solver actually did — mode, DOFs, the slot reprs, the nonlinear driver's

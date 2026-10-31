@@ -224,7 +224,10 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
         )
         # On a reduced system the root-find runs on ũ and returns u = P ũ (identities otherwise).
         _r, _j, _restrict, _prolong = _reduced(lambda u: op.residual(u, args, tau_k), _jac, param_args)
-        u = _prolong(_newton(_r, _restrict(u_prev), _j))
+        from .solver_api import tangent_args
+
+        with tangent_args(args, tau_k):
+            u = _prolong(_newton(_r, _restrict(u_prev), _j))
         # Advance every buffered state: volume states via their `.evolves` formula / a primary-unknown
         # history; surface states (a friction slip) via the surface readout on the region's faces.
         new_states = readout(u, tau_k, args)

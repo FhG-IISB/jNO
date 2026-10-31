@@ -138,6 +138,85 @@ def test_the_combination_reprs_as_the_math():
 
 
 # ======================================================================================
+# a combination is a spec like any other: it compiles, keeps its children's flags, and the
+# tree walkers see through it
+# ======================================================================================
+def test_a_combination_of_traceable_specs_compiles():
+    """`jacobi() + jacobi()` is as traceable as its children, so it takes the compiled slot path; equal
+    combinations are equal values (one program), and a float32 child is a different one."""
+    from jno.utils.solver.solver_api import _compilable
+
+    J = jno.precond.jacobi
+    assert _compilable(jno.solve.cg(), J() + J())
+    assert _compilable(jno.solve.cg(), J() @ J())
+    assert J() + J() == J() + J() and hash(J() + J()) == hash(J() + J())
+    assert J() + J() != J() + J(float32=True)
+    fem, *_ = _poisson()
+    ref = np.asarray(fem.solve())
+    got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=J() + J()))
+    np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-12)
+
+
+def test_a_combination_with_a_host_leaf_does_not_compile():
+    from jno.utils.solver.solver_api import _compilable
+
+    pytest.importorskip("pyamg")
+    assert not _compilable(jno.solve.cg(), jno.precond.jacobi() + jno.precond.amg())
+
+
+def test_a_product_is_flagged_nonsymmetric_and_cg_still_solves():
+    """`M1 M2` of two symmetric factors is not symmetric. Flagged, `cg` switches to flexible CG on its
+    own (`jno.solve.cg`), instead of running standard CG on a preconditioner it is not valid for."""
+    fem, *_ = _poisson()
+    J = jno.precond.jacobi
+    op = LinearOperator(fem.A)
+    assert materialize_precond(J() @ J(), PrecondContext(op, fem)).nonsymmetric
+    assert not materialize_precond(J() + J(), PrecondContext(op, fem)).nonsymmetric
+    lo = materialize_precond(J() + J(float32=True), PrecondContext(op, fem))
+    assert lo.low_precision, "a single-precision child makes the combination single-precision"
+    got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=J() @ J()))
+    np.testing.assert_allclose(got, np.asarray(fem.solve()), rtol=1e-7, atol=1e-12)
+
+
+def test_the_tree_walkers_see_inside_a_combination():
+    """A leaf inside `+` is reached by every walk: the refresh hook fires once per child (not twice, as
+    it would if the combination also forwarded it), an untraceable leaf is found, and `_uncached` strips a
+    `reuse=k` child so a march's chunk cadence is the only policy."""
+    from jno.precond import _Spec
+    from jno.utils.solver import solver_api as sa
+
+    calls = []
+
+    class _Hook(_Spec):
+        traceable = True
+        key = ("hook",)
+
+        def refresh_from(self, sol, fem):
+            calls.append(self)
+
+        def materialize(self, ctx):
+            return lambda v: v
+
+    a, b = _Hook(), _Hook()
+    tree = a + jno.precond.jacobi() @ b
+    sa.refresh_hooks(tree, None, None)
+    assert sorted(map(id, calls)) == sorted([id(a), id(b)])
+    calls.clear()
+    tree.refresh_from(None, None)  # a direct call on the composition reaches the same leaves, once each
+    assert sorted(map(id, calls)) == sorted([id(a), id(b)])
+    assert (jno.precond.jacobi() + jno.precond.jacobi()).refresh_from is None
+
+    pytest.importorskip("pyamg")
+    leaves, untraceable = sa._untraceable_leaves(jno.precond.jacobi() + jno.precond.amg())
+    assert untraceable and len(leaves) == 2
+
+    kept = jno.precond.jacobi(reuse=3)
+    assert sa._refresh_cadence(jno.precond.jacobi() + kept) == 3
+    stripped = sa._uncached(jno.precond.jacobi() + kept)
+    assert type(stripped).__name__ == "_Sum" and getattr(stripped.right, "refresh", None) is None
+
+
+# ======================================================================================
 # the self-check: the algebra must rebuild a built-in
 # ======================================================================================
 def _stokes(mesh_size=0.3, mu=1.0):
@@ -211,3 +290,93 @@ def test_an_auxiliary_form_is_assembled_sparse():
     assert op.bcoo is not None, "the auxiliary must be sparse, not a densified array"
     n = int(op.shape[0])
     assert int(op.bcoo.nse) < 40 * n, f"{op.bcoo.nse} entries for an {n}-dof mass is not sparse"
+
+
+# ======================================================================================
+# `M1 >> M2`: multiplicative combination (subspace correction)
+# ======================================================================================
+def _dense_spec(M, *, symmetric=False, count=None):
+    """A spec applying the dense matrix `M` (and `M^T` as its transpose), for exact-algebra checks."""
+    from jno.precond import _Spec
+    from jno.utils.solver.solver_api import PrecondApplier
+
+    M = jnp.asarray(M)
+
+    class _D(_Spec):
+        traceable = True
+
+        def materialize(self, ctx):
+            if count is not None:
+                count.append(self)
+            return PrecondApplier(lambda v: M @ v, None if symmetric else (lambda v: M.T @ v))
+
+        def __repr__(self):
+            return "D"
+
+    return _D()
+
+
+def _rand(n, seed, *, spd=False):
+    a = np.random.default_rng(seed).standard_normal((n, n)) / n
+    return a @ a.T + np.eye(n) if spd else a + np.eye(n)
+
+
+def test_then_is_the_multiplicative_combination():
+    """`(M1 >> M2) r = M1 r + M2 (r - A M1 r)`: the error propagator is the PRODUCT of the two,
+    `I - B A = (I - M2 A)(I - M1 A)` (Xu, SIAM Rev. 34, 1992, Sec. 3), for a non-symmetric A and factors,
+    and a chain of three is the product of three."""
+    n = 40
+    A, M1, M2, M3 = _rand(n, 0), _rand(n, 1), _rand(n, 2), _rand(n, 3)
+    ctx = PrecondContext(LinearOperator(jax.experimental.sparse.BCOO.fromdense(jnp.asarray(A))), None)
+    eye = np.eye(n)
+    B2 = np.column_stack([np.asarray(materialize_precond(_dense_spec(M1) >> _dense_spec(M2), ctx)(e)) for e in eye])
+    np.testing.assert_allclose(B2, M1 + M2 - M2 @ A @ M1, rtol=1e-12, atol=1e-12)
+    chain = _dense_spec(M1) >> _dense_spec(M2) >> _dense_spec(M3)
+    B3 = np.column_stack([np.asarray(materialize_precond(chain, ctx)(e)) for e in eye])
+    E = (eye - M3 @ A) @ (eye - M2 @ A) @ (eye - M1 @ A)
+    np.testing.assert_allclose(eye - B3 @ A, E, rtol=1e-10, atol=1e-10)
+    assert len(chain.children) == 3, "a chain is flattened, not nested"
+
+
+def test_then_has_the_exact_transpose():
+    """The adjoint solve preconditions `A^T` with `B^T`, which is the reversed chain of transposes on `A^T`."""
+    n = 30
+    A, M1, M2, M3 = _rand(n, 4), _rand(n, 5), _rand(n, 6), _rand(n, 7)
+    ctx = PrecondContext(LinearOperator(jax.experimental.sparse.BCOO.fromdense(jnp.asarray(A))), None)
+    ap = materialize_precond(_dense_spec(M1) >> _dense_spec(M2) >> _dense_spec(M3), ctx)
+    eye = np.eye(n)
+    B = np.column_stack([np.asarray(ap(e)) for e in eye])
+    Bt = np.column_stack([np.asarray(ap.T(e)) for e in eye])
+    np.testing.assert_allclose(Bt, B.T, rtol=1e-11, atol=1e-11)
+
+
+def test_then_symmetry_and_shared_children():
+    """`Q >> M >> Q` of symmetric children is symmetric (for symmetric A), so plain CG may use it; `M >> Q`
+    is not, and says so. A child that appears twice is materialized once."""
+    n = 30
+    A = _rand(n, 8, spd=True)
+    ctx = PrecondContext(LinearOperator(jax.experimental.sparse.BCOO.fromdense(jnp.asarray(A))), None)
+    built = []
+    Q = _dense_spec(np.linalg.inv(A) * 0.5, symmetric=True, count=built)
+    M = _dense_spec(np.diag(1 / np.diag(A)), symmetric=True)
+    bnn = materialize_precond(Q >> M >> Q, ctx)
+    assert not bnn.nonsymmetric and len(built) == 1
+    B = np.column_stack([np.asarray(bnn(e)) for e in np.eye(n)])
+    np.testing.assert_allclose(B, B.T, rtol=1e-11, atol=1e-12)
+    assert materialize_precond(M >> Q, ctx).nonsymmetric
+    assert repr(Q >> M >> Q) == "(D >> D >> D)"
+
+
+def test_then_solves_through_fem_solve():
+    """A preconditioner changes the iteration count, never the answer -- also compiled (both children trace)."""
+    from jno.utils.solver.solver_api import _compilable
+
+    fem, *_ = _poisson()
+    J = jno.precond.jacobi
+    assert _compilable(jno.solve.cg(), J() >> J())
+    ref = np.asarray(fem.solve())
+    for spec in (J() >> J(), J() >> J() >> J()):
+        got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-10), precond=spec))
+        np.testing.assert_allclose(got, ref, rtol=1e-7, atol=1e-12)
+    with pytest.raises(TypeError):
+        _ = J() >> 2.0

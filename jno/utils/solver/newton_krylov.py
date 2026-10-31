@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .krylov import gmres as _scaled_gmres
+from .solver_api import linearized_at
 
 __all__ = ["newton_krylov", "newton_direct", "staggered_newton", "bicgstab"]
 
@@ -986,10 +987,12 @@ def newton_direct(
                     # never tighter than half the outer target over the current residual (the last step need
                     # not out-solve the bound the loop stops on). The loop still stops on the TRUE residual.
                     eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
-                    delta = linear_solve(J_fwd(u), -r, rtol=eta)
+                    with linearized_at(u):
+                        delta = linear_solve(J_fwd(u), -r, rtol=eta)
                 else:
                     eta = eta_prev
-                    delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
+                    with linearized_at(u):
+                        delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u = u + alpha * delta
             return u, f_fwd(u), k + 1, rn, jnp.asarray(eta, rn.dtype)
@@ -1065,8 +1068,10 @@ def newton_direct(
         # Gated on both sides like the Krylov tangents: a direct solve fails differently (a singular
         # or near-singular tangent, not a step cap) but fails just as quietly, and the transpose is
         # the half no caller ever inspects.
-        fwd = lambda _mv, rhs: _gated_direct(J, rhs, linear_solve, "the newton_direct tangent", "forward")  # noqa: E731
-        tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, linear_solve, "the newton_direct tangent", "transpose")  # noqa: E731
+        fwd = lambda _mv, rhs: _solve_at(root, _gated_direct, J, rhs, linear_solve, "the newton_direct tangent", "forward")  # noqa: E731
+        tsp = lambda _mv, rhs: _solve_at(
+            root, _gated_direct, J.T, rhs, linear_solve, "the newton_direct tangent", "transpose"
+        )  # noqa: E731
         return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
     if info is not None:
@@ -1074,6 +1079,12 @@ def newton_direct(
         if _J is not None:
             info["tangent"] = jax.lax.stop_gradient(_J)
     return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
+
+
+def _solve_at(u, fn, *args):
+    """``fn(*args)`` -- a linear solve of the tangent assembled at ``u`` -- marked as such (``linearized_at``)."""
+    with linearized_at(u):
+        return fn(*args)
 
 
 def staggered_newton(
@@ -1214,20 +1225,23 @@ def staggered_newton(
         # problem's DOF layout), so this is a host-side set operation, not a traced one.
         _all = np.arange(n_dofs)
         comps = [jnp.asarray(np.setdiff1d(_all, np.asarray(b)), dtype=jnp.int32) for b in blocks]
+        helds = [np.isin(_all, np.asarray(b), invert=True) for b in blocks]  # what each block step holds fixed
         inner_step = inner_tangent = None
     else:
         inner_step, inner_tangent = _step_and_tangent(
             linear_solve, "the staggered_newton inner linear_solve slot", tol=inner_tol, maxit=inner_maxit
         )
 
-    def _block_step(u_full, b, comp):
+    def _block_step(u_full, b, comp, held):
         """The sparse-direct Newton step for one block: freeze the complement to the identity, solve."""
 
         def step(x, rx):
-            J = jacobian(u_full.at[b].set(x))
+            at = u_full.at[b].set(x)
+            J = jacobian(at)
             J_b = bcoo_set_unit_diag(bcoo_zero_rows_cols(J, comp), comp)
             rhs = jnp.zeros(n_dofs, rx.dtype).at[b].set(-rx)
-            return _dsolve(J_b, rhs)[b]
+            with linearized_at(at, held):
+                return _dsolve(J_b, rhs)[b]
 
         return step
 
@@ -1240,7 +1254,7 @@ def staggered_newton(
 
             # No `custom_root` on the sub-solve: the OUTER one below supplies every derivative, so the
             # inner iteration only has to land on the sub-root.
-            step = _block_step(u, b, comps[j]) if direct else None
+            step = _block_step(u, b, comps[j], helds[j]) if direct else None
             x_sub = _newton_inner(_restricted, u[b], step)
             if over_relax == 1.0:
                 u = u.at[b].set(x_sub)
@@ -1344,8 +1358,12 @@ def staggered_newton(
 
         def _tangent(g, y):
             J = jacobian(root_val)
-            fwd = lambda _mv, rhs: _gated_direct(J, rhs, _dsolve, "the staggered_newton tangent", "forward")  # noqa: E731
-            tsp = lambda _mv, rhs: _gated_direct(J.T, rhs, _dsolve, "the staggered_newton tangent", "transpose")  # noqa: E731
+            fwd = lambda _mv, rhs: _solve_at(
+                root_val, _gated_direct, J, rhs, _dsolve, "the staggered_newton tangent", "forward"
+            )  # noqa: E731
+            tsp = lambda _mv, rhs: _solve_at(
+                root_val, _gated_direct, J.T, rhs, _dsolve, "the staggered_newton tangent", "transpose"
+            )  # noqa: E731
             return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
 
         root = jax.lax.custom_root(f0, root_val, lambda _f, _x0: root_val, _tangent)

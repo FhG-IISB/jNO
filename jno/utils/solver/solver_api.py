@@ -372,6 +372,81 @@ _GATE_SUSPENDED = False
 _RECORD_SUSPENDED = False
 
 
+# The point a Newton driver assembled the tangent it is solving at -- read by a preconditioner whose setup needs
+# more than the tangent's values (GenEO's per-cell matrices: `jno.space.geneo` under `reuse=1`). Set around ONE
+# linear solve, while it is traced, and reset after, so no iterate outlives the solve it belongs to.
+_LINEARIZATION = __import__("contextvars").ContextVar("jno_linearization", default=None)
+
+
+@contextlib.contextmanager
+def linearized_at(u, frozen=None):
+    """Mark the linear solve(s) inside as solving the tangent assembled at ``u``. ``frozen``: ``(n,)`` bool, the
+    unknowns this solve holds fixed (the other blocks of a staggered step: identity rows in the tangent)."""
+    token = _LINEARIZATION.set((u, frozen))
+    try:
+        yield
+    finally:
+        _LINEARIZATION.reset(token)
+
+
+# The step operator a march is solving, as `a M + b J` at time `t`: what a preconditioner reading per-cell matrices
+# has to combine them into. Set around the step's solves while they are traced, like `linearized_at`.
+_STEP_FORM = __import__("contextvars").ContextVar("jno_step_form", default=None)
+
+
+@contextlib.contextmanager
+def step_form(a, b, t=0.0):
+    """Mark the solves inside as being on the step operator ``a M + b J(u, t)`` of a transient block."""
+    token = _STEP_FORM.set((a, b, t))
+    try:
+        yield
+    finally:
+        _STEP_FORM.reset(token)
+
+
+def current_step_form():
+    """``(a, b, t)`` set by :func:`step_form`, or ``None`` (not inside a march's step)."""
+    return _STEP_FORM.get()
+
+
+def _build_step_spaces(precond, fem, A_step, a, b, t, u=None):
+    """Set up the spaces computed from the operator (GenEO, ``jno.space.eigvecs``, a callable) on the step operator
+    itself: GenEO's cell matrices combine as ``a M + b J`` at this state, and a build from the representative pattern
+    (``M`` and ``A`` merely side by side) would measure them against a different matrix."""
+    for s in _specs_in(precond):
+        space = getattr(s, "space", getattr(s, "coarse", None))
+        computed = callable(space) or hasattr(space, "basis") or getattr(s, "_can_follow", False)
+        if computed and getattr(s, "_pattern", None) is None:
+            with step_form(a, b, t), linearized_at(u):
+                s.build(A_step, fem)
+
+
+# The arguments the tangent being solved was assembled with: a march's history buffers and load level, a parametric
+# solve's values. Set around the driver's solves; a preconditioner that assembles its own cells needs the same ones.
+_TANGENT_ARGS = __import__("contextvars").ContextVar("jno_tangent_args", default=None)
+
+
+@contextlib.contextmanager
+def tangent_args(args, t=0.0):
+    """Mark the solves inside as being on a tangent assembled with ``args`` at time or load level ``t``."""
+    token = _TANGENT_ARGS.set((args, t))
+    try:
+        yield
+    finally:
+        _TANGENT_ARGS.reset(token)
+
+
+def current_tangent_args():
+    """``(args, t)`` set by :func:`tangent_args`, or ``None``."""
+    return _TANGENT_ARGS.get()
+
+
+def current_linearization():
+    """``(u, frozen)`` set by :func:`linearized_at` around the solve being built, or ``None`` (a linear problem's
+    solve, or a driver that does not say: a lagged tangent, a matrix-free step)."""
+    return _LINEARIZATION.get()
+
+
 @contextlib.contextmanager
 def gate_suspended(*, record=False):
     """Run a solver call ungated: a preconditioner application, inexact by design. ``record=True`` for a
@@ -1192,19 +1267,48 @@ def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:
     )
 
 
-def _iter_specs(spec):
-    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
-    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. Used to reach hooks
-    like ``refresh_from`` wherever they sit -- a solution-dependent Schur form typically lives one
-    level down, inside ``triangular``'s pressure pair."""
-    if spec is None:
-        return
-    yield spec
+def _spec_children(spec) -> list:
+    """The specs directly inside ``spec``, duck-typed: ``.spec`` is a wrapper (``reuse=``), ``.pairs`` a block
+    preconditioner's ``(field, spec)`` list, ``.children`` a combination's operands (``+``, ``@``, ``>>``)."""
+    out = []
     inner = getattr(spec, "spec", None)
     if inner is not None:
-        yield from _iter_specs(inner)
-    for pair in getattr(spec, "pairs", None) or ():
-        yield from _iter_specs(pair[1])
+        out.append(inner)
+    out.extend(p[1] if isinstance(p, tuple) else p for p in getattr(spec, "pairs", None) or ())
+    out.extend(getattr(spec, "children", None) or ())
+    return out
+
+
+def _is_leaf(spec) -> bool:
+    """A spec that is not a container (a wrapper, a block preconditioner or a combination)."""
+    return not _spec_children(spec)
+
+
+def _iter_specs(spec):
+    """Every spec in a (possibly nested) preconditioner tree (see :func:`_spec_children`). Used to reach
+    hooks like ``refresh_from`` wherever they sit -- a solution-dependent Schur form typically lives one
+    level down, inside ``triangular``'s pressure pair. A spec shared by several branches (``Q >> M >> Q``)
+    is yielded once, so its hook fires once."""
+    seen = set()
+
+    def walk(s):
+        if s is None or id(s) in seen:
+            return
+        seen.add(id(s))
+        yield s
+        for c in _spec_children(s):
+            yield from walk(c)
+
+    yield from walk(spec)
+
+
+def refresh_hooks(precond, sol, fem) -> None:
+    """Fire every leaf's ``refresh_from`` (the Picard lag) once, from the concrete solution ``sol``. Leaves
+    only: a combination's own ``refresh_from`` forwards to the same leaves and would fire them twice."""
+    for s in _iter_specs(precond):
+        hook = getattr(s, "refresh_from", None) if _is_leaf(s) else None
+        if hook is not None:
+            hook(sol, fem)
 
 
 def prepare_precond(spec: Any, fem: Any) -> None:
@@ -1641,10 +1745,7 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
         # the spec then raises its own loud error at materialization if it was never assembled.
         lin = inner
         if precond is not None and fem is not None and not isinstance(u0, jax.core.Tracer):
-            for s in _iter_specs(precond):
-                hook = getattr(s, "refresh_from", None)
-                if hook is not None:
-                    hook(u0, fem)
+            refresh_hooks(precond, u0, fem)
             # A spec whose setup needs a CONCRETE matrix (an unbuilt amg: pyamg; ilu: scipy) cannot set up
             # inside the loop; it is built ONCE, eagerly, from the tangent at the entry iterate. Everything
             # else keeps materializing per linearization, exactly as before.
@@ -1701,6 +1802,9 @@ def _uncached(spec):
     pairs = getattr(spec, "pairs", None)
     if pairs:
         return type(spec)([(f, _uncached(child)) for f, child in pairs])
+    children = getattr(spec, "children", None)
+    if children:
+        return spec._rebuilt([_uncached(c) for c in children])
     return spec
 
 
@@ -1722,15 +1826,9 @@ def _refresh_cadence(precond):
 
 
 def _specs_in(spec):
-    """Every spec in a (possibly nested) preconditioner tree, duck-typed: ``.spec`` is a wrapper
-    (``cached``), ``.pairs`` a block preconditioner's ``(field, spec)`` list. A tree is non-traceable
-    as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
-    yield spec
-    child = getattr(spec, "spec", None)
-    if child is not None:
-        yield from _specs_in(child)
-    for pair in getattr(spec, "pairs", ()) or ():
-        yield from _specs_in(pair[1] if isinstance(pair, tuple) else pair)
+    """Every spec in a (possibly nested) preconditioner tree (see :func:`_spec_children`). A tree is
+    non-traceable as soon as ONE leaf is, so the whole tree has to be walked rather than just its root."""
+    yield from _iter_specs(spec)
 
 
 # ---- a built preconditioner's arrays as ARGUMENTS of a compiled solve -----------------------------------
@@ -1759,10 +1857,9 @@ def precond_state(precond):
             tag = getattr(s, "_state_tag", None)
             tags.append(tag() if callable(tag) else None)
             return
-        if getattr(s, "spec", None) is not None:
-            walk(s.spec)
-        for pr in getattr(s, "pairs", None) or ():
-            walk(pr[1] if isinstance(pr, tuple) else pr)
+        for c in _spec_children(s):
+            if not any(c is k for k in specs):  # a child shared by two branches (`Q >> M >> Q`) is one state
+                walk(c)
 
     if precond is not None:
         walk(precond)
@@ -1815,10 +1912,9 @@ def precond_compiles(spec) -> bool:
         child = getattr(s, "spec", None)
         if child is not None and getattr(s, "traceable", False):
             return True  # a frozen cache that has built: no setup left, whatever it wraps
-        pairs = getattr(s, "pairs", None) or ()
-        if child is None and not pairs:
+        if _is_leaf(s):
             return bool(getattr(s, "traceable", True))
-        return (child is None or ok(child)) and all(ok(p[1] if isinstance(p, tuple) else p) for p in pairs)
+        return all(ok(c) for c in _spec_children(s))
 
     return spec is None or ok(spec)
 
@@ -1875,6 +1971,14 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
     """
     if precond is None:
         return None
+    cadence = next((s._follow for s in _specs_in(precond) if (getattr(s, "_follow", None) or 1) > 1), None)
+    if cadence is not None:
+        raise NotImplementedError(
+            f"fem.solve(precond=jno.precond.<spec>(reuse={cadence})): a nonlinear march runs as one compiled loop, "
+            "where no count of solves can be kept, so a recompute every "
+            f"{cadence} solves would never fire. Use reuse=1 (recompute at every linearization) or leave reuse out "
+            "(the setup's space; the coarse matrix still follows the operator)."
+        )
     # ``state`` is the state to linearise about. The block's own ``state0`` is the INITIAL condition,
     # which for a melt pool is cold and fully solid -- Carman-Kozeny ~1e13, PSPG tau ~1e-9, a stiffness
     # 1e6x its molten value -- so a setup frozen there describes an operator the march leaves behind.
@@ -1920,13 +2024,18 @@ def _freeze_precond_for_march(precond, fem, block, state=None, scale=None):
         return _frozen_at(precond, fem, A_rep, name, leaves)
     M = block.mass(t0, None)
     A_rep = _add_step_operator(M, J, scale)
+    _build_step_spaces(precond, fem, A_rep, 1.0, scale, t0, at)
+    if all(getattr(s, "_follow", None) == 1 for s in _specs_in(precond) if getattr(s, "_can_follow", False)):
+        leaves, untraceable = _untraceable_leaves(precond)
+        if not untraceable:  # built now, and recomputed at every Newton step of the scan: nothing to freeze
+            return precond
     return _frozen_at(precond, fem, A_rep, name, leaves)
 
 
 def _untraceable_leaves(precond):
     """``(leaves, any_untraceable)`` of a preconditioner tree. Only a LEAF decides whether a tree needs a
     concrete matrix: a block container (``triangular``, ``block_diag``) assembles nothing itself."""
-    leaves = [s for s in _specs_in(precond) if not getattr(s, "pairs", None) and getattr(s, "spec", None) is None]
+    leaves = [s for s in _specs_in(precond) if _is_leaf(s)]
     return leaves, not all(bool(getattr(s, "traceable", True)) for s in leaves)
 
 
@@ -2197,7 +2306,9 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
                 # wasted solve. An explicit `nonlinear=` keeps exactly what it asked for.
                 from ... import solve as _solve_ns
 
-                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=True)
+                # (A space that follows the tangent reads the iterate it was assembled at: no lagged tangent.)
+                keep = not any(getattr(s, "_follow", None) for s in _specs_in(precond)) if precond is not None else True
+                nonlinear = _solve_ns.newton(direct=True if getattr(linear, "direct", False) else None, reuse=keep)
             return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
         # A LINEARLY implicit scheme (Rosenbrock) solves linear systems with the stage matrix even on a
         # nonlinear block: it takes the linear step solve composed below, not a Newton driver.
@@ -2223,7 +2334,14 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         solver = _solve_ns.bicgstab()
     else:
         solver = linear
+    _constant_operator = (
+        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
+    )
+    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
     if precond is not None:
+        if _constant_operator:
+            _t0 = float((block.metadata or {}).get("t0", 0.0))
+            _build_step_spaces(precond, fem, _add_step_operator(block.M, block.A, _default_scale), 1.0, _default_scale, _t0)
         prepare_precond(precond, fem)
 
     # Constant-operator fast path: one step matrix, one preconditioner, reused by every step -- and
@@ -2233,10 +2351,6 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
     _static: dict = {}
     # ...and a constant MASS: a `mass_fn` re-assembles M per step, and a prebuilt `block.M + kA` would then
     # disagree with the right-hand side the step forms from it -- a different system, solved silently.
-    _constant_operator = (
-        block.operator_fn is None and block.mass_fn is None and block.A is not None and block.dt is not None
-    )
-    _default_scale = (float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0) * float(block.dt or 0.0)
 
     def _build(key):
         A, scale = block.A, key
@@ -2246,7 +2360,8 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
             alg = _algebraic_rows(block.M, block.M.shape[0], block.M.dtype)
             A, scale = _row_scaled(A, alg.astype(block.M.dtype)), float(block.dt)
         op = LinearOperator(_add_step_operator(block.M, A, scale))
-        _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
+        with step_form(1.0, scale, float((block.metadata or {}).get("t0", 0.0))):
+            _static[key] = (op, materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None)
 
     if _constant_operator:
         # EAGERLY, outside any trace: an AMG/ILU setup needs a concrete matrix, and `step_solve` runs
