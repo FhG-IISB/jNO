@@ -30,6 +30,8 @@ def device_constant(x, dtype=None):
     import hashlib
     import weakref
 
+    from .placement import upload
+
     global _DEVICE_CONSTANTS
     if _DEVICE_CONSTANTS is None:
         _DEVICE_CONSTANTS = weakref.WeakValueDictionary()
@@ -37,7 +39,7 @@ def device_constant(x, dtype=None):
     key = (a.shape, a.dtype.str, hashlib.sha1(a.reshape(-1).view(np.uint8)).hexdigest())
     out = _DEVICE_CONSTANTS.get(key)
     if out is None:
-        out = jnp.asarray(a)
+        out = upload(a)
         _DEVICE_CONSTANTS[key] = out
     return out
 

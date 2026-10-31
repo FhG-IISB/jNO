@@ -6,7 +6,23 @@ jNO: Physics-Informed Neural Operators.
     to continuous change without notice.
 """
 
+import os
 import sys
+
+# A compiled program's large constants (the mesh, per-cell tables, frozen fields) are passed to the executable as
+# ARGUMENTS instead of being read back to the host and folded into it -- JAX's coming default
+# (https://docs.jax.dev/en/latest/internals/constants.html). Measured cold on two design loops, RTX 3070, clocks not held:
+# start-up 55 -> 31 s and 36 -> 16 s, card 2.6 -> 1.6 GiB and 1.8 -> 0.9 GiB, compile cache written 180 -> 3.2 MB and
+# 274 -> 2.6 MB, values and step time unchanged within the run-to-run spread (XLA's own peak +11% and +9%, as the constants
+# are now in its pool). Opt out with JNO_HOIST_CONSTANTS=0. JAX reads the setting when it is first imported, so it is set
+# here, before jNO's own `import jax`; a script that imports jax first is handled after it
+# (`hoist_constants_after_import`).
+_hoist_constants = "JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS" not in os.environ and os.getenv(
+    "JNO_HOIST_CONSTANTS", "1"
+).strip().lower() not in ("0", "false", "off", "no")
+_hoist_after_import = _hoist_constants and "jax" in sys.modules
+if _hoist_constants and not _hoist_after_import:
+    os.environ["JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS"] = "1"
 
 from . import bayesian, fn, litho, lora, optimizers, precond, solve, trackers
 from . import jnp_ops as np
@@ -280,3 +296,12 @@ __all__ = [
 # compile_cache = false`, or jno.setup(compile_cache=False)). Measured 2.1x-4.3x on warm builds;
 # see `jno.utils.config.enable_compile_cache` for the numbers and the first-run populate cost.
 _auto_compile_cache()
+
+if _hoist_after_import:
+    from .utils.config import hoist_constants_after_import
+
+    hoist_constants_after_import()
+if os.environ.get("JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS") == "1" or _hoist_after_import:
+    from .utils.solver.placement import share_program_constants
+
+    share_program_constants()
