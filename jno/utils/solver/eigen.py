@@ -227,6 +227,7 @@ def lobpcg_geneigh(
     maxiter: int = 200,
     seed: int = 0,
     X0=None,
+    Y=None,
 ):
     """The ``k`` eigenpairs of ``K x = λ M x`` by **preconditioned LOBPCG**, without densifying either
     operator.
@@ -262,6 +263,11 @@ def lobpcg_geneigh(
             seeds each solve with the previous point's eigenvectors, cutting the sweeps to the few
             that track the drift instead of re-finding the subspace from random. Missing columns are
             padded with the seeded random block; the columns should be linearly independent.
+        Y: constraints, ``(n, m)``: the iteration is kept M-orthogonal to ``span Y`` (Knyazev 2001, Sec. 4 --
+            the start block and every preconditioned residual are projected), so it returns the eigenpairs of
+            the pencil on the M-orthogonal complement. With ``Y`` known eigenvectors (a free body's rigid
+            modes, the constant of a Neumann problem) those are the NEXT eigenpairs; with any other ``Y``
+            they are the constrained (Courant-Fischer) ones. Dependent columns of ``Y`` are dropped.
 
     Returns:
         ``(λ, X, res)`` — eigenvalues ``(k,)`` in the requested order, M-orthonormal eigenvectors
@@ -289,8 +295,24 @@ def lobpcg_geneigh(
     # its last vector long after the first k-1 are converged (measured on a 40x40 pencil: theta[3] still
     # 7.10 against a true 4.77 while theta[0] was already exact to 4 digits). The guards absorb that
     # slow direction; only the first k are gated on and returned. Standard practice, Knyazev 2001 §5.
-    kb = min(n, k + max(3, (k + 1) // 2))
-    T = (lambda R: R) if precond is None else (lambda R: jax.vmap(precond, in_axes=1, out_axes=1)(R))
+    m_y = 0
+    if Y is not None:
+        Y = jnp.asarray(Y, dtype.dtype)
+        Y = Y[:, None] if Y.ndim == 1 else Y
+        if Y.shape[0] != n:
+            raise ValueError(f"jno.solve.eigs: the deflation space has {Y.shape[0]} rows; the operator has {n}.")
+        Zy, keep_y = _m_orth_basis(Y, _blockmv(Mop, Y), rtol_rank)
+        Y = Y @ Zy  # M-orthonormal; dependent directions are zero columns, which project nothing
+        MY = _blockmv(Mop, Y)
+        m_y = Y.shape[1] if isinstance(keep_y, jax.core.Tracer) else int(jnp.sum(keep_y))
+    if k > n - m_y:
+        raise ValueError(f"jno.solve.eigs: k={k} eigenpairs asked of a space of {n} with {m_y} deflated directions.")
+    kb = min(n - m_y, k + max(3, (k + 1) // 2))
+
+    def proj(V):  # M-orthogonal to span Y: V - Y (Y^T M V)
+        return V if Y is None else V - Y @ (MY.conj().T @ V)
+
+    T = (lambda R: proj(R)) if precond is None else (lambda R: proj(jax.vmap(precond, in_axes=1, out_axes=1)(R)))
 
     def ritz(X, gate_k):
         KX, MX = _blockmv(Kop, X), _blockmv(Mop, X)
@@ -298,6 +320,8 @@ def lobpcg_geneigh(
         den = jnp.sum(X.conj() * MX, axis=0).real
         lam = num / jnp.where(jnp.abs(den) > 0, den, 1.0)
         R = KX - MX * lam[None, :]
+        if Y is not None:  # the constrained residual: what is left after the multipliers on M span(Y)
+            R = R - MY @ (Y.conj().T @ R)
         # Normalize by the SPECTRUM scale (largest Ritz value in the block), not by the per-pair terms
         # `‖Kx‖ + |λ|‖Mx‖`. That textbook denominator is identically ‖Kx‖ for a NULL mode (λ = 0 makes
         # R = Kx), so the ratio pins at exactly 1.0 and the gate can never be met -- which is precisely
@@ -325,6 +349,7 @@ def lobpcg_geneigh(
         Ccol = (Z @ C)[:, idx]
         Xn = S @ Ccol
         Pn = S @ Ccol.at[:kb, :].set(0.0)  # the [W, P] part only — the LOBPCG search direction
+        Xn = proj(Xn)  # exact already in exact arithmetic; this keeps rounding from drifting back into span Y
         Xn = _m_orth_ordered(Xn, _blockmv(Mop, Xn), eps_chol)
         _l, _r, res_n = ritz(Xn, k)
         return (i + 1, Xn, Pn, res_n)
@@ -340,6 +365,7 @@ def lobpcg_geneigh(
             )
         # warm columns lead, the seeded random block pads the guards — _m_orth_ordered keeps the order
         V0 = jnp.concatenate([W0, V0[:, W0.shape[1] :]], axis=1)
+    V0 = proj(V0)
     V0 = _m_orth_ordered(V0, _blockmv(Mop, V0), eps_chol)
     init = (0, V0, jnp.zeros_like(V0), jnp.asarray(jnp.inf, dtype.dtype))
     # stop_gradient: the sweeps are a search for the eigenvector, not part of the value's definition.

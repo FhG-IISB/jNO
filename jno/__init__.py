@@ -24,7 +24,7 @@ _hoist_after_import = _hoist_constants and "jax" in sys.modules
 if _hoist_constants and not _hoist_after_import:
     os.environ["JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS"] = "1"
 
-from . import bayesian, fn, litho, lora, optimizers, precond, solve, trackers
+from . import bayesian, fn, litho, lora, optimizers, precond, solve, space, trackers
 from . import jnp_ops as np
 from ._fem import Coupling, derived, fem, lag
 from .architectures.models import nn, parameter

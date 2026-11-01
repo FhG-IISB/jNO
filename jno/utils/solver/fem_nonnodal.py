@@ -172,6 +172,9 @@ def assemble_fem_nonnodal(
     # the functional behind `fem.eval(F, u)` / `F.integrate(fem)` (steady forms publish it below); cleared
     # first so a functional left on the domain by an earlier assembly is never picked up for this one
     domain._fem_native_term_functional = None
+    domain._fem_native_element_triplets = None  # per-cell matrices: native Lagrange only
+    domain._fem_native_step_triplets = None
+    domain._fem_native_structure = None
 
     spaces = [f["space"] for f in fields]
     if any(s not in ("RT", "N1E", "N2E", "P0", "DG", "Hermite", "Argyris", "Morley", "Lagrange") for s in spaces):
@@ -1581,7 +1584,9 @@ def assemble_fem_nonnodal(
         elif not (_groups or _sgs):
             _vol_idx = jnp.zeros((0, 2), jnp.int32)
 
-        def assemble(args=None, *, surface=True, u_flat=None):
+        def assemble(args=None, *, surface=True, u_flat=None, elements=False):
+            # ``elements=True``: the raw entries, each tagged with its cell, ``(rows, cols, data, cell)``, instead
+            # of the summed operator (a local Neumann matrix sums a subset; see `deflation.element_triplets`).
             # ``u_flat=None`` linearises at u=0, which is exact for a LINEAR form (the tangent does not
             # depend on the state) and is the historic behaviour. Passing the current iterate gives the
             # NONLINEAR tangent J(u_k) instead -- per-element `jacfwd` at that state, exactly what
@@ -1638,8 +1643,9 @@ def assemble_fem_nonnodal(
             # values scatter into their final slots PER GROUP: the full-length data vector exists
             # only on the unplanned fallback, where the uncompressed triplet path still needs it
             _acc_dtype = jnp.result_type(zeros.dtype, np.complex64) if _cx_form else zeros.dtype
-            _acc = jnp.zeros((_vol_nse,), _acc_dtype) if _vinv is not None else None
+            _acc = jnp.zeros((_vol_nse,), _acc_dtype) if _vinv is not None and not elements else None
             data_l = []  # fallback only; the (row, col) pattern is `_vol_idx`
+            _tag_rows, _tag_cols, _tag_cells = [], [], []  # elements=True
             for gi, (tfi, terms_g) in enumerate(_groups):
 
                 def _ke(c, la, _g=tuple(terms_g), _t=tfi):
@@ -1664,6 +1670,10 @@ def assemble_fem_nonnodal(
                     _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1).astype(_acc.dtype))
                 else:
                     data_l.append(Ke.reshape(-1))
+                if elements:
+                    _tag_rows.append(jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape).reshape(-1))
+                    _tag_cols.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], Ke.shape).reshape(-1))
+                    _tag_cells.append(jnp.broadcast_to(jnp.arange(n_cells)[:, None, None], Ke.shape).reshape(-1))
 
             for sgi, _g in enumerate(_sgs):  # general boundary integrands: one jacfwd per facet
                 _la, _lbs = _facet_inputs(_g, jnp.zeros((total,), zeros.dtype) if u_flat is None else u_flat)
@@ -1704,6 +1714,23 @@ def assemble_fem_nonnodal(
                     _acc = _acc.at[_vinv[len(_groups) + sgi]].add(Kf.reshape(-1).astype(_acc.dtype))
                 else:
                     data_l.append(Kf.reshape(-1))
+                if elements:
+                    _rr = jnp.asarray(cdofs[_g["tfi"]])[_g["cell"]]
+                    _tag_rows.append(jnp.broadcast_to(_rr[:, :, None], Kf.shape).reshape(-1))
+                    _tag_cols.append(jnp.broadcast_to(jnp.asarray(_s_cols[sgi])[:, None, :], Kf.shape).reshape(-1))
+                    _tag_cells.append(jnp.broadcast_to(jnp.asarray(_g["cell"])[:, None, None], Kf.shape).reshape(-1))
+            if elements:
+                if _surf_mass_of(args, sparse=True) is not None:
+                    raise NotImplementedError(
+                        "jno.fem (non-nodal): the per-cell matrices of a form with a tangential-trace surface mass "
+                        "(an impedance condition) are not available."
+                    )
+                return (
+                    jnp.concatenate(_tag_rows).astype(jnp.int32),
+                    jnp.concatenate(_tag_cols).astype(jnp.int32),
+                    jnp.concatenate(data_l),
+                    jnp.concatenate(_tag_cells).astype(jnp.int32),
+                )
             data = _acc if _acc is not None else (jnp.concatenate(data_l) if data_l else jnp.zeros((0,), zeros.dtype))
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
@@ -2175,6 +2202,11 @@ def assemble_fem_nonnodal(
     # families keep the dense path below (their Hessian-shape element assembly is not ported; small 2-D problems).
 
     _assemble_sparse_A = _make_sparse_assembler(volume_terms, with_gsurf=True)
+    if not _cx_form:  # the steady operator's cells (see `deflation.element_triplets`) and its structural pattern
+        domain._fem_native_element_triplets = lambda u=None, t=0.0, args=None: _assemble_sparse_A(
+            args, u_flat=u, elements=True
+        )
+        domain._fem_native_structure = lambda args=None: _assemble_sparse_A(args).indices
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):

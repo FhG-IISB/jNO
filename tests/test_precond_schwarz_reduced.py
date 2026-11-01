@@ -3,7 +3,7 @@
 A periodic tie, the exact slip elimination ``n·u = 0`` and hanging-node constraints make every solve run on
 ``P^T A P``. ``schwarz`` and ``fsai`` build their pattern eagerly from a representative operator, and that
 used to be the FULL one: every such solve failed ("incompatible shapes (162, 1), (144, 1)" for Schwarz, an
-IndexError for FSAI). ``schwarz(nullspace="rigid")`` also built its rigid-body modes on the full space.
+IndexError for FSAI). A coarse space written as formulas is also evaluated on the full space and restricted.
 
 Oracles: a sparse-direct solve of the same system (a preconditioner changes how fast a Krylov method
 converges, never what it converges to), and, for the modes themselves, the defining property -- a rigid
@@ -80,6 +80,12 @@ def _strip(*, clamp=True, slip=False, n=8):
     return jno.fem(terms)
 
 
+def _rigid(fem):
+    """The 2-D rigid-body modes as formulas in the problem's coordinates."""
+    x, y = fem.domain.variable("interior", split=True)[:2]
+    return [(1, 0), (0, 1), (-y, x)]
+
+
 def _rel(a, b):
     return float(np.linalg.norm(np.asarray(a) - np.asarray(b)) / np.linalg.norm(np.asarray(b)))
 
@@ -93,7 +99,8 @@ def _reduced_size(fem):
 def test_the_rigid_translations_restrict_exactly_and_stay_in_the_kernel():
     """On the tie-only (singular) operator: the reduced translations are annihilated by ``P^T A P`` and
     prolong back to the translation on every node, the eliminated left face included."""
-    from jno.precond import _near_null_space, _on_solved_space
+    from jno.precond import _on_solved_space
+    from jno.utils.solver.deflation import resolve_space
     from jno.utils.solver.fem_utils import prolong_periodic
 
     fem = _strip(clamp=False)
@@ -101,7 +108,7 @@ def test_the_rigid_translations_restrict_exactly_and_stay_in_the_kernel():
     n_red, n_full = int(A_red.shape[0]), int(fem.blocks[-1].stop)
     pts = np.asarray(fem.field_points[0])
     assert n_full - n_red == 2 * int(np.sum(pts[:, 0] < EPS))  # the whole left face went, counted off the mesh
-    Z = _near_null_space(fem, n_red)
+    Z = resolve_space(_rigid(fem), fem, n_red)
     assert Z.shape == (n_red, 3)  # two translations and the in-plane rotation
     scale = float(np.abs(np.asarray(A_red.todense())).max())
     for c in range(2):
@@ -116,23 +123,23 @@ def test_the_rigid_translations_restrict_exactly_and_stay_in_the_kernel():
 
 
 @pytest.mark.parametrize("parts", [1, 4])
-@pytest.mark.parametrize("nullspace", [None, "rigid"])
-def test_schwarz_on_a_periodic_elasticity_gives_the_direct_answer(_partition, parts, nullspace):
+@pytest.mark.parametrize("space", ["constant", "rigid"])
+def test_schwarz_on_a_periodic_elasticity_gives_the_direct_answer(_partition, parts, space):
     fem = _strip()
     ref = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
-    spec = jno.precond.schwarz(parts=parts, nullspace=nullspace)
+    spec = jno.precond.schwarz(parts=parts, coarse=True if space == "constant" else _rigid(fem))
     got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=2000), precond=spec))
     assert _rel(got, ref) < 1e-9
     assert spec._pattern.n == _reduced_size(fem) < fem.dofs  # the partition is of the system actually solved
-    if nullspace == "rigid":
-        assert spec._pattern.null.shape == (_reduced_size(fem), 3)
+    if space == "rigid":
+        assert spec._pattern.coarse.null.shape == (_reduced_size(fem), 3)
 
 
 def test_schwarz_rigid_on_a_slip_reduced_elasticity_gives_the_direct_answer(_partition):
     fem = _strip(slip=True)
     assert fem._periodic is not None and fem._periodic.get("coupling") == "slip"
     ref = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
-    spec = jno.precond.schwarz(parts=4, nullspace="rigid")
+    spec = jno.precond.schwarz(parts=4, coarse=_rigid(fem))
     got = np.asarray(fem.solve(linear=jno.solve.cg(tol=1e-12, maxiter=2000), precond=spec))
     assert _rel(got, ref) < 1e-9
     assert spec._pattern.n == _reduced_size(fem) < fem.dofs
@@ -152,4 +159,4 @@ def test_a_full_space_nullspace_array_on_a_reduced_system_is_refused():
     fem = _strip()
     wrong = np.ones((fem.dofs, 8))
     with pytest.raises(ValueError, match="REDUCED"):
-        fem.solve(linear=jno.solve.cg(), precond=jno.precond.schwarz(parts=1, nullspace=wrong))
+        fem.solve(linear=jno.solve.cg(), precond=jno.precond.schwarz(parts=1, coarse=wrong))

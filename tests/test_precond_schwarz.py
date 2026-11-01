@@ -147,40 +147,47 @@ def _cantilever(size=0.05):
     eu, ev = jno.np.symgrad(u, [x, y]), jno.np.symgrad(v, [x, y])
     dd = lambda a, b: jno.np.inner(a, b, n_contract=2)  # noqa: E731
     vb = v.bind(x=x, y=y)
-    return jno.fem(
+    fem = jno.fem(
         [
             2.0 * dd(eu, ev) + jno.np.trace(eu) * jno.np.trace(ev) + 0.1 * vb[1],
             u(cl[0], cl[1])[0] - 0.0,
             u(cl[0], cl[1])[1] - 0.0,
         ]
     )
+    return fem, [(1, 0), (0, 1), (-y, x)]  # the problem and its rigid-body modes, written as formulas
 
 
 def test_rigid_body_modes_make_elasticity_scale():
     """Constants alone cannot represent rotations: elasticity iterations then grow with the parts
     (measured 154 -> 256 for 16 -> 256 parts); with the rigid-body modes they do not (103 -> 56)."""
-    fem = _cantilever(0.04)
+    fem, rigid = _cantilever(0.04)
     A, b = fem._op
     b = jnp.asarray(b).reshape(-1)
     its = {}
     for p in (16, 128):
-        for ns in (None, "rigid"):
-            spec = jno.precond.schwarz(parts=p, nullspace=ns)
+        for name, space in (("constant", True), ("rigid", rigid)):
+            spec = jno.precond.schwarz(parts=p, coarse=space)
             spec.build(A, fem=fem)
-            its[p, ns] = _pcg_iterations(A, b, spec)
-    assert its[128, "rigid"] <= its[16, "rigid"] and its[128, "rigid"] < 0.6 * its[128, None], its
+            its[p, name] = _pcg_iterations(A, b, spec)
+    assert its[128, "rigid"] <= its[16, "rigid"] and its[128, "rigid"] < 0.6 * its[128, "constant"], its
 
 
 def test_rigid_through_fem_solve_gives_the_default_answer():
-    fem = _cantilever()
+    fem, rigid = _cantilever()
     ref = _leaf(fem.solve())
-    got = _leaf(fem.solve(linear=jno.solve.cg(tol=1e-11), precond=jno.precond.schwarz(parts=16, nullspace="rigid")))
+    got = _leaf(fem.solve(linear=jno.solve.cg(tol=1e-11), precond=jno.precond.schwarz(parts=16, coarse=rigid)))
     np.testing.assert_allclose(got, ref, rtol=1e-6, atol=1e-6 * np.abs(ref).max())  # the default solves to 1e-8
 
 
-def test_rigid_without_a_problem_is_refused():
-    with pytest.raises(ValueError, match="rigid"):
-        jno.precond.schwarz(nullspace="rigid").build(_poisson()._op[0])
+def test_formulas_without_a_problem_are_refused():
+    with pytest.raises(ValueError, match="problem attached"):
+        jno.precond.schwarz(coarse=[1]).build(_poisson()._op[0])
+
+
+def test_the_named_rigid_space_is_gone_and_says_what_replaces_it():
+    for kw in (dict(nullspace="rigid"), dict(coarse="rigid")):
+        with pytest.raises(ValueError, match=r"\(-y, x\)"):
+            jno.precond.schwarz(**kw)
 
 
 # --- jno.fdm: the same slots, on the operator FDM assembles by colouring ---------------------------------------
@@ -196,32 +203,32 @@ def _fdm_vector_poisson():
     Ui = U.vector.bind(x=x, y=y)
     f = jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
     zero = jno.np.stack([0.0 * xb, 0.0 * xb], axis=-1)
-    return jno.fdm([-Ui.laplacian() - jno.np.stack([f, 2.0 * f], axis=-1), U(xb, yb) - zero])
+    prob = jno.fdm([-Ui.laplacian() - jno.np.stack([f, 2.0 * f], axis=-1), U(xb, yb) - zero])
+    return prob, [(1, 0), (0, 1), (-y, x)]
 
 
 def test_fdm_rigid_modes_follow_fdms_component_blocks():
-    """FDM stores one block of N per component (FEM interleaves them per node), so the rigid-body modes are
-    built from the problem's own layout: translation c is 1 on block c only, the rotation is (-y, x) about
-    the centroid on blocks (0, 1)."""
-    from jno.precond import _near_null_space
+    """FDM stores one block of N per component (FEM interleaves them per node), so a vector formula is placed
+    by the problem's own layout: translation c is 1 on block c only, the rotation (-y, x) on blocks (0, 1)."""
+    from jno.utils.solver.deflation import resolve_space
 
-    prob = _fdm_vector_poisson()
+    prob, rigid = _fdm_vector_poisson()
     N = prob._N
-    Z = _near_null_space(prob, prob._Ntot)
+    Z = resolve_space(rigid, prob, prob._Ntot)
     assert Z.shape == (2 * N, 3)
     np.testing.assert_array_equal(Z[:N, 0], 1.0)
     np.testing.assert_array_equal(Z[N:, 0], 0.0)
     np.testing.assert_array_equal(Z[:N, 1], 0.0)
     np.testing.assert_array_equal(Z[N:, 1], 1.0)
-    xc = np.asarray(prob._pts) - np.asarray(prob._pts).mean(axis=0)
+    xc = np.asarray(prob._pts)
     np.testing.assert_allclose(Z[:N, 2], -xc[:, 1])
     np.testing.assert_allclose(Z[N:, 2], xc[:, 0])
 
 
 def test_fdm_vector_problem_with_rigid_modes_gives_the_default_answer():
-    prob = _fdm_vector_poisson()
+    prob, rigid = _fdm_vector_poisson()
     ref = np.asarray(prob.solve())
-    got = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.schwarz(parts=4, nullspace="rigid")))
+    got = np.asarray(prob.solve(linear=jno.solve.gmres(), precond=jno.precond.schwarz(parts=4, coarse=rigid)))
     assert np.abs(got - ref).max() < 1e-8 * np.abs(ref).max()
 
 

@@ -178,6 +178,7 @@ nav:
       - Deep Ritz (Energy Method): tutorials/08-fem-and-varpinns/deep-ritz-poisson-2d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
+      - "Coarse Spaces for Schwarz (layered elasticity)": tutorials/08-fem-and-varpinns/coarse-spaces-layered-elasticity.md
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
       - "Navier-Stokes Cylinder (DFG 2D-1)": tutorials/08-fem-and-varpinns/navier-stokes-cylinder-dfg.md
       - "Navier-Stokes Stabilised (P1/P1)": tutorials/08-fem-and-varpinns/navier-stokes-stabilised-2d.md

@@ -190,6 +190,50 @@ def test_trace_and_trace_of_inverse():
     assert abs(tri - float(jnp.trace(jnp.linalg.inv(dense)))) / float(jnp.trace(jnp.linalg.inv(dense))) < 0.05
 
 
+def test_a_deflated_trace_is_exact_on_the_space_and_cuts_the_variance():
+    """``tr A = tr(Q^T A Q) + tr(P A P)``. Hutchinson's variance is ``2 ||A||_F^2 / samples``, so a few dominant
+    eigenvalues carry it; with ``Z`` their eigenvectors only the rest is sampled and the spread over probe seeds
+    collapses (Gambhir, Stathopoulos & Orginos 2017). With ``Z`` spanning everything the estimate is exact, and
+    the split holds for any ``Z``. (On a FEM operator whose large eigenvalues form a broad band, a few deflated
+    vectors buy little: measured spread 17 -> 13 with 30 of 150 deflated.)"""
+    n = 120
+    V = np.linalg.qr(np.random.default_rng(0).standard_normal((n, n)))[0]
+    lam = np.concatenate([np.full(5, 1e3), np.linspace(1.0, 2.0, n - 5)])
+    dense = (V * lam) @ V.T
+    op = LinearOperator.from_matvec(lambda v: jnp.asarray(dense) @ v, shape=(n, n))
+    true = float(lam.sum())
+    plain = np.array([float(jno.solve.trace(op, samples=8, key=jax.random.PRNGKey(s))) for s in range(12)])
+    defl = np.array([float(jno.solve.trace(op, samples=8, key=jax.random.PRNGKey(s), deflate=V[:, :5])) for s in range(12)])
+    assert defl.std() < 0.01 * plain.std(), (plain.std(), defl.std())
+    assert abs(defl.mean() - true) < 4 * defl.std() / np.sqrt(len(defl)) + 1e-9 * true
+    np.testing.assert_allclose(float(jno.solve.trace(op, samples=2, deflate=V)), true, rtol=1e-10)
+    Zr = np.random.default_rng(1).standard_normal((n, 5))  # not eigenvectors: the split is still exact
+    exact_part = float(jno.solve.trace(op, samples=2, deflate=Zr)) - float(
+        jno.solve.trace(LinearOperator.from_matvec(lambda v: _p(Zr, dense, v), shape=(n, n)), samples=2)
+    )
+    Q = np.linalg.qr(Zr)[0]
+    np.testing.assert_allclose(exact_part, np.trace(Q.T @ dense @ Q), rtol=1e-9)
+
+
+def _p(Z, A, v):
+    """``P A P v`` with ``P`` the orthogonal projector off ``span Z`` -- the part a deflated trace samples."""
+    Q = jnp.asarray(np.linalg.qr(Z)[0])
+
+    def p(w):
+        return w - Q @ (Q.T @ w)
+
+    return p(jnp.asarray(A) @ p(v))
+
+
+def test_a_deflated_trace_refuses_a_matrix_function_and_a_dependent_space():
+    op, dense = _spd_fem()
+    Z = np.ones((dense.shape[0], 1))
+    with pytest.raises(ValueError, match="invariant"):
+        jno.solve.trace(op, fun=jnp.log, deflate=Z)
+    with pytest.raises(ValueError, match="dependent"):
+        jno.solve.trace(op, deflate=np.concatenate([Z, 2 * Z], axis=1))
+
+
 def test_applyfun_matrix_exponential_is_exact():
     op, dense = _spd_fem()
     w = jnp.asarray(np.random.default_rng(0).standard_normal(dense.shape[0]))

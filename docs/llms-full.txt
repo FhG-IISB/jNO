@@ -513,6 +513,22 @@ extra), `form([terms], inner=)`, `inner(solver)`, `block_diag`/`triangular` (per
 `fem.blocks`); `reuse=True` / `reuse=k` on any of them keeps the setup across solves. Every constructor takes `float32=True`: the preconditioner is built
 and applied in single precision while the solve stays in double.
 
+**Coarse spaces** — `coarse(space, parts=)` is `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r`; the space is a VALUE, never a string:
+formulas (`[1]`, rigid modes `[(1, 0), (0, 1), (-y, x)]`, `{p: [1]}` per field), an `(n, k)` array, a sparse
+`(n, k)` matrix (vectors on overlapping subdomains), a callable `ctx -> Z`, `jno.space.eigvecs(k)`, or
+`jno.space.geneo(tau=0.2)` (GenEO per Schwarz subdomain, for coefficient jumps, on FEM of any element, marches, reduced systems and diagonally dominant FDM; needs `parts=schwarz(coarse=False)`; `coarse(..., reuse=1)` recomputes it every solve and every Newton/staggered linearization, for a moving stiffness pattern). `parts=`
+is an int (METIS), region names, or a `schwarz(coarse=False)` spec to share its subdomains. Combine with `>>`:
+`Q >> M >> Q` (BNN, symmetric, `cg`), `M >> Q` (deflation, `gmres`/`fgmres`). `schwarz(coarse=<space>)` is the
+same thing built in. A space holding an exact kernel (pure-Neumann constant) raises: add a gauge term instead.
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)       # 2-D elasticity
+u = fem.solve(linear=jno.solve.cg(tol=1e-8), precond=Q >> S >> Q)
+G = jno.precond.coarse(jno.space.geneo(), parts=S)               # high contrast: GenEO
+u = fem.solve(linear=jno.solve.cg(tol=1e-8), precond=G >> S >> G)
+```
+
 **AMG is for repeated solves against the same operator** — build the hierarchy once, or an unbuilt
 spec re-runs pyamg's host-side setup every solve:
 
@@ -753,6 +769,10 @@ for signed save/load, and the AD defaults `diff_type` / `hessian_type`.
 These were found by running code, not by reading. (Earlier revisions of this file listed docs
 pages that contradicted the measurements; those pages have since been fixed — the API facts below
 remain the part worth keeping loaded.)
+
+**Batched `jnp.linalg` on the CPU (Schwarz, GenEO setup) is far slower with OpenBLAS's default threads** in jNO's pixi
+environment, whose OpenBLAS is the OpenMP build. Run with `OMP_NUM_THREADS=1 MKL_NUM_THREADS=$(nproc)`;
+`OPENBLAS_NUM_THREADS` is ignored. Not the default: one thread slows a single large dense matrix.
 
 **Removed API — these raise `AttributeError` and appear all over older examples:**
 
