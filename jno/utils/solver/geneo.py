@@ -25,6 +25,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..sets import unique_values
+
 __all__ = ["neumann_tables", "geneo_space", "GeneoPlan", "geneo_plan", "geneo_values"]
 
 
@@ -266,7 +268,7 @@ def edge_split(S):
     keys = np.sort(np.asarray(coo.row, np.int64) * n + np.asarray(coo.col, np.int64))
     up = coo.row < coo.col
     lo = coo.row > coo.col
-    pairs = np.unique(
+    pairs = unique_values(
         np.concatenate(
             [np.asarray(coo.row[up], np.int64) * n + coo.col[up], np.asarray(coo.col[lo], np.int64) * n + coo.row[lo]]
         )

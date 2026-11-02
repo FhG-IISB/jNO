@@ -7,7 +7,10 @@
 //   jno_cudsd_factor / jno_cudsz_factor (values[nnz])       -> token[1]   real / complex
 //   jno_cudsd_solve  / jno_cudsz_solve  (token, b[k, n])    -> x[k, n]    k right-hand sides, each contiguous
 //
-// First factor call: analysis + factorisation; after that: refactorisation (the analysis is kept).
+// First factor call: analysis + factorisation; after that: refactorisation (the analysis is kept), and none at all
+// when the values are bitwise those of the slot's factors (a constant operator solved at every step of a march, a
+// frozen auxiliary solve inside an optimisation step, a program called again with the same operator): one compare
+// of the values on the device instead of a factorisation.
 // A SLOT holds the sparsity (upper triangle, CSR), the cuDSS handle/data and the factors. The pattern is
 // registered once from the host by `jno_cudsd_create`; the VALUES arrive on the device at run time. The
 // matrix is symmetric -- real symmetric indefinite, or COMPLEX SYMMETRIC (A^T = A, not Hermitian) -- so the
@@ -42,6 +45,8 @@ struct Slot {
   int *ptr = nullptr, *idx = nullptr;
   void *val = nullptr, *scratch = nullptr;
   bool factored = false;
+  int *flag = nullptr;                        // device word: 1 when the values differ from the factored ones
+  int64_t nfact = 0;                          // factorisations run (the stats report it)
   cudaStream_t own = nullptr;
   cudaEvent_t in = nullptr, out = nullptr;
   std::map<int64_t, std::pair<cudssMatrix_t, cudssMatrix_t>> dn;  // nrhs -> (X, B), persistent descriptors
@@ -63,7 +68,7 @@ void release(Slot &s) {
   if (s.in) cudaEventDestroy(s.in);
   if (s.out) cudaEventDestroy(s.out);
   if (s.own) cudaStreamDestroy(s.own);
-  cudaFree(s.ptr); cudaFree(s.idx); cudaFree(s.val); cudaFree(s.scratch);
+  cudaFree(s.ptr); cudaFree(s.idx); cudaFree(s.val); cudaFree(s.scratch); cudaFree(s.flag);
   s = Slot();
 }
 
@@ -89,6 +94,7 @@ extern "C" int jno_cudsd_create(int64_t slot, int64_t n, int64_t nnz, const int3
   CK(cudaMalloc(&s.idx, sizeof(int32_t) * nnz));
   CK(cudaMalloc(&s.val, s.es * nnz));
   CK(cudaMalloc(&s.scratch, s.es * n));
+  CK(cudaMalloc(&s.flag, sizeof(int)));
   CK(cudaMemcpy(s.ptr, ptr, sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice));
   CK(cudaMemcpy(s.idx, idx, sizeof(int32_t) * nnz, cudaMemcpyHostToDevice));
   CK(cudaMemset(s.val, 0, s.es * nnz));
@@ -143,11 +149,27 @@ extern "C" int jno_cudsd_stats(int64_t slot, int64_t *out) {
   if (cudssDataGet(s->h, s->data, CUDSS_DATA_LU_NNZ, &lu, sizeof(lu), &w) != CUDSS_STATUS_SUCCESS) return -2;
   cudssDataGet(s->h, s->data, CUDSS_DATA_NPIVOTS, &piv, sizeof(piv), &w);
   cudssDataGet(s->h, s->data, CUDSS_DATA_MEMORY_ESTIMATES, est, sizeof(est), &w);
-  out[0] = lu; out[1] = piv; out[2] = est[0]; out[3] = est[1];
+  out[0] = lu; out[1] = piv; out[2] = est[0]; out[3] = est[1]; out[4] = s->nfact;
   return 0;
 }
 
 namespace {
+
+__global__ void differ_kernel(const unsigned long long *a, const unsigned long long *b, int64_t n, int *flag) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x)
+    if (a[i] != b[i]) { *flag = 1; return; }
+}
+
+// Are `values` bitwise the values the slot's factors were computed from? On the slot's stream, which it synchronises.
+bool same_values(Slot *s, const void *values) {
+  int64_t words = (int64_t)(s->es * s->nnz / sizeof(unsigned long long));
+  cudaMemsetAsync(s->flag, 0, sizeof(int), s->own);
+  differ_kernel<<<1024, 256, 0, s->own>>>((const unsigned long long *)values, (const unsigned long long *)s->val, words, s->flag);
+  int flag = 1;
+  cudaMemcpyAsync(&flag, s->flag, sizeof(int), cudaMemcpyDeviceToHost, s->own);
+  cudaStreamSynchronize(s->own);
+  return flag == 0;
+}
 
 ffi::Error factor_core(cudaStream_t stream, const void *values, int64_t count, int32_t *token, int64_t slot, bool cplx) {
   std::lock_guard<std::mutex> lock(g_mu);
@@ -157,6 +179,14 @@ ffi::Error factor_core(cudaStream_t stream, const void *values, int64_t count, i
   if (count != s->nnz) return ffi::Error::InvalidArgument("jno_cudss_sym factor: nnz mismatch");
   cudaEventRecord(s->in, stream);
   cudaStreamWaitEvent(s->own, s->in, 0);
+  if (s->factored && same_values(s, values)) {  // the factors are these values' already
+    cudaEventRecord(s->out, s->own);
+    cudaStreamWaitEvent(stream, s->out, 0);
+    cudaMemsetAsync(token, 0, sizeof(int32_t), stream);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(e));
+    return ffi::Error::Success();
+  }
   cudaMemcpyAsync(s->val, values, s->es * s->nnz, cudaMemcpyDeviceToDevice, s->own);
   cudssMatrix_t X, B;
   cudssMatrixCreateDn(&X, s->n, 1, s->n, s->scratch, s->dt(), CUDSS_LAYOUT_COL_MAJOR);
@@ -175,6 +205,7 @@ ffi::Error factor_core(cudaStream_t stream, const void *values, int64_t count, i
     return ffi::Error::Internal(std::string("jno_cudss_sym factor: cuDSS (re)factorisation failed, status ") + std::to_string((int)st) +
                                 (st == CUDSS_STATUS_ALLOC_FAILED ? " (out of device memory)" : ""));
   s->factored = true;
+  s->nfact += 1;
   cudaEventRecord(s->out, s->own);
   cudaStreamWaitEvent(stream, s->out, 0);
   cudaMemsetAsync(token, 0, sizeof(int32_t), stream);

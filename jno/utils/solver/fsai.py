@@ -23,6 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..sets import unique_values
+
 __all__ = ["FsaiPattern", "fsai_pattern", "fsai_factor", "fsai_apply", "g_indices", "pattern_values"]
 
 #: Local-block entries gathered per ``lax.map`` batch in the numeric phase: a MEMORY bound (8 bytes each,
@@ -100,7 +102,7 @@ def fsai_pattern(A, *, power: int = 1) -> FsaiPattern:
             "FSAI needs an SPD operator with a structurally non-zero diagonal."
         )
     groups = []
-    for w in np.unique(widths):
+    for w in unique_values(widths):
         rows = np.nonzero(widths == w)[0]
         J = L.indices[L.indptr[rows][:, None] + np.arange(w)]  # (b, w), sorted, so the diagonal is last
         groups.append((jnp.asarray(rows, jnp.int32), jnp.asarray(J, jnp.int32)))

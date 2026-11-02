@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
 
+from ..sets import unique_values
 from .kernel import bar_self, bar_self_jax, internal_impedance, slab_transfer_impedance, wire_self
 from .krylov import gmres_chunked
 
@@ -1705,7 +1706,7 @@ def _sheet_families(axis, skin, span, d, delta, cell_d=None):
         sel = np.asarray(axis) == ax
         if not (np.asarray(span)[sel] == 1).all():
             continue  # already split across its thickness: the elements resolve it themselves
-        th = np.unique(np.round(np.asarray(skin)[sel], 12))
+        th = unique_values(np.round(np.asarray(skin)[sel], 12))
         if th.size != 1:
             continue  # mixed thicknesses cannot share one offset
         thick = float(th[0])

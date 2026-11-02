@@ -2578,40 +2578,65 @@ def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None, *, entity_keys
     # caller -- which knows whether the domain carries a non-conforming interface -- must say which.
     _wtol = 1e-9
     _wround = 1e-6
+    nv = points.shape[0]
+    if entity_keys:
+        # One key per reference point: the sorted global vertex ids of its entity, the weights in that same order. A
+        # reference point's non-zero weights are the same in every cell, so this is one sort per reference point.
+        nzs = [np.flatnonzero(np.abs(weights[d]) > _wtol) for d in range(ndof)]
+        m = max((nz.size for nz in nzs), default=0)
+        keys = np.full((ncell, ndof, 2 * m), -1, dtype=np.int64)
+        for d, nz in enumerate(nzs):
+            vids = cells_p1[:, nz].astype(np.int64)
+            order = np.argsort(vids, axis=1, kind="stable")
+            keys[:, d, : nz.size] = np.take_along_axis(vids, order, axis=1)
+            keys[:, d, m : m + nz.size] = np.round(weights[d][nz][order] / _wround).astype(np.int64)
+        seed = np.full((nv, 2 * m), -1, dtype=np.int64)
+        seed[:, 0] = np.arange(nv)
+        seed[:, m] = int(round(1.0 / _wround))
+    else:
+        keys = np.round(phys / tol).astype(np.int64)
+        seed = np.round(points / tol).astype(np.int64)
+    # The vertices come first, so they keep ids 0..nv-1; a key several of them share (the two faces of a tied interface)
+    # names the last of them. Every other key is a new node, numbered in order of first appearance, cell by cell.
+    group, first = _row_groups(np.concatenate([seed, keys.reshape(-1, keys.shape[-1])]))
+    gid = np.empty(first.size, dtype=np.int64)
+    gid[group[:nv]] = np.arange(nv)  # in order: the last vertex of a group stays
+    new = np.flatnonzero(first >= nv)
+    new = new[np.argsort(first[new], kind="stable")]
+    gid[new] = nv + np.arange(new.size)
+    cells_k = gid[group[nv:]].reshape(ncell, ndof)
+    new_pts = phys.reshape(-1, phys.shape[-1])[first[new] - nv]
+    return np.concatenate([points, new_pts]), cells_k
 
-    def _coord_key(c, d):
-        return tuple(np.round(np.asarray(phys[c, d]) / tol).astype(np.int64))
 
-    def _entity_key(c, d):
-        w = weights[d]
-        nz = np.flatnonzero(np.abs(w) > _wtol)
-        vids = np.asarray(cells_p1[c])[nz]
-        order = np.argsort(vids, kind="stable")
-        return (tuple(int(v) for v in vids[order]), tuple(np.round(w[nz][order] / _wround).astype(np.int64)))
+_ROW_HASH_MULTIPLIER = np.uint64(0x100000001B3)
+_ROW_HASH_SHIFT = np.uint64(29)
 
-    _key = _entity_key if entity_keys else _coord_key
-    ent_to_gid: dict = {}
-    out_pts: List[Any] = []
-    for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
-        _seed = (
-            ((vid,), (int(round(1.0 / _wround)),))
-            if entity_keys
-            else tuple(np.round(np.asarray(points[vid]) / tol).astype(np.int64))
-        )
-        ent_to_gid[_seed] = vid
-        out_pts.append(points[vid])
-    cells_k = np.zeros((ncell, ndof), dtype=np.int64)
-    nid = points.shape[0]
-    for c in range(ncell):
-        for d in range(ndof):
-            k = _key(c, d)
-            gid = ent_to_gid.get(k)
-            if gid is None:
-                gid, ent_to_gid[k] = nid, nid
-                out_pts.append(phys[c, d])
-                nid += 1
-            cells_k[c, d] = gid
-    return np.asarray(out_pts), cells_k
+
+def _row_groups(rows):
+    """``(group, first)``: each row's group of equal rows, and each group's first row.
+
+    By a 64-bit hash of the rows, sorted, with neighbours compared in full; a hash collision (none measured on meshes)
+    falls back to sorting the columns themselves. A Python dict over tuples took 25 of the 36 s of a 950 k-dof P2 build."""
+    n = rows.shape[0]
+    if n == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    h = np.full(n, 0xCBF29CE484222325, dtype=np.uint64)
+    for j in range(rows.shape[1]):
+        h = (h ^ rows[:, j].astype(np.uint64)) * _ROW_HASH_MULTIPLIER
+        h ^= h >> _ROW_HASH_SHIFT
+    order = np.argsort(h)
+    r, hs = rows[order], h[order]
+    same_row = np.all(r[1:] == r[:-1], axis=1)
+    if np.any((hs[1:] == hs[:-1]) & ~same_row):
+        order = np.lexsort(rows.T[::-1])
+        r = rows[order]
+        same_row = np.all(r[1:] == r[:-1], axis=1)
+    starts = np.flatnonzero(np.concatenate([[True], ~same_row]))
+    group = np.empty(n, dtype=np.int64)
+    group[order] = np.cumsum(np.concatenate([[True], ~same_row])) - 1
+    return group, np.minimum.reduceat(order, starts)
 
 
 def _zero_mass_dirichlet_rows(M, bc):
@@ -3005,7 +3030,7 @@ def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarra
     mf = np.asarray(m_facets, dtype=int)
     if sf.size == 0 or mf.size == 0:
         return False
-    q = P[np.unique(sf[:, :3])]
+    q = P[unique_values(sf[:, :3])]
     ids, w, _g0, _a = project_points(q, mf, P, np.tile(np.eye(1, P.shape[1], 0), (len(q), 1)))
     proj = np.einsum("qk,qkd->qd", w, P[ids])
     # Judge each vertex against the facet it actually landed on, not against the median facet of the
@@ -3033,7 +3058,7 @@ def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: n
     m = np.asarray(m_facets, int)[:, :3]
     if s.size == 0 or m.size == 0:
         return False
-    pts = np.asarray(loc, dtype=float)[np.unique(s)]
+    pts = np.asarray(loc, dtype=float)[unique_values(s)]
     best = np.full(len(pts), -np.inf)
     for f in range(m.shape[0]):
         v = np.asarray(loc, dtype=float)[m[f]]
@@ -3066,7 +3091,7 @@ def _facet_rim_nodes(facets: np.ndarray, *, edges: bool) -> np.ndarray:
     tri = f[:, :3]
     e = np.sort(np.stack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=1).reshape(-1, 2), axis=1)
     uniq, counts = np.unique(e, axis=0, return_counts=True)
-    return np.unique(uniq[counts == 1]).astype(np.int64) if uniq.size else np.empty(0, dtype=np.int64)
+    return unique_values(uniq[counts == 1]).astype(np.int64) if uniq.size else np.empty(0, dtype=np.int64)
 
 
 def _rim_redistribution(facets: np.ndarray, s_at: Dict[int, int], n_s: int, *, edges: bool, rim_nodes: Any = None):
@@ -3184,7 +3209,7 @@ def _mortar_rows_3d(
     ks, km = int(s_facets.shape[1]), int(m_facets.shape[1])
     xy = np.asarray(loc, dtype=float)
 
-    s_nodes, m_nodes = np.unique(s_facets), np.unique(m_facets)
+    s_nodes, m_nodes = unique_values(s_facets), unique_values(m_facets)
     s_at = {int(v): i for i, v in enumerate(s_nodes)}
     m_at = {int(v): i for i, v in enumerate(m_nodes)}
     diag = np.zeros(len(s_nodes))
@@ -3341,8 +3366,8 @@ def _mortar_rows_2d(
     sa, sb = t[s_facets[:, 0]], t[s_facets[:, 1]]
     ma, mb = t[m_facets[:, 0]], t[m_facets[:, 1]]
 
-    s_nodes = np.unique(s_facets)
-    m_nodes = np.unique(m_facets)
+    s_nodes = unique_values(s_facets)
+    m_nodes = unique_values(m_facets)
     s_at = {int(n): i for i, n in enumerate(s_nodes)}
     m_at = {int(n): i for i, n in enumerate(m_nodes)}
     diag = np.zeros(len(s_nodes))
@@ -4645,6 +4670,16 @@ def normalize_chunk(chunk):
 # already well above it, so the floor stops mattering exactly where it would have been wrong.
 _CHUNK_MEMORY_FRACTION = 0.0015
 _CHUNK_MIN_CELLS = 8192  # saturation floor; see above -- not derivable, so kept low on purpose
+# The floor counts cells, and it was measured on small blocks: a P2 vector cell holds 30 x 30 x 30 entries against P1's
+# 4 x 4 x 4, so 8192 of them overran the memory cap 50x. Assembly of 33 k cells of 3-D P2 elasticity, cells/chunk:
+#
+#   cells/chunk    16384    8192    4096    2048    1024     512     256
+#   XLA peak MiB    1498    1323     920     744     596     538     526
+#   assembly ms      176     174     173     174     212     216     217
+#
+# and P2 and P1 Laplacians are at their optimum at 8192 whatever is above. So the floor also bounds a chunk's bytes, here
+# at the knee: where a chunk stops being free. Above this one a cell is so large that a few already fill the device.
+_CHUNK_FLOOR_BYTES = 400 << 20
 _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
 
 
@@ -4694,7 +4729,7 @@ def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
         return None if n_items <= setting else _balanced_chunk(n_items, int(setting))
     per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
     chunk = max(1, chunk_budget_bytes() // per)
-    chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
+    chunk = max(chunk, min(_CHUNK_MIN_CELLS, _CHUNK_FLOOR_BYTES // per))  # never starve the device to honour the byte cap
     if n_items <= chunk:
         return None  # one chunk anyway -- skip the scan overhead entirely
     return _balanced_chunk(n_items, chunk)
@@ -4752,6 +4787,8 @@ _ELEM_MAP_STATS: Dict[str, Any] = {"id_hits": 0, "content_hits": 0, "misses": 0,
 _LIFT_MIN_BYTES = 1 << 16
 #: ``JNO_ELEM_MAP_LIFT=0`` restores the baked path everywhere (A/B measurement).
 import os as _os
+
+from ..sets import unique_values
 
 _LIFT_ENABLED = _os.environ.get("JNO_ELEM_MAP_LIFT", "1") != "0"
 #: Compiled lifted programs, keyed by the lifted CONTENT key (big arrays by aval, the rest by value).
@@ -5863,15 +5900,15 @@ def compress_plan_blocks(blocks):
     pending, n_pending = [], 0
     for b in blocks:
         for k in _block_keys(b, stride, _PLAN_BATCH):
-            u = np.unique(k)
+            u = unique_values(k)
             pending.append(u)
             n_pending += u.shape[0]
             # merge when the pending uniques outgrow what is merged: amortised O(nse log nse), bounded memory
             if n_pending > max(_PLAN_BATCH, uniq.shape[0]):
-                uniq = np.unique(np.concatenate([uniq, *pending]))
+                uniq = unique_values(np.concatenate([uniq, *pending]))
                 pending, n_pending = [], 0
     if pending:
-        uniq = np.unique(np.concatenate([uniq, *pending]))
+        uniq = unique_values(np.concatenate([uniq, *pending]))
     del pending
     inv32 = np.empty(total, np.int32)
     off = 0

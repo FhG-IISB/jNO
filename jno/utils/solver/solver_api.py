@@ -802,6 +802,8 @@ class LinearSolver:
         self.name = name
         self.traits = {"vmap": "native", "jit": True, **(traits or {})}
         self.direct = direct  # a direct solver ignores x0 and takes no preconditioner
+        # A choice left open until the solve: a callable returning the spec to use, or None (see `at_solve_spec`).
+        self.at_solve = None
         self.key = None if key is None else (type(self), name, key)
         # What this spec was configured with, by name: `tol`, `atol`, `maxiter`, and whatever else the
         # method takes (GMRES's `restart`). A caller that runs its own loop rather than calling `fn` --
@@ -1496,6 +1498,12 @@ def _composed_compiled(A, b, x0, *, linear, precond):
     return linear(op, jnp.asarray(b).reshape(-1), M=M, x0=x0)
 
 
+def at_solve_spec(linear):
+    """The spec to solve with: ``linear``, unless it left a choice open until the solve (``jno.solve.lu()``)."""
+    pick = getattr(linear, "at_solve", None)
+    return linear if pick is None else pick()
+
+
 def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callable:
     """Compose the linear-mode slots into the classic ``(A, b) -> x`` ``solve_fn`` contract.
 
@@ -1516,6 +1524,7 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
         from ... import solve as _solve_ns
 
         linear = _solve_ns.bicgstab()  # matches the historic matrix-free default
+    linear = at_solve_spec(linear)
     if precond is not None:
         prepare_precond(precond, fem)  # eager auxiliary assembly (safe for traced/parametric solves)
     x0_flat = None if x0 is None else jnp.asarray(x0).reshape(-1)
@@ -1586,10 +1595,11 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None, shard=None) -> Callab
                 x0=x0_flat,
             )
         M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
-        if fem is not None and getattr(linear, "traits", {}).get("solver_context"):
+        context = getattr(fem, "_linear_solver_context", None)  # jno.fdm has none: the solver goes without
+        if context is not None and getattr(linear, "traits", {}).get("solver_context"):
             # what a direct solver may know beyond the values: the operator's pattern (concrete, for a
             # factorisation planned inside a trace) and whether it is a fused complex block
-            op.solver_context = fem._linear_solver_context()
+            op.solver_context = context()
         return linear(op, rhs, M=M, x0=x0_flat)
 
     if not _compilable(linear, precond):
@@ -1684,6 +1694,8 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
     matrix-free ``nonlinear=`` with a direct ``linear=`` is a genuine contradiction and says so.
     """
     from ... import solve as _solve_ns
+
+    linear = at_solve_spec(linear)
 
     # ``LinearSolver.direct`` is exactly the "needs an assembled operator" flag: lu, dense, amg.
     needs_assembled = bool(getattr(linear, "direct", False))

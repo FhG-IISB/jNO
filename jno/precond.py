@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .utils.sets import unique_values
 from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exported for user specs)
     PrecondApplier,
     PrecondContext,
@@ -3567,11 +3568,11 @@ def _region_parts(fem, regions, n, iso):
                 ) from e
             if m.shape[0] != cells.shape[0] or not m.any():
                 raise ValueError(f"jno.precond.coarse(parts=[...]): region {regions[r]!r} has no cells in this problem.")
-            node_part[np.unique(cells[m])] = r
+            node_part[unique_values(cells[m])] = r
         for c in range(idx.shape[1]):
             part[idx[:, c]] = node_part
     part[iso] = len(regions) + 1
-    used = np.unique(part[part <= len(regions)])
+    used = unique_values(part[part <= len(regions)])
     remap = np.full(len(regions) + 2, -1)
     remap[used] = np.arange(used.size)
     p = int(used.size)

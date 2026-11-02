@@ -56,6 +56,7 @@ from .trace import (
     mesh_velocity,
     state_updates,
 )
+from .utils.sets import unique_values
 
 __all__ = ["fem", "FEM"]
 
@@ -128,8 +129,8 @@ def _residual_check(A, b, u, who):
     return u
 
 
-@partial(jax.jit, static_argnums=(2, 3))
-def _bicgstab_jacobi(A, b, tol, maxiter):
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def _bicgstab_jacobi(A, b, tol, maxiter, padded=True):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
     # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
@@ -138,15 +139,15 @@ def _bicgstab_jacobi(A, b, tol, maxiter):
     from .utils.solver.krylov import bicgstab_counted
     from .utils.solver.linear import jacobi, sparse_matvec
 
-    x, k, broke = bicgstab_counted(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    x, k, broke = bicgstab_counted(sparse_matvec(A, padded=padded), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
     return x, k, broke
 
 
-def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side):
+def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side, padded=True):
     """:func:`_bicgstab_jacobi` with its iteration count recorded for ``fem.stats``; returns ``x``."""
     from .utils.solver.solver_api import record_iterations
 
-    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter)
+    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter, padded)
     record_iterations(k, who, side=side, broke=broke)
     return x
 
@@ -229,11 +230,11 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     from .utils.solver import matvec_format
 
     matvec_format.prime(A)  # CSR or COO, measured on THIS operator before it becomes a tracer
-    return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
+    return _firewalled_bicgstab(A, b, float(tol), int(maxiter), matvec_format.has_padding(A))
 
 
-@partial(jax.jit, static_argnums=(2, 3))
-def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def _firewalled_bicgstab(A, b, tol: float, maxiter: int, padded: bool = True):
     """The default solve inside our OWN ``custom_linear_solve``, so its adjoint is ours to check.
 
     Called straight, ``jax.scipy.sparse.linalg.bicgstab`` supplies its own implicit-diff rule, and the
@@ -254,9 +255,9 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
 
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
-    mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
+    mv, mvT = sparse_matvec(A, padded=padded), sparse_matvec(A, transpose=True, padded=padded)  # no re-conversion of A.T
     fwd = lambda _mv, rhs: residual_gate(
-        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward"), who, side="forward"
+        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward", padded), who, side="forward"
     )  # noqa: E501
     rev = lambda _mv, rhs: residual_gate(
         mvT, rhs, _counted_bicgstab_jacobi(AT, rhs, tol, maxiter, who, "transpose"), who, side="transpose"
@@ -1180,7 +1181,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
                     m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
                     if m.shape[0] != cells_i.shape[0]:
                         raise LookupError(r)
-                    reached[np.unique(cells_i[m > 0])] = True
+                    reached[unique_values(cells_i[m > 0])] = True
                 else:
                     # a surface term reaches its facet's nodes; `tag_node_mask` IS reliable for a
                     # boundary tag (it is what `FEM.region_dofs` resolves with)
@@ -1568,6 +1569,19 @@ def _tie_phase(bare: Any) -> Optional[complex]:
     return None
 
 
+def _default_direct(fem_obj):
+    """The ``linear=`` of a runtime-parametric form solved with nothing asked of it, or ``None`` to keep JAX's
+    ``spsolve`` (``FemLinearSystem.solve``'s default): what ``jno.solve.lu()`` resolves to, when that is not spsolve."""
+    from .solve import _preferred_direct_backend, lu
+
+    if fem_obj._mode != "linear" or not isinstance(fem_obj._op, FemLinearSystem):
+        return None
+    periodic = fem_obj._periodic_2n if fem_obj._complex_n is not None else fem_obj._periodic
+    if getattr(fem_obj, "_geometry", None) or periodic is not None:
+        return None
+    return lu(backend="cudss") if _preferred_direct_backend() == "cudss" else None
+
+
 def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
     """One line naming the route a ``solve()`` actually took.
 
@@ -1575,7 +1589,7 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     elasto-plastic march measured 1194 s on the matrix-free Newton (then the default) and 14.6 s with a
     sparse-direct tangent. A user who cannot see which one ran cannot see that difference either.
     """
-    _DIRECT = {"lu", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
+    _DIRECT = {"lu", "lu-host", "lu-cudss", "lu-pardiso", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
 
     def _nm(spec, default):
         return default if spec is None else (getattr(spec, "name", None) or type(spec).__name__.lower())
@@ -1599,6 +1613,9 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     if mode == "nonlinear":
         default_inner = "bicgstab (assembled)" if _assembled and nonlinear is None else "bicgstab (matrix-free)"
         return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
+    if isinstance(getattr(fem_obj, "_op", None), FemLinearSystem) and precond is None:
+        # a runtime-parametric form solves on a sparse-direct factorisation unless told otherwise
+        return f"solve: {mode} · {_lin('lu (JAX spsolve)')}"
     return f"solve: {mode} · {_lin()}"
 
 
@@ -3308,7 +3325,14 @@ class FEM:
         # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
         # the three modes silent about which solver actually ran.
         from .utils.logger import get_logger
+        from .utils.solver.solver_api import at_solve_spec
 
+        if linear is None and all(
+            a_ is None
+            for a_ in (solve_fn, adapt, checkpoint, contact, continuation, x0, nonlinear, precond, time, tau, basis, shard)
+        ):
+            linear = _default_direct(self)
+        linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 
         # Structural singularity is checked at BUILD and reported HERE. A form whose terms cover only
@@ -5833,7 +5857,7 @@ def _face_nodes(
                     _c = np.asarray(cells)
                     _m = np.asarray(_cell_region_mask(domain, owner)).reshape(-1)
                     if _m.shape[0] == _c.shape[0]:
-                        own = np.unique(_c[_m > 0])
+                        own = unique_values(_c[_m > 0])
                 if own is None and owner in ti:  # no assembly cells here: the partition is all there is
                     own = np.asarray(ti[owner], dtype=int).reshape(-1)
                 if own is not None:
@@ -5910,7 +5934,7 @@ def _build_periodic_reduction(
     except Exception:  # noqa: BLE001 - a domain with no volume block (1-D flat-chain route)
         _ct = None
     bfacets = _boundary_facets(points, cells, dim, ele_order, _ct) if cells is not None else None
-    bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
+    bnodes = unique_values(bfacets) if bfacets is not None and bfacets.size else None
 
     pairs = [(main, secondary) for (main, secondary, *_ignore) in ties]
     # Bloch phase per pair (``e^{i k·L}``); 1.0 = plain periodic (the ties may be 4-tuples pre-Bloch).
@@ -5946,7 +5970,7 @@ def _build_periodic_reduction(
                     # ...and the face's node set gains the higher-order nodes those facets carry, which
                     # is what the mortar integrates over. `union1d` so this can only ADD: at order 1 a
                     # facet IS its vertices, so the set is unchanged and P1 ties do not move.
-                    faces[tag] = np.union1d(np.asarray(faces.get(tag, np.empty(0, int))), np.unique(facets[tag]))
+                    faces[tag] = np.union1d(np.asarray(faces.get(tag, np.empty(0, int))), unique_values(facets[tag]))
     else:  # native 1D / no assembly cells -> flat-chain fallback
         facets = {
             t: ff
@@ -6233,7 +6257,7 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     facets = _boundary_facets(points, cells, dim, int(order))
     if facets is None or facets.size == 0:
         return {}
-    bnodes = np.unique(facets)
+    bnodes = unique_values(facets)
     sel = _face_nodes(domain, points, bnodes, region)
     if sel is None or len(sel) == 0:
         return {}
@@ -7309,7 +7333,7 @@ def _check_movable_bc_nodes(domain: Any, dirichlet_raw: Any, boundary_terms: Any
     facets = np.sort(np.stack([cells[:, list(c)] for c in combos], axis=1), axis=-1)
     facets = facets.reshape(-1, len(combos[0]))
     _uniq, _cnt = np.unique(facets, axis=0, return_counts=True)
-    bnodes = np.unique(_uniq[_cnt == 1])
+    bnodes = unique_values(_uniq[_cnt == 1])
     if bnodes.size == 0:
         return
     coords = pts[bnodes]
@@ -7374,7 +7398,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
     if _op_d is not None:
         _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
-    d_dofs = jnp.asarray(np.unique(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
+    d_dofs = jnp.asarray(unique_values(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -10215,7 +10239,8 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
     * ``'mass'``      -> ``M = integral phi_i phi_j``              (``k^T M k = integral k^2``)
 
     Assembled natively: the bilinear form is retagged to the quadrature pool and run through
-    ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes.
+    ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes, sparse (held
+    dense it was n x n on the device, 73 MB at 3 k nodes and 80 GB at 100 k).
     """
     from .utils.solver.fem_native import assemble_fem_native
 
@@ -10233,12 +10258,11 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
     _retag_coords_for_quadrature(bare, "volume", "volume")
     qd = int(getattr(domain, "_fem_quad_degree", 0) or 2)
     op, _mode, _offs = assemble_fem_native(domain, [bare], {}, [], [], vec=1, quad_degree=qd)
-    A = op[0]
-    return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+    return op[0]
 
 
-def _assemble_h1_stiffness(domain: Any):  # back-compat alias
-    return _assemble_fe_gram(domain, "stiffness")
+def _assemble_h1_stiffness(domain: Any):  # back-compat alias: dense, for a small mesh and a test
+    return _assemble_fe_gram(domain, "stiffness").todense()
 
 
 def _fe_element_gradient_data(domain: Any):

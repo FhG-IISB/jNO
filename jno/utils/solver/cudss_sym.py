@@ -163,11 +163,13 @@ class Plan:
         self.indices = jnp.asarray(np.stack([rows, cols], 1).astype(np.int32))
 
     def stats(self) -> dict:
-        """After a factorisation: nnz of the factors, perturbed pivots, cuDSS's device-memory estimates (bytes)."""
-        out = np.zeros(4, np.int64)
+        """After a factorisation: nnz of the factors, perturbed pivots, cuDSS's device-memory estimates (bytes), and how
+        many factorisations the slot has run (a factor call with the values of the current factors runs none)."""
+        out = np.zeros(5, np.int64)
         if _load().jno_cudsd_stats(self.slot, out.ctypes.data) != 0:
             return {}
-        return {"lu_nnz": int(out[0]), "npivots": int(out[1]), "device_permanent": int(out[2]), "device_peak": int(out[3])}
+        names = ("lu_nnz", "npivots", "device_permanent", "device_peak", "factorisations")
+        return {k: int(v) for k, v in zip(names, out)}
 
     def release(self) -> None:
         """Free this slot's factors (cuDSS analysis + factor memory) between programs; the sparsity and the slot
@@ -197,8 +199,7 @@ def _ffi_solve(p: Plan, token, rhs):
     sol = "jno_cudsz_solve" if p.complex else "jno_cudsd_solve"
     r2 = rhs.reshape(p.n, -1).T  # (k, n): each right-hand side contiguous
     # vmap over right-hand sides (a block of loads on one matrix: shared factorisations, jacrev): the solve runs
-    # once per batch entry on the SAME factors. The factorisation has no batching rule on purpose: a batch of
-    # matrices would refactor one slot over and over and every solve would see the last.
+    # once per batch entry on the SAME factors. A batch of matrices is `solve`'s to handle: see there.
     x = jax.ffi.ffi_call(sol, jax.ShapeDtypeStruct(r2.shape, r2.dtype), vmap_method="sequential")(
         token, r2, slot=np.int64(p.slot)
     )
@@ -273,6 +274,7 @@ def solve(p: Plan, values, b, refactor=True, tol=1e-10, maxiter=30):
     import jax
     import jax.experimental.sparse as jsp
     import jax.numpy as jnp
+    from jax.custom_batching import custom_vmap
 
     n, slot = p.n, np.int64(p.slot)
     dt = jnp.complex128 if p.complex else jnp.float64
@@ -281,10 +283,37 @@ def solve(p: Plan, values, b, refactor=True, tol=1e-10, maxiter=30):
     b = b.astype(dt)
     A = jsp.BCOO((values, p.indices), shape=(n, n))
     if refactor:
-        vcsr = jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz]
         # the factorisation is not differentiated: the cotangent of `values` enters through the matvec below
-        token = jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(jax.lax.stop_gradient(vcsr), slot=slot)
-        _solve = lambda _matvec, rhs: _ffi_solve(p, token, rhs)
+        vcsr = jax.lax.stop_gradient(jnp.zeros(p.nnz + 1, dt).at[p.pos].add(values)[: p.nnz])
+        factor = lambda v: jax.ffi.ffi_call(fac, jax.ShapeDtypeStruct((1,), jnp.int32))(v, slot=slot)
+
+        # One slot holds one factorisation, so a batch of matrices (vmap, in or outside a jit) cannot factor them all
+        # and then solve: every solve would see the last. Batched, the factorisation is left to each solve, member by
+        # member in sequence, and an adjoint factors again. One matrix with a batch of right-hand sides keeps its
+        # one factorisation (`_ffi_solve`).
+        @custom_vmap
+        def factored(v):
+            return factor(v)
+
+        @factored.def_vmap
+        def _factored_batch(axis_size, _in_batched, _v):
+            return jnp.zeros((axis_size, 1), jnp.int32), True
+
+        @custom_vmap
+        def on_factors(tok, v, rhs):
+            return _ffi_solve(p, tok, rhs)
+
+        @on_factors.def_vmap
+        def _on_factors_batch(axis_size, in_batched, tok, v, rhs):
+            _tok_b, v_b, rhs_b = in_batched
+            if not v_b:
+                axis = 0 if rhs_b else None
+                return jax.vmap(lambda r: _ffi_solve(p, tok, r), in_axes=axis, axis_size=axis_size)(rhs), True
+            r_b = rhs if rhs_b else jnp.broadcast_to(rhs, (axis_size, *rhs.shape))
+            return jax.lax.map(lambda vr: _ffi_solve(p, factor(vr[0]), vr[1]), (v, r_b)), True
+
+        token = factored(vcsr)
+        _solve = lambda _matvec, rhs: on_factors(token, vcsr, rhs)
     else:
 
         def _solve(matvec, rhs):

@@ -382,6 +382,14 @@ test suites, re-running a script after an edit.
     compile_cache = false
     ```
 
+### Large constants as arguments, not part of the program
+
+A program closes over the mesh, its per-cell tables and every frozen field. `import jno` has JAX pass every constant
+above 32 bytes to the compiled executable as an argument instead of reading it back to the host and folding it into
+the program (`JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS=1`, in either import order). The array stays where it is on the
+device, the program stays small, its compile is shorter, and a compile-cache entry no longer holds the mesh; values
+are unchanged. It is process-wide: `JNO_HOIST_CONSTANTS=0` turns it off, and so does setting the JAX variable yourself.
+
 ### Within a process — identical-problem reuse
 
 Rebuilding an *identical* problem (same mesh content, same terms) reuses the already-compiled

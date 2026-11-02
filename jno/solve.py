@@ -83,7 +83,23 @@ __all__ = [
 ]
 
 
-def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True) -> LinearSolver:
+def _preferred_direct_backend() -> str:
+    """The backend of ``lu()`` when none is named: cuDSS where it runs, else JAX's ``spsolve``.
+
+    Not a choice that depends on the problem: cuSolver's ``spsolve`` is a QR, and on a GPU with cuDSS it lost by more
+    with every size (one parametric solve, RTX 3070: 280 ms against 11 ms at 7.6 k P2 dofs, 2.4 s against 36 ms at 13 k P1
+    elasticity dofs, over 240 s against 0.13 s at 49 k P2 dofs). float64 only: the cuDSS extension's values are doubles."""
+    import jax
+
+    from .utils.solver.linear import _cudss_available
+    from .utils.solver.placement import solve_device
+
+    if jax.config.jax_enable_x64 and solve_device().platform == "gpu" and _cudss_available():
+        return "cudss"
+    return "device"
+
+
+def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = True) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -103,7 +119,12 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         backend: WHERE the factorization happens. All three obey the same ``(A, b) -> x`` contract and
             are equally differentiable; they differ in speed, reach, and what they need installed.
 
-            ``"device"`` (default) -- JAX's ``spsolve``: cuSolver on a CUDA GPU, a native LU on CPU.
+            ``None`` (default) -- ``"cudss"`` where the solve runs on a GPU, it is installed and float64 is on, else
+            ``"device"``. Decided when ``fem.solve`` (or ``jno.fdm``'s) composes the solve, under the ``jax.default_device``
+            in force then; the solve's log line names which one ran. A caller that takes the spec without composing a
+            solve (``jno.solve.eigs(linear=)``, a preconditioner's ``inner=``) gets ``"device"``.
+
+            ``"device"`` -- JAX's ``spsolve``: cuSolver on a CUDA GPU, a native LU on CPU.
             No extra dependency, and the only one of the three that needs nothing installed.
 
             ``"host"`` -- SuperLU on the CPU via ``scipy``, keeping the rest of the solve where it is.
@@ -123,7 +144,9 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             and test swapped, its essential conditions eliminated symmetrically) is factored LDL^T inside the
             program too; anything it cannot show symmetric stays on LU, through a host callback. A pattern
             that is not symmetric stays on LU; values that are not (only checkable after the solve, under
-            a trace) fail the residual gate. Two solves of one form in one program get a factor slot each.
+            a trace) fail the residual gate. Two solves of one form in one program get a factor slot each. Values the slot's
+            factors already came from are not factored again (a constant operator at every step of a march, a frozen
+            solve inside an optimisation step): one compare on the device.
             The in-program path compiles a small extension with ``nvcc`` on first use (cached afterwards).
             It is the one to reach for on a Newton loop or a shift-invert eigensolve, because it separates
             the symbolic plan from the numeric factorization and jNO caches on the SPARSITY: the plan
@@ -150,8 +173,8 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             re-SOLVES against one factorization, and there cuDSS is 11x faster per solve (3.5 ms vs
             40 ms at lap3d 50^3) and additionally takes a whole block of right-hand sides at once.
 
-            There is deliberately no ``"auto"``: which backend wins depends on hardware jNO cannot
-            inspect, and silently choosing would violate the no-surprises rule.
+            Between those two jNO does not choose: which wins depends on the phase your problem repeats and on
+            hardware it cannot inspect.
         host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
             both is an error.
         reuse: keep the factorization for a repeating operator (``"host"`` only; the other backends
@@ -168,12 +191,18 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             ``backend="device"``), with the two answers agreeing to ten significant figures.
     """
     if host is not None:
-        if backend != "device":
+        if backend is not None:
             raise ValueError(
                 f"jno.solve.lu() got both backend={backend!r} and host={host!r}. `host=` is the "
                 f'deprecated spelling of backend="host" -- pass only backend=.'
             )
         backend = "host" if host else "device"
+    if backend is None:
+        # Which backend is known only at the solve: `jax.default_device` says where that runs, and it need not be
+        # where this spec was built. Until then (a caller that does not compose it) this is the device's own solve.
+        spec = lu(backend="device", reuse=reuse)
+        spec.at_solve = lambda: lu(backend=_preferred_direct_backend(), reuse=reuse)
+        return spec
     if backend not in ("device", "host", "cudss", "pardiso"):
         raise ValueError(
             f"jno.solve.lu(backend={backend!r}) is not a known backend. Use 'device' (JAX spsolve: "
@@ -245,7 +274,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         "host_kernel": None if backend == "device" else backend,
         "solver_context": backend == "cudss",
     }
-    return LinearSolver(_fn, name=name, direct=True, traits=traits)
+    return LinearSolver(_fn, name=name, direct=True, traits=traits, settings={"reuse": reuse})
 
 
 def dense() -> LinearSolver:

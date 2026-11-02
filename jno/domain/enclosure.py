@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..trace import Placeholder
+from ..utils.sets import unique_values
 from .mesh_utils import MeshUtils
 
 
@@ -644,7 +645,7 @@ class Enclosure:
     @property
     def nodes(self) -> np.ndarray:
         """The unique global mesh node indices the enclosure touches."""
-        return np.unique(self.elements)
+        return unique_values(self.elements)
 
     def tag_mask(self, tag: str) -> np.ndarray:
         """Boolean (m,) mask of elements belonging to ``tag`` — e.g. to build a per-element emissivity."""

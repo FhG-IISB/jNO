@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.sparse.linalg import spsolve
 
+from ..sets import unique_values
+
 __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
 
 #: Host SuperLU factorizations, keyed on the CONTENT of the operator that produced them.
@@ -131,7 +133,7 @@ def matrix_diagonal(A):
     return jnp.diagonal(jnp.asarray(A))
 
 
-def sparse_matvec(A, *, transpose: bool = False):
+def sparse_matvec(A, *, transpose: bool = False, padded=None):
     """``v -> A @ v`` (or ``A^T @ v``) with the BCOO index work done ONCE, for use inside a solver loop.
 
     The storage it applies is chosen per operator by :mod:`jno.utils.solver.matvec_format`: cuSPARSE
@@ -152,6 +154,9 @@ def sparse_matvec(A, *, transpose: bool = False):
     contribute nothing, because the gather fills with zero and the scatter drops. It is reverse- and
     forward-mode differentiable in both ``A.data`` and ``v`` and batches under ``vmap``.
 
+    ``padded``: whether ``A`` has out-of-bound entries, for a caller that knows (see ``matvec_format.has_padding``) while
+    ``A``'s indices are traced; unknown, they have to be masked, which at the first solve is the largest temporary there is.
+
     Only a plain 2-D BCOO (``n_batch == n_dense == 0``) is rewritten; anything else -- a dense array, a
     batched BCOO, a jNO ``LinearOperator`` -- falls back to its own ``@`` unchanged. Do not pass
     ``indices_are_sorted=True`` to the scatter here: XLA's sorted-scatter path measured 4-7x SLOWER.
@@ -163,7 +168,7 @@ def sparse_matvec(A, *, transpose: bool = False):
     from . import matvec_format
 
     if matvec_format.choose(A) == "csr":
-        return matvec_format.csr_matvec(matvec_format.csr_parts(A), tuple(A.shape), transpose)
+        return matvec_format.csr_matvec(matvec_format.csr_parts(A, padded=padded), tuple(A.shape), transpose)
     return _split_coo_matvec(A, transpose)
 
 
@@ -568,6 +573,8 @@ def _cudss_host_solve(data, indices, rhs, shape, transpose):
         # cuDSS requires a COL-MAJOR multi-RHS block and raises on a C-ordered one.
         return cp.asfortranarray(cp.asarray(r)) if r.ndim > 1 else cp.asarray(r)
 
+    if _np.ndim(rhs) == 2 and rhs.shape[1] == 1:  # one column: the plan of a vector, whose device arrays are (n,)
+        return _cudss_host_solve(data, indices, _np.asarray(rhs)[:, 0], shape, transpose)[:, None]
     data = _np.ascontiguousarray(data)
     idx = _np.ascontiguousarray(_np.asarray(indices))
     rhs = _np.ascontiguousarray(rhs)
@@ -737,8 +744,8 @@ def _symmetric_pattern(rows, cols) -> bool:
     import numpy as np
 
     n = int(max(rows.max(initial=0), cols.max(initial=0))) + 1
-    a = np.unique(rows.astype(np.int64) * n + cols)
-    return bool(np.array_equal(a, np.unique(cols.astype(np.int64) * n + rows)))
+    a = unique_values(rows.astype(np.int64) * n + cols)
+    return bool(np.array_equal(a, unique_values(cols.astype(np.int64) * n + rows)))
 
 
 def _symmetric_values(data, rows, cols, complex_n) -> bool:
@@ -769,7 +776,7 @@ def _current_trace(x):
     return getattr(x, "_trace", None) if isinstance(x, jax.core.Tracer) else None
 
 
-def _ldl_plan(owner, rows, cols, n, complex_values, trace):
+def _ldl_plan(owner, rows, cols, n, complex_values, trace, digests=None):
     """A cuDSS slot for this pattern. A slot holds ONE factorisation per program (the adjoint reuses it), so a
     second solve of the same pattern inside the same trace gets a slot of its own instead of overwriting the
     first one's factors between its forward and its adjoint (which would return a wrong gradient silently)."""
@@ -780,9 +787,21 @@ def _ldl_plan(owner, rows, cols, n, complex_values, trace):
 
     from . import cudss_sym as cs
 
-    h = hashlib.sha1(np.ascontiguousarray(rows).tobytes() + np.ascontiguousarray(cols).tobytes()).hexdigest()
+    # `digests`: the owner's cache of this pattern's digest (per kind), so a pattern is hashed once per form, not per solve
+    h = None if digests is None else digests.get(bool(complex_values))
+    if h is None:
+        h = hashlib.sha1(np.ascontiguousarray(rows).tobytes() + np.ascontiguousarray(cols).tobytes()).hexdigest()
+        if digests is not None:
+            digests[bool(complex_values)] = h
     key = (id(owner), h, int(n), bool(complex_values))
-    pool = _LDL_PLANS.setdefault(key, [])
+    pool = _LDL_PLANS.get(key)
+    if pool is None:
+        pool = _LDL_PLANS[key] = []
+        if owner is not None:  # the plans go with their form: each slot holds the pattern and a values buffer on the device
+            try:
+                weakref.finalize(owner, _LDL_PLANS.pop, key, None)
+            except TypeError:
+                pass
     for entry in pool:
         last = entry["trace"]
         used_here = trace is not None and last is not None and last() is trace
@@ -852,8 +871,12 @@ def cudss_ldl_solve(A, b, context=None):
                 "wrong pattern."
             )
         idx = np.asarray(pat)
+        digests = ctx.setdefault("_ldl_digests", {})  # this pattern's digest, computed once per form rather than per solve
     else:
-        idx = np.asarray(A.indices)
+        idx = np.asarray(
+            A.indices
+        )  # in its own order: a concrete operator may list the entries differently from the pattern
+        digests = None
     rows, cols, m = idx[:, 0], idx[:, 1], int(A.shape[0])
     trace = _current_trace(A.data)
     b = jnp.asarray(b)
@@ -866,16 +889,20 @@ def cudss_ldl_solve(A, b, context=None):
             return None
         if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, n):
             return None  # concrete values, not symmetric: the general LU path solves it
-        plan = _ldl_plan(ctx.get("owner"), rows % n, cols % n, n, True, trace)
+        plan = _ldl_plan(ctx.get("owner"), rows % n, cols % n, n, True, trace, digests)
         weight = jnp.asarray(np.where(tl, 1.0 + 0j, np.where(bl, 1j, 0j)))
         xc = cs.solve(plan, A.data * weight, b[:n] + 1j * b[n:])
         x = jnp.concatenate([xc.real, xc.imag])
     else:
-        if not _symmetric_pattern(rows, cols):
-            return None
-        if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, None):
-            return None
-        plan = _ldl_plan(ctx.get("owner"), rows, cols, m, False, trace)
+        # The weak form can show the operator symmetric (`ctx["symmetric"]`, operator_key.symmetric_operator): then the
+        # pattern and the values are not checked here, as under a trace they cannot be, and the residual gate below
+        # still guards the solution. The two host checks took 0.6 s of a 3.3 s solve at 11 M entries.
+        if not ctx.get("symmetric"):
+            if not _symmetric_pattern(rows, cols):
+                return None
+            if not isinstance(A.data, jax.core.Tracer) and not _symmetric_values(A.data, rows, cols, None):
+                return None
+        plan = _ldl_plan(ctx.get("owner"), rows, cols, m, False, trace, digests)
         x = cs.solve(plan, A.data, b)
     x = residual_gate(lambda v: A @ v, b, x, "lu(backend='cudss') [LDL^T]", rtol=1e-6)
     if not isinstance(x, jax.core.Tracer):

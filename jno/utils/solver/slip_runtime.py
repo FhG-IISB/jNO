@@ -27,6 +27,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse as jsparse
 
+from ..sets import unique_values
+
 
 class StaleSlipP:
     """Placeholder for a slip prolongation whose values depend on runtime coordinates.
@@ -144,7 +146,7 @@ def build_plan(domain, pts_i, cells_i, order_i, regions, nodes, node_dofs, refer
     conn = build_facet_connectivity(cells_i, ctype)
     fn = np.asarray(compute_face_normals(pts_i, conn, cells_i, ctype))
     oriented = {frozenset(int(v) for v in row): fn[k] for k, row in enumerate(np.asarray(conn.face_nodes))}
-    bnodes = np.unique(facets)
+    bnodes = unique_values(facets)
 
     reg_rows, reg_sign = [], []
     for region in regions:
@@ -173,7 +175,7 @@ def build_plan(domain, pts_i, cells_i, order_i, regions, nodes, node_dofs, refer
         reg_sign.append(np.asarray(sgn))
 
     # local point set = every point any slip facet touches; each is a vertex or a straight midside node
-    loc = np.unique(np.concatenate([r.reshape(-1) for r in reg_rows]))
+    loc = unique_values(np.concatenate([r.reshape(-1) for r in reg_rows]))
     g2l = {int(g): k for k, g in enumerate(loc)}
     scale = max(float(np.ptp(V0)), 1e-300)
     vkey = {tuple(np.round(p / scale, 11)): j for j, p in enumerate(V0)}
@@ -308,7 +310,7 @@ def plan_P(plan, args=None, xp=jnp, _raw=False):
             k = gr["src"][:, j, 1]
             rule = gr["src"][:, j, 2]
             rows_j = []
-            for reg in np.unique(r):
+            for reg in unique_values(r):
                 sel = np.flatnonzero(r == reg)
                 mass, area, angw = per_region[int(reg)]
                 rows_j.append((sel, _pick(xp, mass, area, angw, k[sel], xp.asarray(rule[sel]))))
