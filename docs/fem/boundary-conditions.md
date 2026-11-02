@@ -493,6 +493,16 @@ surface state, written out as a `state.evolves(...)` update, not a material obje
     mismatch, not a numerical artefact. Add roller conditions on the side faces if you want a genuinely
     uniaxial press.
 
+### Surface terms on interior interfaces
+
+A conforming mesh names every interface between two regions as its own tag, `"A|B"` (pieces numbered `.0`, `.1`).
+A surface term bound to such a tag integrates over that interface: `h * (Ts - T0) * vs` with `Ts, vs` bound to
+`d.variable("A|B")` is a contact conductance, a membrane, a heat sink on an internal wall. Each interface facet is
+taken from the side of the tag's first region, so a normal points from A into B; continuous fields have the same
+trace from either side. These facets belong only to the tag that names them, never to the catch-all `"boundary"`.
+Until 2026-11 such a term integrated over nothing, silently; a term whose tag selects none of its facets now raises.
+Pinned in `tests/test_fem_interface_surface_terms.py` (interface length, a heat sink against the exact profile).
+
 ### Naming one body's surface — `domain.tag(..., region=...)`
 
 A contact pair needs two surfaces that genuinely differ, and a coordinate predicate often cannot supply

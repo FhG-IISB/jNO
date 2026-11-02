@@ -1180,6 +1180,90 @@ TOPOLOGY_ARG = "__topology__"
 _NO_POINTS = "__jno_no_point_loads__"  # an `args` flag: assemble without the point loads (static placeholders)
 
 
+def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
+    """``(conn, interior)``: the boundary facet connectivity with the facets of every INTERIOR interface tag in
+    ``regions`` appended, and a boolean over the result marking the appended ones.
+
+    An interface facet has two cells; its parent (whose basis evaluates the traces, and out of which its normal
+    points) is the cell on the side of the tag's FIRST region: for ``"A|B"`` the facet belongs to A and its
+    normal points from A into B. A tag without that form takes the first cell found. Continuous fields have the
+    same trace from either side, so only normals and one-sided derivatives depend on the choice."""
+    from ...domain.mesh_utils import mesh_cell_region_membership
+    from .fem_facets import FacetConnectivity, _boundary_faces
+
+    n_b = int(conn.n_bfaces)
+    if not hasattr(domain, "tag_facets") or not regions:
+        return conn, np.zeros(n_b, dtype=bool)
+    boundary_keys = {frozenset(int(x) for x in f) for f in np.asarray(conn.face_nodes)}
+    wanted = []
+    for region in regions:
+        if region == "boundary":
+            continue
+        named = domain.tag_facets(region)
+        if named is None:
+            continue
+        inner = [f for f in np.asarray(named) if frozenset(int(x) for x in f) not in boundary_keys]
+        if inner:
+            wanted.append((str(region), np.asarray(inner, dtype=np.int64)))
+    if not wanted:
+        return conn, np.zeros(n_b, dtype=bool)
+
+    local_faces, n_face_nodes = _face_table(cell_key)
+    flat, _sel, n_local = _boundary_faces(np.asarray(cells_p1), local_faces, n_face_nodes)
+    # one id per distinct node set, shared by the cell faces and the wanted facets (one unique over both,
+    # so the two sides are keyed identically)
+    all_facets = np.concatenate([f for _r, f in wanted])
+    _, ids = np.unique(np.concatenate([np.sort(flat, axis=1), np.sort(all_facets, axis=1)]), axis=0, return_inverse=True)
+    ids = np.asarray(ids).reshape(-1)
+    cell_ids, facet_ids = ids[: len(flat)], ids[len(flat) :]
+    order = np.argsort(cell_ids, kind="stable")
+    sorted_ids = cell_ids[order]
+    regions_cells = mesh_cell_region_membership(domain.mesh, int(domain.dimension))
+
+    def side_cells(name):
+        import re
+
+        for cand in (name, re.sub(r"\.\d+$", "", name)):
+            if cand in regions_cells:
+                return np.asarray(regions_cells[cand], dtype=bool)
+        return None
+
+    parent, local, nodes, seen = [], [], [], set(boundary_keys)
+    at = 0
+    for region, facets in wanted:
+        first = side_cells(region.split("|", 1)[0]) if "|" in region else None
+        for f, fid in zip(facets, facet_ids[at : at + len(facets)]):
+            k = frozenset(int(x) for x in f)
+            if k in seen:
+                continue
+            lo, hi = np.searchsorted(sorted_ids, fid, "left"), np.searchsorted(sorted_ids, fid, "right")
+            rows = order[lo:hi]
+            if rows.size == 0:
+                continue
+            row = rows[0]
+            if first is not None:
+                own = [r for r in rows if first[r // n_local]]
+                row = own[0] if own else rows[0]
+            seen.add(k)
+            parent.append(row // n_local)
+            local.append(row % n_local)
+            nodes.append(flat[row])
+        at += len(facets)
+    if not parent:
+        return conn, np.zeros(n_b, dtype=bool)
+    merged = FacetConnectivity(
+        parent_cell=np.concatenate([np.asarray(conn.parent_cell), np.asarray(parent, dtype=np.int64)]),
+        local_face=np.concatenate([np.asarray(conn.local_face), np.asarray(local, dtype=np.int64)]),
+        face_nodes=np.concatenate(
+            [np.asarray(conn.face_nodes).reshape(-1, n_face_nodes), np.asarray(nodes, dtype=np.int64)]
+        ),
+        n_bfaces=n_b + len(parent),
+    )
+    interior = np.zeros(merged.n_bfaces, dtype=bool)
+    interior[n_b:] = True
+    return merged, interior
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1983,6 +2067,11 @@ def assemble_fem_native(
     # shapes: (n_faces, n_q, n_dof_i), (..., dim), (n_faces, n_q, dim), (n_faces, dim-1, dim), (n_q,)
 
     conn = build_facet_connectivity(cells_p1, cell_key)
+    # Surface terms on INTERIOR interfaces (a tag such as "gas|solid" between two regions): their facets are not
+    # boundary facets, so append them, each once, to the facet list the surface assembly runs over. Without this
+    # such a term integrated over nothing, silently. Only facets a surface term names are added, so a form
+    # without interface terms is assembled exactly as before.
+    conn, _interior_facets = _with_interface_facets(domain, conn, cells_p1, cell_key, list(boundary_terms or {}))
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
     # Frozen outward-orientation sign per boundary facet, so the normals can be recomputed differentiably
     # from moved vertices (``_face_normals_jax``) when coordinates are trainable (Feature 3). The sign is
@@ -2101,8 +2190,15 @@ def assemble_fem_native(
             [
                 all(int(conn.face_nodes[fi, j]) in _rnodes for j in range(conn.face_nodes.shape[1]))
                 for fi in range(conn.n_bfaces)
-            ]
+            ],
+            dtype=bool,
         )
+        _mask &= ~_interior_facets  # interface facets belong only to the tag that names them
+        if not _mask.any() and _named is not None and len(_named) and region != "boundary":
+            raise ValueError(
+                f"jno.fem: the surface term on {region!r} selects none of that tag's {len(_named)} facets on this "
+                "mesh, so it would integrate over nothing. Check that the tag names facets of this mesh."
+            )
         return np.where(_mask)[0].astype(np.int32)
 
     # Boundary-face ids per region that carries a surface state (the faces its readout advances).
