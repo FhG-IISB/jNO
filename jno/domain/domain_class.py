@@ -868,8 +868,12 @@ class domain(MeshIOMixin):
         tau: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
         keep_orphan_nodes: bool = False,
+        axisymmetric: bool = False,
         **_ignored_kwargs,
     ):
+        # The (x, y) plane is a meridian (r, z) half-plane of a body of revolution. jNO still applies no ring
+        # measure for you; operators that integrate over the revolved geometry (d.irradiation) read this.
+        self.__dict__["axisymmetric"] = bool(axisymmetric)
         if "mesh_size" in _ignored_kwargs:
             raise ValueError(
                 "jno.domain(<shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
@@ -2619,6 +2623,14 @@ class domain(MeshIOMixin):
             dom.tag("cylinder", lambda x, y: (x-0.8)**2 + (y-0.5)**2 < 0.21**2)
             # an untagged outlet edge is left as a natural (do-nothing) outflow
         """
+        if isinstance(where, (bool, np.bool_)):
+            raise TypeError(
+                f"tag({name!r}, {where!r}): got a plain bool. A comparison like `d.kappa == 0` is identity in "
+                "jNO (expressions must stay hashable), so it never compares the values. Select regions by a "
+                "property with a predicate over it: d.tag(name, lambda kappa: kappa == 0)."
+            )
+        if self._is_property_predicate(where):
+            return self._tag_by_property(name, where)
         self._tag_predicates = getattr(self, "_tag_predicates", {})
         # A geometry name already means a FACE of the shape. Re-tagging one is an ordinary idiom --
         # `d.tag("left", lambda x, y: x < 1e-9)` restates where `left` already is, harmlessly. But the
@@ -3059,6 +3071,11 @@ class domain(MeshIOMixin):
         material law evaluated at ``args`` (see :meth:`_is_law`). A property that holds a law cannot be used
         bare -- it returns a :class:`_LawProperty`, which refuses arithmetic and says to call it."""
         attached = self.__dict__.get("_region_attachments") or {}
+        if args is not None:
+            from .enclosure import PendingElementExpr
+
+            if any(isinstance(a, PendingElementExpr) for a in args):
+                return self._attached_per_element(name, args)
         values = dict(attached[name])
         # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
         # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
@@ -3126,6 +3143,115 @@ class domain(MeshIOMixin):
                 # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
                 return mark(default_live)
         return mark(self._by_region(live, default=default_live if has_default else None))
+
+    def irradiation(self, T):
+        """The incident thermal radiation G on every radiating face, for the temperature field ``T``.
+
+        Radiating faces are those between a region with attached ``kappa == 0`` (a transparent medium) and its
+        neighbours; each connected medium is one diffuse-grey enclosure; each face's emissivity is its region's
+        attached ``eps`` (a number or a law of T). Use it in the radiation term as written on paper::
+
+            heat += [d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS]     # dS = 2 pi r (axisymmetric)
+
+        ``jno.fem`` integrates such a term over the radiating faces with an exact tangent; see
+        :mod:`jno.domain.radiation` for the scope. Axisymmetry is read from ``.domain(axisymmetric=True)``.
+
+        How the view-factor matrix F is held is chosen automatically (sparse from 2000 faces with at most 30% nonzeros,
+        dense below); ``jno.setup(__file__, radiation_storage="dense" | "sparse")`` overrides it."""
+        from .radiation import Irradiation
+
+        return Irradiation(self, T)
+
+    def _is_property_predicate(self, where) -> bool:
+        """A plain function whose parameters are all names of attached properties selects REGIONS by their
+        property values (``lambda kappa: kappa == 0``), rather than points by coordinates."""
+        if not inspect.isroutine(where):
+            return False
+        props = set(self.__dict__.get("_region_attachments") or {})
+        try:
+            names = [p.name for p in inspect.signature(where).parameters.values()]
+        except (TypeError, ValueError):
+            return False
+        return bool(names) and all(n in props for n in names)
+
+    def _tag_by_property(self, name, where):
+        """Tag the volume regions whose attached properties satisfy ``where`` (called with each region's values,
+        by parameter name). A region without one of the properties is not selected; a law (a function of a
+        field) or an expression as value cannot be compared and raises. The tag is a region selection: its
+        cells are those regions' cells (a nearest-cell-centroid membership, exact at cell centroids, which is
+        how jno.fem assigns cells to regions)."""
+        from scipy.spatial import cKDTree
+
+        from .mesh_utils import mesh_cell_region_membership, p1_cells_dict
+
+        attached = self.__dict__.get("_region_attachments") or {}
+        params = list(inspect.signature(where).parameters)
+        regions = mesh_cell_region_membership(self.mesh, int(self.dimension))
+        chosen = []
+        for r in regions:
+            vals = []
+            for p in params:
+                v = attached[p].get(r, attached[p].get(self._DEFAULT_TARGET))
+                if v is None:
+                    break
+                if not _is_plain_value(v):
+                    raise TypeError(
+                        f"tag({name!r}): property {p!r} of region {r!r} is {v!r}, not a number, so a region "
+                        "selection cannot compare it. Give that region a number for it, or tag it by name."
+                    )
+                vals.append(v)
+            else:
+                if bool(np.asarray(where(*vals))):
+                    chosen.append(r)
+        if not chosen:
+            raise ValueError(f"tag({name!r}): no region's properties {params} satisfy the predicate.")
+        self.__dict__.setdefault("_property_tag_regions", {})[name] = chosen
+        tri = np.asarray(p1_cells_dict(self.mesh)["triangle" if int(self.dimension) == 2 else "tetra"])
+        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
+        inside = np.zeros(len(tri), bool)
+        for r in chosen:
+            inside |= np.asarray(regions[r])
+        tree = cKDTree(pts[tri].mean(axis=1))
+
+        def membership(*xs):
+            q = np.stack([np.asarray(x, float).reshape(-1) for x in xs[: int(self.dimension)]], axis=1)
+            return inside[tree.query(q)[1]].reshape(np.shape(xs[0]))
+
+        get_logger().info(f"tag {name!r}: regions {chosen} (by {params})")
+        return self.tag(name, membership)
+
+    def _attached_per_element(self, name, args):
+        """``d.<name>(gap.field(T))``: the property per enclosure element, from the region each element's
+        surface belongs to (its element tag) -- numbers as they are, laws evaluated at the element values."""
+        from .enclosure import PendingElementExpr
+
+        owner = next((a._owner for a in args if isinstance(a, PendingElementExpr) and a._owner is not None), None)
+        if owner is None:
+            raise TypeError(
+                f"domain.{name}(...): the element values do not say which enclosure they belong to; "
+                f"pass gap.field(T) (or an expression of it) as the argument."
+            )
+        values = dict((self.__dict__.get("_region_attachments") or {})[name])
+        default = values.pop(self._DEFAULT_TARGET, None)
+        tags = np.asarray(owner.element_tags).astype(str)
+        per_tag = {}
+        for t in np.unique(tags):
+            v = values.get(t, default)
+            if v is None:
+                raise ValueError(f"domain.{name}: the radiating surface of region {t!r} has no '{name}' attached.")
+            per_tag[t] = v
+        masks = {t: jnp.asarray(tags == t, dtype=jnp.float64) for t in per_tag}
+        reads = [a._reads for a in args if isinstance(a, PendingElementExpr)]
+        reads = None if any(r is None for r in reads) else np.unique(np.concatenate(reads))
+
+        def fn(u):
+            vals = [a(u) if isinstance(a, PendingElementExpr) else a for a in args]
+            out = 0.0
+            for t, v in per_tag.items():
+                out = out + masks[t] * (v(*vals) if self._is_law(v) else v)
+            return jnp.broadcast_to(jnp.asarray(out, dtype=jnp.float64), masks[next(iter(masks))].shape)
+
+        return PendingElementExpr(fn, reads, owner)
 
     def _is_law(self, value) -> bool:
         """Is an attached value a **material law** -- a function of fields, evaluated where it is called,
@@ -5970,8 +6096,10 @@ class domain(MeshIOMixin):
 
     def enclosure(
         self,
-        tags,
+        tags=None,
         *,
+        medium=None,
+        cache=True,
         axisymmetric=False,
         n_quad=6,  # see build_enclosure: the closed-form azimuth has no near-field refinement
         n_phi=16,
@@ -5991,6 +6119,21 @@ class domain(MeshIOMixin):
         geometry-determined — self-view included), per-element ``areas``/``normals``, the global node
         ``elements``, and an F-quality gate (``.check()`` / ``.quality()``). Write the grey-body
         radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem/geometry.md``.
+
+        **Found surfaces: ``medium=``.** Name the transparent medium instead of the surfaces -- a region, a
+        list of regions, or a tag made from a property (``d.tag("transparent", lambda kappa: kappa == 0)``)
+        -- and the radiating faces are found: every face between a connected medium and the regions next
+        to it. Each connected medium is its own enclosure; the result is an
+        :class:`~jno.domain.enclosure.EnclosureSet` with ``field``, ``irradiation`` and ``load`` over all of
+        them. View factors are cached on disk (``$JNO_CACHE/enclosures``, default ``~/.cache/jno``) by a hash
+        of the mesh, the regions and the options; ``cache=False`` rebuilds. A medium that reaches the domain
+        boundary (away from the axis) raises: radiation would leave through a surface that is not modelled::
+
+            d.tag("transparent", lambda kappa: kappa == 0)
+            rad = d.enclosure(medium="transparent", axisymmetric=True)
+            Te = rad.field(T)
+            e = d.eps(Te)                                         # per face: a number or a law of T
+            heat += [rad.load(e * (SIGMA * Te**4 - rad.irradiation(Te, eps=e)))]
 
         Args:
             tags: Boundary tags forming the enclosure (each a radiating surface; tags only group
@@ -6012,6 +6155,36 @@ class domain(MeshIOMixin):
                 Defaults to half the median element length. Note that this default is itself a ~12%
                 systematic error on the analytic concentric-cylinder view factors; pass a value to override.
         """
+        if medium is not None:
+            # The surfaces are FOUND: every face between a connected transparent medium and its neighbours.
+            from .enclosure import enclosures_of_medium
+
+            if tags is not None or medium_tags is not None:
+                raise ValueError(
+                    "domain.enclosure: pass either medium= (the surfaces are found) or tags= / medium_tags=, not both."
+                )
+            regions = (self.__dict__.get("_property_tag_regions") or {}).get(medium)
+            if regions is None:
+                regions = [medium] if isinstance(medium, str) else list(medium)
+            return enclosures_of_medium(
+                self,
+                regions,
+                cache=cache,
+                axisymmetric=axisymmetric,
+                n_quad=n_quad,
+                n_phi=n_phi,
+                opaque_tags=opaque_tags,
+                enforce_closure=enforce_closure,
+                closure_iters=closure_iters,
+                occlude=occlude,
+                inward=inward,
+                r_min=r_min,
+                near_field=near_field,
+            )
+        if tags is None:
+            raise ValueError(
+                "domain.enclosure: give the radiating tags, or medium= to find them from a transparent region."
+            )
         from .enclosure import build_enclosure
 
         return build_enclosure(

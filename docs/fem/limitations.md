@@ -33,7 +33,7 @@ path is unaffected.
 | Time-varying Dirichlet `g(x, t)` | first-order transients, linear or nonlinear, single-field or coupled, a trainable **parameter** inside the value included (differentiable); not a trainable net inside the value, nor a net/parameter-valued Dirichlet beside it, not a parameter inside it on a `u_tt` form or the τ load path, not a nonlinear `u_tt` form. `sdirk(3)` and `ros2` lose some order to it, and `ros2` holds the wall value only to its order (measured below) | raises |
 | Slip `n·u = 0` on a surface moved by `.trainable()` coordinates | steady nonlinear only (its `P` is rebuilt per solve there) | raises |
 | Affine parameter lowering | one trainable scalar per additive term, not nested | raises |
-| Enclosure radiation | 2-D / axisymmetric, needs a direct solve; you write the radiosity yourself | manual composition |
+| Enclosure radiation (`d.irradiation`, `d.enclosure`) | 2-D / axisymmetric, diffuse-grey, transparent media only (`kappa == 0`); the term evaluated per face with the field unbound and no derivatives; the tangent block on the radiating nodes is dense (k × k) in every storage mode | raises |
 | `jno.derived` nonlocal fields | nodal Lagrange `on=` only; no chained derived fields; host geometry closed over by the rule is **frozen at build**, so it goes stale on a moving mesh | raises, except the moving mesh — **silent** |
 | Plasticity | small-strain, isotropic, linear-hardening | raises |
 | `symmetric=True` matrix fields | native 2-D/3-D Lagrange only — not 1-D, VPINN, periodic ties, complex, or mixed with a non-nodal family; a time-varying whole-tensor Dirichlet value is not mapped to the stored values (write it per entry); an asymmetric whole-tensor value is refused | raises |

@@ -339,6 +339,7 @@ def setup(
     compile_cache: bool | str | None = None,
     lu_stack: int | None = None,
     matvec_format: str | None = None,
+    radiation_storage: str | None = None,
 ) -> str:
     """Initialise logging and return the run directory for *script_file*.
 
@@ -426,6 +427,13 @@ def setup(
             * ``"csr"`` / ``"coo"`` — force one, e.g. for reproducible timings or to rule the choice out
               while debugging. Both are exact, differentiable and vmappable.
 
+        radiation_storage: How the radiation view-factor matrix of ``d.irradiation`` terms is held.
+
+            * ``None`` (default) — read ``[jno] radiation_storage`` from the TOML config; ``"auto"`` if absent.
+            * ``"auto"`` — sparse (BCOO, radiosity by GMRES) from 2000 faces with at most 30% nonzeros, dense
+              (dense LU) below, where a dense solve is faster and the matrix small.
+            * ``"dense"`` / ``"sparse"`` — force one. The tangent block on the radiating nodes is dense either way.
+
     Returns:
         The path of the run directory (created if absent).
     """
@@ -485,6 +493,13 @@ def setup(
     from .solver.matvec_format import set_matvec_format
 
     set_matvec_format(get_config().get("jno", {}).get("matvec_format", "auto") if matvec_format is None else matvec_format)
+
+    # --- Radiation view-factor storage (explicit kwarg wins over TOML; default "auto") ---
+    from ..domain.enclosure import set_radiation_storage
+
+    set_radiation_storage(
+        get_config().get("jno", {}).get("radiation_storage", "auto") if radiation_storage is None else radiation_storage
+    )
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))

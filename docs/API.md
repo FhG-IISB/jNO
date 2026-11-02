@@ -740,7 +740,9 @@ the time. Reach for a coarser mesh or a better preconditioner instead.
 **Process-wide solver settings** (`jno.setup`, or the same keys under `[jno]` in `.jno.toml`):
 `lu_stack=k` stacks `k` systems per call when a batched `jno.solve.lu()` runs on the default `device`
 backend (default `1`); `matvec_format="auto" | "csr" | "coo"` fixes the sparse storage the iterative
-solvers apply an operator with (default `"auto"`, timed on the running device per operator size class). See the `jno.setup` docstring.
+solvers apply an operator with (default `"auto"`, timed on the running device per operator size class);
+`radiation_storage="auto" | "dense" | "sparse"` holds the view factors of `d.irradiation` terms (default `"auto"`:
+sparse from 2000 faces at most 30 % full). See the `jno.setup` docstring.
 
 ::: jno.solve
 

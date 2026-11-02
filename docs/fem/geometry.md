@@ -1087,6 +1087,57 @@ Ch. 4–5 (view factors; the net-radiation / radiosity method for diffuse-grey e
 
 ---
 
+### Radiation written as the equation — `d.irradiation(T)`
+
+Mark the regions radiation crosses with `kappa = 0`, give the surfaces their emissivity `eps` (a number or a law of
+T), and write the radiation term as on paper:
+
+```python
+d = (... .attach(k=..., eps=0.8)                       # opaque parts
+     + gas.name("Gas").attach(k=0.19, eps=1.0, kappa=0.0)   # a medium radiation crosses
+     ).sized(h).domain(axisymmetric=True)               # (r, z) meridian plane: the enclosure revolves it
+T, v = d.fem_symbols(names=("T", "v"))
+dS = 2 * np.pi * r                                      # ring measure on a face (r of the interior variables)
+fem = jno.fem([d.k(T) * (Ti.r * vi.r + Ti.z * vi.z) * dV - d.q * vi * dV,
+               d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS,     # ∫ ε(σT⁴ − G) v dS
+               ...])
+```
+
+`d.irradiation(T)` is the incident radiation G on every radiating face: the faces between a connected region with
+`kappa == 0` and its neighbours, one diffuse-grey enclosure per connected medium (J = (I − diag(1 − ε) F)⁻¹ εσT⁴,
+G = F J; Modest, *Radiative Heat Transfer*, Ch. 5). `eps` and `kappa` are this operator's documented property
+names. A term that contains `d.irradiation` is integrated over the radiating faces: every factor is evaluated per
+face (the field and G at the face's mean temperature, a coordinate at two Gauss points along it, so `dS = 2πr` is
+integrated exactly against each node's hat function) and the term enters with an exact dense tangent on the
+radiating nodes. That tangent is formed analytically, without differentiating through the radiosity solve:
+with M = I − diag(1 − ε) F, dG/dT = F M⁻¹ diag(h), h = d(εσT⁴)/dT − ε′(T) G, and the term's own partials in T and G
+(it is pointwise per face). It equals forward-mode autodiff of the residual to round-off (the test below, with an
+ε(T) law). The view factors are held dense, or sparse with the radiosity solved by GMRES, chosen by size
+(`jno.setup(radiation_storage=...)`, [Solvers](../solvers.md#batched-solves-and-operator-storage-jnosetuplu_stack-matvec_format)). Write it with the field
+and test function themselves (`T`, `v`), not their bound views, and without derivatives; it must be linear in `v`.
+View factors are cached on disk (`$JNO_CACHE/enclosures`, `~/.cache/jno` by default).
+
+Pinned in `tests/test_fem_radiation_term.py`: two concentric cylinders and two concentric spheres (axisymmetric)
+against the analytic exchange, energy balance, a coupled solve equal to the explicit-enclosure spelling, the
+analytic tangent against `jax.jacfwd` (dense and sparse storage), and sparse equal to dense irradiation.
+
+**The explicit route** (`d.enclosure`) stays for custom exchanges: name the medium (`d.enclosure(medium="Gas")`, or
+a property tag `d.tag("transparent", lambda kappa: kappa == 0)` -- `d.kappa == 0` would not work, `==` is identity
+in jNO), then `Te = rad.field(T)`, `e = d.eps(Te)`, `rad.load(e * (SIGMA * Te**4 - rad.irradiation(Te, eps=e)))`
+(`tests/test_fem_enclosure_medium.py`).
+
+**Semi-transparent and optically thick media need no operator.** P1 for κ > 0 is one more field with local terms
+(measured: P1 approaches the Rosseland limit, 189 → 45 → 1.7 K as τ = 1 → 10 → 100):
+
+```python
+G, g = d.fem_symbols(names=("G", "g"))
+p1 = [(Gi.x * gi.x + Gi.y * gi.y) / (3 * d.kappa) + d.kappa * (Gi - 4 * d.n**2 * SIGMA * Ti**4) * gi,
+      d.eps / (2 * (2 - d.eps)) * (G - 4 * d.n**2 * SIGMA * T**4) * g]      # Marshak, on the medium's walls
+heat += [d.kappa * (4 * d.n**2 * SIGMA * Ti**4 - Gi) * vi]
+```
+
+and Rosseland for τ ≫ 1 is a conductivity law, `.attach(k=lambda T: k0 + 16 * n**2 * SIGMA * T**3 / (3 * kappa))`.
+
 ## Nonlocal coupling, in general — `jno.Coupling` and `jno.derived`
 
 Enclosure radiation is one instance of a shape that recurs: **gather → operate → scatter**, where the

@@ -7368,6 +7368,9 @@ class Coupling:
         # `enclosure.load`. With it, jno.fem assembles the coupling's Jacobian as a dense block on those
         # DOFs next to the sparse local tangent; without it the solve stays matrix-free (see _wrap_couplings).
         self._support = None
+        # Optional exact tangent: `_tangent_block(u_field) -> (k, k)`, d residual[support] / d u[support] in the
+        # field's own indexing (set with `_support`; used in place of the k JVPs, see _with_coupling_block).
+        self._tangent_block = None
 
     def __repr__(self):
         return f"Coupling({self.name!r})"
@@ -7389,12 +7392,15 @@ def _coupling_support(couplings, slices):
     return np.unique(np.concatenate(parts)) if parts else None
 
 
-def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, log):
+def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, log, analytic=None, pinned=None):
     """``J(u, args) = J_local(u, args) + B(u, args)``: the assembled local tangent plus the couplings' Jacobian
     as a dense ``k x k`` block on their declared ``support`` (k DOFs), in ONE BCOO.
 
     ``B`` comes from forward-mode AD of the coupling residual restricted to the support: k JVPs per call,
-    exact, and differentiable like everything else. It is exact only because the support is: every coupling
+    exact, and differentiable like everything else. When every coupling supplies its own tangent block
+    (``analytic``: ``[(lo, hi, dofs, block_fn)]``, the block on its ``dofs`` of the field slice ``[lo:hi]``, as
+    ``Coupling._tangent_block`` gives it -- the radiation term does), those are summed instead: no JVPs, and
+    the rows in ``pinned`` are zeroed as the residual's are. It is exact only because the support is: every coupling
     reads and writes nothing outside it (``enclosure.load`` declares the nodes its gathers read and its
     scatter writes). Entries that coincide with the local tangent's are summed by the solvers
     (``sum_duplicates``), so the two need not be merged here."""
@@ -7403,8 +7409,8 @@ def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, l
     nbytes = 8 * k * k
     msg = (
         f"jno.fem: the coupling(s) {names} get an assembled tangent: a dense {k} x {k} block on the DOFs they "
-        f"couple ({nbytes / 2**20:.1f} MB) next to the sparse local tangent, recomputed by {k} JVPs per "
-        f"Newton step."
+        f"couple ({nbytes / 2**20:.1f} MB) next to the sparse local tangent, "
+        + ("recomputed analytically per Newton step." if analytic else f"recomputed by {k} JVPs per Newton step.")
     )
     if nbytes > _COUPLING_BLOCK_WARN_BYTES:
         log.warning(msg + " It is large; if it does not fit, the allocation will fail where it is built.")
@@ -7412,13 +7418,22 @@ def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, l
         log.info(msg)
     S_j = jnp.asarray(S, dtype=jnp.int32)
     block_idx = np.stack([np.repeat(S, k), np.tile(S, k)], axis=1)  # row-major, matching B.reshape(-1)
+    # each analytic block's rows/columns within the support
+    blocks = [(lo, hi, jnp.asarray(np.searchsorted(S, lo + np.asarray(dofs))), fn) for lo, hi, dofs, fn in analytic or ()]
 
     def jacobian(u, args=None):
         import jax.experimental.sparse as jsparse
 
         u = jnp.asarray(u).reshape(-1)
         J_loc = local_jacobian(u, args)
-        B = jax.jacfwd(lambda us: coupling_residual(u.at[S_j].set(us), args)[S_j])(u[S_j])  # B[i, j] = dc_Si/du_Sj
+        if blocks:
+            B = jnp.zeros((k, k), dtype=u.dtype)
+            for lo, hi, pos, block_fn in blocks:
+                B = B.at[pos[:, None], pos[None, :]].add(block_fn(u[lo:hi]))
+            if pinned is not None:
+                B = jnp.where(jnp.isin(S_j, pinned)[:, None], 0.0, B)
+        else:
+            B = jax.jacfwd(lambda us: coupling_residual(u.at[S_j].set(us), args)[S_j])(u[S_j])  # B[i, j] = dc_Si/du_Sj
         data = jnp.concatenate([J_loc.data, B.reshape(-1).astype(J_loc.data.dtype)])
         idx = jnp.concatenate([J_loc.indices, jnp.asarray(block_idx, dtype=J_loc.indices.dtype)])
         return jsparse.BCOO((data, idx), shape=(n, n))
@@ -7632,6 +7647,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     # (Newton-Krylov), and `newton(direct=True)` materialises the whole Jacobian densely instead.
     support = _coupling_support(couplings, slices)
     _names = [c.name for c in couplings]
+    # every coupling that can state its own tangent block does (no JVPs); one that cannot sends all to autodiff
+    _analytic = [
+        (lo, hi, np.asarray(c._support), c._tangent_block)
+        for c, (lo, hi) in zip(couplings, slices)
+        if getattr(c, "_tangent_block", None) is not None and getattr(c, "_support", None) is not None and not c.params
+    ]
+    if len(_analytic) != len(couplings):
+        _analytic = None
     from .utils.logger import get_logger
 
     _log = get_logger()
@@ -7651,7 +7674,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         jac = None
         _A = op.A if isinstance(op, FemLinearSystem) else op[0]  # None: formed per call by a parametric operator_fn
         if support is not None and (_A is None or hasattr(_A, "indices")):
-            jac = _with_coupling_block(local_jacobian, coupling_residual, support, n, _names, _log)
+            jac = _with_coupling_block(local_jacobian, coupling_residual, support, n, _names, _log, _analytic, d_dofs)
         fem_obj._op = FemResidualOperator(residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe)
         # The promoted operator states its essential rows like every other residual operator does, so an
         # extrapolating driver (`staggered(over_relax>1)`) leaves them on their prescribed values.
@@ -7669,7 +7692,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         base_jac = getattr(op, "jacobian", None)
         jac = None
         if support is not None and base_jac is not None:
-            jac = _with_coupling_block(base_jac, coupling_residual, support, n, _names, _log)
+            jac = _with_coupling_block(base_jac, coupling_residual, support, n, _names, _log, _analytic, d_dofs)
         wrapped = FemResidualOperator(
             residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
         )
@@ -7807,6 +7830,7 @@ def fem(
     try:
         with _host_assembly_scope():
             from .domain.equations import lower_complex_terms, lower_initial_values, lower_integral_equations
+            from .domain.radiation import lower_radiation_terms
 
             _terms = list(constraints) if isinstance(constraints, tuple) else constraints
             # `d.unknown()` fields become their trial symbols first: every lowering below sees TrialFunctions
@@ -7814,7 +7838,7 @@ def fem(
             _terms, _initial_used = lower_initial_values(lower_complex_terms(_terms))
             _terms = lower_integral_equations(_terms)
             out = _fem_impl(
-                _lower_unknowns(_terms),
+                _lower_unknowns(lower_radiation_terms(_terms)),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )

@@ -25,6 +25,8 @@ from typing import List, Optional, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
+from jax.scipy.sparse.linalg import gmres
 
 from ..trace import Placeholder
 from .mesh_utils import MeshUtils
@@ -517,7 +519,7 @@ class PendingElementExpr:
             assume a support.
     """
 
-    __slots__ = ("_fn", "_reads")
+    __slots__ = ("_fn", "_reads", "_owner")
 
     # NumPy checks this before trying to coerce an unknown right operand, so `ndarray @ pending`
     # reaches __rmatmul__ instead of being turned into an object array. JAX arrays already return
@@ -525,10 +527,13 @@ class PendingElementExpr:
     __array_priority__ = 1000.0
     __array_ufunc__ = None
 
-    def __init__(self, fn, reads=None):
+    def __init__(self, fn, reads=None, owner=None):
         self._fn = fn
         # The DOFs `fn` reads, as a sorted index array; None when unknown (then nothing may assume a support).
         self._reads = None if reads is None else np.unique(np.asarray(reads, dtype=np.int64).reshape(-1))
+        # The Enclosure / EnclosureSet whose elements the values belong to (for per-element properties,
+        # ``d.eps(gap.field(T))``); kept through arithmetic, dropped when two different owners meet.
+        self._owner = owner
 
     def __call__(self, u):
         return self._fn(u)
@@ -538,8 +543,13 @@ class PendingElementExpr:
         if isinstance(other, PendingElementExpr):
             g = other._fn
             reads = None if self._reads is None or other._reads is None else np.union1d(self._reads, other._reads)
-            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)), reads)
-        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other), self._reads)
+            owner = (
+                self._owner
+                if other._owner is None or other._owner is self._owner
+                else (other._owner if self._owner is None else None)
+            )
+            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)), reads, owner)
+        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other), self._reads, self._owner)
 
     def __add__(self, o):
         return self._lift(o, lambda a, b: a + b)
@@ -576,7 +586,7 @@ class PendingElementExpr:
 
     def __neg__(self):
         fn = self._fn
-        return PendingElementExpr(lambda u: -fn(u), self._reads)
+        return PendingElementExpr(lambda u: -fn(u), self._reads, self._owner)
 
     def apply(self, fn):
         """Record an arbitrary elementwise/array function, for anything the operators do not cover
@@ -589,7 +599,7 @@ class PendingElementExpr:
             PendingElementExpr: the extended record.
         """
         inner = self._fn
-        return PendingElementExpr(lambda u: fn(inner(u)), self._reads)
+        return PendingElementExpr(lambda u: fn(inner(u)), self._reads, self._owner)
 
     def __repr__(self):
         return "PendingElementExpr(<pending nonlocal term; pass to enclosure.load>)"
@@ -630,6 +640,7 @@ class Enclosure:
         self.domain = domain
         self.tags = list(tags)
         self._F = jnp.asarray(F)
+        self._storage = "dense"
         self.elements = np.asarray(elements)
         self.element_tags = np.asarray(element_tags, dtype=object)
         self.areas = jnp.asarray(areas)
@@ -645,8 +656,37 @@ class Enclosure:
 
     @property
     def view_factor(self):
-        """The element-to-element diffuse view factor ``F``, ``(m, m)`` (rows: receiving elements)."""
+        """The element-to-element diffuse view factor ``F``, ``(m, m)`` (rows: receiving elements). A dense array,
+        or a ``jax.experimental.sparse.BCOO`` after :meth:`set_storage` ``("sparse")`` -- code that indexes it or
+        passes it to ``jnp.linalg`` needs the dense one."""
         return self._F
+
+    @property
+    def storage(self) -> str:
+        """``"dense"`` or ``"sparse"``: how ``F`` is held (see :meth:`set_storage`)."""
+        return getattr(self, "_storage", "dense")
+
+    def set_storage(self, mode: str = "auto") -> "Enclosure":
+        """Hold ``F`` dense or sparse. ``"sparse"`` keeps only the nonzero view factors (faces that cannot see each
+        other are exact zeros) as a BCOO; the radiosity then runs on sparse matvecs with GMRES instead of a dense LU
+        (:func:`radiosity_irradiation`). ``"auto"`` picks sparse for ``m >= AUTO_SPARSE_MIN_FACES`` faces with at
+        most ``AUTO_SPARSE_MAX_FILL`` of the entries nonzero, dense otherwise (below that a dense LU is faster and
+        the matrix is small). Returns ``self``."""
+        if mode not in ("dense", "sparse", "auto"):
+            raise ValueError(f"storage must be 'dense', 'sparse' or 'auto', got {mode!r}.")
+        F = self._dense_F()
+        m = F.shape[0]
+        if mode == "auto":
+            sparse = m >= AUTO_SPARSE_MIN_FACES and np.count_nonzero(F) <= AUTO_SPARSE_MAX_FILL * m * m
+            mode = "sparse" if sparse else "dense"
+        if mode != self.storage:
+            self._F = jsparse.BCOO.fromdense(jnp.asarray(F)) if mode == "sparse" else jnp.asarray(F)
+            self._storage = mode
+        return self
+
+    def _dense_F(self) -> np.ndarray:
+        """``F`` as a dense NumPy array whatever the storage."""
+        return np.asarray(self._F.todense() if self.storage == "sparse" else self._F)
 
     @property
     def nodes(self) -> np.ndarray:
@@ -684,7 +724,7 @@ class Enclosure:
         on it is recorded, and :meth:`load` closes it into a ``jno.Coupling``. That is what lets a
         nonlocal term be written as an expression in the ``jno.fem([...])`` list rather than a lambda."""
         if isinstance(u, Placeholder):
-            return PendingElementExpr(self.field, reads=self.nodes)
+            return PendingElementExpr(self.field, reads=self.nodes, owner=self)
         u = jnp.asarray(u).reshape(-1)
         return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
 
@@ -724,12 +764,24 @@ class Enclosure:
         load = load.at[jnp.asarray(self.elements[:, 1])].add(q * w[:, 1])
         return load
 
+    def irradiation(self, T, eps):
+        """Incident radiation ``G`` (W/m^2) on every element, for the element temperatures ``T`` and emissivities
+        ``eps`` of a diffuse-grey enclosure (Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 5)::
+
+            J = eps sigma T^4 + (1 - eps) G,   G = F J   ->   J = (I - diag(1 - eps) F)^-1 eps sigma T^4
+
+        ``T`` and ``eps`` are per-element values -- arrays, or :class:`PendingElementExpr` such as
+        ``gap.field(T)`` and ``d.eps(gap.field(T))`` -- and ``eps`` may also be one number. With a pending
+        argument the result is pending too, so the net flux is written as the equation, e.g.
+        ``gap.load(e * (SIGMA * Te**4 - gap.irradiation(Te, eps=e)))``."""
+        return _irradiation_of(self, [self], T, eps)
+
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
 
         ``closure_error = max|sum_j F_ij - 1|`` (should -> 0 for a closed enclosure) and
         ``reciprocity_error = max|A_i F_ij - A_j F_ji|`` (should -> 0 by reciprocity)."""
-        F = np.asarray(self._F)
+        F = self._dense_F()
         A = np.asarray(self.areas)
         closure = float(np.abs(F.sum(axis=1) - 1.0).max())
         reciprocity = float(np.abs(A[:, None] * F - (A[:, None] * F).T).max())
@@ -1326,3 +1378,274 @@ def build_enclosure(
         F = _enforce_closure(F, areas, n_iter=closure_iters)
 
     return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric, endpoints=(e0, e1))
+
+
+STEFAN_BOLTZMANN = 5.670374419e-8  # W / (m^2 K^4)
+
+#: ``set_storage("auto")`` goes sparse from this many faces, when at most this share of ``F`` is nonzero. Below
+#: it a dense LU of the m x m radiosity system is faster than GMRES and the matrix is small.
+AUTO_SPARSE_MIN_FACES = 2000
+AUTO_SPARSE_MAX_FILL = 0.3
+
+_RADIATION_STORAGE = "auto"
+
+
+def set_radiation_storage(mode: str) -> None:
+    """Process-wide storage of the radiation view factors: ``"auto"`` (default), ``"dense"`` or ``"sparse"``; what
+    ``jno.setup(radiation_storage=...)`` and ``[jno] radiation_storage`` set. Read when ``d.irradiation`` terms are
+    lowered, so it applies to every radiation term built after it."""
+    global _RADIATION_STORAGE
+    if mode not in ("dense", "sparse", "auto"):
+        raise ValueError(f"radiation_storage must be 'dense', 'sparse' or 'auto', got {mode!r}.")
+    _RADIATION_STORAGE = mode
+
+
+def get_radiation_storage() -> str:
+    """The current radiation storage mode (see :func:`set_radiation_storage`)."""
+    return _RADIATION_STORAGE
+
+
+def _radiosity_matrix_solve(F, eps, b):
+    """``(I - diag(1-eps) F)^-1 b`` for a BCOO ``F``, by restarted GMRES on sparse matvecs (nothing dense is formed).
+    ``diag(1-eps) F`` has spectral radius at most ``max(1-eps)`` (rows of a closed enclosure's ``F`` sum to one), so
+    it converges geometrically when every face has ``eps > 0``. Convergence is not checked (it runs traced)."""
+    rho = 1.0 - eps
+    return gmres(lambda x: x - rho * (F @ x), b, x0=b, tol=1e-12, restart=40, maxiter=200)[0]
+
+
+def radiosity_irradiation(F, eps, t):
+    """The incident radiation ``G = F J`` of one diffuse-grey enclosure, ``J = (I - diag(1-eps) F)^-1 eps sigma t^4``
+    (Modest, Ch. 5). ``F`` dense: a dense solve; ``F`` a BCOO: GMRES (:func:`_radiosity_matrix_solve`)."""
+    rhs = eps * STEFAN_BOLTZMANN * t**4
+    if isinstance(F, jsparse.BCOO):
+        J = _radiosity_matrix_solve(F, eps, rhs)
+    else:
+        J = jnp.linalg.solve(jnp.eye(rhs.shape[0], dtype=rhs.dtype) - (1.0 - eps)[:, None] * F, rhs)
+    return F @ J
+
+
+def radiosity_resolvent(F, eps):
+    """``(I - diag(1-eps) F)^-1`` as a dense ``(m, m)`` array: what the exact tangent of ``G`` needs, once per
+    Newton step (``dG/dT = F (I - diag(1-eps) F)^-1 diag(h)``). Dense LU, or one GMRES per column (vmapped) when
+    ``F`` is sparse: the result is m x m either way, only ``F`` itself stays sparse."""
+    eye = jnp.eye(F.shape[0], dtype=jnp.result_type(eps, float))
+    if isinstance(F, jsparse.BCOO):
+        return jax.vmap(lambda b: _radiosity_matrix_solve(F, eps, b), in_axes=1, out_axes=1)(eye)
+    return jnp.linalg.solve(eye - (1.0 - eps)[:, None] * F, eye)
+
+
+def _irradiation_of(owner, parts, T, eps):
+    """G per element for the enclosures ``parts`` (one radiosity system each, concatenated in their order)."""
+    pend = [a for a in (T, eps) if isinstance(a, PendingElementExpr)]
+    sizes = [p.size for p in parts]
+    cuts = np.cumsum([0, *sizes])
+
+    def values(u):
+        t = jnp.asarray(T(u) if isinstance(T, PendingElementExpr) else T, dtype=jnp.float64).reshape(-1)
+        e = eps(u) if isinstance(eps, PendingElementExpr) else eps
+        e = jnp.broadcast_to(jnp.asarray(e, dtype=t.dtype), t.shape)
+        out = []
+        for part, a, b in zip(parts, cuts[:-1], cuts[1:]):
+            out.append(radiosity_irradiation(part.view_factor, e[a:b], t[a:b]))
+        return jnp.concatenate(out)
+
+    if not pend:
+        return values(None)
+    reads = None if any(p._reads is None for p in pend) else np.unique(np.concatenate([p._reads for p in pend]))
+    return PendingElementExpr(values, reads, owner)
+
+
+class EnclosureSet:
+    """Several enclosures handled as one: the radiating faces of every connected transparent medium of a domain,
+    from :meth:`jno.domain.enclosure` with ``medium=``. Each medium is its own radiosity system (no exchange
+    between media); ``field``, ``irradiation``, ``load`` and ``element_tags`` run over all of them, in order."""
+
+    def __init__(self, parts, media):
+        self.parts = list(parts)
+        self.media = [list(m) for m in media]
+        self._cuts = np.cumsum([0, *[p.size for p in self.parts]])
+
+    @property
+    def size(self) -> int:
+        return int(self._cuts[-1])
+
+    @property
+    def nodes(self) -> np.ndarray:
+        return np.unique(np.concatenate([p.nodes for p in self.parts]))
+
+    @property
+    def element_tags(self) -> np.ndarray:
+        return np.concatenate([p.element_tags for p in self.parts])
+
+    def tag_mask(self, tag: str) -> np.ndarray:
+        return self.element_tags == tag
+
+    def field(self, u):
+        """Per-element temperature over all media (pending for a symbolic field, as :meth:`Enclosure.field`)."""
+        if isinstance(u, Placeholder):
+            return PendingElementExpr(self.field, reads=self.nodes, owner=self)
+        return jnp.concatenate([p.field(u) for p in self.parts])
+
+    def irradiation(self, T, eps):
+        """:meth:`Enclosure.irradiation` of every medium, concatenated."""
+        return _irradiation_of(self, self.parts, T, eps)
+
+    def load(self, q, *, size: Optional[int] = None):
+        """Consistent nodal load of a per-element flux over all media (a ``jno.Coupling`` for a pending flux)."""
+        if isinstance(q, PendingElementExpr):
+            from .._fem import Coupling
+
+            names = "; ".join(",".join(m) for m in self.media)
+            c = Coupling(lambda u: self.load(q(u), size=size), name=f"enclosures[{names}]")
+            if q._reads is not None:
+                c._support = np.union1d(q._reads, self.nodes)
+            return c
+        q = jnp.asarray(q).reshape(-1)
+        return sum(p.load(q[a:b], size=size) for p, a, b in zip(self.parts, self._cuts[:-1], self._cuts[1:]))
+
+    def __repr__(self):
+        return f"EnclosureSet({len(self.parts)} media: " + "; ".join(repr(p) for p in self.parts) + ")"
+
+
+def _enclosure_cache_dir():
+    import os
+    from pathlib import Path
+
+    return Path(os.environ.get("JNO_CACHE", Path.home() / ".cache" / "jno")) / "enclosures"
+
+
+def _cached_enclosure(domain, tags, medium, options, cache):
+    """build_enclosure(domain, tags, medium_tags=medium, **options), with the view factors cached on disk by a
+    hash of everything they depend on: the mesh (points and cells), the region membership of its cells, the
+    surfaces, the medium and the options. A mesh or option change is a new key, never a stale hit."""
+    import hashlib
+    import pickle
+    import time
+
+    from .mesh_utils import mesh_cell_region_membership
+
+    mesh = domain.mesh
+    regions = mesh_cell_region_membership(mesh, int(domain.dimension))
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(np.asarray(mesh.points, np.float64)).tobytes())
+    for c in mesh.cells:
+        h.update(c.type.encode())
+        h.update(np.ascontiguousarray(np.asarray(c.data, np.int64)).tobytes())
+    for name in sorted(set(tags) | set(medium)):
+        h.update(name.encode())
+        h.update(np.packbits(np.asarray(regions.get(name, np.zeros(0, bool)))).tobytes())
+    h.update(repr(sorted(options.items())).encode())
+    path = _enclosure_cache_dir() / f"{h.hexdigest()[:20]}.pkl"
+    from ..utils.logger import get_logger
+
+    log = get_logger()
+    if cache and path.exists():
+        st = pickle.loads(path.read_bytes())
+        enc = Enclosure.__new__(Enclosure)
+        enc.__dict__.update(st)
+        enc.domain = domain
+        enc._F, enc.areas, enc.normals = jnp.asarray(st["_F"]), jnp.asarray(st["areas"]), jnp.asarray(st["normals"])
+        enc._node_weights = jnp.asarray(st["_node_weights"])
+        log.info(f"enclosure[{','.join(medium)}]: view factors loaded from the cache ({path.name})")
+        return enc
+    t0 = time.time()
+    enc = build_enclosure(domain, tags, medium_tags=list(medium), **options)
+    if cache:
+        st = {k: (np.asarray(v) if isinstance(v, jax.Array) else v) for k, v in enc.__dict__.items() if k != "domain"}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(pickle.dumps(st))
+        tmp.replace(path)
+    log.info(
+        f"enclosure[{','.join(medium)}]: view factors built in {time.time() - t0:.1f} s"
+        + (f", cached as {path.name}" if cache else "")
+    )
+    return enc
+
+
+def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
+    """One enclosure per **connected** transparent medium among ``medium_regions``: the radiating surfaces are the
+    faces between the medium and every region next to it that is not itself transparent (read from the mesh's
+    interface cell sets ``A|B``). Refuses a medium with no solid neighbour, and a medium that reaches the domain
+    boundary away from the axis of an axisymmetric mesh (radiation would leave through a surface that is not
+    modelled)."""
+    import re
+
+    from .mesh_utils import mesh_cell_region_membership, p1_cells_dict
+
+    mesh = domain.mesh
+    regions = mesh_cell_region_membership(mesh, int(domain.dimension))
+    medium_regions = [str(m) for m in medium_regions]
+    unknown = [m for m in medium_regions if m not in regions]
+    if unknown:
+        raise ValueError(
+            f"domain.enclosure(medium=...): {unknown} are not volume regions of this mesh; known: {sorted(regions)}."
+        )
+    tri = np.asarray(p1_cells_dict(mesh)["triangle"])
+    nodes = {m: set(np.unique(tri[regions[m]]).tolist()) for m in medium_regions}
+
+    # connected media: regions sharing a node belong to one medium
+    parent = {m: m for m in medium_regions}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i, a in enumerate(medium_regions):
+        for b in medium_regions[i + 1 :]:
+            if nodes[a] & nodes[b]:
+                parent[find(a)] = find(b)
+    groups = {}
+    for m in medium_regions:
+        groups.setdefault(find(m), []).append(m)
+    media = [sorted(g) for g in groups.values()]
+
+    def side(name):
+        if name in regions:
+            return name
+        base = re.sub(r"\.\d+$", "", name)
+        return base if base in regions else None
+
+    # medium -> solid neighbours, from the interface sets
+    neighbours = {tuple(g): set() for g in media}
+    for key in getattr(mesh, "cell_sets", {}) or {}:
+        if "|" not in key:
+            continue
+        a, b = (side(x) for x in key.split("|", 1))
+        if a is None or b is None:
+            continue
+        for g in media:
+            if a in g and b not in medium_regions:
+                neighbours[tuple(g)].add(b)
+            if b in g and a not in medium_regions:
+                neighbours[tuple(g)].add(a)
+
+    # a medium must be closed: its cells may touch the domain boundary only on the axis (axisymmetric)
+    edges = np.sort(np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]]), axis=1)
+    owner = np.tile(np.arange(len(tri)), 3)
+    uniq, inv, cnt = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+    bnd = cnt[inv.reshape(-1)] == 1
+    pts = np.asarray(mesh.points)
+    axis_tol = 1e-9 * max(float(np.ptp(pts[:, 0])), 1.0)
+    on_axis = np.all(pts[edges[:, :], 0] <= axis_tol, axis=1) if options.get("axisymmetric") else np.zeros(len(edges), bool)
+    parts = []
+    for g in media:
+        cells = np.zeros(len(tri), bool)
+        for m in g:
+            cells |= np.asarray(regions[m])
+        leak = bnd & cells[owner] & ~on_axis
+        if leak.any():
+            raise ValueError(
+                f"domain.enclosure(medium=...): the transparent medium {g} reaches the domain boundary at "
+                f"{int(leak.sum())} edge(s), so radiation would leave it through a surface that is not modelled. "
+                "Close it with a solid part, or model the outside explicitly."
+            )
+        solids = sorted(neighbours[tuple(g)])
+        if not solids:
+            raise ValueError(
+                f"domain.enclosure(medium=...): the transparent medium {g} has no solid neighbour to radiate from."
+            )
+        parts.append(_cached_enclosure(domain, solids, g, options, cache))
+    return EnclosureSet(parts, media)
