@@ -83,7 +83,7 @@ __all__ = [
 ]
 
 
-def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True) -> LinearSolver:
+def lu(*, backend: str = "device", host: bool | None = None, reuse: bool | None = None) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -113,7 +113,7 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
             points (0.15x-0.81x of its time). Read that as *cuSolver's sparse LU is weak*, not as
             *GPUs lose*: see ``"cudss"``. Its factorization is cached on the operator's CONTENT, so a
             constant-operator march factorizes once for the trajectory (measured 2.9x at 23,934 DOFs
-            over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
+            over 51 steps) and the adjoint reuses it; a Newton loop's steps are not kept (see ``reuse``).
 
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
             on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w
@@ -155,17 +155,12 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
         host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
             both is an error.
         reuse: keep the factorization for a repeating operator (``"host"`` only; the other backends
-            manage their own plan caches). Default ``True``, which is right for a constant-operator
-            march and for an adjoint -- ``A^T x = b`` comes free from the forward factorization.
-
-            **Pass ``reuse=False`` for a Newton march.** A Newton tangent changes every iteration, so
-            the cache never hits; what it does instead is hold host memory. XLA:CPU runs each
-            ``pure_callback`` on a different thread, so a factorization retained past the callback
-            that built it is freed on a LATER thread and glibc cannot return that arena -- one
-            factorization's worth of unreclaimable RSS per Newton iteration. Measured on a 4-field
-            melt pool at 13,278 DOFs over 200 steps: ``reuse=True`` OOM-kills a 62 GB machine,
-            ``reuse=False`` peaks at **2.08 GB** and is **44% faster** (343 s against 494 s for
-            ``backend="device"``), with the two answers agreeing to ten significant figures.
+            manage their own plan caches). Default ``None``: kept -- right for a constant-operator march and
+            for an adjoint, where ``A^T x = b`` comes free from the forward factorization -- except in a
+            Newton driver's forward steps. A Newton tangent changes every iteration, so the cache never hits
+            there; keeping the factorizations held up to 8 of them (measured: 38.9 GB at 44,313 DOFs, against
+            a flat 3.0 GB uncached at 28,675). The factorization at the converged root is kept, so the
+            gradient's transpose solve reuses it. ``True`` / ``False`` force the choice everywhere.
     """
     if host is not None:
         if backend != "device":
@@ -206,11 +201,10 @@ def lu(*, backend: str = "device", host: bool | None = None, reuse: bool = True)
                 if x is not None:
                     return x
         if op.bcoo is not None:
-            # Only the opted-in case changes the call: `reuse=True` is the long-standing behaviour and
-            # keeps the long-standing two-argument convention, so nothing that wraps or stubs
-            # host_lu_solve has to know this option exists.
-            if backend == "host" and not reuse:
-                return solve(op.bcoo, b, reuse=False)
+            # Only an explicit choice changes the call: the default keeps the two-argument convention, so
+            # nothing that wraps or stubs host_lu_solve has to know this option exists.
+            if backend == "host" and reuse is not None:
+                return solve(op.bcoo, b, reuse=reuse)
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
         # nse, which does not exist under jit/vmap tracing. SAY SO when that silently drops a

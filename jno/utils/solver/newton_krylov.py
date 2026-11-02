@@ -1046,7 +1046,15 @@ def newton_direct(
 
     if tangent0 is not None and not reuse:
         raise ValueError("newton_direct(tangent0=...) starts from a kept tangent, which only reuse=True does.")
-    root, _steps, _nfact, _rn, _r0n, _J = _forward(u0)  # un-differentiated forward solve; custom_root supplies the gradient
+    from .linear import factorizations_not_kept
+
+    # A fresh tangent every step: a host factorization kept by the solve's cache would never be hit again. Kept
+    # when the tangent repeats -- a lagged one (reuse=True), or a linear form's constant one.
+    keep = reuse or _LINEAR_FORM[0]
+    with contextlib.nullcontext() if keep else factorizations_not_kept():
+        root, _steps, _nfact, _rn, _r0n, _J = _forward(
+            u0
+        )  # un-differentiated forward solve; custom_root supplies the gradient
     _convergence_check(
         f0,
         u0,
