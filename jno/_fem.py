@@ -2739,7 +2739,7 @@ class FEM:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
 
-    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond):
+    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond, nonlinear=None):
         """Say so when the matrix-free default is about to be pointed at a saddle system.
 
         The default is Jacobi-preconditioned BiCGStab, and a saddle block has a ZERO diagonal -- the
@@ -2750,10 +2750,13 @@ class FEM:
 
         Warn rather than refuse, on purpose: a 2-D saddle of moderate size does solve acceptably this
         way, and refusing would break working code. Only when no solver was chosen -- passing
-        `linear=` or `precond=` means the choice was made deliberately and needs no advice.
+        `linear=` or `precond=` means the choice was made deliberately and needs no advice, and a
+        sparse-direct Newton (`nonlinear=jno.solve.newton(direct=True)`) factorizes its tangent.
         """
         blocks = getattr(self, "_saddle_blocks", ())
         if not blocks or solve_fn is not None or linear is not None or precond is not None:
+            return
+        if getattr(nonlinear, "direct", None) is True:
             return
         if getattr(self, "_saddle_warned", False):
             return
@@ -3344,7 +3347,7 @@ class FEM:
                 else:
                     self._periodic = reduction
             try:
-                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
+                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond, nonlinear)
                 # A steady NONLINEAR solve has no assembled operator to partition, so its CELLS are split
                 # instead: the residual (and so every Jacobian-free J.v) is evaluated per device on a share
                 # of the elements, one all-reduce per evaluation. Read while the solve traces; a deferred

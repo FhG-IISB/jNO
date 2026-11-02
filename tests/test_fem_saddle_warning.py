@@ -140,3 +140,26 @@ def test_it_fires_under_jit_where_the_residual_guard_cannot():
 def test_it_warns_once_per_problem():
     _, _, _, _, fem = _stokes()
     assert len(_saddle_warnings(lambda: (fem.solve(), fem.solve()))) == 1
+
+
+def test_a_direct_newton_is_silent():
+    """``newton(direct=True)`` factorizes its tangent by sparse LU: the saddle block is no trouble for it, so the
+    advice to choose a solver would be noise."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain()
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    fem = jno.fem(
+        [
+            inner(gu, gv, n_contract=2) - pp * trace(gv) + ui[0] ** 3 * vi[0] - 1.0 * vi[1],  # nonlinear: Newton
+            -qq * trace(gu),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            p.pin(),
+        ]
+    )
+    assert fem._saddle_blocks == ("p",)
+    assert _saddle_warnings(lambda: fem.solve(nonlinear=jno.solve.newton(direct=True))) == []
