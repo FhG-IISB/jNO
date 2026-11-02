@@ -259,12 +259,6 @@ the running device, once per operator size class (`matvec_format="auto"`, the de
 `jno.setup(__file__, matvec_format="csr")` or `"coo"` (or `[jno] matvec_format`) forces one — for reproducible timings, or to
 rule the choice out while debugging.
 
-The view factors of a `d.irradiation` term are held dense, or as a BCOO with the radiosity solved by GMRES:
-`radiation_storage="auto"` (the default) goes sparse from 2000 faces with at most 30 % of `F` nonzero, dense below.
-`jno.setup(__file__, radiation_storage="dense")` or `"sparse"` (or `[jno] radiation_storage`) forces one. The
-tangent block on the radiating nodes is dense in every mode (see
-[Radiation written as the equation](fem/geometry.md#radiation-written-as-the-equation-dirradiationt)).
-
 ## Preconditioners
 
 Declarative specs — materialized against the assembled operator at solve time. A preconditioner never

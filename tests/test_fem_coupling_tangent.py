@@ -1,6 +1,6 @@
-"""An assembled tangent for a problem with a nonlocal Coupling.
+"""An assembled tangent for a problem with a nonlocal (internal) Coupling, what ``d.irradiation`` lowers to.
 
-An enclosure coupling declares exactly which DOFs it reads and writes, so ``jno.fem`` assembles its Jacobian as a
+A coupling that declares exactly which DOFs it reads and writes gets its Jacobian assembled by ``jno.fem`` as a
 dense block on those DOFs next to the sparse local tangent. That makes ``newton(direct=True)`` (sparse LU, forward
 and adjoint) available on radiation problems. A coupling that declares nothing keeps the matrix-free default, and
 ``direct=True`` then materialises the whole Jacobian densely, with a warning that states its size.
@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 
 import jno
+from jno._fem import Coupling
+from jno.domain.enclosure import build_enclosure
 
 jax.config.update("jax_enable_x64", True)
 
@@ -40,33 +42,51 @@ def _rings():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     xh, yh, _ = d.variable("hot", split=True)
     xc, yc, _ = d.variable("cold", split=True)
-    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap = build_enclosure(d, ["inner_gap", "outer_gap"])
     F = jnp.asarray(gap.view_factor)
-    eps = gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6})
+    eps = jnp.where(jnp.asarray(gap.tag_mask("inner_gap")), 0.8, 0.6)
     Q = (jnp.diag(F.sum(1)) - F) @ jnp.linalg.solve(jnp.eye(gap.size) - (1 - eps)[:, None] * F, jnp.diag(eps * SIGMA))
     conduction = lambda k: k * (ui.x * vi.x + ui.y * vi.y)  # noqa: E731
     walls = [u(xh, yh) - 1000.0, u(xc, yc) - 300.0]
     return d, u, gap, Q, conduction, walls
 
 
+def _radiation(gap, Q, n, declared=True):
+    """The grey-body net flux of the enclosure as a coupling: face temperature = mean of its two nodes, half of
+    each face's flux to each node (a straight 2-D face)."""
+    a, b = jnp.asarray(gap.elements[:, 0]), jnp.asarray(gap.elements[:, 1])
+    half = 0.5 * jnp.asarray(gap.areas)
+
+    def residual(w):
+        q = half * (Q @ (0.5 * (w[a] + w[b])) ** 4)
+        return jnp.zeros(n, dtype=q.dtype).at[a].add(q).at[b].add(q)
+
+    c = Coupling(residual, name="radiation")
+    if declared:
+        c._support = gap.nodes
+    return c
+
+
 def _fem_declared(k=20.0):
     d, u, gap, Q, conduction, walls = _rings()
-    return jno.fem([conduction(k), gap.load(Q @ gap.field(u) ** 4), *walls]), gap, d
+    return jno.fem([conduction(k), _radiation(gap, Q, len(d.mesh.points)), *walls]), gap, d
 
 
 def _fem_undeclared(k=20.0):
-    """The same physics as a bare function: a Coupling that says nothing about the DOFs it touches."""
+    """The same physics as a Coupling that says nothing about the DOFs it touches."""
     d, u, gap, Q, conduction, walls = _rings()
-    n = len(d.mesh.points)
-    return jno.fem([conduction(k), lambda w: gap.load(Q @ gap.field(w) ** 4, size=n), *walls])
+    return jno.fem([conduction(k), _radiation(gap, Q, len(d.mesh.points), declared=False), *walls])
 
 
-def test_enclosure_coupling_declares_exactly_the_nodes_it_touches():
-    d, u, gap, Q, _c, _w = _rings()
-    c = gap.load(Q @ gap.field(u) ** 4)
-    np.testing.assert_array_equal(c._support, gap.nodes)
-    # an expression that cannot know what it reads declares nothing
-    assert jno.Coupling(lambda w: w)._support is None
+def test_a_coupling_declares_nothing_unless_told():
+    assert Coupling(lambda w: w)._support is None and Coupling(lambda w: w)._tangent_block is None
+
+
+def test_a_function_in_the_term_list_is_refused():
+    """A residual function is not a term: nonlocal terms are written as math and lowered by jno.fem."""
+    d, u, gap, Q, conduction, walls = _rings()
+    with pytest.raises(TypeError, match="written as math"):
+        jno.fem([conduction(20.0), lambda w: 0.0 * w, *walls])
 
 
 def test_assembled_tangent_matches_jacfwd_of_the_residual():
@@ -102,7 +122,7 @@ def test_gradient_through_the_direct_newton_matches_finite_differences():
     the assembled tangent; it must match a central difference of two forward solves."""
     d, u, gap, Q, conduction, walls = _rings()
     k = jno.np.parameter((1,), name="k")
-    fem = jno.fem([conduction(k), gap.load(Q @ gap.field(u) ** 4), *walls])
+    fem = jno.fem([conduction(k), _radiation(gap, Q, len(d.mesh.points)), *walls])
     # atol=1e-8 is ~6e-14 of ||r(x0)|| = 1.7e5; the residual floor at the root is ~2e-10 (1e-15 relative), so
     # the 1e-10 this used to ask for was below round-off and passed only when an iterate happened to dip under it.
     nl = jno.solve.newton(direct=True, rtol=0.0, atol=1e-8)

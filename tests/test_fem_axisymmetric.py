@@ -141,31 +141,3 @@ def test_handwritten_ring_measure_on_a_boundary_flux():
     load = np.asarray(fem.operator[1]).reshape(-1)
     exact = g * TWO_PI * b * h
     assert abs(load.sum() - exact) / exact < 1e-9, f"ring flux {load.sum():.6f} vs exact {exact:.6f}"
-
-
-def test_enclosure_axisymmetric_load_is_per_full_revolution():
-    """``Enclosure.load`` with ``axisymmetric=True`` is per full revolution (measure ``2πr ds``), so a
-    hand-written form it is added to must carry the same factor. Locks the convention numerically."""
-    from jno.domain.enclosure import Enclosure
-
-    R, n, q0 = 0.7, 6, 3.0
-    rr = np.linspace(0.0, R, n + 1)
-    e0 = np.c_[rr[:-1], np.zeros(n)]
-    e1 = np.c_[rr[1:], np.zeros(n)]
-    areas = TWO_PI * (0.5 * (e0[:, 0] + e1[:, 0])) * np.linalg.norm(e1 - e0, axis=1)
-    gap = Enclosure(
-        domain=None,
-        tags=["disc"],
-        F=np.zeros((n, n)),
-        elements=np.c_[np.arange(n), np.arange(1, n + 1)],
-        element_tags=np.array(["disc"] * n, dtype=object),
-        areas=areas,
-        normals=np.tile([0.0, 1.0], (n, 1)),
-        midpoints=0.5 * (e0 + e1),
-        axisymmetric=True,
-        endpoints=(e0, e1),
-    )
-    load = np.asarray(gap.load(jnp.full(n, q0), size=n + 1))
-    assert abs(load.sum() - q0 * np.pi * R**2) < 1e-12 * q0 * np.pi * R**2, (
-        "the scattered load must equal flux x the full revolved disc area"
-    )

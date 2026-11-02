@@ -28,8 +28,6 @@ defaults (Jacobi-BiCGStab / Newton on the assembled tangent / backward-Euler) yo
 from __future__ import annotations
 
 import contextlib
-import functools
-import inspect
 import warnings
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -301,7 +299,7 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
     the general spelling for nonlocal coupling that enters as a *value*.
 
     A weak term is *local*: an integrand evaluated at one quadrature point. Some physics is not. Where
-    :class:`jno.Coupling` carries a nonlocal *residual* ``R(u) += c(u)``, ``derived`` carries a nonlocal
+    a nonlocal residual term (``d.irradiation``) adds ``R(u) += c(u)``, ``derived`` carries a nonlocal
     *value* ``d = f(u)`` on the nodes, usable **anywhere a field is** -- a coefficient, a source, a
     material property. The distinction is not cosmetic: a beam's attenuation ``exp(-tau(u))``
     *multiplies* a source, so it cannot be written as a load; and a quantity needed inside a term has
@@ -331,10 +329,9 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
       rather than returning a plausible wrong field;
     * convergence is **linear, not quadratic**, at a rate set by the coupling strength. For a strongly
       coupled nonlocality -- radiation-dominated enclosure, optically thick beam -- it can stall or
-      diverge, where an in-residual :class:`jno.Coupling` would have kept the coupling in its tangent.
+      diverge, where a nonlocal residual term (``d.irradiation``) keeps the coupling in its tangent.
       ``fem.solve(nonlinear=jno.solve.picard(damping=...))`` or ``newton(line_search=True)`` is the
-      remedy. Reach for ``Coupling`` when you need the exact tangent, ``derived`` when you need the
-      value inside a term or the cheap tangent.
+      remedy.
 
     ``every`` sets the cadence. ``"residual"`` (default) re-evaluates ``fn`` at every residual
     evaluation, so a transient step is fully implicit in the coupling; ``"step"`` evaluates it once per
@@ -344,7 +341,7 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
 
     ``params=[...]`` declares ``jno.np.parameter`` nodes used only inside ``fn`` (the trace walk that
     finds weak-form parameters cannot see into an opaque function); ``fn`` then takes a trailing
-    ``{name: value}`` dict, as a :class:`jno.Coupling`'s residual does.
+    ``{name: value}`` dict.
 
     **Inverse-problem caveat**: parameters inside ``fn`` are not lagged, so the direct sensitivity
     through them is exact, but the path through ``u`` uses the lagged Jacobian -- the standard "Picard
@@ -7303,60 +7300,17 @@ def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
 
 
 class Coupling:
-    """A **nonlocal** residual term passed in the ``jno.fem([...])`` list.
+    """INTERNAL: a **nonlocal** residual term, what ``jno.fem`` lowers a nonlocal term written as math to
+    (``d.irradiation(T)``, see :mod:`jno.domain.radiation`; the equation of a constant unknown). Not public API:
+    the user writes the term, never the residual function.
 
-    A weak term is *local* (a per-quadrature-point integrand, assembled element-by-element). Some physics
-    is irreducibly *nonlocal* — enclosure radiation (every surface sees every other through the radiosity
-    solve), integral / non-reflecting BCs, contact, peridynamics — and cannot be written as a local
-    integrand. A ``Coupling`` carries a pure-JAX residual contribution ``residual_fn(u) -> (n_dofs,)`` that
-    ``jno.fem`` **adds to the assembled residual**: ``R(u) = R_local(u) + sum_k coupling_k(u)``.
-
-    This composes generally: a linear local form is *promoted* to a nonlinear residual operator
-    (``R(u)=A u - b + sum_k coupling_k(u)``), a nonlinear one just gains the extra term; either way
-    ``fem.solve()`` drives it with the matrix-free, ``custom_root``-differentiable ``newton_krylov`` (so it
-    stays differentiable in any ``jno.np.parameter`` in the form, and trains through ``jno.core``). The
-    contribution is zeroed on Dirichlet-pinned DOFs so it never corrupts a prescribed value.
-
-    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and just **put the function
-    in the** ``jno.fem([...])`` **list** -- no wrapper needed (a plain function/lambda is unambiguous next
-    to the trace-node weak/Dirichlet terms). Grey-body enclosure radiation, for instance, is the radiosity
-    solve on top of the enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the
-    geometry only; ``jno.fem`` never writes the physics for you)::
-
-        F, eps = gap.view_factor, gap.emissivity({"hot": 0.8, "cold": 0.5})
-        rho, eye, s_row = 1 - eps, jnp.eye(gap.size), F.sum(axis=1)
-
-        def radiation(u):                                    # net grey-body surface load (n_dofs,)
-            Tk = gap.field(u) + 273.15                       # absolute per-element temperature
-            J = jnp.linalg.solve(eye - rho[:, None] * F, eps * SIGMA * Tk**4)   # radiosity
-            return gap.load(s_row * J - F @ J)               # net flux -> consistent nodal load
-
-        fem = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])   # radiation is the bare function
-        Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
-
-    Wrapping it in ``jno.Coupling(fn, name=...)`` explicitly is still accepted -- needed only for a
-    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips),
-    to give it a label, or to declare **trainable parameters** that live only inside the coupling. A
-    ``jno.np.parameter`` in a *weak* term is found by walking the trace, but a coupling is an opaque
-    pure-JAX function, so name its parameters explicitly with ``params=[...]``; the residual then takes a
-    second argument, the ``{name: value}`` dict, so ``fem.solve()`` threads the trained values in and
-    ``jno.core`` recovers them (e.g. a calibrated emissivity)::
-
-        eps = jno.np.parameter((1,), name="eps")
-        def radiation(u, p):                                 # p -> {"eps": value}
-            J = jnp.linalg.solve(eye - (1 - p["eps"])[:, None] * F, p["eps"] * SIGMA * (gap.field(u) + 273.15)**4)
-            return gap.load(s_row * J - F @ J)
-        fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
-
-    In a **multifield** system, pass ``field_key=`` to act on one field's DOF sub-block: the residual then
-    receives and returns *that field's* sub-vector (so the same ``gap.field``/``load`` scalar-T code works
-    whether T stands alone or is one field of a heat+flow / thermo-mechanical system), and ``jno.fem``
-    scatters it into the field's global block. Without ``field_key`` the coupling spans the whole vector
-    (single field). The ``field_key`` is the trial field's key (its ``value_shape``/name, as elsewhere).
-
-    Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
-    and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
-    coupling. The targeted field must be scalar P1 (its block is node-indexed, as ``gap.load`` assumes)."""
+    ``residual_fn(u) -> (n_dofs,)`` is pure JAX and is ADDED to the assembled residual,
+    ``R(u) = R_local(u) + sum_k coupling_k(u)``: a linear local form is promoted to a nonlinear residual operator,
+    a nonlinear one gains the term. The contribution is zeroed on Dirichlet-pinned DOFs. ``field_key=`` makes it
+    act on one field's DOF sub-block (it receives and returns that field's sub-vector; scalar P1 only).
+    ``params=[...]`` names trainable parameters read only inside the residual, which then takes a second argument,
+    the ``{name: value}`` dict. ``_support`` (the DOFs it reads and writes, exactly) gives it an assembled tangent
+    block; ``_tangent_block`` (optional) forms that block itself instead of by JVPs."""
 
     def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None, params=None):
         # residual_fn: (u_flat,) -> (n_dofs,), or (u_flat, {name: value}) -> (n_dofs,) when params are declared
@@ -7977,26 +7931,20 @@ def _fem_impl(
     couplings: List[Coupling] = []
     _rest: List[Any] = []
     for c in constraints:
-        if isinstance(c, Coupling):
+        if isinstance(c, Coupling):  # made by a lowering (d.irradiation, an integral equation), never by the user
             couplings.append(c)
-        elif inspect.isfunction(c) or inspect.ismethod(c) or isinstance(c, functools.partial):
-            couplings.append(Coupling(c, name=getattr(c, "__name__", "coupling")))
         else:
             _rest.append(c)
     constraints = _rest
 
-    # The bare-function shorthand only catches a *plain* function/lambda/partial -- it deliberately skips
-    # callable trace nodes (a bare symbol, `jno.fn(...)`) so it can never swallow a real term. The flip side
-    # is it also can't see a callable *object* meant as a coupling -- a `jax.jit(residual)` or an instance
-    # with `__call__`. Rather than let that fall through to weak/Dirichlet classification and fail with an
-    # opaque error, point the user at the explicit wrapper. (Trace expressions are not callable; the only
-    # callable list-items are Placeholders, which keep their own handling.)
+    # A function in the term list is not a term: a nonlocal term is written as math (d.irradiation(T) for
+    # radiation, (expr * dV).integrate() - P for an integral equation) and lowered by jno.fem itself.
     for c in constraints:
         if callable(c) and not isinstance(c, Placeholder):
             raise TypeError(
-                f"jno.fem: got a callable {type(c).__name__!s} in the constraint list. A *plain* function "
-                "is taken as a nonlocal coupling residual automatically, but a jitted/object callable is "
-                "not -- wrap it explicitly as jno.Coupling(fn) to use it as a coupling term."
+                f"jno.fem: got a callable {type(c).__name__!s} in the term list. Terms are written as math, not as "
+                "residual functions: radiation is d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS, an integral "
+                "equation (expr * dV).integrate() - P."
             )
 
     domain = _discover_domain(constraints)
@@ -8727,10 +8675,10 @@ def _fem_impl(
             # Coupling is folded in -- so the coupling was DROPPED, silently: a `1e6 * u` coupling left
             # the trajectory bit-identical to the uncoupled one.
             raise NotImplementedError(
-                "jno.fem: a nonlocal `jno.Coupling` on a second-order-in-time (u_tt) form is not wired -- "
+                "jno.fem: a nonlocal term (d.irradiation) on a second-order-in-time (u_tt) form is not wired -- "
                 "the augmented [u; v] block has no slot for it, and it would be dropped. Write the problem "
-                "first order in time with an explicit velocity field (a first-order transient takes a "
-                "Coupling), or express the term locally in the weak form."
+                "first order in time with an explicit velocity field (a first-order transient takes the "
+                "term), or express the term locally in the weak form."
             )
         # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
         # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries

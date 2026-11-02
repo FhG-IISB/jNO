@@ -21,6 +21,7 @@ import jax.numpy as jnp  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
+from jno._fem import Coupling  # noqa: E402
 
 PI = np.pi
 
@@ -77,7 +78,7 @@ def _build(extra_source=None, coupling=None, mesh_size=0.07):
 
 def test_periodic_coupling_promotes_and_reduces():
     """A periodic tie + a Coupling: the local form is promoted to nonlinear AND the tie reduces it."""
-    fem = _build(coupling=lambda w: jnp.zeros_like(jnp.asarray(w).reshape(-1)))
+    fem = _build(coupling=Coupling(lambda w: jnp.zeros_like(jnp.asarray(w).reshape(-1))))
     assert fem._mode == "nonlinear", "the coupling must promote the linear periodic form to nonlinear"
     assert fem._periodic is not None, "the u(left)-u(right) tie must still reduce the coupled system"
     assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the secondary-face DOFs"
@@ -88,7 +89,9 @@ def test_periodic_coupling_zero_is_plain_periodic():
     promotion to a nonlinear residual + the periodic reduction must not perturb the solution. This also
     cross-checks the nonlinear-periodic solve path against the linear-periodic path."""
     u_plain = _eval(_build())  # linear periodic path
-    u_zero = _eval(_build(coupling=lambda w: jnp.zeros_like(jnp.asarray(w).reshape(-1))))  # nonlinear+periodic path
+    u_zero = _eval(
+        _build(coupling=Coupling(lambda w: jnp.zeros_like(jnp.asarray(w).reshape(-1))))
+    )  # nonlinear+periodic path
     assert np.allclose(u_zero, u_plain, atol=1e-6), "zero coupling perturbed the periodic solve"
 
     pts = np.asarray(_build().points)
@@ -109,7 +112,7 @@ def test_periodic_coupling_constant_load_matches_extra_source():
     extra = jnp.asarray(b_loaded - b_plain)  # the FE load of s0*vi (Dirichlet rows cancel -> 0 there)
 
     u_ref = _eval(_build(extra_source=s0))  # plain linear periodic, equivalent problem
-    u_coupled = _eval(_build(coupling=lambda w: -extra))  # nonlinear+periodic path
+    u_coupled = _eval(_build(coupling=Coupling(lambda w: -extra)))  # nonlinear+periodic path
     rel = float(np.linalg.norm(u_coupled - u_ref) / np.linalg.norm(u_ref))
     assert rel < 1e-5, f"periodic+coupling disagrees with the equivalent extra-source periodic solve: {rel:.3e}"
     # and the coupling genuinely moved the solution off the no-load periodic solve
@@ -135,7 +138,7 @@ def _transient(order, tie, value_shape=()):
         xl, yl, _ = d.variable("left", split=True)
         xr, yr, _ = d.variable("right", split=True)
         terms.append(u(xl, yl) - u(xr, yr))
-    return terms + [jno.Coupling(lambda U: 1e6 * U, name="stiff")]
+    return terms + [Coupling(lambda U: 1e6 * U, name="stiff")]
 
 
 @pytest.mark.parametrize(
@@ -150,7 +153,7 @@ def test_a_coupling_on_a_route_that_cannot_carry_it_is_refused_not_dropped(order
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
-        with pytest.raises(NotImplementedError, match="Coupling"):
+        with pytest.raises(NotImplementedError, match="nonlocal"):
             jno.fem(_transient(order, tie, value_shape))
     finally:
         jax.config.update("jax_enable_x64", prev)

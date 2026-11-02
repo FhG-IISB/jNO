@@ -344,7 +344,7 @@ class _LawProperty:
 
     def __init__(self, domain, name, regions, refusal=None):
         self._domain, self._name, self._regions = domain, name, list(regions)
-        self._refusal = refusal  # an incomplete property: usable per enclosure face only
+        self._refusal = refusal  # an incomplete property: the error to raise where it is used
 
     def __call__(self, *args):
         if not args:
@@ -3061,8 +3061,7 @@ class domain(MeshIOMixin):
             except AttributeError as e:
                 if "never attached" not in str(e):
                     raise
-                # Some regions lack the property: wrong as a volume coefficient, fine per enclosure face
-                # (`d.eps(gap.field(T))` needs it only on the radiating solids). Defer the error to its use.
+                # Some regions lack the property: defer the error to its use (reading d.<name> must not raise).
                 return _LawProperty(self, name, [], refusal=str(e))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
@@ -3071,11 +3070,6 @@ class domain(MeshIOMixin):
         material law evaluated at ``args`` (see :meth:`_is_law`). A property that holds a law cannot be used
         bare -- it returns a :class:`_LawProperty`, which refuses arithmetic and says to call it."""
         attached = self.__dict__.get("_region_attachments") or {}
-        if args is not None:
-            from .enclosure import PendingElementExpr
-
-            if any(isinstance(a, PendingElementExpr) for a in args):
-                return self._attached_per_element(name, args)
         values = dict(attached[name])
         # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
         # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
@@ -3154,10 +3148,7 @@ class domain(MeshIOMixin):
             heat += [d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS]     # dS = 2 pi r (axisymmetric)
 
         ``jno.fem`` integrates such a term over the radiating faces with an exact tangent; see
-        :mod:`jno.domain.radiation` for the scope. Axisymmetry is read from ``.domain(axisymmetric=True)``.
-
-        How the view-factor matrix F is held is chosen automatically (sparse from 2000 faces with at most 30% nonzeros,
-        dense below); ``jno.setup(__file__, radiation_storage="dense" | "sparse")`` overrides it."""
+        :mod:`jno.domain.radiation` for the scope. Axisymmetry is read from ``.domain(axisymmetric=True)``."""
         from .radiation import Irradiation
 
         return Irradiation(self, T)
@@ -3220,39 +3211,6 @@ class domain(MeshIOMixin):
         get_logger().info(f"tag {name!r}: regions {chosen} (by {params})")
         return self.tag(name, membership)
 
-    def _attached_per_element(self, name, args):
-        """``d.<name>(gap.field(T))``: the property per enclosure element, from the region each element's
-        surface belongs to (its element tag) -- numbers as they are, laws evaluated at the element values."""
-        from .enclosure import PendingElementExpr
-
-        owner = next((a._owner for a in args if isinstance(a, PendingElementExpr) and a._owner is not None), None)
-        if owner is None:
-            raise TypeError(
-                f"domain.{name}(...): the element values do not say which enclosure they belong to; "
-                f"pass gap.field(T) (or an expression of it) as the argument."
-            )
-        values = dict((self.__dict__.get("_region_attachments") or {})[name])
-        default = values.pop(self._DEFAULT_TARGET, None)
-        tags = np.asarray(owner.element_tags).astype(str)
-        per_tag = {}
-        for t in np.unique(tags):
-            v = values.get(t, default)
-            if v is None:
-                raise ValueError(f"domain.{name}: the radiating surface of region {t!r} has no '{name}' attached.")
-            per_tag[t] = v
-        masks = {t: jnp.asarray(tags == t, dtype=jnp.float64) for t in per_tag}
-        reads = [a._reads for a in args if isinstance(a, PendingElementExpr)]
-        reads = None if any(r is None for r in reads) else np.unique(np.concatenate(reads))
-
-        def fn(u):
-            vals = [a(u) if isinstance(a, PendingElementExpr) else a for a in args]
-            out = 0.0
-            for t, v in per_tag.items():
-                out = out + masks[t] * (v(*vals) if self._is_law(v) else v)
-            return jnp.broadcast_to(jnp.asarray(out, dtype=jnp.float64), masks[next(iter(masks))].shape)
-
-        return PendingElementExpr(fn, reads, owner)
-
     def _is_law(self, value) -> bool:
         """Is an attached value a **material law** -- a function of fields, evaluated where it is called,
         ``d.k(T)`` -- rather than a number, an expression, or a function of position?
@@ -3302,13 +3260,8 @@ class domain(MeshIOMixin):
         """The raw ``{region: value}`` mapping for a property declared with :meth:`shape.attach`.
 
         ``d.<name>`` gives the per-region *coefficient*, ready for a weak form. This gives the values
-        themselves, for the consumers that need a mapping rather than an expression -- most notably
-        ``enclosure.emissivity({tag: eps})``, since enclosure element tags are region names::
-
-            eps = gap.emissivity(d.attached("eps"))
-
-        Unlike ``d.<name>`` this does not require every region to have declared the property: an
-        enclosure only spans some of them, and a mapping is allowed to be partial.
+        themselves, for the consumers that need a mapping rather than an expression. Unlike ``d.<name>`` this
+        does not require every region to have declared the property: a mapping is allowed to be partial.
         """
         attached = self.__dict__.get("_region_attachments") or {}
         if name not in attached:
@@ -6093,115 +6046,6 @@ class domain(MeshIOMixin):
         centroid = pts.mean(axis=0)
         angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
         return np.argsort(angles)
-
-    def enclosure(
-        self,
-        tags=None,
-        *,
-        medium=None,
-        cache=True,
-        axisymmetric=False,
-        n_quad=6,  # see build_enclosure: the closed-form azimuth has no near-field refinement
-        n_phi=16,
-        opaque_tags=None,
-        medium_tags=None,
-        enforce_closure=False,
-        closure_iters=200,
-        occlude=True,
-        inward=False,
-        r_min=None,
-        near_field=True,
-    ):
-        """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
-
-        Discretises the listed boundary surfaces into mesh-edge **elements** (aligned to FEM nodes) and
-        returns a handle exposing the element-to-element view factor ``enclosure.view_factor`` (fully
-        geometry-determined — self-view included), per-element ``areas``/``normals``, the global node
-        ``elements``, and an F-quality gate (``.check()`` / ``.quality()``). Write the grey-body
-        radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem/geometry.md``.
-
-        **Found surfaces: ``medium=``.** Name the transparent medium instead of the surfaces -- a region, a
-        list of regions, or a tag made from a property (``d.tag("transparent", lambda kappa: kappa == 0)``)
-        -- and the radiating faces are found: every face between a connected medium and the regions next
-        to it. Each connected medium is its own enclosure; the result is an
-        :class:`~jno.domain.enclosure.EnclosureSet` with ``field``, ``irradiation`` and ``load`` over all of
-        them. View factors are cached on disk (``$JNO_CACHE/enclosures``, default ``~/.cache/jno``) by a hash
-        of the mesh, the regions and the options; ``cache=False`` rebuilds. A medium that reaches the domain
-        boundary (away from the axis) raises: radiation would leave through a surface that is not modelled::
-
-            d.tag("transparent", lambda kappa: kappa == 0)
-            rad = d.enclosure(medium="transparent", axisymmetric=True)
-            Te = rad.field(T)
-            e = d.eps(Te)                                         # per face: a number or a law of T
-            heat += [rad.load(e * (SIGMA * Te**4 - rad.irradiation(Te, eps=e)))]
-
-        Args:
-            tags: Boundary tags forming the enclosure (each a radiating surface; tags only group
-                elements for per-surface emissivity — they never block exchange).
-            axisymmetric: Treat the 2D mesh as a meridional ``(r, z)`` half-plane (bodies of revolution).
-            n_quad: Gauss points per element for the double-area view-factor quadrature.
-            opaque_tags: Optional boundary tags that block rays (occluders) without radiating.
-            medium_tags: Optional transparent (meshed) medium regions, by geometry-part name. When given,
-                ``tags`` are solid geometry-part names and the radiating elements are the internal
-                solid|medium **interface** edges (the common furnace case where the gas/air gap is meshed),
-                with normals pointing out of the solid into the medium. When ``None`` (default), the
-                radiating elements are domain **boundary** edges on ``tags`` (an un-meshed/vacuum gap).
-            inward: Boundary mode only. When ``True``, element normals point *into* the meshed domain —
-                use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
-                furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
-                the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
-            r_min: Axisymmetric only. Near-field FLOOR for the ring kernel (``R^2 -> R^2 + r_min^2``) — a
-                fudge that caps the kernel for near-coincident rings rather than integrating them properly.
-                Defaults to half the median element length. Note that this default is itself a ~12%
-                systematic error on the analytic concentric-cylinder view factors; pass a value to override.
-        """
-        if medium is not None:
-            # The surfaces are FOUND: every face between a connected transparent medium and its neighbours.
-            from .enclosure import enclosures_of_medium
-
-            if tags is not None or medium_tags is not None:
-                raise ValueError(
-                    "domain.enclosure: pass either medium= (the surfaces are found) or tags= / medium_tags=, not both."
-                )
-            regions = (self.__dict__.get("_property_tag_regions") or {}).get(medium)
-            if regions is None:
-                regions = [medium] if isinstance(medium, str) else list(medium)
-            return enclosures_of_medium(
-                self,
-                regions,
-                cache=cache,
-                axisymmetric=axisymmetric,
-                n_quad=n_quad,
-                n_phi=n_phi,
-                opaque_tags=opaque_tags,
-                enforce_closure=enforce_closure,
-                closure_iters=closure_iters,
-                occlude=occlude,
-                inward=inward,
-                r_min=r_min,
-                near_field=near_field,
-            )
-        if tags is None:
-            raise ValueError(
-                "domain.enclosure: give the radiating tags, or medium= to find them from a transparent region."
-            )
-        from .enclosure import build_enclosure
-
-        return build_enclosure(
-            self,
-            tags,
-            axisymmetric=axisymmetric,
-            n_quad=n_quad,
-            n_phi=n_phi,
-            opaque_tags=opaque_tags,
-            medium_tags=medium_tags,
-            enforce_closure=enforce_closure,
-            closure_iters=closure_iters,
-            occlude=occlude,
-            inward=inward,
-            r_min=r_min,
-            near_field=near_field,
-        )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
         """Compute view factors over a combined radiation enclosure.

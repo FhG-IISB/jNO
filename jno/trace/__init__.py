@@ -6774,9 +6774,9 @@ class MeshVelocityField(FrozenField):
 
 class DerivedField(FrozenField):
     """A nodal field **computed from the current state** by a pure-JAX rule -- the value side of nonlocal
-    coupling, as opposed to :class:`jno.Coupling`'s residual side. Built by :func:`jno.derived`.
+    coupling, as opposed to a nonlocal residual term's (``d.irradiation``). Built by :func:`jno.derived`.
 
-    Where a :class:`Coupling` adds a nonlocal *residual vector* ``R(u) += c(u)``, a derived field carries a
+    Where a nonlocal residual term adds ``R(u) += c(u)``, a derived field carries a
     nonlocal *nodal value* ``d = f(u)`` that can be used **anywhere a field can** -- as a coefficient, a
     source, a material property. That is what a beam's optical depth ``tau(u)`` needs: ``exp(-tau)``
     multiplies a source, it is not a load.

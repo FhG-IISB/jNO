@@ -15,7 +15,7 @@ radiating face -- the field at the face's mean temperature (the radiosity's own 
 Gauss points along it (so ``dS = 2 pi r`` is integrated exactly against each node's hat function, the enclosure's
 ring-consistent weights), a region mask by the face's region -- and the result, which must be linear in the test
 function, is scattered to the face's two nodes. The term becomes
-a ``jno.Coupling`` with its support declared, so Newton's tangent carries the whole term exactly (dense on the
+an internal ``Coupling`` with its support declared, so Newton's tangent carries the whole term exactly (dense on the
 radiating nodes), including dG/dT and d eps/dT.
 
 Scope: 2-D and axisymmetric meshes (the enclosure's own scope); the term must use the field and the test function
@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..trace import Placeholder
-from .enclosure import STEFAN_BOLTZMANN, get_radiation_storage, radiosity_irradiation, radiosity_resolvent
+from .enclosure import STEFAN_BOLTZMANN, radiosity_irradiation, radiosity_resolvent
 
 
 class Irradiation(Placeholder):
@@ -126,6 +126,13 @@ def _face_eval(e, env):
                 f"d.irradiation: the radiation term reads the field {e!r}, which is not the field the irradiation is of."
             )
         return env["fields"][key]
+    from ..trace import ModelCall
+
+    if isinstance(e, ModelCall):
+        raise NotImplementedError(
+            "d.irradiation: a trainable parameter or network (jno.np.parameter, jno.nn) cannot be in a radiation term "
+            "yet; it is evaluated on the radiating faces, outside the weak-form trace. Use a number or a law of T."
+        )
     raise NotImplementedError(
         f"d.irradiation: {type(e).__name__} cannot be evaluated on a radiating face (no derivatives, networks or "
         "boundary bindings in a radiation term)."
@@ -134,13 +141,9 @@ def _face_eval(e, env):
 
 def radiating_faces(domain):
     """The domain's radiating faces: an EnclosureSet over every connected region with attached ``kappa == 0``,
-    built once per domain (view factors cached on disk). Each enclosure holds its view factors as the process-wide
-    radiation storage says (chosen automatically; ``jno.setup(radiation_storage=...)`` overrides)."""
-    storage = get_radiation_storage()
+    built once per domain (view factors cached on disk)."""
     cached = domain.__dict__.get("_radiation_faces")
     if cached is not None:
-        for part in cached.parts:
-            part.set_storage(storage)
         return cached
     from .enclosure import enclosures_of_medium
     from .mesh_utils import mesh_cell_region_membership
@@ -157,14 +160,12 @@ def radiating_faces(domain):
     rad = enclosures_of_medium(
         domain, media, axisymmetric=bool(domain.__dict__.get("axisymmetric", False)), enforce_closure=True
     )
-    for part in rad.parts:
-        part.set_storage(storage)
     domain.__dict__["_radiation_faces"] = rad
     return rad
 
 
 def lower_radiation_terms(constraints):
-    """Replace every term that contains ``d.irradiation`` by the ``jno.Coupling`` that integrates it over the
+    """Replace every term that contains ``d.irradiation`` by the internal ``Coupling`` that integrates it over the
     radiating faces (see the module docstring); other terms pass through."""
     if not isinstance(constraints, (list, tuple)):
         return constraints

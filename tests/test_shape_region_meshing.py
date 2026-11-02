@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno.domain.enclosure import build_enclosure
 
 
 def test_enclosure_on_a_shape_domain_has_an_occluder_model():
@@ -27,7 +28,7 @@ def test_enclosure_on_a_shape_domain_has_an_occluder_model():
         + jno.Shape.rect(0, 0, 10, 10, size=1.0).name("medium")
     ).domain()
 
-    gap = d.enclosure(["left", "blocker", "right"], medium_tags=["medium"], axisymmetric=True, enforce_closure=False)
+    gap = build_enclosure(d, ["left", "blocker", "right"], medium_tags=["medium"], axisymmetric=True, enforce_closure=False)
     tags = np.array([str(t) for t in np.asarray(gap.element_tags)])
     F = np.asarray(gap.view_factor)
     lo, hi = tags == "left", tags == "right"

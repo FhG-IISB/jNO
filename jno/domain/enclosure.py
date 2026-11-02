@@ -1,17 +1,16 @@
-"""Enclosure radiation handle: ``domain.enclosure(tags)``.
+"""View factors of diffuse-grey enclosures: the geometry behind ``d.irradiation`` (``jno.domain.radiation``).
 
-An :class:`Enclosure` turns a set of boundary tags into the geometric ingredients an enclosure-radiation
-boundary condition needs — built directly from the **FEM mesh boundary edges**, so the view-factor rows
-align with global mesh nodes (and therefore FEM DOFs for a P1 field). The radiating surface is
-discretised into **boundary elements** (mesh edges in 2D / meridional segments in the axisymmetric
-``(r, z)`` plane); the element-to-element view-factor matrix ``F`` is *fully geometry-determined* —
-occlusion (visibility) and orientation (cosine) decide every entry, only the ``i == i`` self-pair is
-removed. Tags are merely element groups (for per-surface emissivity); they never block exchange, so a
-concave surface keeps its self-view.
+An :class:`Enclosure` turns a set of surfaces into the geometric ingredients of enclosure radiation, built
+directly from the **FEM mesh edges**, so the view-factor rows align with global mesh nodes. The radiating surface
+is discretised into **elements** (mesh edges in 2D / meridional segments in the axisymmetric ``(r, z)`` plane);
+the element-to-element view-factor matrix ``F`` is *fully geometry-determined* -- occlusion (visibility) and
+orientation (cosine) decide every entry, only the ``i == i`` self-pair is removed. Tags are merely element groups
+(for per-surface emissivity); they never block exchange, so a concave surface keeps its self-view.
 
-The radiosity physics (``q = (I-F)(I-diag(rho)F)^-1 diag(eps) sigma T^4``) is written by the user in
-``jno.np`` on top of ``enclosure.view_factor``; this module only supplies the quality-gated ``F``, the
-element/node bookkeeping, and the per-element measure used to scatter a flux back onto FEM nodes.
+:func:`enclosures_of_medium` finds the surfaces of every connected transparent medium and caches their view
+factors on disk; :func:`radiosity_irradiation` and :func:`radiosity_resolvent` are the radiosity solve and the
+resolvent its exact tangent needs. The radiation term itself is written as the equation, ``d.eps(T) * (SIGMA *
+T**4 - d.irradiation(T)) * v * dS``, and lowered in ``jno.domain.radiation``.
 
 Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4-5 (view factors; the net-radiation /
 radiosity method for diffuse-grey enclosures).
@@ -25,10 +24,7 @@ from typing import List, Optional, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import sparse as jsparse
-from jax.scipy.sparse.linalg import gmres
 
-from ..trace import Placeholder
 from .mesh_utils import MeshUtils
 
 
@@ -451,160 +447,6 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, occluders=Non
     return vis
 
 
-def _consistent_node_weights(areas: np.ndarray, endpoints, axisymmetric: bool) -> np.ndarray:
-    r"""Per-element P1 load weights ``(m, 2)``: the two endpoint shares of ``\int_elem N_i \,d\Gamma``.
-
-    **2D** — the measure is the edge length and ``N_i`` is symmetric about the midpoint, so each endpoint
-    takes half: ``(L/2, L/2)``.
-
-    **Axisymmetric** — the measure carries the ring Jacobian, ``d\Gamma = 2\pi r \,ds``, and ``r`` varies
-    linearly along the element (``r(s) = r_0 + s\,\Delta``, ``\Delta = r_1 - r_0``). The halves are then
-    *not* equal: the endpoint at the larger radius sweeps more area. With ``L`` the meridional length,
-
-    .. math::
-        \int_0^1 (1-s)\,r(s)\,2\pi L\,ds = \tfrac{\pi L}{3}(2r_0 + r_1), \qquad
-        \int_0^1 s\,r(s)\,2\pi L\,ds     = \tfrac{\pi L}{3}(r_0 + 2r_1)
-
-    which still sums to the ring area ``2\pi \bar{r} L`` but splits it ``(2r_0+r_1) : (r_0+2r_1)``. Using
-    the 2D half-and-half split instead is exact only for an element at constant radius (a cylindrical
-    wall, ``\Delta = 0``); for a radial element spanning ``0 \to R`` -- an end disc, which every closed
-    axisymmetric cavity has -- it puts ``R/4`` on each node where the truth is ``R/6`` and ``R/3``, i.e.
-    50% too much on the inner node. These weights integrate a linear test function EXACTLY (verified
-    against ``\int 2\pi r \cdot r\,dr``), which the equal split does not.
-    """
-    areas = np.asarray(areas, dtype=np.float64)
-    if not axisymmetric or endpoints is None:
-        half = 0.5 * areas
-        return np.stack([half, half], axis=1)
-    e0, e1 = (np.asarray(e, dtype=np.float64) for e in endpoints)
-    r0, r1 = e0[:, 0], e1[:, 0]
-    length = np.linalg.norm(e1 - e0, axis=1)
-    w0 = np.pi * length * (2.0 * r0 + r1) / 3.0
-    w1 = np.pi * length * (r0 + 2.0 * r1) / 3.0
-    return np.stack([w0, w1], axis=1)
-
-
-class PendingElementExpr:
-    """A per-element computation still waiting for the solution vector.
-
-    Produced by :meth:`Enclosure.field` when it is handed a *symbolic* trial function rather than a
-    concrete DOF vector, and consumed by :meth:`Enclosure.load`, which closes it into a
-    ``jno.Coupling``. Arithmetic records the operation instead of performing it, so a nonlocal term is
-    written as an expression in the ``jno.fem([...])`` list::
-
-        gap.load(G @ gap.field(u) ** 4)              # an expression, sits in the term list
-        lambda T: gap.load(G @ gap.field(T) ** 4)    # the same thing, written by hand
-
-    This is not radiation-specific. Every nonlocal term in jNO has the same **gather -> operate ->
-    scatter** shape -- integral and non-reflecting BCs, contact, peridynamics -- and ``field``/``load``
-    are already the gather and the scatter, so deferring them covers all of them with one mechanism.
-    The physics in between stays yours to write.
-
-    This is the **residual** spelling of that shape: it produces a load vector, in-residual, with the
-    nonlocality carried exactly in the tangent. :func:`jno.derived` is the **value** spelling -- a nodal
-    field, lagged, usable anywhere a field is. An enclosure flux fits either (divide ``load`` by the
-    consistent weights ``gap.load(ones)`` to get nodal values); a quantity needed INSIDE a term, like a
-    beam's attenuation multiplying a source, fits only the second. See ``docs/fem/geometry.md``.
-
-    .. important::
-       The block this produces is **dense** in element space. It reads like a weak term and is not
-       one: its Jacobian couples every element to every other. The expression records which DOFs its
-       gathers read (``_reads``), and :meth:`Enclosure.load` hands that support to the ``Coupling``, so
-       ``jno.fem`` can assemble the block as a dense ``k x k`` patch on exactly those DOFs, next to the
-       sparse local tangent, instead of leaving the whole solve matrix-free.
-
-    Args:
-        fn: the recorded computation, ``u -> per-element array``, applied once the solution is known.
-        reads: the DOFs ``fn`` reads (any integer array); ``None`` when unknown, and then nothing may
-            assume a support.
-    """
-
-    __slots__ = ("_fn", "_reads", "_owner")
-
-    # NumPy checks this before trying to coerce an unknown right operand, so `ndarray @ pending`
-    # reaches __rmatmul__ instead of being turned into an object array. JAX arrays already return
-    # NotImplemented for unrecognized operands, which routes there too.
-    __array_priority__ = 1000.0
-    __array_ufunc__ = None
-
-    def __init__(self, fn, reads=None, owner=None):
-        self._fn = fn
-        # The DOFs `fn` reads, as a sorted index array; None when unknown (then nothing may assume a support).
-        self._reads = None if reads is None else np.unique(np.asarray(reads, dtype=np.int64).reshape(-1))
-        # The Enclosure / EnclosureSet whose elements the values belong to (for per-element properties,
-        # ``d.eps(gap.field(T))``); kept through arithmetic, dropped when two different owners meet.
-        self._owner = owner
-
-    def __call__(self, u):
-        return self._fn(u)
-
-    def _lift(self, other, op, swap=False):
-        fn = self._fn
-        if isinstance(other, PendingElementExpr):
-            g = other._fn
-            reads = None if self._reads is None or other._reads is None else np.union1d(self._reads, other._reads)
-            owner = (
-                self._owner
-                if other._owner is None or other._owner is self._owner
-                else (other._owner if self._owner is None else None)
-            )
-            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)), reads, owner)
-        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other), self._reads, self._owner)
-
-    def __add__(self, o):
-        return self._lift(o, lambda a, b: a + b)
-
-    def __radd__(self, o):
-        return self._lift(o, lambda a, b: a + b, swap=True)
-
-    def __sub__(self, o):
-        return self._lift(o, lambda a, b: a - b)
-
-    def __rsub__(self, o):
-        return self._lift(o, lambda a, b: a - b, swap=True)
-
-    def __mul__(self, o):
-        return self._lift(o, lambda a, b: a * b)
-
-    def __rmul__(self, o):
-        return self._lift(o, lambda a, b: a * b, swap=True)
-
-    def __truediv__(self, o):
-        return self._lift(o, lambda a, b: a / b)
-
-    def __rtruediv__(self, o):
-        return self._lift(o, lambda a, b: a / b, swap=True)
-
-    def __matmul__(self, o):
-        return self._lift(o, lambda a, b: a @ b)
-
-    def __rmatmul__(self, o):
-        return self._lift(o, lambda a, b: a @ b, swap=True)
-
-    def __pow__(self, o):
-        return self._lift(o, lambda a, b: a**b)
-
-    def __neg__(self):
-        fn = self._fn
-        return PendingElementExpr(lambda u: -fn(u), self._reads, self._owner)
-
-    def apply(self, fn):
-        """Record an arbitrary elementwise/array function, for anything the operators do not cover
-        (``gap.field(u).apply(jnp.exp)``).
-
-        Args:
-            fn: an array function applied to the per-element values.
-
-        Returns:
-            PendingElementExpr: the extended record.
-        """
-        inner = self._fn
-        return PendingElementExpr(lambda u: fn(inner(u)), self._reads, self._owner)
-
-    def __repr__(self):
-        return "PendingElementExpr(<pending nonlocal term; pass to enclosure.load>)"
-
-
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
@@ -621,7 +463,7 @@ class Enclosure:
         nodes ((k,) np.ndarray): Unique global node indices used by the enclosure (FEM DOFs for a scalar
             P1 field).
 
-    Built by ``d.enclosure(...)``.
+    Built by :func:`build_enclosure`; ``d.irradiation`` builds one per transparent medium.
 
     Args:
         domain: the domain the surfaces belong to.
@@ -633,21 +475,18 @@ class Enclosure:
         normals: per-element unit normals into the enclosure.
         midpoints: per-element midpoints.
         axisymmetric: whether the geometry is axisymmetric (ring elements).
-        endpoints: per-element endpoint coordinates, when kept.
     """
 
-    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric, endpoints=None):
+    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric):
         self.domain = domain
         self.tags = list(tags)
         self._F = jnp.asarray(F)
-        self._storage = "dense"
         self.elements = np.asarray(elements)
         self.element_tags = np.asarray(element_tags, dtype=object)
         self.areas = jnp.asarray(areas)
         self.normals = jnp.asarray(normals)
         self.midpoints = np.asarray(midpoints)
         self.axisymmetric = bool(axisymmetric)
-        self._node_weights = jnp.asarray(_consistent_node_weights(np.asarray(areas), endpoints, self.axisymmetric))
 
     @property
     def size(self) -> int:
@@ -656,37 +495,8 @@ class Enclosure:
 
     @property
     def view_factor(self):
-        """The element-to-element diffuse view factor ``F``, ``(m, m)`` (rows: receiving elements). A dense array,
-        or a ``jax.experimental.sparse.BCOO`` after :meth:`set_storage` ``("sparse")`` -- code that indexes it or
-        passes it to ``jnp.linalg`` needs the dense one."""
+        """The element-to-element diffuse view factor ``F``, ``(m, m)`` (rows: receiving elements)."""
         return self._F
-
-    @property
-    def storage(self) -> str:
-        """``"dense"`` or ``"sparse"``: how ``F`` is held (see :meth:`set_storage`)."""
-        return getattr(self, "_storage", "dense")
-
-    def set_storage(self, mode: str = "auto") -> "Enclosure":
-        """Hold ``F`` dense or sparse. ``"sparse"`` keeps only the nonzero view factors (faces that cannot see each
-        other are exact zeros) as a BCOO; the radiosity then runs on sparse matvecs with GMRES instead of a dense LU
-        (:func:`radiosity_irradiation`). ``"auto"`` picks sparse for ``m >= AUTO_SPARSE_MIN_FACES`` faces with at
-        most ``AUTO_SPARSE_MAX_FILL`` of the entries nonzero, dense otherwise (below that a dense LU is faster and
-        the matrix is small). Returns ``self``."""
-        if mode not in ("dense", "sparse", "auto"):
-            raise ValueError(f"storage must be 'dense', 'sparse' or 'auto', got {mode!r}.")
-        F = self._dense_F()
-        m = F.shape[0]
-        if mode == "auto":
-            sparse = m >= AUTO_SPARSE_MIN_FACES and np.count_nonzero(F) <= AUTO_SPARSE_MAX_FILL * m * m
-            mode = "sparse" if sparse else "dense"
-        if mode != self.storage:
-            self._F = jsparse.BCOO.fromdense(jnp.asarray(F)) if mode == "sparse" else jnp.asarray(F)
-            self._storage = mode
-        return self
-
-    def _dense_F(self) -> np.ndarray:
-        """``F`` as a dense NumPy array whatever the storage."""
-        return np.asarray(self._F.todense() if self.storage == "sparse" else self._F)
 
     @property
     def nodes(self) -> np.ndarray:
@@ -697,91 +507,12 @@ class Enclosure:
         """Boolean (m,) mask of elements belonging to ``tag`` — e.g. to build a per-element emissivity."""
         return self.element_tags == tag
 
-    def emissivity(self, values) -> jnp.ndarray:
-        """Per-element emissivity ``(m,)`` from a ``{tag: eps}`` mapping (or a scalar for all surfaces).
-
-        Args:
-            values: a scalar for every surface, or ``{tag: eps}``.
-
-        Returns:
-            jnp.ndarray: one emissivity per element.
-        """
-        if np.isscalar(values):
-            return jnp.full(self.size, float(values))
-        eps = np.zeros(self.size)
-        for tag, val in dict(values).items():
-            eps[self.tag_mask(tag)] = float(val)
-        return jnp.asarray(eps)
-
-    def field(self, u) -> jnp.ndarray:
-        """Per-element temperature ``(m,)`` from the global solution ``u`` — the **nonlocal gather**.
-
-        Radiosity is piecewise-constant per boundary element, so each element's temperature is the mean
-        of its two endpoint (FEM node) values. Differentiable in ``u`` (used inside the Newton residual).
-
-        Handed a **symbolic** trial function (``u, v = d.fem_symbols()``) instead of a concrete DOF
-        vector, this returns a :class:`PendingElementExpr` instead: the gather is recorded, arithmetic
-        on it is recorded, and :meth:`load` closes it into a ``jno.Coupling``. That is what lets a
-        nonlocal term be written as an expression in the ``jno.fem([...])`` list rather than a lambda."""
-        if isinstance(u, Placeholder):
-            return PendingElementExpr(self.field, reads=self.nodes, owner=self)
-        u = jnp.asarray(u).reshape(-1)
-        return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
-
-    def load(self, q, *, size: Optional[int] = None) -> jnp.ndarray:
-        """Consistent global surface load ``(n_dofs,)`` from a per-element flux ``q`` ``(m,)``.
-
-        Scatters ``∫_Γ q v dΓ`` onto the FEM nodes for piecewise-constant ``q`` and P1 test functions.
-        In 2D the two endpoints split the edge evenly; in **axisymmetric** mode the ring Jacobian
-        ``2πr`` weights them by radius instead (see :func:`_consistent_node_weights`), which is what
-        makes the load exact for a linear test function on a radial element. ``size`` defaults to the
-        mesh node count (scalar P1 DOF layout).
-
-        .. important::
-           With ``axisymmetric=True`` this load is **per full revolution** (W, not W/m): the measure is
-           ``2πr ds``. jNO does not weight the FEM forms for you, so the weak form this load is added to
-           must carry the same ``2πr`` factor or the two sides differ by exactly that. See the
-           *Axisymmetric* section of ``docs/fem/geometry.md``.
-
-        Given a :class:`PendingElementExpr` (anything built from a symbolic ``field(u)``) this returns
-        the ``jno.Coupling`` that closes it over the solution vector, so the whole nonlocal term is an
-        expression that drops straight into the ``jno.fem([...])`` list."""
-        if isinstance(q, PendingElementExpr):
-            from .._fem import Coupling  # local: jno._fem imports the domain package
-
-            tags = ",".join(map(str, self.tags)) if getattr(self, "tags", None) else "enclosure"
-            c = Coupling(lambda u: self.load(q(u), size=size), name=f"enclosure[{tags}]")
-            # Exact support: the gathers read q._reads, and the scatter writes onto this enclosure's nodes.
-            # jno.fem assembles the coupling's Jacobian as a dense block on these DOFs only.
-            if q._reads is not None:
-                c._support = np.union1d(q._reads, self.nodes)
-            return c
-        q = jnp.asarray(q).reshape(-1)
-        n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
-        w = self._node_weights.astype(q.dtype)
-        load = jnp.zeros(n, dtype=q.dtype)
-        load = load.at[jnp.asarray(self.elements[:, 0])].add(q * w[:, 0])
-        load = load.at[jnp.asarray(self.elements[:, 1])].add(q * w[:, 1])
-        return load
-
-    def irradiation(self, T, eps):
-        """Incident radiation ``G`` (W/m^2) on every element, for the element temperatures ``T`` and emissivities
-        ``eps`` of a diffuse-grey enclosure (Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 5)::
-
-            J = eps sigma T^4 + (1 - eps) G,   G = F J   ->   J = (I - diag(1 - eps) F)^-1 eps sigma T^4
-
-        ``T`` and ``eps`` are per-element values -- arrays, or :class:`PendingElementExpr` such as
-        ``gap.field(T)`` and ``d.eps(gap.field(T))`` -- and ``eps`` may also be one number. With a pending
-        argument the result is pending too, so the net flux is written as the equation, e.g.
-        ``gap.load(e * (SIGMA * Te**4 - gap.irradiation(Te, eps=e)))``."""
-        return _irradiation_of(self, [self], T, eps)
-
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
 
         ``closure_error = max|sum_j F_ij - 1|`` (should -> 0 for a closed enclosure) and
         ``reciprocity_error = max|A_i F_ij - A_j F_ji|`` (should -> 0 by reciprocity)."""
-        F = self._dense_F()
+        F = np.asarray(self._F)
         A = np.asarray(self.areas)
         closure = float(np.abs(F.sum(axis=1) - 1.0).max())
         reciprocity = float(np.abs(A[:, None] * F - (A[:, None] * F).T).max())
@@ -1163,10 +894,10 @@ def build_enclosure(
         tags = [tags]
     tags = [str(t) for t in tags]
     if not tags:
-        raise ValueError("domain.enclosure requires at least one boundary tag.")
+        raise ValueError("build_enclosure requires at least one boundary tag.")
     if int(getattr(domain, "dimension", 0)) != 2:
         raise NotImplementedError(
-            "domain.enclosure is implemented for 2D and axisymmetric (r, z) meshes; 3D enclosure radiation is future work."
+            "Enclosure radiation is implemented for 2D and axisymmetric (r, z) meshes; 3D enclosure radiation is future work."
         )
 
     mesh = domain.mesh
@@ -1188,7 +919,7 @@ def build_enclosure(
             mask[np.asarray(tag_indices[tag], dtype=np.int64)] = True
             return mask
         raise ValueError(
-            f"domain.enclosure: tag '{tag}' has neither a spatial predicate (domain.tag) nor mesh node "
+            f"build_enclosure: tag '{tag}' has neither a spatial predicate (domain.tag) nor mesh node "
             "indices; define it with domain.tag(name, predicate) or as a geometry part."
         )
 
@@ -1207,7 +938,7 @@ def build_enclosure(
                     elem_tag.append(tag)
                     break
         if not elem_nodes_list:
-            raise ValueError(f"domain.enclosure: no boundary elements found on tags {tags}.")
+            raise ValueError(f"build_enclosure: no boundary elements found on tags {tags}.")
     else:
         # Interface mode: radiating elements are internal solid|medium interface edges. ``tags`` are
         # solid geometry-part names; ``medium_tags`` are the transparent (meshed) media. The normal of
@@ -1237,7 +968,7 @@ def build_enclosure(
                 third[key] = t1
         if not elem_nodes_list:
             raise ValueError(
-                f"domain.enclosure: no solid|medium interface elements found between tags {tags} and "
+                f"build_enclosure: no solid|medium interface elements found between tags {tags} and "
                 f"medium_tags {list(medium_tags)}."
             )
     elem_nodes = np.asarray(elem_nodes_list, dtype=np.int64)  # (m, 2)
@@ -1377,131 +1108,42 @@ def build_enclosure(
     if enforce_closure:
         F = _enforce_closure(F, areas, n_iter=closure_iters)
 
-    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric, endpoints=(e0, e1))
+    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric)
 
 
 STEFAN_BOLTZMANN = 5.670374419e-8  # W / (m^2 K^4)
 
-#: ``set_storage("auto")`` goes sparse from this many faces, when at most this share of ``F`` is nonzero. Below
-#: it a dense LU of the m x m radiosity system is faster than GMRES and the matrix is small.
-AUTO_SPARSE_MIN_FACES = 2000
-AUTO_SPARSE_MAX_FILL = 0.3
-
-_RADIATION_STORAGE = "auto"
-
-
-def set_radiation_storage(mode: str) -> None:
-    """Process-wide storage of the radiation view factors: ``"auto"`` (default), ``"dense"`` or ``"sparse"``; what
-    ``jno.setup(radiation_storage=...)`` and ``[jno] radiation_storage`` set. Read when ``d.irradiation`` terms are
-    lowered, so it applies to every radiation term built after it."""
-    global _RADIATION_STORAGE
-    if mode not in ("dense", "sparse", "auto"):
-        raise ValueError(f"radiation_storage must be 'dense', 'sparse' or 'auto', got {mode!r}.")
-    _RADIATION_STORAGE = mode
-
-
-def get_radiation_storage() -> str:
-    """The current radiation storage mode (see :func:`set_radiation_storage`)."""
-    return _RADIATION_STORAGE
-
-
-def _radiosity_matrix_solve(F, eps, b):
-    """``(I - diag(1-eps) F)^-1 b`` for a BCOO ``F``, by restarted GMRES on sparse matvecs (nothing dense is formed).
-    ``diag(1-eps) F`` has spectral radius at most ``max(1-eps)`` (rows of a closed enclosure's ``F`` sum to one), so
-    it converges geometrically when every face has ``eps > 0``. Convergence is not checked (it runs traced)."""
-    rho = 1.0 - eps
-    return gmres(lambda x: x - rho * (F @ x), b, x0=b, tol=1e-12, restart=40, maxiter=200)[0]
-
 
 def radiosity_irradiation(F, eps, t):
     """The incident radiation ``G = F J`` of one diffuse-grey enclosure, ``J = (I - diag(1-eps) F)^-1 eps sigma t^4``
-    (Modest, Ch. 5). ``F`` dense: a dense solve; ``F`` a BCOO: GMRES (:func:`_radiosity_matrix_solve`)."""
+    (Modest, Ch. 5), by a dense solve."""
     rhs = eps * STEFAN_BOLTZMANN * t**4
-    if isinstance(F, jsparse.BCOO):
-        J = _radiosity_matrix_solve(F, eps, rhs)
-    else:
-        J = jnp.linalg.solve(jnp.eye(rhs.shape[0], dtype=rhs.dtype) - (1.0 - eps)[:, None] * F, rhs)
+    J = jnp.linalg.solve(jnp.eye(rhs.shape[0], dtype=rhs.dtype) - (1.0 - eps)[:, None] * F, rhs)
     return F @ J
 
 
 def radiosity_resolvent(F, eps):
     """``(I - diag(1-eps) F)^-1`` as a dense ``(m, m)`` array: what the exact tangent of ``G`` needs, once per
-    Newton step (``dG/dT = F (I - diag(1-eps) F)^-1 diag(h)``). Dense LU, or one GMRES per column (vmapped) when
-    ``F`` is sparse: the result is m x m either way, only ``F`` itself stays sparse."""
+    Newton step (``dG/dT = F (I - diag(1-eps) F)^-1 diag(h)``)."""
     eye = jnp.eye(F.shape[0], dtype=jnp.result_type(eps, float))
-    if isinstance(F, jsparse.BCOO):
-        return jax.vmap(lambda b: _radiosity_matrix_solve(F, eps, b), in_axes=1, out_axes=1)(eye)
     return jnp.linalg.solve(eye - (1.0 - eps)[:, None] * F, eye)
 
 
-def _irradiation_of(owner, parts, T, eps):
-    """G per element for the enclosures ``parts`` (one radiosity system each, concatenated in their order)."""
-    pend = [a for a in (T, eps) if isinstance(a, PendingElementExpr)]
-    sizes = [p.size for p in parts]
-    cuts = np.cumsum([0, *sizes])
-
-    def values(u):
-        t = jnp.asarray(T(u) if isinstance(T, PendingElementExpr) else T, dtype=jnp.float64).reshape(-1)
-        e = eps(u) if isinstance(eps, PendingElementExpr) else eps
-        e = jnp.broadcast_to(jnp.asarray(e, dtype=t.dtype), t.shape)
-        out = []
-        for part, a, b in zip(parts, cuts[:-1], cuts[1:]):
-            out.append(radiosity_irradiation(part.view_factor, e[a:b], t[a:b]))
-        return jnp.concatenate(out)
-
-    if not pend:
-        return values(None)
-    reads = None if any(p._reads is None for p in pend) else np.unique(np.concatenate([p._reads for p in pend]))
-    return PendingElementExpr(values, reads, owner)
-
-
 class EnclosureSet:
-    """Several enclosures handled as one: the radiating faces of every connected transparent medium of a domain,
-    from :meth:`jno.domain.enclosure` with ``medium=``. Each medium is its own radiosity system (no exchange
-    between media); ``field``, ``irradiation``, ``load`` and ``element_tags`` run over all of them, in order."""
+    """The radiating faces of every connected transparent medium of a domain (what ``d.irradiation`` integrates
+    over), one :class:`Enclosure` per medium: each is its own radiosity system, no exchange between media."""
 
     def __init__(self, parts, media):
         self.parts = list(parts)
         self.media = [list(m) for m in media]
-        self._cuts = np.cumsum([0, *[p.size for p in self.parts]])
 
     @property
     def size(self) -> int:
-        return int(self._cuts[-1])
-
-    @property
-    def nodes(self) -> np.ndarray:
-        return np.unique(np.concatenate([p.nodes for p in self.parts]))
+        return int(sum(p.size for p in self.parts))
 
     @property
     def element_tags(self) -> np.ndarray:
         return np.concatenate([p.element_tags for p in self.parts])
-
-    def tag_mask(self, tag: str) -> np.ndarray:
-        return self.element_tags == tag
-
-    def field(self, u):
-        """Per-element temperature over all media (pending for a symbolic field, as :meth:`Enclosure.field`)."""
-        if isinstance(u, Placeholder):
-            return PendingElementExpr(self.field, reads=self.nodes, owner=self)
-        return jnp.concatenate([p.field(u) for p in self.parts])
-
-    def irradiation(self, T, eps):
-        """:meth:`Enclosure.irradiation` of every medium, concatenated."""
-        return _irradiation_of(self, self.parts, T, eps)
-
-    def load(self, q, *, size: Optional[int] = None):
-        """Consistent nodal load of a per-element flux over all media (a ``jno.Coupling`` for a pending flux)."""
-        if isinstance(q, PendingElementExpr):
-            from .._fem import Coupling
-
-            names = "; ".join(",".join(m) for m in self.media)
-            c = Coupling(lambda u: self.load(q(u), size=size), name=f"enclosures[{names}]")
-            if q._reads is not None:
-                c._support = np.union1d(q._reads, self.nodes)
-            return c
-        q = jnp.asarray(q).reshape(-1)
-        return sum(p.load(q[a:b], size=size) for p, a, b in zip(self.parts, self._cuts[:-1], self._cuts[1:]))
 
     def __repr__(self):
         return f"EnclosureSet({len(self.parts)} media: " + "; ".join(repr(p) for p in self.parts) + ")"
@@ -1545,7 +1187,6 @@ def _cached_enclosure(domain, tags, medium, options, cache):
         enc.__dict__.update(st)
         enc.domain = domain
         enc._F, enc.areas, enc.normals = jnp.asarray(st["_F"]), jnp.asarray(st["areas"]), jnp.asarray(st["normals"])
-        enc._node_weights = jnp.asarray(st["_node_weights"])
         log.info(f"enclosure[{','.join(medium)}]: view factors loaded from the cache ({path.name})")
         return enc
     t0 = time.time()
@@ -1578,9 +1219,7 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     medium_regions = [str(m) for m in medium_regions]
     unknown = [m for m in medium_regions if m not in regions]
     if unknown:
-        raise ValueError(
-            f"domain.enclosure(medium=...): {unknown} are not volume regions of this mesh; known: {sorted(regions)}."
-        )
+        raise ValueError(f"d.irradiation: {unknown} are not volume regions of this mesh; known: {sorted(regions)}.")
     tri = np.asarray(p1_cells_dict(mesh)["triangle"])
     nodes = {m: set(np.unique(tri[regions[m]]).tolist()) for m in medium_regions}
 
@@ -1638,14 +1277,12 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
         leak = bnd & cells[owner] & ~on_axis
         if leak.any():
             raise ValueError(
-                f"domain.enclosure(medium=...): the transparent medium {g} reaches the domain boundary at "
+                f"d.irradiation: the transparent medium {g} reaches the domain boundary at "
                 f"{int(leak.sum())} edge(s), so radiation would leave it through a surface that is not modelled. "
                 "Close it with a solid part, or model the outside explicitly."
             )
         solids = sorted(neighbours[tuple(g)])
         if not solids:
-            raise ValueError(
-                f"domain.enclosure(medium=...): the transparent medium {g} has no solid neighbour to radiate from."
-            )
+            raise ValueError(f"d.irradiation: the transparent medium {g} has no solid neighbour to radiate from.")
         parts.append(_cached_enclosure(domain, solids, g, options, cache))
     return EnclosureSet(parts, media)

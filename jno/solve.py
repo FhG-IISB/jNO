@@ -660,8 +660,8 @@ def _root_driver(
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
             if jacobian is None:
-                # No assembled tangent (a residual-only operator, or a Coupling that did not declare which
-                # DOFs it touches): the user asked for a direct solve, so materialise the Jacobian DENSELY.
+                # No assembled tangent (a residual-only operator, or a nonlocal term that did not declare
+                # which DOFs it touches): the user asked for a direct solve, so materialise the Jacobian DENSELY.
                 jacobian, linear_solve = _dense_tangent(residual_fn, u0, linear_solve)
             from .utils.solver.newton_krylov import newton_direct
 
@@ -735,7 +735,7 @@ def _dense_tangent(residual_fn, u0, linear_solve):
     n = int(_np.size(u0))
     get_logger().warning(
         f"newton(direct=True): this problem has no assembled tangent (a residual-only operator, or a "
-        f"jno.Coupling that does not declare the DOFs it touches), so its Jacobian is materialised DENSE by "
+        f"nonlocal term that does not declare the DOFs it touches), so its Jacobian is materialised DENSE by "
         f"forward-mode AD: {n} x {n} = {8 * n * n / 2**20:.1f} MB, {n} JVPs and a dense LU per Newton step. "
         f"Fine for small problems; for large ones use the matrix-free default (drop direct=True)."
     )
