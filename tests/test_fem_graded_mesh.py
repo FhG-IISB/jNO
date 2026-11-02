@@ -82,3 +82,15 @@ def test_a_graded_mesh_composes_with_a_time_grid():
     size, yc, n = _element_sizes(d)
     assert n > 0 and np.isfinite(size).all()
     assert size[yc < 0.25 * BAND].mean() > 3.0 * size[yc > LY - 0.25 * BAND].mean()
+
+
+def test_a_size_callable_on_a_multi_region_plan_composes_with_region_sizes():
+    """Regions with their own `.size()` take the region-sizing path; a callable on the whole plan must still
+    refine there (min with the region sizes), not be dropped. Left half fine by the callable, right coarse."""
+    R = jno.shape.rect
+    f = lambda x, y, z: 0.01 if x < 0.5 else 0.2  # noqa: E731
+    plan = (R(0, 0, 1, 1).name("a").size(0.05) + R(0, 0, 2, 1).name("b").size(0.2)).sized(f)
+    p = np.asarray(plan.domain().mesh.points)
+    left = int((p[:, 0] < 0.5).sum())
+    # a 0.5 x 1 strip at h = 0.01 holds thousands of nodes; at the region size 0.05 a few hundred
+    assert left > 2000, left
