@@ -3413,7 +3413,9 @@ class domain(MeshIOMixin):
         what makes a boundary tag silently unsamplable, so it is settled here rather than left to
         an empty rejection loop to discover.
         """
-        plan, dim = self._lazy_plan, int(self.dimension)
+        # once the mesh is built the mesh-free plan is consumed; the shape it came from is kept
+        plan = self.__dict__.get("_lazy_plan") or self.__dict__.get("_shape_plan")
+        dim = int(self.dimension)
         rng = np.random.default_rng(0)
         inner = plan.sample_interior(self._GEOMETRY_PILOT, rng)
         edge, _nrm = plan.sample_boundary(self._GEOMETRY_PILOT, rng)
@@ -3431,7 +3433,9 @@ class domain(MeshIOMixin):
         """
         from ..geometry.naming import _classify
 
-        plan, dim = self._lazy_plan, int(self.dimension)
+        # once the mesh is built the mesh-free plan is consumed; the shape it came from is kept
+        plan = self.__dict__.get("_lazy_plan") or self.__dict__.get("_shape_plan")
+        dim = int(self.dimension)
         pts_out, nrm_out, have = [], [], 0
         for _ in range(10_000):
             batch = max(4 * (n - have), 256)
