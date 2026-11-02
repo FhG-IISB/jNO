@@ -614,6 +614,45 @@ def _has_time_variable(node):
     return any(_has_time_variable(c) for c in _iter(n))
 
 
+def _unknown_initial(model):
+    """The trial symbol of a ``domain.unknown()`` field (its Model) when ``.initialize`` gave it a value."""
+    sym = getattr(model, "__dict__", {}).get("_unknown_symbol")
+    return sym if sym is not None and "_initial" in sym.__dict__ else None
+
+
+def _initial_condition_terms(constraints, unknowns):
+    """Append ``u(initial) - u0`` for each field initialized on a time-dependent domain (``u.initialize(u0)``).
+    Returns the terms and ``[(symbol, version)]`` of the values used."""
+    from .trace import ModelCall
+
+    out, used = list(constraints), []
+    for model in unknowns:
+        sym = _unknown_initial(model)
+        dom = getattr(model, "_fem_field_domain", None)
+        if sym is None or not getattr(dom, "_is_time_dependent", False):
+            continue
+        calls = []
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, ModelCall) and n.model is model:
+                calls.append(n)
+            for c in _iter(n):
+                walk(c)
+
+        for c in constraints:
+            walk(c)
+        if any(_region_tag(c) == "initial" and not _has_temporal(c) and _contains_unknown(c, model) for c in constraints):
+            raise ValueError(
+                f"jno.fdm: the initial state of {sym.name} is given twice, by {sym.name}.initialize(...) and by a "
+                f"term {sym.name}(initial) - u0. Keep one."
+            )
+        coords = dom.variable("initial", split=True)[: dom.dimension]
+        out.append(calls[0](*coords) - sym.__dict__["_initial"])
+        used.append((sym, sym.__dict__.get("_initial_version", 0)))
+    return out, used
+
+
 def _find_unknowns(constraints):
     """All ``domain.unknown()`` fields (nodal-field-parameter ModelCalls' Models) in the constraints, in
     **declaration** order — a **coupled** system has several, and ``.solve()`` returns one row per field in
@@ -881,6 +920,8 @@ class _TraceFDM:
     def __init__(self, constraints):
         self._constraints = list(constraints)  # kept verbatim so a coupled solve can re-author with an interface pin
         self.unknowns = _find_unknowns(constraints)  # coupled system ⇒ several, in declaration order
+        # `u.initialize(u0)` on a time-dependent domain is the initial condition `u(initial) - u0`
+        constraints, self._initial_used = _initial_condition_terms(list(constraints), self.unknowns)
         self.unknown = self.unknowns[0]  # the single-field paths (transient/flux/parametric) use this
         self.domain = self.unknown._fem_field_domain
         from .geometry.parametric import refuse_if_parametric
@@ -2401,6 +2442,14 @@ class _TraceFDM:
         interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step."""
         if save_ts is not None and not self._transient:
             raise ValueError("jno.fdm([...]): save_ts= samples a transient march; this problem is steady.")
+        for _sym, _ver in self._initial_used:
+            if _sym.__dict__.get("_initial_version", 0) != _ver:
+                raise ValueError(
+                    f"jno.fdm: {_sym.name}.initialize(...) changed after jno.fdm was built; the initial state of a "
+                    "time-dependent problem is read when the problem is built. Call jno.fdm(...) again."
+                )
+        if x0 is None and not self._transient:
+            x0 = self._initialized_x0()
 
         def _run():
             trainable = self._trainable_params()
@@ -2435,6 +2484,47 @@ class _TraceFDM:
         from .utils.profiling import profile_solve
 
         return profile_solve(_run, label=f"fdm profile · {self._N} nodes · {'transient' if self._transient else 'steady'}")
+
+    def _initialized_x0(self):
+        """The steady start from the fields' ``.initialize(value)`` over the blocked DOF vector (zero for a field
+        without one), or None when no field is initialized. A number fills the field (or one value per component),
+        an array is ``(N,)`` / ``(N, components)`` node-major as ``jno.fem`` takes it, a formula is evaluated at
+        the grid nodes."""
+        from ._fem import _bare, _eval_value_node_at
+        from .trace import Placeholder
+
+        if not any(_unknown_initial(m) is not None for m in self.unknowns):
+            return None
+        x = jnp.zeros(self._Ntot)
+        for k, model in enumerate(self.unknowns):
+            sym = _unknown_initial(model)
+            if sym is None:
+                continue
+            val, nc = sym.__dict__["_initial"], self._ncomp[k]
+            if isinstance(_bare(val), Placeholder):
+                v = jnp.asarray(_eval_value_node_at(_bare(val), self._pts))
+            else:
+                v = jnp.asarray(val)
+            if jnp.iscomplexobj(v):
+                raise ValueError(f"{sym.name}.initialize: jno.fdm solves real fields; got a complex value.")
+            v = v.reshape(-1)
+            if v.size == 1:
+                v = jnp.full((self._N, nc), v[0])
+            elif nc > 1 and v.size == nc:
+                v = jnp.broadcast_to(v, (self._N, nc))
+            elif v.size == self._N * nc:
+                v = v.reshape(self._N, nc)
+            elif nc > 1 and v.size == self._N:
+                v = jnp.repeat(v[:, None], nc, axis=1)
+            else:
+                raise ValueError(
+                    f"{sym.name}.initialize: {v.size} values for a field of {self._N} nodes x {nc} components; give a "
+                    "number, one value per component, or one per node (and component)."
+                )
+            for c in range(nc):
+                b = self._block0[k] + c
+                x = x.at[b * self._N : (b + 1) * self._N].set(v[:, c].astype(x.dtype))
+        return x
 
     def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None, linear=None, precond=None):
         """The steady solve: fold the flux and Dirichlet rows into the residual and hand it to the

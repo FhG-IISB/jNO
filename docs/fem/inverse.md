@@ -71,15 +71,15 @@ solve happens **now**, returning the array rather than a node for `crux`:
 ```python
 cap = jno.np.parameter((1,), name="cap")
 fem = jno.fem([...])                                # built ONCE
-x = None
 for v in np.geomspace(G / 2000.0, G, 8):            # a continuation, as a plain Python loop
-    x = fem.solve(cap=v, x0=x, nonlinear=jno.solve.newton(direct=True))
+    x = fem.solve(cap=v, nonlinear=jno.solve.newton(direct=True))
+    u.initialize(x)                                 # the next solve starts here
 ```
 
 The alternative — rebuilding `jno.fem` per value — re-meshes, re-assembles and re-compiles the whole
 problem to change one number. Measured on an 8-value sweep: **6.20 s rebuilding, 0.55 s this way**.
 The solve is staged **once** (6 tracings for 8 values, not 48) because the value arrives as a runtime
-argument and jit keys on shape, not on value; `x0=` warm-starts across the sweep without re-staging.
+argument and jit keys on shape, not on value; `u.initialize(x)` warm-starts across the sweep without re-staging.
 
 The same call works on every path that solves: steady linear and nonlinear, a transient (it returns the
 trajectory), a load-path `.i(k)` march (the declared grid, an explicit `tau=<schedule>`, and the
@@ -349,7 +349,7 @@ steady forms and **coupled (multi-field)** forms, and with the scalar C¹ famili
 
 **Unknown boundary / initial conditions.** A network as an *essential value* is a trainable *profile*
 (it enters the lift, not the operator): a *Dirichlet* value `u(∂Ω) - net(xb, yb)` (an unknown boundary
-profile) or an *initial condition* `u(initial) - net(xi, yi)` (an unknown starting state, recovered from
+profile) or an *initial condition* `u.initialize(net(xi, yi))` (the same as the term `u(initial) - net(xi, yi)`) (an unknown starting state, recovered from
 a trajectory). Both supported for a **bare** `net(x)`, native Lagrange single-field — the Dirichlet on
 steady / nonlinear / linear-transient / nonlinear-transient forms, the IC on a linear-transient form; a
 compound value, or a net IC on a nonlinear transient, fails loud.

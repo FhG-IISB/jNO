@@ -483,7 +483,14 @@ class Placeholder:
         return fc
 
     def __call__(self, *args):
-        """Call this expression with different variables (auto-wraps in operation)."""
+        """Call this expression with different variables (auto-wraps in operation).
+
+        An attached property, ``d.k``, called with FIELDS rather than coordinate variables -- ``d.k(T)`` --
+        is the same coefficient with its material laws evaluated at them (``domain._attached_coefficient``)."""
+        prop = getattr(self, "_jno_property", None)
+        if prop is not None and args and not all(isinstance(a, Variable) for a in args):
+            domain, name = prop
+            return domain._attached_coefficient(name, args)
         # Auto-wrap this expression in an OperationDef if not already one
         if not hasattr(self, "_auto_op"):
             self._auto_op = OperationDef(self)
@@ -4466,6 +4473,14 @@ class ModelCall(Placeholder):
         Returns:
             ``self``, for chaining.
         """
+        sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+        if sym is not None:
+            # `u = d.unknown()`: its start value / initial state (a number, an array, a formula), as on a field
+            # from fem_symbols -- see TrialFunction.initialize. Not the weights of a network.
+            if key is not None:
+                raise TypeError(f"{sym.name}.initialize: an unknown's starting value takes no key=.")
+            sym.initialize(weights)
+            return self
         self.model.initialize(weights, key=key)
         return self
 
@@ -6369,6 +6384,34 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
                 t._complex_field_member = True
             self._test = t
         return t
+
+    def initialize(self, value) -> "TrialFunction":
+        """The field's starting value: a number, a nodal array (one value per DOF, node-major for a vector
+        field), or a formula of the coordinates (``jno.np`` functions, a parameter, a network)::
+
+            T.initialize(1500.0); A.initialize(a0); I.initialize(300.0)
+            u.initialize(jno.np.sin(jno.np.pi * x))
+
+        * **Steady problem:** the solve's starting point -- Newton's first iterate, an iterative linear solver's
+          warm start. Read when ``fem.solve()`` is called, so it may change between solves of one ``fem``
+          (a continuation: ``u.initialize(sol)`` before each). Fields not initialized start at zero.
+        * **Time-dependent domain:** the initial state, exactly the term ``u(initial) - value`` (which still
+          works; giving both for one field raises). ``jno.fem`` reads it when it is built, so set it first;
+          a change after the build raises at ``fem.solve()``. A velocity initial condition of a second-order
+          problem stays the term ``u.t(initial) - v0``.
+
+        Read by ``jno.fem`` and ``jno.fdm`` alike. Returns the field, so it chains:
+        ``T = d.unknown.scalar("T").initialize(300.0)``."""
+        import os as _os
+
+        if isinstance(value, (str, bytes, _os.PathLike)) or (callable(value) and not isinstance(value, Placeholder)):
+            raise TypeError(
+                f"{self.name}.initialize: a field starts at a number, a nodal array or a formula of the coordinates; "
+                f"got {type(value).__name__} (checkpoints and weight initializers are for networks)."
+            )
+        self.__dict__["_initial"] = value
+        self.__dict__["_initial_version"] = self.__dict__.get("_initial_version", 0) + 1
+        return self
 
     def across(self, main: str, *, domain):
         """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak

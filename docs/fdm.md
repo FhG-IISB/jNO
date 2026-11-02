@@ -465,7 +465,7 @@ jno.fdm([
     exactly via its owning tetrahedron's apex (a flat face gives an exact axis normal), so face-edge
     nodes keep their flux row; where a flux face meets a Dirichlet face, the Dirichlet value wins (its
     row is applied last). A nonlinear condition is fine when it is well posed: the Newton tangent of
-    `(∂u/∂n)³ − g³` is zero at a zero initial guess, and that solve fails loudly. Give `x0=`, or write a
+    `(∂u/∂n)³ − g³` is zero at a zero initial guess, and that solve fails loudly. Give a start (`u.initialize(u0)`), or write a
     condition whose slope in ∂u/∂n does not vanish.
 
 !!! measured "The flux closure follows the interior stencil — both stay second order"
@@ -516,8 +516,8 @@ Dirichlet one.
 ## Transient problems
 
 A problem is **transient** exactly when it carries an initial condition — and, as in `jno.fem`, the
-IC is *found from the constraints* (`u(xi, yi) - u0`, with `xi, yi` the `"initial"` region), never a
-config flag. The time window and step count come from `domain.time = (t0, t1, n)`; the `u.t` term
+IC is given on the field, `u.initialize(u0)` (a number, nodal values or a formula), or as the term
+`u(xi, yi) - u0` with `xi, yi` the `"initial"` region; never a config flag. The time window and step count come from `domain.time = (t0, t1, n)`; the `u.t` term
 marks the time derivative, and `jno.fdm` marches by the **method of lines**, reusing the very same
 semidiscrete time-stepper `jno.fem` uses. `.solve()` returns the trajectory `(n_steps, N)`:
 
@@ -528,10 +528,10 @@ xb, yb, _ = d.variable("boundary", split=True)
 xi, yi, _ = d.variable("initial",  split=True)     # the t = t0 slice
 ui = u.bind(x=x, y=y, t=t)
 
+u.initialize(jnn.sin(np.pi*x) * jnn.sin(np.pi*y))  # initial condition
 traj = jno.fdm([
     ui.t - nu * (ui.xx + ui.yy),                       # u_t = nu * Delta u
     u(xb, yb) - 0.0,                                   # Dirichlet
-    u(xi, yi) - jnn.sin(np.pi*xi) * jnn.sin(np.pi*yi), # initial condition
 ]).solve()
 ```
 
@@ -539,6 +539,9 @@ The `u.t` term carries a **unit or a general `c(x)·u.t` mass coefficient** (var
 `ρcₚ(x)·u.t`): it is extracted by a two-probe `c = F(u.t=1) − F(u.t=0)` and carried as `M = diag(c)`, so
 no structural parsing is needed; a nonlinear `c(u)·u.t` fails loud. Nonlinear transient residuals are
 handled the same way (the march reuses the Newton driver).
+
+A **steady** nonlinear problem starts its Newton iteration from `u.initialize(u0)` too (zero for a field
+without one), read when `.solve()` is called, exactly as in `jno.fem`.
 
 ### Time-dependent data
 
@@ -943,7 +946,7 @@ A boundary node would not do: the pressure's flux rows are independent of each o
 them leaves the system singular. Measured on the lid-driven cavity at Re = 100 (no slip, lid u = 1, wall
 pressure from the momentum balance, default solver), `u(0.5, y)` against Ghia, Ghia & Shin (1982,
 Table I): max deviation 0.014 on 33² and 0.0019 on 65² (7 s). From a zero initial guess, Newton at
-higher Re diverges and raises. Continuing in Re with `x0=` from the previous solution
+higher Re diverges and raises. Continuing in Re from the previous solution (`u.initialize(previous)`)
 (`nonlinear=jno.solve.newton(line_search=True)`) reached Re = 300 on 65² and failed at 350, where the cell
 Reynolds number Re·h is 5.5. That is past the classical limit of 2 for central differencing of
 convection, where the discrete steady solution can stop existing. Higher Re is not verified here.

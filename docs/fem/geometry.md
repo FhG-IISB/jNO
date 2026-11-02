@@ -773,6 +773,65 @@ and is not watched.
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
 
+### Material laws — `d.k(T)`
+
+A property can depend on a field: conductivity on temperature, reluctivity on the flux density, permeability
+on the pressure head. Attach the law with the material, as a function, and evaluate it where the weak form
+uses it, the way the equation is written, ∫ k(T) ∇T·∇v:
+
+```python
+d = (felt.name("insulation").attach(k=lambda T: 0.05 + 2e-4 * T)   # a law of the field T
+     + crystal.name("crystal").attach(k=220.0)                      # a number, as before
+     ).domain()
+T, v = d.fem_symbols(names=("T", "v"))
+Ti, vi = T.bind(x=x, y=y), v.bind(x=x, y=y)
+heat = d.k(T) * (Ti.x * vi.x + Ti.y * vi.y) - d.q * vi              # numbers pass through, laws are evaluated
+```
+
+Write the law as the equation it is, e.g. a fibre insulation whose conductivity grows with the radiation
+between its fibres, k(T) = k0 + k1 T + k3 T^3:
+
+```python
+k_felt = lambda T: k0 + k1 * T + k3 * T**3
+```
+
+Any callable that is not a jNO expression is a law: a lambda, a function, or an object with `__call__` (a
+table of datasheet points interpolated with `jno.np` operations, where no formula is known).
+
+**Trainable coefficients.** A coefficient of the law may be a `jno.np.parameter`; `fem.solve()` then returns a
+trace node and `jno.core` fits the coefficient through the nonlinear solve (implicit differentiation, never an
+unrolled Newton loop):
+
+```python
+theta = jno.np.parameter((2,), name="theta")             # .initialize(...), .optimizer(optax.lbfgs())
+d.attach("insulation", k=lambda T: theta[0] * (1 + theta[1] * T))
+T_h = jno.fem([d.k(T) * (Ti.x * vi.x + Ti.y * vi.y), ...]).solve(nonlinear=jno.solve.newton(direct=True))
+jno.core([(T_h - T_measured).mse]).solve(30)
+```
+
+Only what the data can see is recovered: with the temperature fixed on both ends of a slab, a uniform
+scale of k leaves T unchanged, so `theta[0]` stays where it started while `theta[1]` is found (measured:
+b = 2.0000 from a start of 0.5, `tests/test_fem_material_laws.py`). The argument is any expression -- the field, a bound
+view of it, or a derived quantity (`d.nu(Bx**2 + By**2)`). Because the law contains the unknown, the form is
+nonlinear and Newton's tangent carries dk/dT exactly; nothing is passed to `fem.solve()`.
+
+The rules that keep a law apart from a **function of position** (`.attach(k=lambda r, z: ...)`, called with
+the coordinates when `d.k` is read, as before):
+
+* A plain function whose parameters are exactly the coordinates (one per dimension) is a function of
+  position, unless one of its parameters is named after a declared field (`fem_symbols(names=...)`), which
+  makes it a law. So `lambda T, c: ...` on a 2-D domain is a law once `T` is a field, not silently a function
+  of (x, y).
+* A property with a law **must be called**: bare `d.k` returns a placeholder that raises in any arithmetic,
+  naming the regions and the fix. `d.k(T)` on a property of numbers only is the same coefficient as `d.k`,
+  so one spelling serves either way.
+* `d.k(x, y)` with coordinate variables keeps its meaning (binding to those coordinates).
+* A law is captured as written: re-attaching it after `jno.fem` is built refuses at the next solve (the
+  re-attached number path still re-assembles).
+
+Pinned in `tests/test_fem_material_laws.py` (a law and a number in two layers against the exact Kirchhoff
+profile, a datasheet object, and each guard).
+
 ### `domain.mask` — a field's values on one region
 
 `d.mask(name)` is a boolean mask over the mesh nodes (`d.mesh.points`): every node of the region's

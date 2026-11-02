@@ -1675,3 +1675,23 @@ def test_frozen_network_gradient_enrichment_improves_prior():
     enriched_rel = float(np.linalg.norm(prior + u_h - exact) / np.linalg.norm(exact))
     assert enriched_rel < 1.5e-2, f"enriched solution inaccurate: rel-L2={enriched_rel:.3e}"
     assert enriched_rel <= prior_rel * 1.2, f"correction worsened the prior: {prior_rel:.3e} -> {enriched_rel:.3e}"
+
+
+def test_ic_net_through_initialize_is_the_ic_term():
+    """``u.initialize(net(x, y))`` on a transient form is the term ``u(initial) - net``: the same parametric
+    initial state (``state0_fn``), the same trajectory, differentiable in the net's weights."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, _ = _transient_setup()
+    net = _const_net(0.5)
+    u.initialize(net(xi, yi))
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0])
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert getattr(fem.operator, "state0_fn", None) is not None
+    ts = _grid_ts(fem.operator)
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, ts)
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, _2 = _transient_setup()
+    ref = jno.fem([u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci2[0], ci2[1]) - 0.5])
+    np.testing.assert_allclose(np.asarray(traj), np.asarray(_default_transient_integrate(ref.operator, {}, ts)), atol=1e-8)
+    g = jax.grad(lambda module: jnp.sum(_default_transient_integrate(fem.operator, {name: module}, ts)))(net.module)
+    assert jnp.isfinite(g.c) and abs(float(g.c)) > 1e-6

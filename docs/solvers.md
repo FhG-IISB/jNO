@@ -51,9 +51,10 @@ Pick by structure:
     and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
 
-### Warm starts — what `x0=` actually buys
+### Warm starts — what a starting point actually buys
 
-`x0=` is free to pass and easy to misjudge, so here is the rule, measured. A Krylov solve has to
+A starting point is set on the fields, `u.initialize(u0)` (see the FEM guide: number, nodal array or
+formula). It is free to give and easy to misjudge, so here is the rule, measured. A Krylov solve has to
 cover the distance from its initial residual down to `rtol`. A warm start removes the decades it
 already starts below, so the **fraction of iterations saved is a ratio of logarithms** — not a
 ratio of errors:
@@ -96,9 +97,9 @@ warm start — it is smooth, and it is *wrong in the same modes* the operator is
 
     The arithmetic is why, and it is not an engineering problem: at a realistic surrogate accuracy of
     1e-2 to 1e-3 the law caps the prize at 20–30 %, and collecting it needs an output that is smooth as
-    well as accurate. Reach for `x0=` where a *nearby solve* already exists — a continuation sweep
+    well as accurate. Reach for a warm start where a *nearby solve* already exists — a continuation sweep
     (`jno.solve.continuation`, which warm-starts for you), a transient step (which warm-starts
-    automatically, and rejects `x0=` for that reason), or a Newton loop. Those are smooth by
+    automatically), or a Newton loop. Those are smooth by
     construction and free.
 
 ### A learned **subspace** is worth far more than a learned point
@@ -432,7 +433,7 @@ fem.solve(linear=jno.solve.fgmres(),
 For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
 so the velocity block AMG is built on is the Oseen operator. `reuse=k` is **refused**
 here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
-which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
+which the steady solve does not do. To rebuild at a better state, solve again from that state (`u.initialize(state)`).
 
 ### When the pressure mass is not enough
 
@@ -1492,7 +1493,8 @@ compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so co
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
-block. Each step warm-starts from the previous state (so `x0=` is rejected).
+block. Each step warm-starts from the previous state; the first state is the initial condition
+(`u.initialize(u0)` or `u(initial) - u0`).
 
 !!! measured "A constant step operator factorizes once, not once per step"
     The step matrix is
@@ -1524,8 +1526,8 @@ Complex problems are assembled as one real `2n` system over the stacked `[Re; Im
 real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex
 transient is therefore an ordinary transient block (the slots configure its per-step solve as above, and
 `theta` / `adaptive` / `exponential` all apply), and a complex steady problem is an ordinary linear
-system: the `linear` / `precond` slots and `x0=` work on it, with a **complex** `x0` mapped into the
-block layout for you. Its default solver stays **sparse-direct**, not the matrix-free BiCGStab real
+system: the `linear` / `precond` slots and a start work on it: `A.initialize(a0)` with a **complex** `a0`
+fills both real parts for you. Its default solver stays **sparse-direct**, not the matrix-free BiCGStab real
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 

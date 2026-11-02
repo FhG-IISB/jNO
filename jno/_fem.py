@@ -1036,16 +1036,25 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
         return False
     if _trial_spaces(constraints) - _NATIVE_SPACES:
         return False
-    # complex=True fields: the real-equivalent form couples re/im test functions within one term,
-    # which the native one-test-field-per-term classifier rejects -> route to the complex branch.
-    if any(
-        getattr(n, "_complex_field_member", False)
-        for c in constraints
-        for n in _walk(_bare(c))
-        if isinstance(n, (TrialFunction, TestFunction))
-    ):
+    # complex=True fields: a term coupling the re/im test functions is rejected by the native
+    # one-test-field-per-term classifier -> route to the complex branch. Terms lowered by
+    # lower_complex_terms are already split per test function and stay native.
+    if _couples_complex_tests(constraints):
         return False
     return True
+
+
+def _couples_complex_tests(constraints: List[Any]) -> bool:
+    """Whether a term holds two different test functions of complex=True fields."""
+    for c in constraints:
+        keys = {
+            getattr(n, "field_key", id(n))
+            for n in _walk(_bare(c))
+            if isinstance(n, TestFunction) and getattr(n, "_complex_field_member", False)
+        }
+        if len(keys) > 1:
+            return True
+    return False
 
 
 def _element_for(dimension: int, order: int) -> str:
@@ -1089,6 +1098,21 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
                     seen.add(k)
                     keys.append(k)
     return keys
+
+
+class Fields(dict):
+    """The solution by field, from ``fem.split``: a dict that also reads its fields as attributes, ``sol.T`` for
+    ``sol["T"]``. A field whose name is a dict method (``keys``, ``items``, ...) or not an identifier is read with
+    brackets only."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(f"the solution has no field {name!r}; its fields are {sorted(self)}.") from None
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | {k for k in self if isinstance(k, str) and k.isidentifier()})
 
 
 def _field_names(constraints: List[Any]) -> Dict[Any, str]:
@@ -1725,7 +1749,7 @@ def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: b
         where = "a VPINN (network trial)"
     elif _trial_spaces(constraints) - {"Lagrange"}:
         where = "a form mixing in a non-nodal element family"
-    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+    elif _couples_complex_tests(constraints):
         where = "a complex form"
     if where is not None:
         raise NotImplementedError(
@@ -1892,7 +1916,7 @@ def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_t
         where = "a form with periodic ties"
     elif _trial_spaces(constraints) - {"Lagrange"}:
         where = "a form mixing in a non-nodal element family"
-    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+    elif _couples_complex_tests(constraints):
         where = "a complex form"
     if where is not None:
         raise NotImplementedError(
@@ -3014,6 +3038,19 @@ class FEM:
             mesh).
         """
         self._refresh_attachments()
+        for _u, _ver in getattr(self, "_initial_used", ()):
+            if _u.__dict__.get("_initial_version", 0) != _ver:
+                raise ValueError(
+                    f"fem.solve: {_u.name}.initialize(...) changed after jno.fem was built; the initial state of a "
+                    "time-dependent problem is read when the form is built. Call jno.fem(...) again."
+                )
+        if x0 is None:
+            x0 = self._initialized_x0()
+            if x0 is not None and adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=...): a field's .initialize(...) start does not survive the change of mesh "
+                    "(the DOF layout changes across it). Solve without adapt= from that start, or drop the start."
+                )
         import time as _time
 
         from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
@@ -5160,6 +5197,101 @@ class FEM:
         (2, 3): "triangle", (2, 6): "triangle6", (2, 4): "quad", (2, 8): "quad8", (2, 9): "quad9",
         (3, 4): "tetra", (3, 10): "tetra10", (3, 8): "hexahedron", (3, 20): "hexahedron20", (3, 27): "hexahedron27",
     }  # fmt: skip
+
+    def split(self, solution):
+        """The solution of this problem by field, in the assembler's field order: a :class:`Fields` dict, read as
+        ``sol.T`` or ``sol["T"]``.
+
+        A scalar field gives (n,), a vector field (n, k), a constant unknown its single value; the two real
+        parts of a complex field (fem_symbols(complex=True), named <name>_re and <name>_im) come back
+        as one complex array under <name>::
+
+            sol = fem.split(fem.solve())
+            A, T, I = sol.A, sol.T, sol.I
+        """
+        arr = np.asarray(solution).reshape(-1)
+        offs = list(self.offsets) if self.offsets is not None else [0, int(arr.size)]
+        if int(offs[-1]) != int(arr.size):
+            raise ValueError(
+                f"fem.split: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} DOFs."
+            )
+        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        names = _field_names(self._constraints or [])
+        trials = {}
+        for c in self._constraints or []:
+            for n in _walk(_bare(c)):
+                if isinstance(n, TrialFunction):
+                    trials.setdefault(getattr(n, "field_key", n.op_id), n)
+        out = {}
+        for i, k in enumerate(keys[: len(offs) - 1]):
+            blk = arr[offs[i] : offs[i + 1]]
+            t = trials.get(k)
+            vs = tuple(getattr(t, "value_shape", ()) or ())
+            if getattr(t, "_is_constant", False):
+                blk = blk.reshape(vs) if vs else blk.reshape(())
+            elif vs:
+                blk = blk.reshape((-1,) + vs)
+            out[names.get(k, str(k))] = blk
+        for nm in [n for n in out if n.endswith("_re") and n[:-3] + "_im" in out]:
+            out[nm[:-3]] = out.pop(nm) + 1j * out.pop(nm[:-3] + "_im")
+        return Fields(out)
+
+    def _initialized_x0(self):
+        """The starting point from the fields' ``.initialize(value)`` (zero where a field has none), or None when no
+        field of a steady problem is initialized. A number fills its field (or one value per component), a nodal
+        array is taken as it is, and a formula of the coordinates is evaluated at the field's DOF nodes."""
+        if self._mode not in ("linear", "nonlinear", "complex") or getattr(self.domain, "_is_time_dependent", False):
+            return None  # a time-dependent form: initialize is its initial state, built in by jno.fem
+        trials = {}
+        for c in self._constraints or []:
+            for nd in _walk(_bare(c)):
+                if isinstance(nd, TrialFunction) and "_initial" in nd.__dict__:
+                    trials.setdefault(getattr(nd, "field_key", nd.op_id), nd)
+        if not trials:
+            return None
+        offs = list(self.offsets) if self.offsets is not None else None
+        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        if offs is None or len(keys) < len(offs) - 1:
+            raise ValueError(
+                "u.initialize: this problem's DOF layout per field is not known; pass the start to the solver."
+            )
+        points = None
+        x = jnp.zeros((int(offs[-1]),))
+        for i, k in enumerate(keys[: len(offs) - 1]):
+            u = trials.get(k)
+            if u is None:
+                continue
+            size, val = int(offs[i + 1] - offs[i]), u.__dict__["_initial"]
+            ncomp = int(np.prod(getattr(u, "value_shape", ()) or (1,)))
+            if isinstance(_bare(val), Placeholder):
+                if getattr(u, "_is_constant", False):
+                    raise ValueError(f"{u.name}.initialize: a constant unknown starts at a number, not a formula.")
+                points = self.field_points if points is None else points
+                if i >= len(points) or int(np.asarray(points[i]).shape[0]) * ncomp != size:
+                    raise ValueError(
+                        f"{u.name}.initialize: the DOF nodes of this field are not known here; give a nodal array."
+                    )
+                vals = jnp.asarray(_eval_value_node_at(_bare(val), jnp.asarray(points[i]))).reshape(-1)
+            else:
+                vals = jnp.asarray(val).reshape(-1)
+            if jnp.iscomplexobj(vals):
+                raise ValueError(f"{u.name}.initialize: a real field takes a real value (a complex field splits its own).")
+            n_nodes = size // ncomp
+            if vals.size == size:
+                blk = vals
+            elif vals.size == 1:
+                blk = jnp.full((size,), vals[0])
+            elif ncomp > 1 and vals.size == ncomp:
+                blk = jnp.tile(vals, n_nodes)
+            elif ncomp > 1 and vals.size == n_nodes:
+                blk = jnp.repeat(vals, ncomp)
+            else:
+                raise ValueError(
+                    f"{u.name}.initialize: {vals.size} values for a field of {size} DOFs; give a number, one value per "
+                    "component, or one per DOF."
+                )
+            x = x.at[offs[i] : offs[i + 1]].set(blk.astype(x.dtype))
+        return x
 
     def export(self, solution, save_path: str, *, file_format=None):
         """Write a solution to VTK (or any meshio format) — **one file per field**.
@@ -7674,12 +7806,20 @@ def fem(
     _fn._QUAD_REPORTED.clear()
     try:
         with _host_assembly_scope():
+            from .domain.equations import lower_complex_terms, lower_initial_values, lower_integral_equations
+
+            _terms = list(constraints) if isinstance(constraints, tuple) else constraints
+            # `d.unknown()` fields become their trial symbols first: every lowering below sees TrialFunctions
+            _terms = _lower_unknowns(_terms)
+            _terms, _initial_used = lower_initial_values(lower_complex_terms(_terms))
+            _terms = lower_integral_equations(_terms)
             out = _fem_impl(
-                _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints),
+                _lower_unknowns(_terms),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
         out._attach_watch = _attach_watch(constraints)
+        out._initial_used = _initial_used  # the initial states baked into a transient form (initialize)
         out._rebuild_kwargs = {"quad_degree": quad_degree, "chunk": chunk, "_dd_overlap": _dd_overlap}
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element

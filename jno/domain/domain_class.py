@@ -333,6 +333,40 @@ def _is_plain_value(v) -> bool:
     return isinstance(v, jax.Array) and not isinstance(v, jax.core.Tracer)
 
 
+class _LawProperty:
+    """``d.<name>`` when a region attached a **material law** (a function of fields): not a coefficient yet.
+
+    Call it with the fields the laws depend on -- ``d.k(T)`` -- to get the coefficient, with numbers passed
+    through and each law evaluated at the arguments. Used bare in arithmetic it raises, naming the regions and
+    the fix: a law silently treated as a number or as a function of position would be wrong physics."""
+
+    __slots__ = ("_domain", "_name", "_regions", "_refusal")
+
+    def __init__(self, domain, name, regions, refusal=None):
+        self._domain, self._name, self._regions = domain, name, list(regions)
+        self._refusal = refusal  # an incomplete property: usable per enclosure face only
+
+    def __call__(self, *args):
+        if not args:
+            raise TypeError(f"domain.{self._name}(): give the field(s) the law depends on, e.g. d.{self._name}(T).")
+        return self._domain._attached_coefficient(self._name, args)
+
+    def _refuse(self, *_a, **_k):
+        if self._refusal:
+            raise AttributeError(self._refusal)
+        raise TypeError(
+            f"domain.{self._name} is a material law in region(s) {self._regions}: a function of a field, so it "
+            f"has no value until it is evaluated. Write d.{self._name}(T) (with the field it depends on) where "
+            f"it is used, e.g. d.{self._name}(T) * (T.x * v.x + T.y * v.y)."
+        )
+
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _refuse
+    __truediv__ = __rtruediv__ = __pow__ = __rpow__ = __matmul__ = __rmatmul__ = __neg__ = _refuse
+
+    def __repr__(self):
+        return f"<material law d.{self._name} in {self._regions}: call it, d.{self._name}(T)>"
+
+
 def _masked_sum(values, mask_cls, default, *, what: str, key: str):
     """``sum_k mask_cls(k) * values[k]`` — the one desugaring behind ``_by_region`` and ``_by_tag``.
 
@@ -2088,6 +2122,7 @@ class domain(MeshIOMixin):
         # space (mirrors how Variable carries its _domain).
         trial._domain = self
         test._domain = self
+        self.__dict__.setdefault("_field_names", set()).add(str(trial_name))  # for telling laws of fields apart
         return (trial, test)
 
     def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
@@ -3009,68 +3044,133 @@ class domain(MeshIOMixin):
         # touching another missing attribute would recurse forever.
         attached = self.__dict__.get("_region_attachments") or {}
         if name in attached:
-            values = dict(attached[name])
-            # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
-            # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
-            has_default = self._DEFAULT_TARGET in values
-            default = values.pop(self._DEFAULT_TARGET, None)
-            kinds = self.__dict__.get("_attachment_kind") or {}
-            declared = {kinds.get(t, "volume") for t in values}
-            if len(declared) > 1:
-                raise AttributeError(
-                    f"domain.{name}: declared on both a volume region and a boundary tag "
-                    f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
-                    f"over cells or over facets, not both. Give the two halves different property "
-                    f"names, or split the tag."
-                )
-            resolved = {t: self._resolve_attached(v) for t, v in values.items()}
-            # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
-            # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
-            # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
-            # so the fem can refuse to solve with it once the property is re-attached.
-            live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
-            snapshot = not all(_is_plain_value(v) for v in resolved.values())
-            if has_default:
-                snapshot = snapshot or not _is_plain_value(self._resolve_attached(default))
-
-            def mark(e):
-                if snapshot:
-                    e._attached_snapshot = (self, name)
-                e._attached_name = name  # what jno.info prints for it (jno.trace.pretty)
-                return e
-
-            if declared == {"surface"}:
-                # No completeness rule on the boundary: tags are not a partition of it, and untagged
-                # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
-                # contribute nothing to this coefficient -- documented, not silently patched. A
-                # default has nothing to mean here, so asking for one is a mistake worth naming.
-                if has_default:
-                    raise AttributeError(
-                        f"domain.{name}: a bare .attach({name}=...) default was declared, but "
-                        f"'{name}' lives on boundary tag(s) {sorted(values)}. Tags are not a "
-                        f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
-                        f"so a surface default has no meaning. Attach it to each tag instead."
-                    )
-                return mark(self._by_tag(live))
-            known = set(self.__dict__.get("_shape_regions") or {})
-            missing = sorted(known - set(values))
-            if missing and not has_default:
-                raise AttributeError(
-                    f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
-                    f"declare it -- add .attach({name}=...) to each, or declare a default for the rest "
-                    f"with a bare .attach({name}=...)."
-                )
-            # The explicit targets already won: `default` only fills what they left, so the two
-            # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
-            if has_default:
-                dv = self._resolve_attached(default)
-                default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
-                if not live:
-                    # Only a default was declared: the coefficient is that value everywhere -- there is
-                    # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
-                    return mark(default_live)
-            return mark(self._by_region(live, default=default_live if has_default else None))
+            try:
+                return self._attached_coefficient(name)
+            except AttributeError as e:
+                if "never attached" not in str(e):
+                    raise
+                # Some regions lack the property: wrong as a volume coefficient, fine per enclosure face
+                # (`d.eps(gap.field(T))` needs it only on the radiating solids). Defer the error to its use.
+                return _LawProperty(self, name, [], refusal=str(e))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def _attached_coefficient(self, name, args=None):
+        """The coefficient ``d.<name>`` (``args is None``), or ``d.<name>(*args)``: the same coefficient with every
+        material law evaluated at ``args`` (see :meth:`_is_law`). A property that holds a law cannot be used
+        bare -- it returns a :class:`_LawProperty`, which refuses arithmetic and says to call it."""
+        attached = self.__dict__.get("_region_attachments") or {}
+        values = dict(attached[name])
+        # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
+        # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
+        has_default = self._DEFAULT_TARGET in values
+        default = values.pop(self._DEFAULT_TARGET, None)
+        kinds = self.__dict__.get("_attachment_kind") or {}
+        declared = {kinds.get(t, "volume") for t in values}
+        if len(declared) > 1:
+            raise AttributeError(
+                f"domain.{name}: declared on both a volume region and a boundary tag "
+                f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
+                f"over cells or over facets, not both. Give the two halves different property "
+                f"names, or split the tag."
+            )
+        if args is None:
+            laws = sorted(str(t) for t, v in attached[name].items() if self._is_law(v))
+            if laws:
+                return _LawProperty(self, name, laws)
+        resolved = {t: self._evaluate_attached(v, args, name, t) for t, v in values.items()}
+        # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
+        # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
+        # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
+        # so the fem can refuse to solve with it once the property is re-attached.
+        live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
+        snapshot = not all(_is_plain_value(v) for v in resolved.values())
+        if has_default:
+            snapshot = snapshot or not _is_plain_value(self._evaluate_attached(default, args, name, "default"))
+
+        def mark(e):
+            if snapshot:
+                e._attached_snapshot = (self, name)
+            e._attached_name = name  # what jno.info prints for it (jno.trace.pretty)
+            if args is None:
+                e._jno_property = (self, name)  # so `d.<name>(T)` re-reads it with laws evaluated at T
+            return e
+
+        if declared == {"surface"}:
+            # No completeness rule on the boundary: tags are not a partition of it, and untagged
+            # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
+            # contribute nothing to this coefficient -- documented, not silently patched. A
+            # default has nothing to mean here, so asking for one is a mistake worth naming.
+            if has_default:
+                raise AttributeError(
+                    f"domain.{name}: a bare .attach({name}=...) default was declared, but "
+                    f"'{name}' lives on boundary tag(s) {sorted(values)}. Tags are not a "
+                    f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
+                    f"so a surface default has no meaning. Attach it to each tag instead."
+                )
+            return mark(self._by_tag(live))
+        known = set(self.__dict__.get("_shape_regions") or {})
+        missing = sorted(known - set(values))
+        if missing and not has_default:
+            raise AttributeError(
+                f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
+                f"declare it -- add .attach({name}=...) to each, or declare a default for the rest "
+                f"with a bare .attach({name}=...)."
+            )
+        # The explicit targets already won: `default` only fills what they left, so the two
+        # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
+        if has_default:
+            dv = self._evaluate_attached(default, args, name, "default")
+            default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
+            if not live:
+                # Only a default was declared: the coefficient is that value everywhere -- there is
+                # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
+                return mark(default_live)
+        return mark(self._by_region(live, default=default_live if has_default else None))
+
+    def _is_law(self, value) -> bool:
+        """Is an attached value a **material law** -- a function of fields, evaluated where it is called,
+        ``d.k(T)`` -- rather than a number, an expression, or a function of position?
+
+        A law is any callable that is not a jNO expression, except a plain function that takes exactly the
+        coordinates (one parameter per dimension) and is not named after a declared field: that stays a
+        function of position, called with the coordinates when ``d.k`` is read, as before. So
+        ``lambda T: ...`` (one argument on a 2-D domain), a datasheet object with ``__call__``, and
+        ``lambda T, c: ...`` once fields ``T`` and ``c`` are declared are laws; ``lambda r, z: ...`` is not."""
+        from ..trace import Placeholder
+        from ..trace.views import _VIEW_TYPES
+
+        if not callable(value) or isinstance(value, (Placeholder, *_VIEW_TYPES)) or isinstance(value, type):
+            return False
+        if not inspect.isroutine(value):
+            return True  # a callable object: a datasheet table, a fitted law
+        try:
+            params = [
+                p
+                for p in inspect.signature(value).parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+            ]
+        except (TypeError, ValueError):
+            return False
+        fields = self.__dict__.get("_field_names") or set()
+        if any(p.name in fields for p in params):
+            return True
+        return len(params) != int(self.dimension)
+
+    def _evaluate_attached(self, value, args, name, target):
+        """One attached value inside the coefficient: a law evaluated at ``args``, a function of position
+        resolved with the coordinates, anything else as it is."""
+        if not self._is_law(value):
+            return self._resolve_attached(value)
+        if args is None:  # unreachable from d.<name>: a law there returns a _LawProperty first
+            raise TypeError(f"domain.{name}: the law in {target!r} needs its arguments: write d.{name}(T).")
+        try:
+            return value(*args)
+        except TypeError as e:
+            raise TypeError(
+                f"domain.{name}({', '.join('<expr>' for _ in args)}): the law attached to {target!r} could not "
+                f"be called with {len(args)} argument(s): {e}. A law takes the fields it depends on, e.g. "
+                f".attach({name}=lambda T: ...) and d.{name}(T)."
+            ) from e
 
     def attached(self, name: str) -> dict:
         """The raw ``{region: value}`` mapping for a property declared with :meth:`shape.attach`.

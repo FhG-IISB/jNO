@@ -1640,15 +1640,86 @@ def _rmul(a, b):
 def _as_pair(o):
     """Coerce ``o`` to a :class:`ComplexPair` (``NotImplemented`` if not possible).
 
-    A Python ``complex`` becomes its ``(real, imag)`` constants; any real
-    expression/number becomes ``(o, 0)``."""
+    A Python ``complex`` becomes its ``(real, imag)`` constants; a real expression/number becomes ``(o, 0)``. An
+    expression that CONTAINS a complex constant -- ``1j * w * d.sigma`` is built left to right, so the ``1j``
+    meets the real coefficient before it meets the pair -- is split into its real and imaginary parts
+    (:func:`_split_complex`) rather than treated as real, which would drop or mangle the imaginary part."""
     if isinstance(o, ComplexPair):
         return o
     if isinstance(o, complex):
         return ComplexPair(o.real if o.real != 0 else None, o.imag if o.imag != 0 else None)
-    if isinstance(o, (int, float)) or isinstance(o, (Placeholder, ScalarView, VectorView)):
+    if isinstance(o, (int, float)):
         return ComplexPair(o, None)
+    if isinstance(o, (Placeholder, ScalarView, VectorView)):
+        split = _split_complex(o)
+        return ComplexPair(o, None) if split is None else ComplexPair(*split)
     return NotImplemented
+
+
+def _split_complex(o):
+    """``(re, im)`` of an expression that contains complex constants (``None`` for a zero part), or ``None``
+    when it contains none. Distributes over ``+ - * /``; a complex constant inside any other operation (a
+    function call, a power of a complex value) raises: its real and imaginary parts are not separable here."""
+    from . import BinaryOp, Literal
+
+    def has_complex(e):
+        e = e._expr if isinstance(e, _VIEW_TYPES) else e
+        if isinstance(e, Literal):
+            try:
+                return bool(jnp.iscomplexobj(jnp.asarray(e.value)))
+            except Exception:  # noqa: BLE001
+                return False
+        if isinstance(e, BinaryOp):
+            return has_complex(e.left) or has_complex(e.right)
+        if isinstance(e, Placeholder):
+            return any(has_complex(v) for v in getattr(e, "args", []) or [] if isinstance(v, Placeholder))
+        return isinstance(e, complex)
+
+    if not has_complex(o):
+        return None
+
+    def add(a, b):
+        return b if a is None else a if b is None else a + b
+
+    def sub(a, b):
+        return (None if b is None else -b) if a is None else a if b is None else a - b
+
+    def mul(a, b):
+        return None if a is None or b is None else a * b
+
+    def parts(e):
+        e = e._expr if isinstance(e, _VIEW_TYPES) else e
+        if isinstance(e, complex):
+            return (e.real or None, e.imag or None)
+        if isinstance(e, Literal):
+            v = jnp.asarray(e.value)
+            if jnp.iscomplexobj(v):
+                re, im = jnp.real(v), jnp.imag(v)
+                return (Literal(re) if bool(jnp.any(re != 0)) else None, Literal(im) if bool(jnp.any(im != 0)) else None)
+            return (e, None)
+        if isinstance(e, BinaryOp) and has_complex(e):
+            (ar, ai), (br, bi) = parts(e.left), parts(e.right)
+            if e.op == "+":
+                return add(ar, br), add(ai, bi)
+            if e.op == "-":
+                return sub(ar, br), sub(ai, bi)
+            if e.op == "*":
+                return sub(mul(ar, br), mul(ai, bi)), add(mul(ar, bi), mul(ai, br))
+            if e.op == "/":
+                if bi is None:
+                    return (None if ar is None else ar / br, None if ai is None else ai / br)
+                den = add(mul(br, br), mul(bi, bi))
+                re, im = add(mul(ar, br), mul(ai, bi)), sub(mul(ai, br), mul(ar, bi))
+                return (None if re is None else re / den, None if im is None else im / den)
+            raise NotImplementedError(f"a complex constant inside '{e.op}' cannot be split into real and imaginary parts.")
+        if has_complex(e):
+            raise NotImplementedError(
+                f"a complex constant inside {type(e).__name__} cannot be split into real and imaginary parts; "
+                "write the complex factor outside the function (e.g. 1j * w * f(x), not f(1j * x))."
+            )
+        return (e, None)
+
+    return parts(o)
 
 
 def _complex_times_real(real_view, c: complex) -> "ComplexPair":
@@ -1702,6 +1773,46 @@ class ComplexPair:
     def imag(self):
         """The imaginary part (``0.0`` for a pair built from a real value)."""
         return self._im if self._im is not None else 0.0
+
+    def initialize(self, value) -> "ComplexPair":
+        """The complex field's starting value or initial state (see ``TrialFunction.initialize``): a complex
+        number, a complex nodal array, or a formula (a complex constant in it is split into its real and
+        imaginary parts). Sets both real fields of a ``fem_symbols(complex=True)`` field."""
+        if isinstance(value, (Placeholder, ScalarView, VectorView, ComplexPair)):
+            p = _as_pair(value)
+            re, im = p._re, p._im
+        else:
+            v = jnp.asarray(value)
+            re, im = jnp.real(v), jnp.imag(v)
+        for part, val in ((self._re, re), (self._im, im)):
+            field = part._expr if isinstance(part, (ScalarView, VectorView)) else part
+            if not hasattr(field, "initialize"):
+                raise TypeError(
+                    "initialize: only a field from fem_symbols(complex=True) has a starting value; this complex "
+                    f"quantity's part is a {type(field).__name__}."
+                )
+            field.initialize(0.0 if val is None else val)
+        return self
+
+    def __call__(self, *args, **kw) -> "ComplexPair":
+        """``A(x, y)``: both parts bound to the coordinates (e.g. a Dirichlet value on a tag)."""
+        return ComplexPair(
+            None if self._re is None else self._re(*args, **kw), None if self._im is None else self._im(*args, **kw)
+        )
+
+    def __abs__(self):
+        """``abs(A)``: the modulus sqrt(Re^2 + Im^2). ``abs(A)**2`` is exactly Re^2 + Im^2 (no square root, so its
+        derivative stays finite where A = 0 -- the Joule heat sigma w^2 |A|^2 / 2 of a field that vanishes on an
+        axis)."""
+        from . import FunctionCall
+
+        sq = None
+        for p in (self._re, self._im):
+            if p is not None:
+                sq = p * p if sq is None else sq + p * p
+        if sq is None:
+            return 0.0
+        return _Modulus(FunctionCall(jnp.sqrt, [_unwrap(sq)], name="abs"), sq)
 
     @property
     def conj(self) -> "ComplexPair":
@@ -3258,3 +3369,16 @@ __all__ = [
     "FieldView",
     "FieldViewWithPartials",
 ]
+
+
+class _Modulus(ScalarView):
+    """``abs(A)`` of a :class:`ComplexPair`: behaves as the modulus, but ``abs(A)**2`` is the exact Re^2 + Im^2."""
+
+    def __init__(self, expr, square):
+        super().__init__(expr)
+        self._square = square
+
+    def __pow__(self, other):
+        if isinstance(other, (int, float)) and float(other) == 2.0:
+            return self._square
+        return super().__pow__(other)
