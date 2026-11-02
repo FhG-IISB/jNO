@@ -7830,6 +7830,7 @@ def fem(
     try:
         with _host_assembly_scope():
             from .domain.equations import lower_complex_terms, lower_initial_values, lower_integral_equations
+            from .domain.mapping import lower_mapped_regions
             from .domain.radiation import lower_radiation_terms
 
             _terms = list(constraints) if isinstance(constraints, tuple) else constraints
@@ -7838,7 +7839,7 @@ def fem(
             _terms, _initial_used = lower_initial_values(lower_complex_terms(_terms))
             _terms = lower_integral_equations(_terms)
             out = _fem_impl(
-                _lower_unknowns(lower_radiation_terms(_terms)),
+                _lower_unknowns(lower_mapped_regions(lower_radiation_terms(_terms))),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )

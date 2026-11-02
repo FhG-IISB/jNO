@@ -960,6 +960,40 @@ what the continuity equation and the pressure term must both use.
 
 ---
 
+## Mapped regions — `.attach(map=f)`
+
+A region of the mesh can stand for another region of space. Attach the map from its mesh coordinates x′ to the
+physical coordinates x = f(x′), written with `jno.np`, and every weak term integrated there is evaluated by the
+change of variables (J = ∂f/∂x′ by automatic differentiation of f): a coordinate becomes f(x′), a derivative becomes
+J⁻ᵀ∇′, the measure picks up det J. The equations are written once for the whole domain.
+
+The unbounded outside of a body, closed by a finite shell whose outer edge is infinity:
+
+```python
+def to_infinity(r, z):                      # rho = R^2 / (2R - rho'): R <= rho' <= 2R covers R <= rho < infinity
+    rho = jno.np.sqrt(r**2 + z**2)
+    q = R**2 / ((2 * R - rho) * rho)
+    return r * q, z * q
+
+d = (... + (half(2 * R) - half(R)).name("infinity").attach(map=to_infinity)).sized(h).domain()
+fem = jno.fem([nu * curl(A) @ curl(W) * dV - J * W * dV, A(axis) - 0.0, A(arc) - 0.0])   # arc = infinity
+```
+
+Every decaying mode rho^-(n+1) becomes a polynomial of the mesh coordinate, so a coarse shell resolves it. A complex
+map is an absorbing layer for waves (rho~ = rho′ + (i/k) ∫σ, with Bermúdez' σ = 1/(L − s) needing no tuning); the
+form then becomes complex and goes through the real-equivalent complex route. Maps along one axis close half-spaces
+(with corner regions mapping both axes).
+
+**Checked:** f must be the identity where the region meets an unmapped one (otherwise the field would jump; raises).
+**Scope (first version):** first derivatives (a second derivative in a mapped region raises); volume terms (Dirichlet
+values are not mapped; surface terms on a mapped region's own faces are not supported); fields whose components
+transform as numbers -- not edge or face elements, which need a Piola map. A 1/rho field in an axisymmetric shell
+wants the shell graded towards its outer edge (measured: error ~h^0.8 on a uniform shell, ~h^2 graded).
+
+Pinned in `tests/test_fem_mapped_regions.py`: a current loop (elliptic-integral field), a sphere at fixed temperature
+in an unbounded medium, a line source under a grounded surface (axis maps and corners), a 2-D net source, an outgoing
+wave through a complex map (Hankel), and the interface guard.
+
 ## Enclosure radiation (nonlocal boundary flux)
 
 Grey-body radiation between surfaces is **nonlinear** (`T⁴`) and **nonlocal** (every surface element
