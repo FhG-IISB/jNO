@@ -949,11 +949,20 @@ def newton_direct(
     # cannot transpose ("Reverse-mode differentiation does not work for lax.while_loop"). `lu` got away
     # with it because those tangents were dead code; a Krylov slot's residual gate keeps them alive, so
     # every iterative `linear=` on this path was not differentiable.
-    f_c, f_consts = jax.closure_convert(f0, u0)
-    J_c, J_consts = jax.closure_convert(jacobian_fn, u0)
-    f_consts, J_consts = jax.lax.stop_gradient((f_consts, J_consts))
+    #
+    # Each converted function is wrapped in ONE `jax.jit`, and every use below goes through it: the start
+    # residual, the loop body, the line search, custom_root's residual and its tangent at the root. A bare
+    # converted function re-binds its whole jaxpr at every call site; on a many-region form that replay
+    # was most of the solve's trace. Through `jit` the repeats are trace-cache hits (same shapes, same
+    # function), and the un-stopped constants keep custom_root's residual and tangent differentiable.
+    f_c, f_consts0 = jax.closure_convert(f0, u0)
+    J_c, J_consts0 = jax.closure_convert(jacobian_fn, u0)
+    f_c, J_c = jax.jit(f_c, inline=True), jax.jit(J_c, inline=True)
+    f_consts, J_consts = jax.lax.stop_gradient((f_consts0, J_consts0))
     f_fwd = lambda u: f_c(u, *f_consts)  # noqa: E731
     J_fwd = lambda u: J_c(u, *J_consts)  # noqa: E731
+    f_root = lambda u: f_c(u, *f_consts0)  # noqa: E731
+    J_root = lambda u: J_c(u, *J_consts0)  # noqa: E731
 
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
         return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
@@ -1084,7 +1093,7 @@ def newton_direct(
         return jax.lax.cond(r_rel < max(1e-8, 1e4 * eps), lambda: x, lambda: sparse_lu_solve(A, rhs))
 
     def _tangent(g, y):  # solve J_root x = y (and Jᵀ on the reverse pass) DIRECTLY at the converged root
-        J = jacobian_fn(root)
+        J = J_root(root)
         # Gated on both sides like the Krylov tangents: a direct solve fails differently (a singular
         # or near-singular tangent, not a step cap) but fails just as quietly, and the transpose is
         # the half no caller ever inspects.
@@ -1096,7 +1105,7 @@ def newton_direct(
         info["norms"] = (_rn, _r0n)
         if _J is not None:
             info["tangent"] = jax.lax.stop_gradient(_J)
-    return jax.lax.custom_root(f0, root, lambda _f, _x0: root, _tangent)
+    return jax.lax.custom_root(f_root, root, lambda _f, _x0: root, _tangent)
 
 
 def staggered_newton(
