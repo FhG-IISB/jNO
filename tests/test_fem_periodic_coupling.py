@@ -44,7 +44,7 @@ def _eval(fem):
     coupled (nonlinear) periodic solve is a *traced* node, evaluated via a throwaway crux -- the
     established nonlinear-periodic pattern (the residual may carry trainable params)."""
     out = fem.solve()
-    if isinstance(out, jax.Array):
+    if isinstance(out, (jax.Array, jno.Solution)):
         return np.asarray(out).reshape(-1)
     crux = jno.core([out.mean], domain=_DUMMY)
     return np.asarray(crux.eval([out])).reshape(-1)

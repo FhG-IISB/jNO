@@ -1,4 +1,4 @@
-"""Complex fields written as math in linear, nonlinear and coupled forms; integral equations; fem.split.
+"""Complex fields written as math in linear, nonlinear and coupled forms; integral equations; the solution by field.
 
 * A complex constant that meets a regional coefficient first (``1j * w * d.sigma * A * W``) is split into its real
   and imaginary parts (it used to fail to assemble, or drop the imaginary part).
@@ -53,7 +53,7 @@ def test_complex_constant_meeting_a_regional_coefficient_matches_bessel():
             A(*d.variable("left", split=True)[:2]) - 0.0,
         ]
     )
-    a = fem.split(fem.solve(linear=jno.solve.lu()))["A"]
+    a = fem.solve(linear=jno.solve.lu()).A
     assert np.iscomplexobj(a)
     pts, tri = np.asarray(d.mesh.points)[:, :2], np.asarray(d.mesh.cells_dict["triangle"])
     blocks = [c.type == "triangle" for c in d.mesh.cells]
@@ -122,10 +122,7 @@ def test_complex_field_in_a_nonlinear_coupled_form_equals_the_real_pair():
         fem = jno.fem([*field, d.k * (Ti.d(r) * vi.d(r) + Ti.d(z) * vi.d(z)) * dV - joule * vi * dV, heat_bc])
         n = int(np.asarray(fem.offsets)[-1])
         x0 = np.zeros(n)
-        sol = fem.split(
-            fem.solve(x0=x0 + 300.0 * 0, nonlinear=jno.solve.newton(direct=True, rtol=1e-13, atol=0.0, max_steps=40))
-        )
-        return sol
+        return fem.solve(x0=x0 + 300.0 * 0, nonlinear=jno.solve.newton(direct=True, rtol=1e-13, atol=0.0, max_steps=40))
 
     c, p = build(True), build(False)
     a_pair = p["A"][:, 0] + 1j * p["A"][:, 1]
@@ -144,7 +141,7 @@ def test_integral_equation_sets_the_constant_unknown():
     I = d.unknown.scalar(constant=True, name="I")  # noqa: E741  (the current, as written in the equations)
     P = 0.37
     fem = jno.fem([ui.d(x) * vi.d(x) + ui.d(y) * vi.d(y) - I * vi, u(xb, yb) - 0.0, ui.integrate() - P])
-    sol = fem.split(fem.solve(linear=jno.solve.lu()))
+    sol = fem.solve(linear=jno.solve.lu())
     ref = jno.fem([ui.d(x) * vi.d(x) + ui.d(y) * vi.d(y) - 1.0 * vi, u(xb, yb) - 0.0])
     u1 = np.asarray(ref.solve(linear=jno.solve.lu()))
     c = float(np.asarray(sol["u"]).sum() * 0 + _p1_integral(d, u1))
@@ -186,14 +183,14 @@ def test_complex_field_with_a_constant_set_by_its_power():
         return d.nu * _curl_dot(Ai, Wi, r, z) * dV + 1j * W_ * d.sigma * Ai * Wi * dV - current * d.J * Wi * dV
 
     one = jno.fem([field(1.0), axis])
-    a1 = one.split(one.solve(linear=jno.solve.lu()))["A"]
+    a1 = one.solve(linear=jno.solve.lu()).A
     P1 = float((0.5 * W_**2 * SIG) * _rod_power(d, a1))
     P = 4.0 * P1
     I = d.unknown.scalar(constant=True, name="I")  # noqa: E741
     fem = jno.fem([field(I), axis, (joule * dV).integrate() - P])
     A.initialize(a1)
     I.initialize(1.0)
-    sol = fem.split(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=0.0, max_steps=30)))
+    sol = fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=0.0, max_steps=30))
     assert float(sol["I"]) == pytest.approx(np.sqrt(P / P1), rel=1e-6)
     np.testing.assert_allclose(sol["A"], float(sol["I"]) * a1, rtol=1e-6, atol=1e-12)
 

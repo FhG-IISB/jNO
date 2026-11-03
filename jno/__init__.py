@@ -10,7 +10,7 @@ import sys
 
 from . import bayesian, fn, litho, lora, optimizers, precond, solve, trackers
 from . import jnp_ops as np
-from ._fem import derived, fem, lag
+from ._fem import Solution, derived, fem, lag
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -209,6 +209,7 @@ __all__ = [
     "Path",
     "do",
     "fem",
+    "Solution",
     "fdm",
     "fd",
     "rcwa",

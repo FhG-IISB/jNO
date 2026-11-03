@@ -1097,19 +1097,112 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
     return keys
 
 
-class Fields(dict):
-    """The solution by field, from ``fem.split``: a dict that also reads its fields as attributes, ``sol.T`` for
-    ``sol["T"]``. A field whose name is a dict method (``keys``, ``items``, ...) or not an identifier is read with
-    brackets only."""
+@jax.tree_util.register_pytree_node_class
+class Solution:
+    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name.
+
+        u = fem.solve()
+        u.T, u.A, u.I          # nodal T, complex nodal A (from its two real halves), a constant unknown's value
+        u["T"], u.fields       # the same by key; the field names
+        u[0], u @ u, 2 * u, jnp.linalg.norm(u), np.asarray(u), fem.solve(x0=u)   # still the flat vector
+
+    A scalar field gives ``(n,)``, a vector field ``(n, k)``, a constant unknown its value; a trajectory
+    (transient) keeps its leading time axis on every field. A field's name wins over the array attribute of
+    the same name: ``u.T`` is the field ``T``, not the transpose (``u.flat.T`` is). The fields are slices of
+    the vector, so they are differentiable. It is a pytree of the one vector, so it passes through ``jit``,
+    ``grad`` and ``vmap``.
+    """
+
+    __slots__ = ("flat", "_layout", "__weakref__")
+    __array_priority__ = 1000  # numpy defers mixed arithmetic to us
+
+    def __init__(self, flat, layout):
+        object.__setattr__(self, "flat", flat)
+        object.__setattr__(self, "_layout", layout)
+
+    # -- pytree
+    def tree_flatten(self):
+        return (self.flat,), self._layout
+
+    @classmethod
+    def tree_unflatten(cls, layout, children):
+        return cls(children[0], layout)
+
+    # -- fields
+    @property
+    def fields(self):
+        """The field names, in the solution's order."""
+        return tuple(name for name, *_ in self._layout)
+
+    def _field(self, name):
+        for nm, parts, shape in self._layout:
+            if nm == name:
+                u = self.flat
+                lead = tuple(u.shape[:-1])
+                blocks = [u[..., a:b] for a, b in parts]
+                blk = blocks[0] if len(blocks) == 1 else blocks[0] + 1j * blocks[1]
+                return blk.reshape(lead + shape) if shape == () else blk.reshape(lead + (-1,) + shape[1:])
+        raise AttributeError(
+            f"the solution has no field {name!r}; its fields are {', '.join(map(repr, sorted(self.fields)))}."
+        )
 
     def __getattr__(self, name):
+        if name.startswith("__") or name in ("flat", "_layout"):
+            raise AttributeError(name)
+        if any(nm == name for nm, *_ in self._layout):
+            return self._field(name)
         try:
-            return self[name]
-        except KeyError:
-            raise AttributeError(f"the solution has no field {name!r}; its fields are {sorted(self)}.") from None
+            return getattr(self.flat, name)
+        except AttributeError:
+            raise AttributeError(
+                f"the solution has no field or array attribute {name!r}; its fields are "
+                f"{', '.join(map(repr, sorted(self.fields)))}."
+            ) from None
+
+    def __setattr__(self, name, value):
+        raise AttributeError("a Solution is read-only")
 
     def __dir__(self):
-        return sorted(set(super().__dir__()) | {k for k in self if isinstance(k, str) and k.isidentifier()})
+        return sorted(set(object.__dir__(self)) | {n for n in self.fields if n.isidentifier()})
+
+    def __getitem__(self, key):
+        return self._field(key) if isinstance(key, str) else self.flat[key]
+
+    # -- the array
+    def __jax_array__(self):
+        return jnp.asarray(self.flat)
+
+    def __array__(self, dtype=None, copy=None):
+        a = np.asarray(self.flat)
+        return a if dtype is None else a.astype(dtype)
+
+    def __len__(self):
+        return len(self.flat)
+
+    def __iter__(self):
+        return iter(self.flat)
+
+    def __float__(self):
+        return float(self.flat)
+
+    def __repr__(self):
+        return f"Solution(fields={list(self.fields)}, flat={self.flat!r})"
+
+
+def _solution_op(name):
+    def op(self, *other):
+        return getattr(self.flat, name)(*[o.flat if isinstance(o, Solution) else o for o in other])
+
+    op.__name__ = name
+    return op
+
+
+for _name in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow", "matmul"):
+    for _n in (f"__{_name}__", f"__r{_name}__"):
+        setattr(Solution, _n, _solution_op(_n))
+for _n in ("__neg__", "__pos__", "__abs__", "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"):
+    setattr(Solution, _n, _solution_op(_n))
+Solution.__hash__ = None
 
 
 def _field_names(constraints: List[Any]) -> Dict[Any, str]:
@@ -3083,7 +3176,7 @@ class FEM:
                     "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
                 )
             out = coupled(_em, self).solve(**kwargs)
-            return jnp.asarray(out.field) if isinstance(out, ElectroThermalSolution) else out
+            return self._as_solution(jnp.asarray(out.field)) if isinstance(out, ElectroThermalSolution) else out
 
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
@@ -3098,7 +3191,7 @@ class FEM:
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
-        return out
+        return self._as_solution(out)
 
     def _march_phrase(self, since: float) -> str:
         """The march headline for the log line, from THIS solve's stats only (a path that does not
@@ -3122,6 +3215,8 @@ class FEM:
         """
         import numpy as _np
 
+        if isinstance(out, Solution):
+            out = out.flat
         try:
             parts = [f"solved: {self._mode} · {wall:.3g} s"]
             march = self._march_phrase(since)
@@ -5195,24 +5290,13 @@ class FEM:
         (3, 4): "tetra", (3, 10): "tetra10", (3, 8): "hexahedron", (3, 20): "hexahedron20", (3, 27): "hexahedron27",
     }  # fmt: skip
 
-    def split(self, solution):
-        """The solution of this problem by field, in the assembler's field order: a :class:`Fields` dict, read as
-        ``sol.T`` or ``sol["T"]``.
-
-        A scalar field gives (n,), a vector field (n, k), a constant unknown its single value; the two real
-        parts of a complex field (fem_symbols(complex=True), named <name>_re and <name>_im) come back
-        as one complex array under <name>::
-
-            sol = fem.split(fem.solve())
-            A, T, I = sol.A, sol.T, sol.I
-        """
-        arr = np.asarray(solution).reshape(-1)
-        offs = list(self.offsets) if self.offsets is not None else [0, int(arr.size)]
-        if int(offs[-1]) != int(arr.size):
-            raise ValueError(
-                f"fem.split: the solution has {int(arr.size)} entries but this problem has {int(offs[-1])} DOFs."
-            )
+    def _solution_layout(self):
+        """``((name, ((start, stop), ...), shape), ...)``: each field's slice(s) of the DOF vector (two for a complex
+        field's real halves) and its shape per node (``()`` for a constant unknown's value)."""
+        offs = list(self.offsets) if self.offsets is not None else None
         keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        if offs is None or not keys:
+            return None
         names = _field_names(self._constraints or [])
         trials = {}
         for c in self._constraints or []:
@@ -5221,17 +5305,24 @@ class FEM:
                     trials.setdefault(getattr(n, "field_key", n.op_id), n)
         out = {}
         for i, k in enumerate(keys[: len(offs) - 1]):
-            blk = arr[offs[i] : offs[i + 1]]
             t = trials.get(k)
             vs = tuple(getattr(t, "value_shape", ()) or ())
-            if getattr(t, "_is_constant", False):
-                blk = blk.reshape(vs) if vs else blk.reshape(())
-            elif vs:
-                blk = blk.reshape((-1,) + vs)
-            out[names.get(k, str(k))] = blk
+            shape = vs if getattr(t, "_is_constant", False) else (-1,) + vs
+            out[names.get(k, str(k))] = ([(int(offs[i]), int(offs[i + 1]))], shape)
         for nm in [n for n in out if n.endswith("_re") and n[:-3] + "_im" in out]:
-            out[nm[:-3]] = out.pop(nm) + 1j * out.pop(nm[:-3] + "_im")
-        return Fields(out)
+            (re, shape), (im, _) = out.pop(nm), out.pop(nm[:-3] + "_im")
+            out[nm[:-3]] = (re + im, shape)
+        return tuple((nm, tuple(parts), shape) for nm, (parts, shape) in out.items()), int(offs[-1])
+
+    def _as_solution(self, out):
+        """``out`` as a :class:`Solution` when it is this problem's DOF vector (or a trajectory of them); anything
+        else (a deferred trace node, an adaptive trajectory, a coupled solve's own object) is returned as it is."""
+        if isinstance(out, Solution) or not (isinstance(out, (jax.Array, np.ndarray)) and out.ndim >= 1):
+            return out
+        lay = self._solution_layout()
+        if lay is None or int(out.shape[-1]) != lay[1]:
+            return out
+        return Solution(out, lay[0])
 
     def _initialized_x0(self):
         """The starting point from the fields' ``.initialize(value)`` (zero where a field has none), or None when no

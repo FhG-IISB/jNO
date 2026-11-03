@@ -81,14 +81,10 @@ def test_a_constant_unknown_and_a_complex_field_start_where_told():
     A.initialize(a0)
     I.initialize(0.7)
     x0 = np.asarray(fem._initialized_x0())
-    start = fem.split(x0)
-    np.testing.assert_allclose(start["A"], a0)
-    assert float(start["I"]) == 0.7
-    assert start.A is start["A"] and start.I is start["I"]  # fields read as attributes too
-    assert {"A", "I"} <= set(dir(start))
-    with pytest.raises(AttributeError, match="no field 'B'.*'A', 'I'"):
-        start.B
-    sol = fem.split(fem.solve(nonlinear=jno.solve.newton(**NEWTON)))
+    start = fem._as_solution(x0)
+    np.testing.assert_allclose(start.A, a0)
+    assert float(start.I) == 0.7
+    sol = fem.solve(nonlinear=jno.solve.newton(**NEWTON))
     assert abs(float(sol["I"])) > 0  # it solved from there
 
 

@@ -281,17 +281,21 @@ u.initialize(jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y))   # a formul
 - Not with `adapt=`: a start does not survive the change of mesh.
 - The same `u.initialize` is read by `jno.fdm` (steady start and initial state alike).
 
-### The solution by field — `fem.split`
+### The solution by field
 
-`fem.solve()` returns one vector of all DOFs; `fem.split` cuts it into the fields, by their names:
+`fem.solve()` returns a `jno.Solution`: the vector of every DOF, which also reads its fields by name:
 
 ```python
-sol = fem.split(fem.solve())
-sol.T, sol.A, sol.I        # nodal T, complex nodal A, the constant's value (sol["T"] works too)
+u = fem.solve()
+u.T, u.A, u.I              # nodal T, complex nodal A, the constant's value (u["T"] works too; u.fields lists them)
+u[0], 2 * u, jnp.linalg.norm(u), np.asarray(u), fem.solve(x0=u)   # still the flat vector
 ```
 
 A scalar field gives `(n,)`, a vector field `(n, k)`, a constant unknown its value, a complex field one complex
-array. A field named like a dict method (`keys`, `items`, ...) is read with brackets only.
+array; a transient trajectory keeps its time axis on every field. A field's name wins over the array attribute of
+the same name (`u.T` is the field `T`; the transpose is `u.flat.T`). The fields are slices of the vector, so they
+are differentiable, and a `Solution` is a pytree of that one vector (`jit`, `grad`, `vmap` pass through it). A
+deferred solve (a trace node inside `jno.core`) is not a `Solution`.
 
 ### Transient (semidiscrete `M u̇ + A u = c`)
 
