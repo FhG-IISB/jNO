@@ -3427,15 +3427,20 @@ class domain(MeshIOMixin):
             # squares a predicate true everywhere gave `sA` and `sB` the SAME 40 facets, the whole
             # boundary, of which only 16 and 24 respectively were their own. A tag naming one body's
             # surface is what `u.gap` needs to say which side of a contact it means.
+            # A named block (an interface side) is decided by its NAME, which is exact even where the two
+            # sides' facets coincide. The unnamed blocks (the exterior boundary, interface blocks without
+            # an owner) fall back to cell topology -- safe there, since two bodies' exterior faces cannot
+            # coincide -- in ONE call: the region's cell mask behind it classifies every cell of the mesh,
+            # so a call per block repeated that work once per block (dozens per tag on a many-region mesh).
             own = np.zeros(len(ents), dtype=bool)
-            _i = 0
-            for _b, _o in zip(blocks, owners):
-                _n = len(_b)
-                # A named block (an interface side) is decided by its NAME, which is exact even where
-                # the two sides' facets coincide. The exterior boundary carries no owner, so it falls
-                # back to cell topology -- safe there, since two bodies' exterior faces cannot coincide.
-                own[_i : _i + _n] = (_o == region) if _o is not None else self._facets_owned_by(_b, region, dim)
-                _i += _n
+            starts = np.cumsum([0] + [len(b) for b in blocks])
+            unnamed = [i for i, o in enumerate(owners) if o is None]
+            for i, o in enumerate(owners):
+                if o is not None:
+                    own[starts[i] : starts[i + 1]] = o == region
+            if unnamed:
+                rows = np.concatenate([np.arange(starts[i], starts[i + 1]) for i in unnamed])
+                own[rows] = self._facets_owned_by(ents[rows], region, dim)
             keep &= own
         if not keep.any():
             return

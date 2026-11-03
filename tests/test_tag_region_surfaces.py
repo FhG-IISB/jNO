@@ -229,3 +229,30 @@ def test_a_region_scoped_dirichlet_works_at_any_element_order(order):
     assert eB < tol, f"P{order}: body B should be 2xy, worst node off by {eB:.2e}"
     if order == 2:
         assert pts.shape[0] > int(np.asarray(d.built_mesh.points).shape[0]), "P2 adds midside nodes"
+
+
+def test_region_tag_classifies_the_region_once(monkeypatch):
+    """``d.tag(..., region=)`` decides ownership of every unnamed facet block from the region's cell mask,
+    and that mask classifies every cell of the mesh. Asking once per block repeated it for each interface
+    block of a many-region mesh (6 times here, dozens on larger part lists), for the same answer."""
+    import jno.utils.solver.fem_utils as fu
+    from jno import shape
+
+    d = (
+        (
+            shape.rect(0, 0, 1, 1).name("A")
+            + shape.rect(0, 1, 1, 2).name("B")
+            + shape.rect(0, 2, 1, 3).name("C")
+            + shape.rect(-1, -1, 2, 4).name("Out")
+        )
+        .sized(0.25)
+        .domain()
+    )
+    _ = d.mesh
+    calls = []
+    real = fu._cell_region_mask
+    monkeypatch.setattr(fu, "_cell_region_mask", lambda *a, **k: calls.append(a[1]) or real(*a, **k))
+    d.tag("sB", lambda x, y: (x > 0.99) & (x < 1.01) & (y > 1) & (y < 2), region="B")
+    assert calls == ["B"]
+    pts = np.asarray(d._boundary_regions["sB"].points)
+    assert len(pts) == 5 and np.allclose(pts[:, 0], 1.0) and pts[:, 1].min() >= 1 and pts[:, 1].max() <= 2
