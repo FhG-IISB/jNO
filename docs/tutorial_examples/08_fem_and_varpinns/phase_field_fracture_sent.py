@@ -72,9 +72,10 @@ dom.tag("top", lambda x, y: y > 1 - 1e-9)
 co, cb, ct = (dom.variable(r, split=True) for r in ("interior", "bot", "top"))
 X = [co[0], co[1]]
 
-u, phi = dom.fem_symbols(value_shape=(2,))  # displacement (vector)
-dm, q = dom.fem_symbols()  # damage (scalar)
-Hs, _ = dom.fem_symbols(value_shape=())  # the history state — never solved for, only evolved
+u = dom.unknown.vector(2, name="u")  # displacement
+dm = dom.unknown.scalar(name="d")  # damage
+Hs = dom.unknown.scalar(name="H")  # the history state — never solved for, only evolved
+phi, q = u.test(), dm.test()
 
 # --- the energy, written once; the stress follows by differentiating it ------------------------------
 I2 = ident(2)

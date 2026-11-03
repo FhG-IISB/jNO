@@ -3798,6 +3798,20 @@ class ModelCall(Placeholder):
         the unknown is the trial function and ``v`` its test function -- same space, shape and order."""
         return self._unknown_symbol_or_raise("u.test()").test()
 
+    def bounds(self, lo=None, hi=None) -> "BoundConstraint":
+        """A **box constraint** ``lo <= u <= hi`` on this unknown (``domain.unknown()``), exactly as
+        :meth:`Placeholder.bounds` on its trial symbol. A history bound written on the unknown itself,
+        ``d.bounds(d.i(-1), 1.0)``, is re-targeted onto that symbol, which is what the bound reads."""
+        sym = self._unknown_symbol_or_raise("u.bounds()")
+
+        def _side(v):
+            node = v._expr if hasattr(v, "_expr") else v
+            if isinstance(node, HistoryRef) and node.target is self:
+                return sym.i(node.offset)
+            return v
+
+        return sym.bounds(_side(lo), _side(hi))
+
     # docstring-from: jno.trace.TrialFunction.pin
     def pin(self, value=0.0, mean=False):
         """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.

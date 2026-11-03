@@ -1512,13 +1512,20 @@ def _eval_integrand(domain, node, local):
     if isinstance(node, Variable):
         dim_start, dim_end = node.dim
 
-        # Local quadrature coordinates
+        # Local quadrature coordinates. One direction (`x` of `variable(..., split=True)`) is a per-point
+        # scalar, ``(n_quad,)``: the slice would keep a phantom ``(n_quad, 1)`` axis, harmless in a weak
+        # term (the test function absorbs it) but rank-broadcasting against a scalar ``state.i(-1)`` slice
+        # in an ``.evolves`` readout -- the same convention a scalar trial follows (see below).
+        def _coords():
+            q = local["physical_quad_points"][..., dim_start:dim_end]
+            return q[..., 0] if dim_end - dim_start == 1 else q
+
         if local.get("surface", False):
             if isinstance(node.tag, str) and node.tag.startswith("gauss_"):
-                return local["physical_quad_points"][..., dim_start:dim_end]
+                return _coords()
         else:
             if node.tag == "fem_gauss":
-                return local["physical_quad_points"][..., dim_start:dim_end]
+                return _coords()
 
         if node.tag == "cell_size":
             arr = local["domain_context"].get("cell_size")

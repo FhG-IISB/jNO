@@ -443,10 +443,27 @@ def _lower_unknowns(obj: Any) -> Any:
     bare = _bare(obj)
     if not isinstance(bare, Placeholder):
         return obj
-    from .trace import Jacobian, TemporalDerivative
+    from .trace import HistoryRef, Jacobian, StateUpdate, TemporalDerivative
+
+    if isinstance(bare, HistoryRef):
+        # `u.i(k)` on an unknown reads the history of its trial symbol: the buffer is keyed by the field's
+        # identity, so the read and the `.evolves` update (lowered below) must name the same symbol.
+        sym = _unknown_symbol_of(bare.target)
+        return obj if sym is None else HistoryRef(sym, bare.offset)
+
+    if isinstance(bare, StateUpdate):
+        # `_walk` does not descend into a state update (it is pulled out of the weak-form classification),
+        # so its state field and formula are lowered here, each like a term of its own.
+        target, formula = _lower_unknowns(bare.target), _lower_unknowns(bare.expr)
+        if target is bare.target and formula is bare.expr:
+            return obj
+        return StateUpdate(target, formula, region=bare.region)
 
     nodes = list(_walk(bare))
     mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    for n in nodes:
+        if isinstance(n, HistoryRef) and _unknown_symbol_of(n.target) is not None:
+            mapping[n] = HistoryRef(_unknown_symbol_of(n.target), n.offset)
     if not mapping:
         return obj
     for n in nodes:
