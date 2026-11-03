@@ -1133,10 +1133,19 @@ def staggered(
             anderson=anderson,
         )
 
-    def _label(f):  # a field's value identity for the repr; an unnamed one falls back to its repr (never equal)
+    def _label(f):
+        """A field's value identity for the repr, which compiled-solve caches key on: its name AND its
+        ``field_key``, since two fields may share a name. A ``domain.unknown()`` field is labelled by the
+        trial symbol it stands for (its own ``name`` is a method, the same for every field). A field
+        with no key falls back to its repr."""
         if isinstance(f, (list, tuple)):
             return tuple(_label(g) for g in f)
-        return getattr(f, "name", None) or repr(f)
+        f = getattr(getattr(f, "model", None), "__dict__", {}).get("_unknown_symbol", f)
+        f = getattr(f, "_expr", f)  # a typed view labels as the field it views
+        name, key = getattr(f, "name", None), getattr(f, "field_key", None)
+        if isinstance(name, str) and key is not None:
+            return f"{name}#{key}"
+        return name if isinstance(name, str) and name else repr(f)
 
     config = dict(
         fields=tuple(_label(f) for f in fields), rtol=rtol, atol=atol, max_sweeps=max_sweeps,

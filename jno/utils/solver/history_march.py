@@ -47,7 +47,7 @@ def _roll_buffer(buf, nv):
     return jnp.concatenate([nv[:, :, None, ...], buf[:, :, :-1, ...]], axis=2)
 
 
-def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, checkpoint=None):
+def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, checkpoint=None, cache_key=None):
     """March ``fem`` over its domain's pseudo-time grid and return the ``(n_steps, n_dofs)`` trajectory.
 
     ``solve_fn`` (if given) is a nonlinear solver ``(residual_fn, u0) -> u`` — e.g. the one composed from
@@ -72,8 +72,26 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
     an interrupted run -- see :func:`_march`. A forward run only: it is refused where the march must stay
     one differentiable scan (a parametric trace node) and on the legs with their own loops (adaptive,
     arc-length, contact).
+
+    ``cache_key`` is the per-step solver's value identity (``fem.solve`` passes it for jNO's own drivers,
+    ``None`` for a user ``solve_fn=``). With one, the compiled scan and the adaptive pilot's compiled step
+    are kept on the operator and reused by every later solve with an equal solver; a rebuilt fem has a new
+    operator, so nothing stale survives a re-assembly.
     """
     op = fem._op
+    _cache = op.__dict__.setdefault("_march_cache", {}) if cache_key is not None else None
+
+    def _cached(name, build):
+        """``build()`` once per (operator, solver, ``name``) -- every closure the compiled program captures
+        is fixed by those (the operator, the solver it was composed from, the zero initial state);
+        everything that varies between solves (runtime values, the τ grid, load-path frames) is an argument."""
+        if _cache is None:
+            return build()
+        key = (name, cache_key)
+        if key not in _cache:
+            _cache[key] = build()
+        return _cache[key]
+
     if checkpoint is not None:
         _refuse_checkpoint_leg(fem, path, contact, values)
     if values is not None:
@@ -255,6 +273,23 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
         _grid = tau_grid if grid is None else grid
         _frames = path_frames if grid is None else {}
 
+        from .march_checkpoint import claim
+
+        spec = claim("load-path march")
+        if spec is not None:
+            return _march_checkpointed(spec, _scan_step(param_args), (u0, buffers0, sbuffers0), _grid, _frames, param_args)
+        # Compiled once per (operator, solver) and reused by every later solve: the scan used to run eagerly,
+        # so each `fem.solve()` traced and compiled the whole march again (see `_cached`).
+        scan = _cached(
+            "scan", lambda: jax.jit(lambda pa, g, f: lax.scan(_scan_step(pa), (u0, buffers0, sbuffers0), (g, f)))
+        )
+        _final, (traj, r_end, r_start) = scan(param_args, _grid, _frames)
+        _check_march_converged(r_end, r_start, _grid, solve_fn, states=traj)
+        return traj  # (n_steps, n_dofs)
+
+    def _scan_step(param_args):
+        """The scan body of one load step, for the given runtime-parameter values."""
+
         def step(carry, xs):
             tau_k, path_k = xs  # this step's τ and its per-load-step field slices ({fid: (n_nodes,)})
             u_prev, buffers, sbuffers = carry
@@ -270,14 +305,7 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
             r_start = jnp.linalg.norm(jnp.asarray(root_fn(u_ref)))
             return (u, new_buffers, new_sbuffers), (u, r_end, r_start)
 
-        from .march_checkpoint import claim
-
-        spec = claim("load-path march")
-        if spec is not None:
-            return _march_checkpointed(spec, step, (u0, buffers0, sbuffers0), _grid, _frames, param_args)
-        _final, (traj, r_end, r_start) = lax.scan(step, (u0, buffers0, sbuffers0), (_grid, _frames))
-        _check_march_converged(r_end, r_start, _grid, solve_fn, states=traj)
-        return traj  # (n_steps, n_dofs)
+        return step
 
     def _march_checkpointed(spec, step, carry, _grid, _frames, param_args):
         """The same march as one ``lax.scan``, run as chunks of ``spec.every`` steps with the trajectory and
@@ -562,7 +590,19 @@ def run_history_march(fem, solve_fn=None, path=None, contact=None, values=None, 
 
         def _run_adaptive(param_args, replay=True):
             schedule, states = _pilot_schedule(
-                path, limits, tau_pts, u0, buffers0, sbuffers0, _step_once, param_args, dtype, op, solve_fn, _root_of
+                path,
+                limits,
+                tau_pts,
+                u0,
+                buffers0,
+                sbuffers0,
+                _step_once,
+                param_args,
+                dtype,
+                op,
+                solve_fn,
+                _root_of,
+                cached=_cached,
             )
             fem._tau_schedule = np.asarray(schedule)  # observability: what the pilot actually chose
             src = jnp.asarray(schedule, dtype=dtype)
@@ -904,7 +944,19 @@ def _check_march_moved(r_end, r_start, bound, rtol, atol, *, states=None, what="
 
 
 def _pilot_schedule(
-    path, limits, tau_pts, u0, buffers0, sbuffers0, step_once, param_args, dtype, op=None, solve_fn=None, root_of=None
+    path,
+    limits,
+    tau_pts,
+    u0,
+    buffers0,
+    sbuffers0,
+    step_once,
+    param_args,
+    dtype,
+    op=None,
+    solve_fn=None,
+    root_of=None,
+    cached=None,
 ):
     """March EAGERLY with rejection; return ``(schedule, states)`` — the accepted τ values and the
     solution at each of them.
@@ -951,7 +1003,10 @@ def _pilot_schedule(
         r_after = jnp.linalg.norm(jnp.asarray(root_fn(u)))
         return u, nb, nsb, r_before, r_after
 
-    _attempt_c = _jax.jit(_attempt) if op is not None else _attempt
+    # `cached` (the march's per-operator cache) keeps the compiled attempt across solves, as for the scan.
+    _attempt_c = (
+        (cached or (lambda _name, build: build()))("attempt", lambda: _jax.jit(_attempt)) if op is not None else _attempt
+    )
     dtau = float(path.dt0) if path.dt0 is not None else span / max(1, len(tau_pts) - 1)
     dtau_min = span * 1e-8
     shrink, grow = float(path.shrink), float(path.grow)
