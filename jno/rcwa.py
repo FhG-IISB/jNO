@@ -120,11 +120,10 @@ def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
             the last sample of one layer and the first of the next, so a thickness is only known to one
             sample spacing. The front door passes a bisection on the permittivity itself, which finds a
             sharp interface exactly and a mesh field's interface where its interpolant crosses halfway
-            between the layers.
-        A layer's thickness is the distance between the interfaces that bound it -- not between its
-            first
-        and last samples, which is short by up to one spacing (a 0.2 slab sampled every 1/63 came out
-        11/63 = 0.175 thick, and its reflectance 0.34 against Airy's 0.62).
+            between the layers. A layer's thickness is the distance between the interfaces that bound
+            it -- not between its first and last samples, which is short by up to one spacing (a 0.2
+            slab sampled every 1/63 came out 11/63 = 0.175 thick, and its reflectance 0.34 against
+            Airy's 0.62).
 
     Returns:
         list[tuple[float, np.ndarray]]: ``[(thickness, eps_xy), ...]`` super→substrate; the two ambients
@@ -2071,7 +2070,8 @@ def rcwa(
         wavelength: Free-space wavelength (same length unit as the geometry). Optional — inferred from
             the superstrate (assumed vacuum) when omitted. Pass it to override or if no ambient is
             vacuum.
-        grid, nz: Transverse resolution and number of z-samples used to detect the layer stack.
+        grid: Transverse resolution used to detect the layer stack.
+        nz: Number of z-samples used to detect the layer stack.
         slices: Staircase a continuously-varying permittivity into this many layers instead of raising.
         params: values of the problem's ``jno.np.parameter`` nodes, by name, used for the eager
             inference (structure, source, wavelength) instead of their initial values.

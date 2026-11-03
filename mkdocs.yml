@@ -61,6 +61,8 @@ plugins:
             show_signature_annotations: true
             separate_signature: true
             docstring_style: google
+            docstring_options:
+              warn_missing_types: false
             docstring_section_style: spacy
             merge_init_into_class: true
             members_order: source

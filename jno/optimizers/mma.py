@@ -36,15 +36,17 @@ class MMAOptimizer:
         move: Move limit as a fraction of the box width -- the most a variable may change in one
             iteration. The single most important knob: too large oscillates, too small crawls.
             ``0.1``-``0.2`` is usual for densities, much smaller for geometry.
-        lower, upper: Box bounds — a scalar, or an array of one bound per variable. A density is
+        lower: Lower box bound — a scalar, or an array of one bound per variable. A density is
             ``lower=1e-3`` (not 0, which makes the stiffness singular) and ``upper=1.0``. A nodal
             coordinate is bounded per node, since the limit is on its movement about its OWN
             initial position: ``lower=x0 - 2``, ``upper=x0 + 2``.
+        upper: Upper box bound, as ``lower``.
         asy_init: Initial asymptote distance, as a fraction of the box width.
-        asy_shrink, asy_grow: Asymptote adaptation. A variable that just reversed direction has its
+        asy_shrink: Asymptote adaptation. A variable that just reversed direction has its
             asymptotes pulled in by ``asy_shrink`` (damping the oscillation); one moving steadily
             has them pushed out by ``asy_grow`` (accelerating). This history-dependence is what
             distinguishes MMA from a fixed convex approximation.
+        asy_grow: Asymptote growth factor for a variable moving steadily, see ``asy_shrink``.
         move_gamma: Per-iteration decay of the move limit, ``move_k = move * move_gamma**k``,
             floored at ``move_min``. MMA does not converge to a point: near the optimum the
             iterates keep chattering at the scale of the move limit, which is fine for the design
@@ -113,15 +115,17 @@ def mma(
         move: Move limit as a fraction of the box width -- the most a variable may change in one
             iteration. The single most important knob: too large oscillates, too small crawls.
             ``0.1``-``0.2`` is usual for densities, much smaller for geometry.
-        lower, upper: Box bounds — a scalar, or an array of one bound per variable. A density is
+        lower: Lower box bound — a scalar, or an array of one bound per variable. A density is
             ``lower=1e-3`` (not 0, which makes the stiffness singular) and ``upper=1.0``. A nodal
             coordinate is bounded per node, since the limit is on its movement about its OWN
             initial position: ``lower=x0 - 2``, ``upper=x0 + 2``.
+        upper: Upper box bound, as ``lower``.
         asy_init: Initial asymptote distance, as a fraction of the box width.
-        asy_shrink, asy_grow: Asymptote adaptation. A variable that just reversed direction has its
+        asy_shrink: Asymptote adaptation. A variable that just reversed direction has its
             asymptotes pulled in by ``asy_shrink`` (damping the oscillation); one moving steadily
             has them pushed out by ``asy_grow`` (accelerating). This history-dependence is what
             distinguishes MMA from a fixed convex approximation.
+        asy_grow: Asymptote growth factor for a variable moving steadily, see ``asy_shrink``.
         move_gamma: Per-iteration decay of the move limit, ``move_k = move * move_gamma**k``,
             floored at ``move_min``. MMA does not converge to a point: near the optimum the
             iterates keep chattering at the scale of the move limit, which is fine for the design
