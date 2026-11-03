@@ -4738,6 +4738,24 @@ def assemble_fem_native(
                 # batched: one vmap over every boundary node x every region facet was the build's peak
                 mask = map_points(loc, coords, getattr(loc, "n_entities", 1)).astype(bool)
             bnodes = bnodes[mask]
+        # A tag on a body's faces INSIDE a conforming mesh (`d.tag(name, where, region=body)` over part of
+        # an interface): its nodes are not on any boundary facet, so the walk above finds only those that
+        # also touch the outer boundary. Measured on two stacked squares: `T(seg) - 1` pinned 1 of the
+        # segment's 11 nodes, silently. Add the body's nodes it shares with other cells (its surface
+        # inside the mesh, P2 midpoints included: the field's own connectivity) where `where` holds.
+        if region in (getattr(domain, "_interior_face_tags", ()) or ()):
+            _body = (getattr(domain, "_tag_regions", {}) or {}).get(region)
+            _pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
+            _cf = np.asarray(cells_f_real[fidx])
+            _in = np.asarray(_cell_region_mask(domain, _body)).reshape(-1) > 0
+            if _pred is None or _in.shape[0] != _cf.shape[0]:
+                raise NotImplementedError(
+                    f"Dirichlet on {region!r}: the faces of body {_body!r} inside the mesh could not be "
+                    "resolved on this field's cells. Pin a whole interface tag (domain.interface_tags()) instead."
+                )
+            _surf = np.intersect1d(np.unique(_cf[_in]), np.unique(_cf[~_in]))
+            _keep = np.asarray(_pred(*(pts_all[_surf, i] for i in range(dim))), dtype=bool).reshape(-1)
+            bnodes = np.union1d(np.asarray(bnodes, dtype=np.int64), _surf[_keep])
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
         # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
         # ownership is the only thing that separates them, and it lives in the node ids.

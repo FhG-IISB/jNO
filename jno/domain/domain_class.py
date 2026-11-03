@@ -2601,6 +2601,13 @@ class domain(MeshIOMixin):
         It is equally the answer to "the part of the outer boundary belonging to *this* body", which a
         coordinate predicate also cannot express once two bodies touch.
 
+        With ``region=`` the predicate may also pick part of the body's surface INSIDE a conforming mesh
+        (a piece of an interface): surface terms integrate over those facets and ``u(name) - g`` pins
+        their nodes::
+
+            d.tag("seg", lambda x, y: (abs(y - 1) < 1e-9) & (x < 0.5), region="a")
+            T(*d.variable("seg", split=True)[:2]) - 1.0     # T = 1 on that piece of a's top
+
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
         sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
