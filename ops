@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1793743592,"nonce":"y1myisxYWM4QP5xCbV7jfe+eodw=","message":"Fixed in 7294e67b; test: tests/test_fem_history_march_cache.py::test_a_reordered_or_renamed_sweep_is_a_different_solver","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1793743592,"nonce":"1F+kUCj+cxpTWWCYhIkzrECkXS0=","status":2}]}
