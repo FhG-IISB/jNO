@@ -1266,6 +1266,10 @@ def _is_space_frozen(node, local=None) -> bool:
         return False
     if local is not None and ("frozen", node.frozen_id) in (local.get("coef_fields") or {}):
         return True
+    if str(node.space).upper() == "LAGRANGE" and local is not None and node.frozen_id in (local.get("frozen_fields") or {}):
+        # Its nodal values are gathered for this cell (a previous-step field of a P2 unknown, delivered on
+        # the load-path channel): read it on the source field's own basis, whatever its order.
+        return False
     return not (str(node.space).upper() == "LAGRANGE" and int(node.order) == 1)
 
 
