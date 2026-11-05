@@ -161,6 +161,47 @@ def _contains_fd_partial(node) -> bool:
     return False
 
 
+def _trace_nodes(node, seen=None):
+    """Every node of a trace subtree, once (the attributes ``_contains_fd_partial`` walks)."""
+    seen = set() if seen is None else seen
+    if id(node) in seen:
+        return
+    seen.add(id(node))
+    yield node
+    for attr in ("left", "right", "target", "expr", "operation", "model"):
+        child = getattr(node, attr, None)
+        if isinstance(child, Placeholder):
+            yield from _trace_nodes(child, seen)
+    for attr in ("args", "variables", "options"):
+        for v in getattr(node, attr, None) or ():
+            for vv in v if isinstance(v, (list, tuple)) else (v,):
+                if isinstance(vv, Placeholder):
+                    yield from _trace_nodes(vv, seen)
+
+
+def _guard_ad_on_coordinate_free(target) -> None:
+    """Raise if an automatic-differentiation derivative is taken of a network or data expression that
+    depends on no coordinate at all -- ``grad(net(rho), x)`` with ``rho`` a per-sample data tensor.
+
+    Nothing in such a target reaches ``x``, so AD returns exactly 0, a plausible-looking wrong answer. When
+    the network's output is a field on the mesh (an FNO), that is what ``.field.bind(x=..., y=...)``
+    declares: its derivatives then come from the grid, or inside ``jno.fem`` from the FE basis.
+    Expressions with a coordinate, an FE trial or test function, or no network / data at all pass.
+    """
+    nodes = list(_trace_nodes(target))
+    if any(isinstance(n, (Variable, TrialFunction, TestFunction)) for n in nodes):
+        return
+    culprit = next((n for n in nodes if isinstance(n, ModelCall) and n.args), None)
+    culprit = culprit or next((n for n in nodes if isinstance(n, TensorTag)), None)
+    if culprit is not None:
+        raise ValueError(
+            f"An automatic-differentiation derivative of {culprit!r} is exactly 0: the expression depends on "
+            "no coordinate (its input is data, not x). If it is a field on the mesh -- the output of a "
+            "neural operator such as an FNO -- declare it with `.field.bind(x=x, y=y)`: its derivatives "
+            "then come from the grid, and inside `jno.fem` from the FE basis."
+        )
+
+
 def _guard_ad_on_fd(target, scheme: str) -> None:
     """Raise if an automatic-differentiation derivative is requested over a
     FieldView finite-difference partial.
@@ -172,6 +213,7 @@ def _guard_ad_on_fd(target, scheme: str) -> None:
     """
     if str(scheme).startswith("finite_difference"):
         return
+    _guard_ad_on_coordinate_free(target)
     if _contains_fd_partial(target):
         raise ValueError(
             "Cannot apply an automatic-differentiation derivative to an expression built "
@@ -1270,6 +1312,7 @@ class Placeholder:
         """
         from .views import FieldView
 
+        self._mesh_field = True  # declared a field on the mesh: jno.fem reads it as nodal values
         return FieldView(self)
 
     # ------------------------------------------------------------------

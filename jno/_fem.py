@@ -7391,14 +7391,8 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     # pair either, and a contribution left on it is added to its `u - g` -- measured: a coupling of 0.1
     # held such a wall at 0.4 where 0.5 was prescribed. The operator's own declaration joins in for the
     # paths that do not stash on the domain (1-D).
-    _d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
-    for _dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
-        _d.extend(int(i) for i in np.asarray(_dofs).reshape(-1))
-    _d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
-    _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
-    if _op_d is not None:
-        _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
-    d_dofs = jnp.asarray(unique_values(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
+    _d = _essential_dof_ids(domain, fem_obj._op)
+    d_dofs = jnp.asarray(_d, dtype=jnp.int32) if _d.size else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -7581,6 +7575,19 @@ _TIED_CONSTANT_DOMAINS: List[Any] = []
 
 
 # docstring-from: jno._fem._fem_impl
+def _essential_dof_ids(domain: Any, op: Any) -> np.ndarray:
+    """Every DOF carrying an essential condition, sorted: constant-valued, time-varying and args-driven rows,
+    plus the ones the operator declares itself (the paths that do not stash on the domain, 1-D)."""
+    d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
+    for dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
+        d.extend(int(i) for i in np.asarray(dofs).reshape(-1))
+    d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
+    op_d = getattr(op, "dirichlet_dofs", None)
+    if op_d is not None:
+        d.extend(int(i) for i in np.asarray(op_d).reshape(-1))
+    return np.asarray(unique_values(np.asarray(d, dtype=np.int64)), dtype=np.int64) if d else np.zeros(0, np.int64)
+
+
 def fem(
     constraints: Any,
     *,
@@ -7637,10 +7644,26 @@ def fem(
     _fn._CHUNK_CONSUMED[0] = False
     _fn._QUAD_EXPLICIT[0] = quad_degree is not None
     _fn._QUAD_REPORTED.clear()
+    lowered = _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints)
+    from .utils.solver.nodal_trial import NetworkTrialResidual, split_network_trial
+
+    split = split_network_trial(lowered)
+    if split is not None:  # u = net(rho).field in the unknown's place: assemble with the FE trial, return its residual
+        inner = fem(split["constraints"], quad_degree=quad_degree, chunk=chunk, _dd_overlap=_dd_overlap)
+        if inner.mode != "linear":
+            raise NotImplementedError(
+                f"jno.fem: a network field trial (u = net(rho).field.bind(...)) needs a form linear in u; this one "
+                f"assembles as {inner.mode!r}. Nonlinear forms are not supported on this route yet."
+            )
+        from .utils.logger import get_logger
+
+        out = NetworkTrialResidual(inner, split["network"], split["data"])
+        get_logger().info(f"jno.fem: network field trial, the loss is the FE residual of its output ({out!r})")
+        return out
     try:
         with _host_assembly_scope():
             out = _fem_impl(
-                _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints),
+                lowered,
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
