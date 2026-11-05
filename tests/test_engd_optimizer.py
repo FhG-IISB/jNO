@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import equinox as eqx
 import jax
@@ -280,3 +281,127 @@ def test_engd_optimizer_in_compare():
 
     assert "ENGD-new" in results
     assert math.isfinite(results["ENGD-new"])
+
+
+# ---------------------------------------------------------------------------
+# SPRING momentum + Levenberg-Marquardt damping (Goldshlager, Abrahamsen & Lin 2024,
+# arXiv:2401.10190; Jnini et al. 2026, arXiv:2604.05230, Sec. 2.3, eq. 26)
+# ---------------------------------------------------------------------------
+
+
+def _spring_kernel_oracle(J, r, phi_prev, mu, lam):
+    """Eq. 26 of arXiv:2604.05230 in the paper's own N x N (kernel) form."""
+    import jax.numpy as jnp
+
+    N = J.shape[0]
+    M = J @ J.T + lam * jnp.eye(N)
+    return mu * phi_prev + J.T @ jnp.linalg.solve(M, r - mu * J @ phi_prev)
+
+
+@pytest.mark.parametrize("mu,lam", [(0.0, 1e-3), (0.9, 1e-3), (0.99, 1e-6), (0.5, 10.0)])
+def test_spring_direction_matches_kernel_form(mu, lam):
+    """The P x P step with g = J^T r, G = J^T J equals the paper's N x N SPRING step (N < P)."""
+    import jax.numpy as jnp
+
+    from jno.utils.explainability import engd_direction
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+    N, P = 12, 40
+    J = jax.random.normal(k1, (N, P))
+    r = jax.random.normal(k2, (N,))
+    phi_prev = jax.random.normal(k3, (P,))
+    got = engd_direction(J.T @ J, J.T @ r, phi_prev, momentum=mu, damping=lam, rcond=None)
+    want = _spring_kernel_oracle(J, r, phi_prev, mu, lam)
+    # P > N: J^T J + lam I has P - N eigenvalues equal to lam, so the P x P solve carries
+    # cond = (sigma_max^2 + lam) / lam more rounding than the N x N one. Bound by that, not a guess.
+    cond = (jnp.linalg.norm(J, 2) ** 2 + lam) / lam
+    tol = 100 * jnp.finfo(J.dtype).eps * cond
+    assert float(jnp.max(jnp.abs(got - want)) / jnp.max(jnp.abs(want))) < tol
+
+
+def test_spring_undamped_is_pseudo_inverse_limit():
+    """damping=0 (lstsq): phi = mu phi_prev + J^+ (r - mu J phi_prev), momentum only in null(J)."""
+    import jax.numpy as jnp
+
+    from jno.utils.explainability import engd_direction
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(1), 3)
+    N, P, mu = 10, 30, 0.8
+    J = jax.random.normal(k1, (N, P))
+    r = jax.random.normal(k2, (N,))
+    phi_prev = jax.random.normal(k3, (P,))
+    got = engd_direction(J.T @ J, J.T @ r, phi_prev, momentum=mu, damping=0.0, rcond=None)
+    want = mu * phi_prev + jnp.linalg.pinv(J) @ (r - mu * J @ phi_prev)
+    assert jnp.allclose(got, want, rtol=1e-7, atol=1e-9)
+
+
+def test_engd_direction_plain_is_unchanged():
+    """momentum=0, damping=0 is exactly the old lstsq(G, g)."""
+    import jax.numpy as jnp
+
+    from jno.utils.explainability import engd_direction
+
+    J = jax.random.normal(jax.random.PRNGKey(2), (50, 20))
+    g = jax.random.normal(jax.random.PRNGKey(3), (20,))
+    G = J.T @ J
+    got = engd_direction(G, g, jnp.zeros(20), momentum=0.0, damping=0.0, rcond=None)
+    assert jnp.array_equal(got, jnp.linalg.lstsq(G, g)[0])
+
+
+@pytest.mark.parametrize(
+    "kw,match",
+    [({"momentum": -0.1}, "momentum"), ({"momentum": 1.0}, "momentum"), ({"damping": -1e-3}, "damping")],
+)
+def test_engd_rejects_bad_momentum_and_damping(kw, match):
+    """Both spellings (the sentinel and jno.callbacks.engd) reject momentum outside [0, 1) and damping < 0."""
+    with pytest.raises(ValueError, match=match):
+        engd(**kw)
+    net, _, gram_terms, _ = _build_poisson2d(seed=0)
+    with pytest.raises(ValueError, match=match):
+        jno.callbacks.engd(gram_terms, **kw)
+
+
+def test_engd_spring_convergence():
+    """engd(momentum=, damping=) (SPRING) reaches rel-L2 < 1e-3 in 200 epochs on Poisson2D."""
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
+    net.optimizer(engd(momentum=0.9, damping=1e-8, line_search=True))
+    crux = jno.core(losses)
+    crux.solve(200)
+    err = eval_error(crux)
+    assert math.isfinite(err), f"SPRING produced non-finite error: {err}"
+    assert err < 1e-3, f"SPRING did not converge: rel-L2 = {err:.3e} (expected < 1e-3)"
+
+
+def test_engd_callback_carries_spring_state():
+    """The callback keeps phi between steps (momentum is applied, not silently dropped)."""
+    net, losses, gram_terms, _ = _build_poisson2d(seed=0)
+    cb = jno.callbacks.engd(gram_terms, momentum=0.9, damping=1e-6, line_search=False)
+    net.optimizer(optax.sgd(1e-3))
+    jno.core(losses).solve(3, callbacks=[cb])
+    assert cb._phi is not None and float(jax.numpy.linalg.norm(cb._phi)) > 0.0
+
+    net0, losses0, gram_terms0, _ = _build_poisson2d(seed=0)
+    net1, losses1, gram_terms1, _ = _build_poisson2d(seed=0)
+    c0 = jno.callbacks.engd(gram_terms0, momentum=0.0, damping=1e-6, line_search=False)
+    c1 = jno.callbacks.engd(gram_terms1, momentum=0.9, damping=1e-6, line_search=False)
+    for n in (net0, net1):
+        n.optimizer(optax.sgd(1e-3))
+    k0, k1 = jno.core(losses0), jno.core(losses1)
+    k0.solve(3, callbacks=[c0])
+    k1.solve(3, callbacks=[c1])
+    p0 = jax.flatten_util.ravel_pytree(eqx.filter(k0.models, eqx.is_array))[0]
+    p1 = jax.flatten_util.ravel_pytree(eqx.filter(k1.models, eqx.is_array))[0]
+    assert not jax.numpy.allclose(p0, p1)
+
+
+def test_engd_spring_line_search_carries_taken_step(monkeypatch):
+    """P > N with the line search, momentum 0.9: carrying alpha_k * phi_k converges (measured 1.7e-6);
+    eq. 26's unscaled phi_k stalled at 2.3e-3 on this exact setup."""
+    monkeypatch.setattr(sys.modules[__name__], "_N_INT", 12)
+    monkeypatch.setattr(sys.modules[__name__], "_N_BDY", 12)
+    net, losses, _, eval_error = _build_poisson2d(seed=0, hidden_dims=20, num_layers=2)  # P = 501 > N = 192
+    net.optimizer(engd(momentum=0.9, damping=1e-8, line_search=True))
+    crux = jno.core(losses)
+    crux.solve(200)
+    err = eval_error(crux)
+    assert err < 1e-4, f"SPRING (P > N, line search) stalled: rel-L2 = {err:.3e}"

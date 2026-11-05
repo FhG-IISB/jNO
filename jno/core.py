@@ -2673,6 +2673,8 @@ class core:
                     gram_interval=_sentinel._gram_interval,
                     rcond=_sentinel._rcond,
                     line_search=_sentinel._line_search,
+                    momentum=_sentinel._momentum,
+                    damping=_sentinel._damping,
                 )
                 if callbacks is None:
                     callbacks = [_cb]
