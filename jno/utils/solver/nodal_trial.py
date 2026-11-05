@@ -209,7 +209,10 @@ class NetworkTrialResidual:
                 A0, _ = op.evaluate(self._args_zero)
                 A1, _ = op.evaluate({k: jnp.ones_like(v) for k, v in self._args_zero.items()})
                 z = jnp.asarray(np.random.default_rng(0).normal(size=int(self.fem.dofs)), A0.dtype)
-                if not np.allclose(np.asarray(A0 @ z), np.asarray(A1 @ z)):
+                # Relative, at sqrt(eps): re-assembling A in float32 on a GPU moves it by round-off (~1e-7),
+                # while an input field that really enters A changes it by O(1) between 0 and 1.
+                a0, a1 = np.asarray(A0 @ z, np.float64), np.asarray(A1 @ z, np.float64)
+                if np.linalg.norm(a1 - a0) > np.sqrt(np.finfo(np.dtype(A0.dtype)).eps) * np.linalg.norm(a0):
                     raise NotImplementedError(
                         f"jno.fem (network field trial): the input field(s) {sorted(self._data)} enter the operator A, "
                         "so A differs per sample and one preconditioner built for all of them would be wrong for "

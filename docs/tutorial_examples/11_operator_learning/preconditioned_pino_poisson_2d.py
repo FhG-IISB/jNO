@@ -39,6 +39,7 @@ def forcings(rho):
     return dom
 
 
+print(jno.info())  # environment: device, precision
 train = forcings(sine_series(POOL, seed=1)[0])
 U, V = train.fem_symbols()
 xi, yi, _ = train.variable("interior", split=True)
@@ -61,6 +62,8 @@ net.optimizer(optax.adam(optax.cosine_decay_schedule(LR, EPOCHS, alpha=0.1)))
 u = net(rho).field.bind(x=xi, y=yi)  # the FNO's output is a field on the mesh, not a function of (x, y)
 
 pde = jno.fem([u.x * vi.x + u.y * vi.y - rho * vi, U(xb, yb) - 0.0])
+print(jno.info(net))
+print(jno.info(pde.fem))  # the assembled form behind the loss
 crux = jno.core([pde.solve(precond=jno.precond.gmg()).mse])
 crux.solve(epochs=EPOCHS, batchsize=BATCH)
 

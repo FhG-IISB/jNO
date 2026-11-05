@@ -223,3 +223,26 @@ def test_an_undeclared_network_of_data_as_trial_is_refused_by_name():
     U, vi, _xi, _yi, xb, yb, f, net = _small()
     with pytest.raises(ValueError, match=r"field\.bind"):
         jno.fem([net(f) * vi - f * vi, U(xb, yb) - 0.0])
+
+
+def test_a_load_only_input_field_keeps_its_preconditioner_in_float32():
+    """``rho`` only in the load leaves A independent of the sample, also in single precision on a GPU,
+    where re-assembling A at two values of ``rho`` differs by round-off (~1e-7 relative). Breaks if the
+    "does the input field enter A" probe compares at an absolute tolerance below float32 round-off: it
+    then refuses the preconditioner of the very problem the route is for (seen on the GPU at 65x65)."""
+    jax.config.update("jax_enable_x64", False)  # the autouse fixture restores it
+    N = 64
+    d = 2 * jno.shape.rect(0, 0, 1, 1).structured(n=N).quad().domain(compute_mesh_connectivity=True)
+    U, V = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    vi = V.bind(x=xi, y=yi)
+    f = d.variable("_f", np.random.default_rng(0).normal(size=(2, 1, 1, N + 1, N + 1, 1)).astype(np.float32))
+
+    class _Id(eqx.Module):
+        def __call__(self, x):
+            return x
+
+    u = jno.nn.wrap(_Id())(f).field.bind(x=xi, y=yi)
+    pde = jno.fem([u.x * vi.x + u.y * vi.y - f * vi, U(xb, yb) - 0.0])
+    assert np.isfinite(_eval(pde.solve(precond=jno.precond.gmg()), d, samples=2)).all()
