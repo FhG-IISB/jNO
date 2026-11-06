@@ -7703,6 +7703,34 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 return jnp.asarray(_b(u, t, args)).reshape(-1) + coupling_residual(u, args)
 
             block.residual = _t_residual
+            # The step tangent gains the coupling's block too, as on a steady form: left as the local tangent
+            # alone, the per-step Newton ran on a Jacobian without the coupling and diverged (an enclosure-
+            # radiation march grew its residual to NaN in the first step from a steady start). Without a
+            # declared support there is no assembled block, so the step goes matrix-free.
+            _jloc = getattr(block, "jacobian", None)
+            if _jloc is not None:
+                support = _coupling_support(couplings, slices)
+                if support is None:
+                    block.jacobian = None
+                else:
+                    _an = [
+                        (lo, hi, np.asarray(c._support), c._tangent_block)
+                        for c, (lo, hi) in zip(couplings, slices)
+                        if getattr(c, "_tangent_block", None) is not None and not c.params
+                    ]
+                    from .utils.logger import get_logger
+
+                    _jw = _with_coupling_block(
+                        lambda u, ta, _j=_jloc: _j(u, ta[0], ta[1]),
+                        lambda u, ta: coupling_residual(u, ta[1]),
+                        support, n, [c.name for c in couplings], get_logger(),
+                        _an if len(_an) == len(couplings) else None, d_dofs,
+                    )  # fmt: skip
+
+                    def _t_jacobian(u, t, args=None, _jw=_jw):
+                        return _jw(u, (t, args))
+
+                    block.jacobian = _t_jacobian
         else:  # promote the linear payload -> nonlinear so the coupling enters the backward-Euler step
             _M, _A, _opfn = block.M, block.A, block.operator_fn
             _fvfn, _cbias = block.forcing_vector_fn, block.affine_bias
