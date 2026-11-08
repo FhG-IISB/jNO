@@ -1276,6 +1276,12 @@ def host_lu_solve(A, b, *, reuse: bool | None = None):
         # steps: cached OOM-kills a 62 GB machine, uncached peaks at 2.08 GB, and the two answers
         # agree to ten significant figures.
         def _splu(mat):
+            # Factor the NONZEROS, not the stored pattern: an assembled form stores every entry its cell
+            # blocks could touch (all fields against all fields, and a `region=` field's pinned outside
+            # DOFs with their full pattern), and SuperLU orders and fills whatever is stored. On a coupled
+            # five-field form 96% of the stored entries were zeros, and factoring them made each Newton
+            # step minutes instead of seconds (tests/test_host_lu_stored_zeros.py).
+            mat.eliminate_zeros()
             # A singular operator fails INSIDE SuperLU, with a message that names neither the matrix nor
             # the cause; name both. Only the failure path pays anything.
             try:
