@@ -3824,6 +3824,53 @@ def assemble_fem_native(
         cell, N = _point_shape(pos, pts_dyn)
         return cell, coef[:, None] * N
 
+    # --- DOFs held at 0 outside their field's region (`d.unknown(..., region=R)`) ------------------------
+    # Such a field numbers its DOFs on the whole mesh and pins those outside R (`_region_field_pins`), so
+    # after the Dirichlet elimination each is an identity row and column. Two things follow, both exact:
+    # a cell where every DOF of the TEST field is pinned contributes only to pinned rows, so its block
+    # need not be computed; and an entry in a pinned row or column is zeroed by the elimination, so it
+    # need not be STORED. Without the second, every pinned DOF kept its whole cell-block pattern as
+    # explicit zeros, and every consumer of the stored pattern (the LU's ordering and fill, the device
+    # matvec, the scatter) paid for it: 93% of a coupled flow-and-heat tangent's stored entries.
+    # Static connectivity only: a runtime triangulation moves the cells these sets are taken from.
+    _dead_cache: Dict[str, Any] = {}
+
+    def _dead_dofs():
+        """Bool ``(total,)`` of the pinned outside DOFs, or ``None`` when there are none."""
+        if "dead" not in _dead_cache:
+            dead = None
+            if not dynamic_topology and any(f.get("region") is not None for f in fields):
+                dead = np.zeros(int(total), dtype=bool)
+                dead[np.asarray([p for p, _v in _region_field_pins()], dtype=np.int64)] = True
+                dead = dead if dead.any() else None
+            _dead_cache["dead"] = dead
+        return _dead_cache["dead"]
+
+    def _live_cells(tfi):
+        """The cells holding a free DOF of test field ``tfi`` (int32), or ``None`` for every cell."""
+        key = ("cells", int(tfi))
+        if key not in _dead_cache:
+            dead, cells = _dead_dofs(), None
+            if dead is not None:
+                live = ~dead[np.asarray(cdofs[tfi])].all(axis=1)
+                cells = None if live.all() else np.flatnonzero(live).astype(np.int32)
+            _dead_cache[key] = cells
+        return _dead_cache[key]
+
+    def _drop_dead(plan):
+        """``plan`` without the slots in a pinned row or column; their raw triplets scatter out of range,
+        which ``segment_sum`` drops."""
+        dead = _dead_dofs()
+        if plan is None or dead is None:
+            return plan
+        idx, inv, nse = plan
+        keep = ~(dead[idx[:, 0]] | dead[idx[:, 1]])
+        if keep.all():
+            return plan
+        n_keep = int(keep.sum())
+        pos = np.where(keep, np.cumsum(keep) - 1, n_keep).astype(np.int32)
+        return (np.ascontiguousarray(idx[keep]), pos[inv], n_keep)
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -3848,22 +3895,25 @@ def assemble_fem_native(
                 kernel = lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(  # noqa: E731
                     c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
                 )
+                lc = _live_cells(tfi)  # None: every cell
+                cells_t = jnp.arange(n_cells) if lc is None else jnp.asarray(lc)
+                rows_t = cd_d[tfi] if lc is None else cd_d[tfi][lc]
                 if _emesh is None:
                     R = _elem_map(
                         kernel,
-                        (jnp.arange(n_cells), local_all),
-                        _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
-                        scatter=(R, cd_d[tfi]),
+                        (cells_t, local_all if lc is None else local_all[lc]),
+                        _cell_chunk(int(cells_t.shape[0]), cd_d[tfi].shape[1], cad_d.shape[1]),
+                        scatter=(R, rows_t),
                     )
                 else:
                     Rp = _sharded_element_add(
                         Rp,
-                        cd_d[tfi],
+                        rows_t,
                         # indices, not gathered values: each device gathers only its own cells' DOFs
                         lambda xs, _k=kernel, _t=tfi: _elem_map(
                             _k, (xs[0], u_flat[xs[1]]), _cell_chunk(int(xs[0].shape[0]), cd_d[_t].shape[1], cad_d.shape[1])
                         ),
-                        (jnp.arange(n_cells), cad_d),
+                        (cells_t, cad_d if lc is None else cad_d[lc]),
                         _emesh,
                     )
             if Rp is not None:
@@ -4119,7 +4169,10 @@ def assemble_fem_native(
             _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
             _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
             for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-                _blocks.append(("outer", _cdofs32[_tfi_s], _cad32))
+                _lc = _live_cells(_tfi_s)
+                _blocks.append(
+                    ("outer", _cdofs32[_tfi_s], _cad32) if _lc is None else ("outer", _cdofs32[_tfi_s][_lc], _cad32[_lc])
+                )
             for _region_s, _face_ids_s, _btyped_s in surface_work:
                 _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
                 _fcols = _cad32[_pc]
@@ -4163,7 +4216,7 @@ def assemble_fem_native(
                 # So fall through to the ordinary path.
             _idx_static = None
             try:
-                _plan = compress_plan_blocks(_blocks) if _blocks else None
+                _plan = _drop_dead(compress_plan_blocks(_blocks)) if _blocks else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
                 # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
                 # across traces, and the fallback below rebuilds it in-trace anyway.
@@ -4317,7 +4370,13 @@ def assemble_fem_native(
                     Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
                     return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
 
-                _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                _lc = _live_cells(tfi)  # None: every cell (see `_dead_dofs`)
+                _cells_t = jnp.arange(n_cells) if _lc is None else jnp.asarray(_lc)
+                _n_t = int(_cells_t.shape[0])
+                _la_t = local_all if _lc is None else local_all[_lc]
+                _cd_t = cd_d[tfi] if _lc is None else cd_d[tfi][_lc]
+                _cad_t = cad_d if _lc is None else cad_d[_lc]
+                _chunk_v = _cell_chunk(_n_t, cd_d[tfi].shape[1], cad_d.shape[1])
                 if diag:
                     # per cell: the block's entries at (row a, the column holding the same global DOF)
                     _rows_t = cd_d[tfi]
@@ -4326,7 +4385,7 @@ def assemble_fem_native(
                         same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
                         return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
 
-                    _dacc[0] = _elem_map(_kd, (jnp.arange(n_cells), local_all), _chunk_v, scatter=(_dacc[0], _rows_t))
+                    _dacc[0] = _elem_map(_kd, (_cells_t, _la_t), _chunk_v, scatter=(_dacc[0], _cd_t))
                     continue
                 if _plan is not None:
                     # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
@@ -4337,11 +4396,11 @@ def assemble_fem_native(
                     # scratch does not.
                     k = _blk_sizes[_nblk[0]]
                     n_t, n_l = int(cd_d[tfi].shape[1]), int(cad_d.shape[1])
-                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(n_cells, n_t * n_l))
+                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(_n_t, n_t * n_l))
                     acc = _acc[0] if _acc[0] is not None else jnp.zeros((_plan[2],), dtype=local_all.dtype)
                     _acc[0] = _elem_map(
                         lambda c, la, _k=_ke: _k(c, la).reshape(-1),
-                        (jnp.arange(n_cells), local_all),
+                        (_cells_t, _la_t),
                         _chunk_v,
                         scatter=(acc, inv_b),
                     )
@@ -4350,13 +4409,13 @@ def assemble_fem_native(
                     continue
                 Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
                     _ke,
-                    (jnp.arange(n_cells), local_all),
+                    (_cells_t, _la_t),
                     _chunk_v,
                 )
                 _emit(
                     Ke.reshape(-1),
-                    lambda _K=Ke, _t=tfi: jnp.broadcast_to(cd_d[_t][:, :, None], _K.shape).reshape(-1),
-                    lambda _K=Ke: jnp.broadcast_to(cad_d[:, None, :], _K.shape).reshape(-1),
+                    lambda _K=Ke, _r=_cd_t: jnp.broadcast_to(_r[:, :, None], _K.shape).reshape(-1),
+                    lambda _K=Ke, _c=_cad_t: jnp.broadcast_to(_c[:, None, :], _K.shape).reshape(-1),
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion

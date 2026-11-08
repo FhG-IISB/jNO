@@ -182,3 +182,69 @@ def test_a_region_field_is_held_at_zero_outside_next_to_a_term_on_interior_faces
         inside = pts[:, 1] <= 1.0 + 1e-12
         np.testing.assert_allclose(uu[:n][inside], (pts[:, 1] - 0.5 * pts[:, 1] ** 2)[inside], atol=1e-10)
         assert np.all(uu[:n][~inside] == 0.0), complex_field
+
+
+def _coupled(h=0.2, interior_face=False):
+    """T on the whole mesh, u (P2) on `lower` only, coupled both ways, nonlinear in u.
+
+    ``interior_face`` adds a transfer term for T on the faces between the parts, which sends the form down
+    the non-nodal assembler.
+
+    u: -u'' + u^3 = 1 + u_e^3 on `lower`, u = 0 at y = 0, natural at y = 1, with u_e = y - y^2/2 in the P2
+    space: the discrete solution is u_e exactly. T: -T'' = 1 + u, T = 0 at y = 0 (u reads 0 outside)."""
+    d = _stacked(h)
+    T = d.unknown.scalar("T")
+    u = d.unknown.scalar("u", order=2, region="lower")
+    w, v = T.test(), u.test()
+    x, y = d.variable("interior", split=True)[:2]
+    xl, yl = d.variable("lower", split=True)[:2]
+    xb, yb = d.variable("bottom", split=True)[:2]
+    Ti, wi, ui = T.bind(x=x, y=y), w.bind(x=x, y=y), u.bind(x=x, y=y)
+    ub, vb = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl)
+    ue = yl - 0.5 * yl * yl
+    terms = [
+        Ti.d(x) * wi.d(x) + Ti.d(y) * wi.d(y) - (1.0 + ui) * wi,
+        ub.d(xl) * vb.d(xl) + ub.d(yl) * vb.d(yl) + ub**3 * vb - (1.0 + ue**3) * vb,
+        T(xb, yb) - 0.0,
+        u(xb, yb) - 0.0,
+    ]
+    if interior_face:
+        d.tag("mid", lambda x_, y_: np.abs(y_ - 1.0) < 1e-9, region="upper")
+        xm, ym = d.variable("mid", split=True)[:2]
+        terms.append(2.0 * T.bind(x=xm, y=ym) * w.bind(x=xm, y=ym))
+    return d, jno.fem(terms)
+
+
+@pytest.mark.parametrize("interior_face", [False, True], ids=["nodal", "non-nodal"])
+def test_the_tangent_stores_nothing_in_the_rows_or_columns_of_the_pinned_dofs(interior_face):
+    """A DOF held at 0 outside its region keeps only its diagonal in the STORED pattern, not just in the
+    nonzeros: every backend (the LU's ordering, the device matvec, the plan's scatter) works on what is
+    stored. Before, each one kept its whole cell-block pattern as explicit zeros, in its row and in its
+    column -- 96% of a coupled flow-and-heat tangent's stored entries."""
+    d, fem = _coupled(interior_face=interior_face)
+    sol = fem.solve(linear=jno.solve.lu(backend="host"))
+    n_T, n_u = np.asarray(sol.T).size, np.asarray(sol.u).size
+    total = n_T + n_u
+    J = fem.operator.jacobian(np.full(total, 0.1))
+    assert J.shape == (total, total)
+    # u's DOFs follow T's, and P2 numbers the mesh vertices first: the vertices above `lower` are pinned
+    pts = np.asarray(d.mesh.points)[:, :2]
+    dead = np.zeros(total, bool)
+    dead[n_T : n_T + len(pts)] = pts[:, 1] > 1.0 + 1e-9
+    assert dead.sum() > 0
+    idx = np.asarray(J.indices)
+    r, c = idx[:, 0], idx[:, 1]
+    off_diag = (r != c) & (dead[r] | dead[c])
+    assert not off_diag.any(), f"{off_diag.sum()} of {len(r)} stored entries couple a pinned DOF to another"
+
+
+@pytest.mark.parametrize("interior_face", [False, True], ids=["nodal", "non-nodal"])
+def test_the_coupled_region_problem_still_gives_the_exact_solution(interior_face):
+    d, fem = _coupled(interior_face=interior_face)
+    sol = fem.solve(linear=jno.solve.lu(backend="host"))
+    fp = np.asarray(d.mesh.points)[:, :2]
+    uu = np.asarray(sol.u).reshape(-1)[: len(fp)]
+    inside = fp[:, 1] <= 1.0 + 1e-12
+    np.testing.assert_allclose(uu[inside], (fp[:, 1] - 0.5 * fp[:, 1] ** 2)[inside], atol=1e-10)
+    assert np.all(uu[~inside] == 0.0)
+    assert np.isfinite(np.asarray(sol.T)).all()
