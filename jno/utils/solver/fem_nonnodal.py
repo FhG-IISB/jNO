@@ -1414,6 +1414,10 @@ def assemble_fem_nonnodal(
     # only; guided = rotation only; free = neither. Value BCs arrive in ``dirichlet_raw``; rotation BCs in
     # ``rotation_bcs`` (normalised to the same 5-tuple shape, value node = the prescribed ∂u/∂n).
     _rot_as_dir = [(fk, region, None, None, vn) for (fk, region, vn) in rotation_bcs]
+    # A field declared on one region (`d.unknown(..., region=R)`): its DOFs outside R are held at 0, as the
+    # nodal assembler does (`fem_native._region_field_pins`). First in the list, so a condition the problem
+    # states on such a DOF wins (the dedupe below keeps the last pin per DOF).
+    pins = _region_field_pins(fields, spaces, cdofs, offs, domain) + pins
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
@@ -3066,6 +3070,40 @@ def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_n
             gdofs = np.concatenate([cells[c], n_verts + ce[c]])
         np.add.at(b, np.asarray(int(base) + gdofs, dtype=np.intp), contrib)
     return jnp.asarray(b)
+
+
+def _region_field_pins(fields, spaces, cdofs, offs, domain):
+    """``(dof, 0.0)`` for every DOF of a region field (``d.unknown(..., region=R)``) that no cell of R touches.
+
+    The cells of R come from :func:`fem_utils._cell_region_mask` (a cell is in R iff its centroid is) -- the
+    classification the assembler integrates with -- so a DOF on R's boundary, shared with a cell inside,
+    stays free and takes the problem's conditions there. Without these pins the outside DOFs sit in no
+    equation and the operator is singular. Scalar nodal Lagrange fields only (any order); anything else
+    with a region raises rather than leaving its outside DOFs unconstrained."""
+    from .fem_utils import _cell_region_mask
+
+    out = []
+    for i, f in enumerate(fields):
+        region = f.get("region")
+        if region is None:
+            continue
+        if spaces[i] != "Lagrange" or int(f.get("vec", 1)) != 1:
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): region={region!r} is wired for scalar Lagrange fields on this path, not a "
+                f"{spaces[i]} field with {f.get('vec', 1)} components (this form takes the non-nodal assembler "
+                "because of a non-nodal family, a term on interior faces or an `across` coupling). Write a vector "
+                "as one scalar unknown per component."
+            )
+        m = np.asarray(_cell_region_mask(domain, region)).reshape(-1)
+        cd = np.asarray(cdofs[i])
+        if m.shape[0] != cd.shape[0] or not m.any():
+            raise ValueError(
+                f"jno.fem (non-nodal): a field is declared on region={region!r}, which no cell of the mesh is in."
+            )
+        free = np.zeros(int(offs[i + 1]) - int(offs[i]), dtype=bool)
+        free[np.unique(cd[m > 0]) - int(offs[i])] = True
+        out.extend((int(offs[i]) + int(k), 0.0) for k in np.flatnonzero(~free))
+    return out
 
 
 def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None):

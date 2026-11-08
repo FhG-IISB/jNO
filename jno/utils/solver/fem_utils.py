@@ -586,6 +586,7 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                         "constant": _is_constant_field(node),
                         "order": int(getattr(node, "order", 1)),
                         "space": str(getattr(node, "space", "Lagrange")),
+                        "region": getattr(node, "field_region", None),
                     }
                 )
             return

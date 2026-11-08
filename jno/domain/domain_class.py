@@ -685,7 +685,16 @@ class _UnknownNamespace:
         self._domain = domain
 
     def __call__(
-        self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+        self,
+        value_shape=(),
+        name="u",
+        *,
+        order=1,
+        space="Lagrange",
+        complex=False,
+        symmetric=False,
+        constant=False,
+        region=None,
     ) -> "Unknown":
         return self._domain._make_unknown(
             value_shape=value_shape,
@@ -695,22 +704,31 @@ class _UnknownNamespace:
             complex=complex,
             symmetric=symmetric,
             constant=constant,
+            region=region,
         )
 
-    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False, region=None) -> "Unknown":
         """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
-        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
+        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant, region=region)
 
-    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False, region=None) -> "Unknown":
         """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
-        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
+        return self(
+            value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant, region=region
+        )
 
-    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False) -> "Unknown":
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False, region=None) -> "Unknown":
         """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
         values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
         one matrix over the whole domain."""
         return self(
-            value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric, constant=constant
+            value_shape=(int(n), int(m)),
+            name=name,
+            order=order,
+            complex=complex,
+            symmetric=symmetric,
+            constant=constant,
+            region=region,
         )
 
 
@@ -2051,7 +2069,7 @@ class domain(MeshIOMixin):
         return [loc_fns, vec_ids, val_fns]
 
     def variational_symbols(
-        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False, region=None
     ):
         """Return generic variational symbols.
 
@@ -2068,6 +2086,13 @@ class domain(MeshIOMixin):
                 the upper triangle, ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still
                 behaves as the full ``n x n`` matrix in every expression, and its test function is the
                 symmetric one.
+            region (str | None, default=None): The named region (a ``shape`` part, a mesh-file volume) the
+                field lives on. Every DOF on a node outside it is held at 0 -- an identity row with no
+                off-diagonal entry, so the factorisation is the region's own -- while the nodes on the
+                region's boundary stay free and take the problem's conditions there. For a field governed
+                on one part of a multi-material domain: the velocity and pressure of a fluid inside a
+                solid body whose temperature lives everywhere. ``p.pin()`` on such a field gauges at a vertex
+                of the region. Not for ``space`` other than ``"Lagrange"``.
 
         Returns:
             (trial, test): Symbolic variational placeholders carrying shape metadata.
@@ -2094,6 +2119,11 @@ class domain(MeshIOMixin):
             raise NotImplementedError(f"symmetric=True is wired for nodal Lagrange fields only, not space={space!r}.")
         if symmetric and complex:
             raise NotImplementedError("symmetric=True is not wired for a complex field; declare it real, or full.")
+        if region is not None and space != "Lagrange":
+            raise NotImplementedError(
+                f"region={region!r} is wired for nodal Lagrange fields only, not space={space!r}: the DOFs held at 0 "
+                "outside the region are picked per node."
+            )
         if complex:
             # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
             # representation. The user writes the weak form with ordinary complex algebra
@@ -2111,6 +2141,7 @@ class domain(MeshIOMixin):
             re_tr._test, im_tr._test = re_te, im_te  # so `u.test()` returns this very pair
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
+                _s.field_region = region
                 # Mark these as members of a complex (re, im) pair. The real-equivalent weak form
                 # couples re/im test functions within a single additive term, which the native
                 # assembler's one-test-field-per-term classifier rejects; jno.fem routes any form
@@ -2126,10 +2157,13 @@ class domain(MeshIOMixin):
         # space (mirrors how Variable carries its _domain).
         trial._domain = self
         test._domain = self
+        trial.field_region = test.field_region = region  # the field's DOFs outside it are held at 0 (fem_native)
         self.__dict__.setdefault("_field_names", set()).add(str(trial_name))  # for telling laws of fields apart
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
+    def fem_symbols(
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False, region=None
+    ):
         """Backward-compatible alias for variational_symbols().
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
@@ -2165,7 +2199,13 @@ class domain(MeshIOMixin):
                 fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
         return self.variational_symbols(
-            value_shape=value_shape, names=names, order=order, complex=complex, space=space, symmetric=symmetric
+            value_shape=value_shape,
+            names=names,
+            order=order,
+            complex=complex,
+            space=space,
+            symmetric=symmetric,
+            region=region,
         )
 
     def test_function(self, value_shape=(), name="phi", order=1):
@@ -2217,6 +2257,10 @@ class domain(MeshIOMixin):
             u = d.unknown(); v = u.test()
             jno.fem([inner(grad(u), grad(v)) - f * v, u(xb, yb) - 0.0]).solve()
 
+        ``region="fluid"`` makes it live on that named region only: its DOFs outside are held at 0 (identity
+        rows, no fill-in), the region's boundary nodes stay free (see :meth:`variational_symbols`). A
+        region unknown is FEM-only.
+
         ``constant=True`` makes it ONE value (vector, matrix) over the whole domain, solved for with the
         fields: ``U = d.unknown.scalar(constant=True)``; ``u(xr, yr) - U`` ties a field to it on a region
         exactly, ``U - g`` pins it, and a weak term carrying ``U.test()`` is an integral row (``jno.fem`` only).
@@ -2228,11 +2272,24 @@ class domain(MeshIOMixin):
         return _UnknownNamespace(self)
 
     def _make_unknown(
-        self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+        self,
+        value_shape=(),
+        name="u",
+        order=1,
+        space="Lagrange",
+        complex=False,
+        symmetric=False,
+        constant=False,
+        region=None,
     ) -> "Unknown":
         """Build an unknown -- see :attr:`unknown`."""
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
+        if constant and region is not None:
+            raise ValueError(
+                f"domain.unknown(..., constant=True, region={region!r}): a constant is one value over the whole "
+                "domain and has no nodes to restrict; drop region=."
+            )
         if constant:
             # ONE value (vector, matrix) over the whole domain, solved for with the fields. It has no element,
             # so `order`/`space` do not apply; it is an FEM unknown (jno.fdm has no global unknowns).
@@ -2253,8 +2310,9 @@ class domain(MeshIOMixin):
             complex=complex,
             space=space,
             symmetric=symmetric,
+            region=region,
         )
-        nodal_p1 = int(order) == 1 and str(space) == "Lagrange" and not complex and not symmetric
+        nodal_p1 = int(order) == 1 and region is None and str(space) == "Lagrange" and not complex and not symmetric
         if not nodal_p1:
             # FEM-only: there is no valued P1 nodal field behind it. Mark it so jno.fdm can say why it
             # cannot solve for it, instead of reporting that it found no unknown at all.

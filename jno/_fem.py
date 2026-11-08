@@ -828,6 +828,21 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     pts = _np.asarray(domain.mesh.points)[:, :dim]
     corner = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex...
     d2 = ((pts - corner) ** 2).sum(axis=1)
+    corner_nid = int(d2.argmin())
+    region = getattr(field, "field_region", None)
+    if region is not None:
+        # ...of the field's REGION (`d.unknown(..., region=R)`): every vertex outside it is already held at 0,
+        # and a pin there leaves the constant free -- a singular system that SuperLU still factorises into a
+        # finite, wrong answer.
+        from .utils.solver.fem_utils import _cell_region_mask
+
+        cells = _np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+        m = _np.asarray(_cell_region_mask(domain, region)).reshape(-1)
+        if m.shape[0] != cells.shape[0] or not m.any():
+            raise ValueError(f"jno.fem: p.pin() on a field of region={region!r} found no cell of that region.")
+        outside = _np.ones(len(pts), dtype=bool)
+        outside[_np.unique(cells[m > 0])] = False
+        d2 = _np.where(outside, _np.inf, d2)
     nid = int(d2.argmin())
     if ties:
         # ...or, with ties, the vertex nearest it that no tie touches (either side of any tie: the
@@ -854,7 +869,7 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     # A vertex other than the min-corner is named in the tag too: the same field pinned with and without
     # ties on one domain must not share a region that sits at the wrong node for one of them.
     tag = f"_gauge_pin_{getattr(field, 'name', None) or field.field_key}"
-    if nid != int(d2.argmin()):
+    if nid != corner_nid:
         tag = f"{tag}_v{nid}"
     cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
     if tag not in cache:
@@ -4709,7 +4724,15 @@ class FEM:
 
         with beacon.session(log, "fem.eigs"):
             return self._eigs_inner(
-                mass=mass, k=k, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0,
+                mass=mass,
+                k=k,
+                which=which,
+                sigma=sigma,
+                linear=linear,
+                precond=precond,
+                tol=tol,
+                maxiter=maxiter,
+                X0=X0,
                 contour=contour,
             )
 

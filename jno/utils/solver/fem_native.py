@@ -4783,6 +4783,34 @@ def assemble_fem_native(
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]
 
+    def _region_field_pins() -> List[Tuple[int, float]]:
+        """``(dof, 0.0)`` for every DOF of a region field on a node outside its region.
+
+        The node set comes from :func:`_region_node_ids_from_cells` on the field's own connectivity -- the
+        same centroid classification the assembler integrates with -- so a node on the region's boundary
+        (shared with a cell inside) is IN the region and stays free. A region this cannot resolve raises:
+        pinning nothing would leave the field's outside DOFs in no equation, and pinning everything would
+        solve for zero."""
+        out: List[Tuple[int, float]] = []
+        for fidx, f in enumerate(fields):
+            region = f.get("region")
+            if region is None:
+                continue
+            inside = _region_node_ids_from_cells(domain, region, np.asarray(cells_f_all[fidx]))
+            if inside is None:
+                known = sorted(
+                    set(getattr(domain, "_source_regions", None) or {}) | set(getattr(domain, "_shape_regions", None) or {})
+                )
+                raise ValueError(
+                    f"jno.fem: a field is declared on region={region!r}, which is not a named region of this "
+                    f"domain (a shape part or a mesh-file volume). Known regions: {known}."
+                )
+            outside = np.ones(int(n_nodes_f[fidx]), dtype=bool)
+            outside[np.asarray(inside, dtype=int)] = False
+            vt = int(vecs[fidx])
+            out.extend((int(offs[fidx] + nid * vt + c), 0.0) for nid in np.flatnonzero(outside) for c in range(vt))
+        return out
+
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
         from ..._fem import _eval_value_node_at, _is_temporal_value_node
         from ...trace import ModelCall
@@ -4793,6 +4821,9 @@ def assemble_fem_native(
         # They get no constant pair either, and a consumer that zeroes "the constrained rows" -- a nonlocal
         # `Coupling` -- must see them, or it adds its contribution onto the row's `u - g` and shifts the wall.
         args_dofs: List[int] = []
+        # A field declared on one region (`d.unknown(..., region=R)`): its DOFs on every node outside R are
+        # held at 0. First in the list, so a condition the problem states on such a node wins (last wins).
+        pairs.extend(_region_field_pins())
 
         def _row_dofs(fidx, region, comp):
             vt = vecs[fidx]
