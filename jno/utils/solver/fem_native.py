@@ -91,6 +91,7 @@ from .fem_utils import (
     compress_plan,
     compress_plan_blocks,
     elem_map,
+    input_dependencies,
     raw_pattern_from_blocks,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
@@ -3060,14 +3061,19 @@ def assemble_fem_native(
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
     def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
-                      seeded=True):  # fmt: skip
+                      seeded=True, cell_sols=None):  # fmt: skip
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
         O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
         per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
-        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh)."""
-        cell_sols = _split_cell_local(local_all)
+        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh).
+        ``cell_sols`` (per-field local vectors) stands in for ``local_all``: one input per field, which is how
+        :func:`input_dependencies` tells the fields a term reads apart."""
+        if cell_sols is None:
+            cell_sols = _split_cell_local(local_all)
+        else:
+            local_all = cell_sols[0]  # only its dtype is read below
         per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts, cells, cells_f)
         # The `dom.cell_size` / `dom.cell_metric` geometry symbols a stabilized form reads.
         h_qp, G_qp = _cell_geometry_symbols(meas, _J)
@@ -3871,6 +3877,51 @@ def assemble_fem_native(
         pos = np.where(keep, np.cumsum(keep) - 1, n_keep).astype(np.int32)
         return (np.ascontiguousarray(idx[keep]), pos[inv], n_keep)
 
+    _term_cols_cache: Dict[Any, Any] = {}
+
+    def _term_cols(coeff, tfi, rnames):
+        """``(columns, own)`` of a volume term's tangent: the positions, in the cell's all-field local vector,
+        of the DOFs of every field the term reads (int32, field order), and where the test field's own block
+        sits among them (``None`` when the term does not read it).
+
+        The fields come from :func:`input_dependencies` over the term's element residual with one input per
+        field, which never leaves out a field the residual can depend on. A runtime triangulation keeps every
+        column (its host plan is built per triangulation from the full layout), and so does a term whose
+        element residual cannot be traced here for the analysis (it then costs columns, not correctness)."""
+        key = (id(coeff), int(tfi), rnames)
+        hit = _term_cols_cache.get(key)
+        if hit is not None and hit[0] is coeff:
+            return hit[1]
+        deps = list(range(len(fields)))
+        if not dynamic_topology:
+            sols0 = [jnp.zeros((n_local_f[i], vecs[i]), dtype=jnp.result_type(float)) for i in range(len(fields))]
+            try:
+                deps = [
+                    i - 1
+                    for i in input_dependencies(
+                        lambda c, *sl: _vol_elem_res(
+                            c, None, coeff, tfi, rnames, 0.0, None, None, None, None, seeded=True, cell_sols=list(sl)
+                        ),
+                        jnp.asarray(0, jnp.int32),
+                        *sols0,
+                    )
+                    if i >= 1
+                ]
+            except Exception:  # noqa: BLE001 -- not traceable without runtime args: keep every column
+                deps = list(range(len(fields)))
+        cols = (
+            np.concatenate([np.arange(loc_seg[i], loc_seg[i + 1]) for i in deps]).astype(np.int32)
+            if deps
+            else np.zeros(0, np.int32)
+        )
+        own = None
+        if tfi in deps:
+            lo = sum(loc_seg[i + 1] - loc_seg[i] for i in deps if i < tfi)
+            own = (int(lo), int(lo + loc_seg[tfi + 1] - loc_seg[tfi]))
+        out = (cols, own)
+        _term_cols_cache[key] = (coeff, out)
+        return out
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -4043,6 +4094,12 @@ def assemble_fem_native(
         tangent tensor and OOMs on any non-trivial mesh). The dense result is entry-for-entry
         identical to that global ``jacfwd``, just assembled within a per-element memory budget."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
+        # Each volume term's tangent is taken against the fields it READS (`_term_cols`), not every field of
+        # the cell: the columns of a field it does not read are zero for every state, so they are neither
+        # computed nor stored. A term that reads no unknown (a load) has no tangent block at all.
+        # `typed_with_masks` below is the tangent's term list: (coeff, test field, mask, columns, own block).
+        typed_with_masks = [t + _term_cols(*t) for t in typed_with_masks]
+        typed_with_masks = [t for t in typed_with_masks if t[3].shape[0] > 0]
 
         # --- hoist the (row, col) pattern out of the trace -------------------------------------
         # The triplet INDICES come exclusively from host-static mesh connectivity (`cdofs`,
@@ -4168,10 +4225,11 @@ def assemble_fem_native(
             _blocks = []
             _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
             _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
-            for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
+            for _coeff_s, _tfi_s, _rn_s, _sel_s, _own_s in typed_with_masks:
                 _lc = _live_cells(_tfi_s)
+                _cs = _cad32[:, _sel_s]
                 _blocks.append(
-                    ("outer", _cdofs32[_tfi_s], _cad32) if _lc is None else ("outer", _cdofs32[_tfi_s][_lc], _cad32[_lc])
+                    ("outer", _cdofs32[_tfi_s], _cs) if _lc is None else ("outer", _cdofs32[_tfi_s][_lc], _cs[_lc])
                 )
             for _region_s, _face_ids_s, _btyped_s in surface_work:
                 _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
@@ -4254,10 +4312,11 @@ def assemble_fem_native(
                 dtype=np.int64,
             )
             rows, cols = [], []
-            for _c_s, _tfi_s, _rn_s in typed_with_masks:
-                sh = (n_cells, cdh[_tfi_s].shape[1], cadh.shape[1])
+            for _c_s, _tfi_s, _rn_s, _sel_s, _own_s in typed_with_masks:
+                _ch = cadh[:, _sel_s]
+                sh = (n_cells, cdh[_tfi_s].shape[1], _ch.shape[1])
                 rows.append(np.broadcast_to(cdh[_tfi_s][:, :, None], sh).reshape(-1))
-                cols.append(np.broadcast_to(cadh[:, None, :], sh).reshape(-1))
+                cols.append(np.broadcast_to(_ch[:, None, :], sh).reshape(-1))
             for _r_s, _fids_s, _bt_s in surface_work:
                 pc = ph[np.asarray(_fids_s, dtype=np.int64)]
                 fcols = cadh[pc]
@@ -4360,29 +4419,33 @@ def assemble_fem_native(
                 _off[0] += k
                 _nblk[0] += 1
 
-            for coeff, tfi, rnames in typed_with_masks:
+            for coeff, tfi, rnames, sel, own in typed_with_masks:
+                _sel_j = jnp.asarray(sel)
 
-                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
+                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn, _s=_sel_j, _o=own):
                     # Forward over the SEEDED residual (one reverse pass per cell for every test DOF), not over
                     # the per-test-DOF evaluation: that one evaluated the integrand k_test x k_trial times per
                     # point. Its block is symmetric to round-off only, so it is averaged within the solver's
                     # own symmetry gate (`_symmetrise_own_block`), which makes it bitwise symmetric.
-                    Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
-                    return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
+                    # Against the term's own columns only (`_term_cols`); the rest of the cell's are zero.
+                    Ke = jax.jacfwd(
+                        lambda vs: _vol_elem_res(c, la.at[_s].set(vs), _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True)
+                    )(la[_s])
+                    return Ke if _o is None else _symmetrise_own_block(Ke, _o[0], _o[1])
 
                 _lc = _live_cells(tfi)  # None: every cell (see `_dead_dofs`)
                 _cells_t = jnp.arange(n_cells) if _lc is None else jnp.asarray(_lc)
                 _n_t = int(_cells_t.shape[0])
                 _la_t = local_all if _lc is None else local_all[_lc]
                 _cd_t = cd_d[tfi] if _lc is None else cd_d[tfi][_lc]
-                _cad_t = cad_d if _lc is None else cad_d[_lc]
-                _chunk_v = _cell_chunk(_n_t, cd_d[tfi].shape[1], cad_d.shape[1])
+                _cad_t = cad_d[:, sel] if _lc is None else cad_d[_lc][:, sel]
+                _chunk_v = _cell_chunk(_n_t, cd_d[tfi].shape[1], int(sel.shape[0]))
                 if diag:
                     # per cell: the block's entries at (row a, the column holding the same global DOF)
                     _rows_t = cd_d[tfi]
 
-                    def _kd(c, la, _k=_ke, _rt=_rows_t):
-                        same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
+                    def _kd(c, la, _k=_ke, _rt=_rows_t, _s=_sel_j):
+                        same = _rt[c][:, None] == cad_d[c][_s][None, :]  # (n_test, n_term_cols)
                         return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
 
                     _dacc[0] = _elem_map(_kd, (_cells_t, _la_t), _chunk_v, scatter=(_dacc[0], _cd_t))
@@ -4395,7 +4458,7 @@ def assemble_fem_native(
                     # 16^3 P1/P1 Navier-Stokes tangent, growing with the cell count where the chunked
                     # scratch does not.
                     k = _blk_sizes[_nblk[0]]
-                    n_t, n_l = int(cd_d[tfi].shape[1]), int(cad_d.shape[1])
+                    n_t, n_l = int(cd_d[tfi].shape[1]), int(sel.shape[0])
                     inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(_n_t, n_t * n_l))
                     acc = _acc[0] if _acc[0] is not None else jnp.zeros((_plan[2],), dtype=local_all.dtype)
                     _acc[0] = _elem_map(

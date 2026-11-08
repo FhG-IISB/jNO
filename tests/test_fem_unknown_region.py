@@ -248,3 +248,26 @@ def test_the_coupled_region_problem_still_gives_the_exact_solution(interior_face
     np.testing.assert_allclose(uu[inside], (fp[:, 1] - 0.5 * fp[:, 1] ** 2)[inside], atol=1e-10)
     assert np.all(uu[~inside] == 0.0)
     assert np.isfinite(np.asarray(sol.T)).all()
+
+
+@pytest.mark.parametrize("interior_face", [False, True], ids=["nodal", "non-nodal"])
+def test_each_equation_stores_columns_only_for_the_fields_it_reads(interior_face):
+    """u's equation reads u alone (T's reads T and u): its rows hold no column of T. Before, every cell
+    block was differentiated against every field of the cell and stored the other fields' columns as zeros.
+    The tangent must still be the residual's derivative: checked against a dense jacfwd of the residual."""
+    d, fem = _coupled(interior_face=interior_face)
+    sol = fem.solve(linear=jno.solve.lu(backend="host"))
+    n_T, n_u = np.asarray(sol.T).size, np.asarray(sol.u).size
+    total = n_T + n_u
+    u0 = np.random.default_rng(0).uniform(0.1, 0.5, total)
+    J = fem.operator.jacobian(u0)
+    idx = np.asarray(J.indices)
+    r, c = idx[:, 0], idx[:, 1]
+    bad = (r >= n_T) & (c < n_T)
+    assert not bad.any(), f"{bad.sum()} stored entries of u's rows lie in T's columns"
+    dense = np.zeros((total, total))
+    np.add.at(dense, (r, c), np.asarray(J.data))
+    import jax.numpy as jnp
+
+    ref = np.asarray(jax.jacfwd(lambda u: fem.operator.residual(u, {}))(jnp.asarray(u0)))
+    np.testing.assert_allclose(dense, ref, rtol=0, atol=1e-11 * np.abs(ref).max())

@@ -5481,6 +5481,63 @@ def _chunked_scatter(fn, xs, c, out, index):
     return jax.lax.scan(body_slid, out, jnp.arange(nb))[0]
 
 
+#: Primitives whose sub-program is analysed in place: ``jit``/``pjit``, ``closed_call``, ``remat``. Any other
+#: primitive with a sub-program (a custom derivative rule, ``scan``, ``cond``, ``while``) is taken as a whole:
+#: every output depends on every input, which may over-include but never misses a dependency.
+_DEP_CALLS = {"jit", "pjit", "closed_call", "core_call", "remat", "checkpoint", "remat2"}
+
+
+def _jaxpr_input_deps(jaxpr, in_deps):
+    """Per output of ``jaxpr`` (a core ``Jaxpr``), the union of the ``in_deps`` sets its value can be reached from."""
+    from jax.extend import core as _jc
+
+    env = {}
+    for v, d in zip(jaxpr.invars, in_deps):
+        env[v] = d
+    for v in jaxpr.constvars:
+        env[v] = frozenset()
+
+    def read(v):
+        return frozenset() if isinstance(v, _jc.Literal) else env.get(v, frozenset())
+
+    for eqn in jaxpr.eqns:
+        ins = [read(v) for v in eqn.invars]
+        name = eqn.primitive.name
+        if name == "stop_gradient":  # no derivative flows through: the output is a constant to the tangent
+            outs = [frozenset()] * len(eqn.outvars)
+        else:
+            sub = eqn.params.get("jaxpr", eqn.params.get("call_jaxpr")) if name in _DEP_CALLS else None
+            sub = getattr(sub, "jaxpr", sub)  # a ClosedJaxpr's inner Jaxpr
+            if sub is not None and len(sub.invars) == len(ins) and len(sub.outvars) == len(eqn.outvars):
+                outs = _jaxpr_input_deps(sub, ins)
+            else:
+                u = frozenset().union(*ins) if ins else frozenset()
+                outs = [u] * len(eqn.outvars)
+        for v, d in zip(eqn.outvars, outs):
+            env[v] = d
+    return [read(v) for v in jaxpr.outvars]
+
+
+def input_dependencies(fn, *args):
+    """The positions of ``args`` the outputs of ``fn(*args)`` can DEPEND ON for a derivative, from a dataflow
+    pass over its jaxpr.
+
+    Structural, so it is sound: a position left out cannot change any output (its tangent is zero for every
+    value of every input). It may over-include -- it follows variables, not array elements, and takes a
+    custom derivative rule, a loop or a branch as depending on all of its inputs -- which costs columns, not
+    correctness. ``stop_gradient`` cuts a dependency, as it cuts the derivative.
+
+    The FEM assemblers use it to take an element block's tangent only against the fields its term reads
+    (``fem_native._make_jacobian``, ``fem_nonnodal._make_sparse_assembler``): before, every cell block was
+    differentiated against every field of the cell and stored their columns as zeros."""
+    closed = jax.make_jaxpr(fn)(*args)
+    flat = []
+    for i, a in enumerate(args):  # one dependency label per argument, whatever its pytree
+        flat += [frozenset({i})] * len(jax.tree_util.tree_leaves(a))
+    outs = _jaxpr_input_deps(closed.jaxpr, flat)
+    return sorted(frozenset().union(*outs)) if outs else []
+
+
 def elem_map(fn, xs, chunk, *, scatter=None):
     """``vmap(fn)`` over the leading axis, in chunks of ``chunk`` when one is set -- COMPILED.
 
