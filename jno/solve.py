@@ -618,8 +618,11 @@ def amg(
 
 def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
-    reuse=False, anderson=0,
+    reuse=False, anderson=0, stall=None,
 ) -> NonlinearSolver:  # fmt: skip
+    from .utils.solver.newton_krylov import _stall_check
+
+    stall = _stall_check(stall)
     if reuse and direct is False:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED tangent between steps (and, for the sparse-direct "
@@ -654,6 +657,7 @@ def _root_driver(
                 ls_c=ls_c,
                 linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
                 reuse=reuse,
+                stall=stall,
                 **carry,
             )
         if direct:
@@ -680,6 +684,7 @@ def _root_driver(
                 # the historic sparse-LU default
                 linear_solve=linear_solve,
                 reuse=reuse,
+                stall=stall,
                 **carry,
             )
         from .utils.solver.newton_krylov import newton_krylov
@@ -700,6 +705,7 @@ def _root_driver(
             ls_max=ls_max,
             ls_c=ls_c,
             anderson=anderson,
+            stall=stall,
         )
 
     # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
@@ -713,6 +719,8 @@ def _root_driver(
         config["anderson"] = anderson
     if reuse:
         config["reuse"] = reuse
+    if stall is not None:
+        config["stall"] = stall
     return NonlinearSolver(
         _fn,
         name=name,
@@ -759,6 +767,7 @@ def newton(
     ls_c: float = 1e-4,
     direct: bool | None = None,
     reuse: bool = False,
+    stall: int | None = None,
 ) -> NonlinearSolver:
     """Newton root-find, as a configurable slot. Three inner-solve modes:
 
@@ -804,7 +813,15 @@ def newton(
     tangent from step to step as well: the tangent of a march changes little between steps, so it is
     assembled a handful of times per march rather than at every Newton iteration (measured on a stabilised
     3-D flow: once for 8 steps, 0.80 -> 0.30 s per step). An explicit ``nonlinear=newton()`` keeps a fresh
-    tangent per iteration."""
+    tangent per iteration.
+
+    ``stall=N`` ends the solve once ``N`` steps in a row have not brought the residual norm 1% below the best
+    it had reached, and raises saying it stalled (with the residual, the step it stopped at, and what to try),
+    instead of spending the rest of ``max_steps`` at the same residual. A globalised Newton (``damping``,
+    ``line_search``) that meets a minimum of ``||r||`` that is no root, or a tangent that does not match the
+    residual, can sit there for every remaining step, each a full assembly and factorization; a caller with a
+    fallback (another damping, a continuation) gets to it at once. ``None`` (the default) runs to ``max_steps``
+    as before. A converging solve is unchanged: every step that lowers the residual 1% resets the count."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -818,6 +835,7 @@ def newton(
         ls_c=ls_c,
         direct=direct,
         reuse=reuse,
+        stall=stall,
     )
 
 
