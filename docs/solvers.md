@@ -1599,7 +1599,7 @@ A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
 (the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
 rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
-damped), and `.adaptive()` (step doubling sizes a one-step method).
+damped), and `.adaptive()` (the controller sizes one-step methods only).
 
 Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
 as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
@@ -1632,6 +1632,12 @@ sol = fem.solve(time=jno.solve.rosenbrock().adaptive(rtol=1e-4))
 ```
 
 Both expose a stepper, so `.adaptive()` works, and both refuse second-order-in-time (`u_tt`) blocks.
+SDIRK and ROS34PW2 carry an embedded lower-order solution built from the same stages (order 2 for SDIRK3
+and ROS34PW2, order 1 for SDIRK2), so the controller gets its error estimate without extra solves; every
+other base is sized by step doubling (one step against two half-steps). A step over the tolerance is
+rejected and retried smaller; the step sizes are treated as constants in the gradient. On the 2-D heat
+test of `tests/test_fem_adaptive_timestep.py` at `rtol=1e-5`, the embedded pair needed about 40% fewer
+base steps than step doubling for an error no larger.
 On a nonlinear heat problem, ROS34PW2 reached a given accuracy in the least wall time of the schemes
 compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so compare on yours.
 

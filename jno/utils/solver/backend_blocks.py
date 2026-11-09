@@ -87,10 +87,33 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     import jax
     import jax.numpy as jnp
 
+    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+
+    # The solve is linear in ``rhs``, so its derivative is another solve -- with the TRANSPOSED operator for
+    # reverse mode. Both go through `_krylov_step_solve` behind a guard that returns 0 for a zero right-hand
+    # side: JAX's BiCGStab divides 0/0 there (``omega``) and returns NaN, and a zero cotangent is exactly what
+    # a state the march discards (a rejected adaptive step) sends back. Measured before the guard: a rejected
+    # step turned a finite gradient (FD -16.52) into NaN. A zero system has the zero solution; nothing else
+    # changes (the guard is one norm, and the transpose has the same diagonal for the Jacobi scaling).
+    def guarded(warm):
+        def solve(op, b):
+            return jax.lax.cond(
+                jnp.any(b != 0), lambda: _krylov_step_solve(op, b, warm, inv, krylov), lambda: jnp.zeros_like(b)
+            )
+
+        return solve
+
+    return jax.lax.custom_linear_solve(step_op, rhs, guarded(x0), transpose_solve=guarded(None))
+
+
+def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
+    """The Krylov solve behind :func:`_default_step_solve` (``inv`` is the Jacobi scaling)."""
+    import jax
+    import jax.numpy as jnp
+
     from .krylov import gmres as _scaled_gmres  # scale-invariant: JAX's Arnoldi zeroes a tiny ||b||
 
     n = rhs.shape[0]
-    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
     # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
     # the default and is right for the symmetric real blocks; the complex real-equivalent block
     # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break

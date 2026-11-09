@@ -571,7 +571,7 @@ as `fem.solve(time=…)`, the *same* slot object — to change it:
 
 ```python
 traj = jno.fdm([...]).solve(time=jno.solve.theta(0.5))   # Crank–Nicolson (2nd-order in time)
-traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptive step size
+traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # adaptive step size (step doubling on backward Euler)
 ```
 
 `save_ts=` picks the times the march returns, as in `fem.solve(save_ts=…)`. The step Δt stays the one

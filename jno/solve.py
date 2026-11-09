@@ -2101,7 +2101,9 @@ def sdirk(order: int = 3):
     ``M + gamma*dt*A`` -- so ``linear=``/``precond=`` slots, a sparse-direct factorisation and a constant
     preconditioner are built once. Stiffly accurate, so Dirichlet / algebraic (zero-mass) rows are exact
     at every step, and L-stable, so it damps stiff transients the way backward Euler does (unlike
-    Crank-Nicolson). Composes with ``.adaptive(...)`` (step doubling with exponent ``1/(order+1)``).
+    Crank-Nicolson). Composes with ``.adaptive(...)``, which estimates the error from an embedded
+    lower-order solution built from the same stages (no extra solve): order 2 for ``order=3``, order 1
+    for ``order=2``.
 
     Costs ``order`` implicit solves per step. A state-dependent mass ``c(u) u_t`` is integrated in its
     non-conservative form (as ``bdf2`` does). Refuses a second-order-in-time (``u_tt``) block: an L-stable
@@ -2126,7 +2128,9 @@ def rosenbrock(method: str = "ros34pw2"):
       stiffly accurate, so prefer ``ros34pw2`` with algebraic rows.
 
     Composes with ``linear=`` / ``precond=`` (the stage matrix is what they see; on a linear block with a
-    constant operator it is built once) and with ``.adaptive(...)``. Refuses what a linearly implicit form
+    constant operator it is built once) and with ``.adaptive(...)``: ``"ros34pw2"`` estimates the error
+    with its embedded order-2 solution (Rang & Angermann 2005, same stages, no extra solve), ``"ros2"``
+    has no embedded pair and uses step doubling. Refuses what a linearly implicit form
     cannot carry: a time-dependent or parameter-dependent mass, a state-dependent mass ``c(u) u_t``, and a
     second-order-in-time (``u_tt``) block -- use ``sdirk()`` / ``bdf2()`` for the first two.
     """
@@ -2175,39 +2179,41 @@ def adaptive(
     grow: float = 1.5,
 ):
     """**Adaptive step-size** time scheme for ``fem.solve(time=...)``: the step size is chosen per step
-    from a **step-doubling** (Richardson) local-error estimate — one full step compared with two
-    half-steps — so a stiff / sharp / multi-rate transient takes small steps only where it needs them and
-    large steps elsewhere, instead of the fixed ``dt`` from ``domain(time=(t0,t1,n))``.
+    from a local-error estimate, so a stiff / sharp / multi-rate transient takes small steps only where it
+    needs them and large steps elsewhere, instead of the fixed ``dt`` from ``domain(time=(t0,t1,n))``.
+    A base with an **embedded pair** — :func:`sdirk` and ``rosenbrock("ros34pw2")`` — compares its step
+    with the embedded lower-order solution of the same stages, so an attempt costs one step. Every other
+    base (the θ-steps, ``rosenbrock("ros2")``) uses **step doubling** (Richardson): one full step against
+    two half-steps, 3 steps per attempt. A step whose error exceeds the tolerance is **rejected** and
+    retried smaller, unless it is already at the smallest allowed step.
 
     Built on the block's own implicit θ-step, so it inherits the DAE (Dirichlet) handling and works for a
     **linear or nonlinear**, **scalar or vector**, **plain, periodic, or complex** transient. It is a
     **fixed-length** ``lax.scan`` of ``max_steps`` attempts (a static trip count — the settled tail just
-    consumes an attempt), which keeps it **reverse-mode differentiable** (the gradient flows through the
-    realized step sequence). ``rtol``/``atol`` set the mixed relative/absolute tolerance; ``max_steps`` is
+    consumes an attempt), which keeps it **reverse-mode differentiable**: the gradient flows through the
+    accepted steps, and the step sizes (chosen from ``stop_gradient`` error norms) are treated as
+    constants, as in the usual discretise-then-differentiate adaptive integrators. A rejected attempt
+    contributes nothing to the gradient. ``rtol``/``atol`` set the mixed relative/absolute tolerance; ``max_steps`` is
     the step **budget** — if it is exhausted before ``t1`` the trajectory is returned as ``NaN`` (raise it),
     never silently under-resolved. Composes with ``linear=``/``precond=`` (the per-step solve).
     Backward-Euler order (first-order in time); pair with a fine tolerance for accuracy.
 
-    ``dt0`` is the **first** step. It defaults to the smallest allowed step (``1e-4`` of the time span) so
-    the controller **approaches the right step size from below**. That default matters: there is no step
-    rejection (see :func:`jno.utils.solver.timeschemes.adaptive_march` — a discarded state would make the
-    per-step solve adjoint run at zero cotangent and return a ``NaN`` gradient), so an over-large step is
-    *committed*, not retried, and only the next one shrinks. Growing into the step size can never commit an
-    over-tolerance step — an under-sized step is wasteful, not inaccurate — whereas starting at the output
-    grid's ``dt`` bakes in the error of the first few steps permanently. On a 2-D heat benchmark, taking
-    ``dt0`` from the output grid left the result **4.2x** less accurate than growing from below, for the same
-    tolerance and ~18% fewer steps. Pass ``dt0`` explicitly only if you know the correct scale; the growth
-    cap is 5x per step, so the default reaches any scale in a handful of attempts.
+    ``dt0`` is the **first** step. It defaults to the smallest allowed step (``1e-4`` of the time span), and
+    the controller grows from there (at most 5x per step), reaching any scale in a handful of attempts. A
+    larger ``dt0`` is safe: an over-tolerance first step is rejected and retried, at the price of the
+    attempts the rejections use from ``max_steps``.
 
     This bare form sizes **whatever step the assembly picked** for the block — backward Euler for a
     parabolic block, which is **first order**. That is the single biggest accuracy lever here, and it is
     worth moving: step doubling costs 3 implicit solves per step, so spending them on a first-order base
-    cannot beat a first-order fixed march by much. Attach the controller to a **second-order** step instead
-    and the same tolerance is far cheaper per digit — the step-size exponent follows the base's order
-    automatically (``1/(p+1)``)::
+    cannot beat a first-order fixed march by much. Attach the controller to a **higher-order** step instead
+    and the same tolerance is far cheaper per digit — the step-size exponent follows the order of the
+    error estimate automatically (``1/(q+1)``, ``q`` the embedded order, or the base's order for step
+    doubling)::
 
         fem.solve(time=jno.solve.adaptive(rtol=1e-4))                    # 5.1e-3 for 162 solves
         fem.solve(time=jno.solve.theta(0.5).adaptive(rtol=1e-4))         # 2.2e-4 for  48 solves
+        fem.solve(time=jno.solve.sdirk(3).adaptive(rtol=1e-5))           # embedded pair, L-stable
 
     (~23x the accuracy on ~3x less work, measured on the 2-D heat benchmark of
     ``tests/test_fem_adaptive_timestep.py`` — ``mesh_size=0.15``, t=0.05, x64, against the semidiscrete
@@ -2222,7 +2228,8 @@ def adaptive(
 
     NOTE on what adaptivity does and does not buy: on the benchmarks measured here a *well-chosen fixed*
     dt matches or beats it at equal work, because the optimal step size is nearly constant and the error
-    estimate costs 3x. Reach for ``adaptive`` when you **cannot** pick dt in advance — unknown or
+    estimate costs extra (3x with step doubling; with an embedded pair, only the rejected attempts).
+    Reach for ``adaptive`` when you **cannot** pick dt in advance — unknown or
     parameter-dependent stiffness, sweeps, inverse problems whose fitted parameter moves the timescale —
     not as a speed optimization.
 

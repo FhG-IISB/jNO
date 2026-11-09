@@ -389,9 +389,23 @@ class _SDIRKScheme(_TimeScheme):
     """
 
     def __init__(self, order):
+        import numpy as np
+
         self.order = int(order)
         self.A, self.c, self.gamma = _sdirk_tableau(self.order)
         self.D = _sdirk_shift(self.A)
+        # Embedded solution u_hat = u + dt sum_j bhat_j F_j of order `order - 1`, from the SAME stages. With
+        # M Z = dt (A x I) F it is u + sum_k d_k Z_k, d = bhat^T A^-1 -- no extra solve and no M^-1. Order 3:
+        # bhat on stages 1-2 only, from sum bhat = 1 and bhat.c = 1/2; order 2: bhat = (1, 0). Their stability
+        # functions are bounded at infinity (Rhat(inf) = -0.96 and -2.41), so a stiff mode inflates the
+        # estimate only while it is present, not for the whole march.
+        if self.order == 3:
+            b2 = (1.0 - 2.0 * self.gamma) / (1.0 - self.gamma)
+            bhat = np.array([1.0 - b2, b2, 0.0])
+        else:
+            bhat = np.array([1.0, 0.0])
+        self.d_hat = bhat @ np.linalg.inv(self.A)
+        self.embedded_order = self.order - 1
 
     @property
     def step_order(self):
@@ -426,17 +440,28 @@ class _SDIRKScheme(_TimeScheme):
                 theta=1.0,
                 linear_solve=linear_solve,
                 nonlinear_solve=nonlinear_solve,
-                report=report,
+                report=report is True,
             )
-            if report:
+            if report is True:
                 out, r_end, r_start = out
                 reports.append((r_end, r_start))
             Z.append(out - u)
+        if report == "embedded":
+            u_hat = u
+            for k, dk in enumerate(self.d_hat):
+                if dk != 0.0:
+                    u_hat = u_hat + float(dk) * Z[k]
+            return u + Z[-1], u_hat
         return u + Z[-1], reports  # stiffly accurate: the last stage is the step's answer
 
     def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
         self._refuse(block)
         return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve, nonlinear_solve, False)[0]
+
+    def embedded_stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        """``(u, t, dt) -> (u(t+dt), u_hat)``: the step and its embedded lower-order solution."""
+        self._refuse(block)
+        return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve, nonlinear_solve, "embedded")
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         import jax
@@ -554,10 +579,12 @@ def _rosenbrock_tableau(method):
             ]
         )
         b = np.array([2.4212380706095346e-01, -1.2232505839045147e00, 1.5452602553351020e00, 4.3586652150845900e-01])
-        return a, g, b, 3
+        # the embedded order-2 solution of the same paper (Rhat(inf) = -0.48)
+        bhat = np.array([3.7810903145819369e-01, -9.6042292212423178e-02, 0.5, 2.1793326075422950e-01])
+        return a, g, b, 3, bhat
     if method == "ros2":
         gam = 1.0 + 1.0 / np.sqrt(2.0)
-        return np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[gam, 0.0], [-2.0 * gam, gam]]), np.array([0.5, 0.5]), 2
+        return np.array([[0.0, 0.0], [1.0, 0.0]]), np.array([[gam, 0.0], [-2.0 * gam, gam]]), np.array([0.5, 0.5]), 2, None
     raise ValueError(f"jno.solve.rosenbrock(method={method!r}): method must be 'ros34pw2' or 'ros2'.")
 
 
@@ -577,7 +604,9 @@ class _RosenbrockScheme(_TimeScheme):
 
     def __init__(self, method):
         self.method = method
-        self.a, self.g, self.b, self.order = _rosenbrock_tableau(method)
+        self.a, self.g, self.b, self.order, self.bhat = _rosenbrock_tableau(method)
+        if self.bhat is not None:
+            self.embedded_order = self.order - 1
         self.gamma = float(self.g[0, 0])
         self.alpha = self.a.sum(axis=1)
         self.gsum = self.g.sum(axis=1)
@@ -628,7 +657,7 @@ class _RosenbrockScheme(_TimeScheme):
 
         return R, (lambda u, t: A_of(t)), (lambda t: blk.mass_fn(t, args) if blk.mass_fn is not None else blk.M)
 
-    def _one_step(self, blk, u, t, h, args, linear_solve):
+    def _one_step(self, blk, u, t, h, args, linear_solve, embedded=False):
         import jax
         import jax.numpy as jnp
 
@@ -681,11 +710,29 @@ class _RosenbrockScheme(_TimeScheme):
         out = u
         for i, k in enumerate(ks):
             out = out + float(self.b[i]) * k
+        if embedded:
+            u_hat = u
+            for i, k in enumerate(ks):
+                u_hat = u_hat + float(self.bhat[i]) * k
+            return out, u_hat
         return out
 
     def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
         self._refuse(block)
         return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve)
+
+    @property
+    def embedded_stepper(self):
+        """``(block, args, ...) -> ((u, t, dt) -> (u(t+dt), u_hat))`` where the method has an embedded pair
+        (``ros34pw2``); absent otherwise, and the adaptive controller then doubles steps."""
+        if self.bhat is None:
+            raise AttributeError("embedded_stepper")
+
+        def make(block, args, *, linear_solve=None, nonlinear_solve=None):
+            self._refuse(block)
+            return lambda u, t, dt: self._one_step(block, u, t, dt, args, linear_solve, embedded=True)
+
+        return make
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         import jax
@@ -781,6 +828,11 @@ class _AdaptiveScheme(_TimeScheme):
     def adaptive(self, **kwargs):
         raise NotImplementedError("this scheme is already adaptively sized; .adaptive() does not nest.")
 
+    @staticmethod
+    def _embedded_of(base):
+        """The base scheme's embedded-pair stepper factory, or ``None`` (then the controller doubles steps)."""
+        return getattr(base, "embedded_stepper", None)
+
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         if self.limit is not None:
             raise ValueError(
@@ -793,10 +845,17 @@ class _AdaptiveScheme(_TimeScheme):
         u0 = jnp.asarray(s0f(args) if s0f is not None else block.state0).reshape(-1)
         base = self.base_for(block)
         step_fn = base.stepper(block, args, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+        # one step per attempt where the scheme has an embedded pair (sdirk, ros34pw2), else step doubling
+        make_embedded = self._embedded_of(base)
+        embedded = (
+            make_embedded(block, args, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+            if make_embedded is not None
+            else None
+        )
 
         # NOTE: deliberately NOT ``block.dt``. The output grid's dt has no relation to the correct step
-        # size, and with no rejection an over-large first step is committed for good — ``dt0=None`` lets
-        # the marcher start at its floor and grow into the right scale. See ``adaptive_march``.
+        # size; an over-large first step is rejected and retried, which costs attempts from the budget,
+        # while ``dt0=None`` starts at the floor and grows into the right scale. See ``adaptive_march``.
         return adaptive_march(
             step_fn,
             u0,
@@ -807,7 +866,8 @@ class _AdaptiveScheme(_TimeScheme):
             atol=self.atol,
             max_steps=self.max_steps,
             dt0=self.dt0,
-            order=base.step_order,
+            order=base.embedded_order if embedded is not None else base.step_order,
+            embedded=embedded,
         )
 
     def __repr__(self):
@@ -846,86 +906,87 @@ def adaptive_march(
     max_steps,
     dt0=None,
     order=1,
+    embedded=None,
     safety=0.9,
     min_factor=0.2,
     max_factor=5.0,
 ):
-    """Adaptive step-size march via **step doubling** (Richardson error control), reverse-mode
-    differentiable. ``step_fn(u, t, dt) -> u(t+dt)`` is one implicit step (the block's DAE-correct
-    θ-step, or the complex 2n-block step). Each attempt compares a single full step with two half-steps;
-    the normalized RMS difference sizes the next dt (exponent ``1/(order+1)`` — ½ for a first-order base
-    such as backward Euler, ⅓ for a second-order one such as trapezoidal / Crank–Nicolson). The march is a
-    **fixed-length** ``lax.scan`` of ``max_steps`` — a static trip count, so the whole thing stays
-    reverse-differentiable — where the settled / over-budget tail simply consumes an iteration without
-    advancing ``t``. The trajectory is sampled at ``save_ts`` by interpolation; if the budget is exhausted
-    before ``t1`` the result is **NaN-poisoned** (raise ``max_steps``) rather than silently under-resolving
-    the tail — jNO never fails silently.
+    """Adaptive step-size march with error control and step REJECTION, reverse-mode differentiable.
 
-    **Every attempt is accepted** — see the ``body`` comment for why rejection is not available here. The
-    consequence is that ``dt0`` must not overshoot: an over-large step is committed, and only the *next* one
-    shrinks (and by at most ``1/min_factor`` per attempt). ``dt0=None`` (the default) therefore starts at
-    the floor ``1e-4·span`` and lets the controller **grow** into the right scale at up to ``max_factor``
-    per attempt — an under-sized step costs work, never accuracy, so approaching from below cannot commit
-    an out-of-tolerance step. Passing the caller's output-grid ``dt`` instead measured **4.2x** worse on a
-    2-D heat benchmark, its first two attempts landing 741x and 34x over tolerance and staying in the
-    answer."""
+    Two error estimates:
+
+    * **embedded** (``embedded(u, t, dt) -> (u_new, u_hat)``): the base scheme's own lower-order solution
+      ``u_hat`` from the SAME stages (Hairer & Wanner II, Sec. IV.8; Rosenbrock: Rang & Angermann 2005). One
+      step per attempt; ``order`` is then the order ``q`` of ``u_hat``, whose local error ``O(dt^(q+1))`` the
+      controller sizes with exponent ``1/(q+1)``.
+    * **step doubling** (no ``embedded``): ``step_fn(u, t, dt) -> u(t+dt)`` once over ``dt`` and twice over
+      ``dt/2``, three steps per attempt (Hairer, Norsett & Wanner I, Sec. II.4); ``order`` is the step's order
+      ``p`` and the exponent ``1/(p+1)``. Kept for the theta-steps, which have no embedded pair.
+
+    The error is the RMS of ``(u_new - u_hat) / (atol + rtol * max(|u_new|, |u_hat|))``. An attempt with error
+    above 1 is REJECTED -- the state and time stay, the step shrinks -- unless it is already at the floor
+    ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march is a fixed-length
+    ``lax.scan`` of ``max_steps`` attempts (rejections count) -- a static trip count, so it stays reverse
+    differentiable -- where the settled tail consumes attempts without solving. The trajectory is sampled at
+    ``save_ts`` by interpolation; an exhausted budget NaN-poisons the result (raise ``max_steps``).
+
+    Rejection is differentiable because a discarded attempt's states receive an exactly ZERO cotangent, and
+    the step solves return 0 for a zero right-hand side (``backend_blocks._default_step_solve``) instead of
+    the 0/0 = NaN JAX's BiCGStab gives there. The controller (error, accept, next ``dt``) is ``stop_gradient``-
+    ed, as in Diffrax: the gradient is the derivative at the realized step schedule."""
     u0 = jnp.asarray(u0).reshape(-1)
     rt = jnp.real(u0).dtype  # time / dt live in the state's real dtype (a complex system marches its real 2n block)
     t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
     span = jnp.abs(t1 - t0)
     # A non-degenerate floor: a *tiny* dt makes ``M + dt·A`` near-singular on the zeroed Dirichlet rows
-    # (its adjoint then blows up to NaN), so never step below this — the fixed-length scan already bounds
-    # the count, so the floor needs only to keep every step well-conditioned, not to bound work.
+    # (its adjoint then blows up to NaN), so never step below this.
     dt_min = 1e-4 * span
     dt_max = span
-    # Approach the step size from BELOW by default (see the docstring): growth is safe, overshoot is not.
+    # With rejection an over-large first step is retried, not kept; starting at the floor still costs only
+    # the few attempts it takes to grow (at most `max_factor` each) and never one wasted rejection.
     dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
 
     def _err(a, b):  # normalized RMS of the two estimates' difference (mixed absolute / relative tolerance)
+        a, b = jax.lax.stop_gradient(a), jax.lax.stop_gradient(b)
         scale = atol + rtol * jnp.maximum(jnp.abs(a), jnp.abs(b))
         return jnp.sqrt(jnp.mean(jnp.abs((a - b) / scale) ** 2))
 
     def _take(operand):
         u, _t, _dt = operand
-        # ``u_full`` is used ONLY to size the next step, so freeze its gradient entirely — otherwise its
-        # matrix-free solve adjoint would run with a zero cotangent and hit a 0/0 (‖r‖/‖b‖ with b=0) → NaN.
+        if embedded is not None:
+            u_new, u_hat = embedded(u, _t, _dt)
+            return u_new, _err(u_new, u_hat)
+        # ``u_full`` is used ONLY to size the next step, so freeze its gradient entirely.
         u_full = jax.lax.stop_gradient(step_fn(u, _t, _dt))
-        u_half = step_fn(step_fn(u, _t, 0.5 * _dt), _t + 0.5 * _dt, 0.5 * _dt)  # the accepted (more accurate) state
-        return u_half, jax.lax.stop_gradient(_err(u_full, u_half))
+        u_half = step_fn(step_fn(u, _t, 0.5 * _dt), _t + 0.5 * _dt, 0.5 * _dt)  # the kept (more accurate) state
+        return u_half, _err(u_full, u_half)
+
+    k = int(order) + 1  # the estimate's local error is O(dt^k)
 
     def body(carry, _):
-        t, u, dt = carry  # t, dt are the step SCHEDULE (control); the gradient flows through the state u only
+        t, u, dt, grow_ok = carry  # t, dt are the step SCHEDULE (control); the gradient flows through u only
         remaining = t1 - t
         done = remaining <= dt_min
         dt_ctrl = jnp.clip(dt, dt_min, dt_max)
         dt_step = jnp.clip(jnp.minimum(dt_ctrl, remaining), dt_min, dt_max)  # land on t1; never a degenerate dt
-        # Differentiate the numerical state at the REALIZED (t, dt) schedule; the controller (the error
-        # estimate and the next dt) is a discrete control decision whose derivative is both fragile (√err
-        # blows up exactly when a step is well-resolved) and not what an inverse problem wants, so
-        # ``stop_gradient`` it — the standard way to differentiate an adaptive solver (Diffrax does the
-        # same): the gradient goes through u and the operator params at the step sequence the forward pass
-        # chose. On a **settled** step ``lax.cond`` runs the *skip* branch (no solve), so no zero-cotangent
-        # solve adjoint runs there.
-        #
-        # **No rejection**, and the reason is AD, not stability: rejecting would mean discarding this
-        # attempt's ``u_half`` (``where(accept, u_half, u)``), whose cotangent is then exactly zero, so the
-        # matrix-free solve adjoint runs on ``b = 0`` and its relative-residual test divides 0/0. Measured:
-        # adding rejection turns a finite gradient (AD -21.92 vs FD -21.99) into ``NaN``. Accepting every
-        # attempt keeps ``u_half`` a genuinely-used state. NOTE the older rationale here — "a too-large step
-        # is only inaccurate, never unstable (backward Euler is L-stable)" — argued the wrong thing:
-        # L-stability says the step will not blow up, not that an out-of-tolerance step is acceptable to
-        # keep. Since it IS kept, the burden falls on ``dt0`` never overshooting (see the docstring).
+        # Differentiate the numerical state at the REALIZED (t, dt) schedule; the controller is a discrete
+        # control decision, `stop_gradient`-ed (Diffrax does the same). On a settled step `lax.cond` runs the
+        # skip branch (no solve).
         _t, _dt = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
-        u_new, err = jax.lax.cond(done, lambda o: (o[0], jnp.asarray(0.0, rt)), _take, (u, _t, _dt))
-        t_new = jnp.where(done, t, t + _dt)
-        # Exponent 1/(p+1) for a base method of order p — NOT a hardwired ½. A second-order base (θ=1/2,
-        # including the trapezoidal step the assembly picks for second-order systems) needs ⅓, or every
-        # step is mis-sized.
-        fac = jnp.clip(safety * jnp.maximum(err, 1e-12) ** (-1.0 / (int(order) + 1)), min_factor, max_factor)
-        dt_next = jnp.clip(dt_ctrl * fac, dt_min, dt_max)
-        return (t_new, u_new, dt_next), (t_new, u_new)
+        u_try, err = jax.lax.cond(done, lambda o: (o[0], jnp.asarray(0.0, rt)), _take, (u, _t, _dt))
+        at_floor = _dt <= dt_min * (1.0 + 1e-9)
+        accept = done | (err <= 1.0) | at_floor
+        u_new = jnp.where(accept, u_try, u)  # a rejected attempt's state gets a zero cotangent (see docstring)
+        t_new = jnp.where(done | ~accept, t, t + _dt)
+        fac = jnp.clip(safety * jnp.maximum(err, 1e-12) ** (-1.0 / k), min_factor, max_factor)
+        fac = jnp.where(grow_ok, fac, jnp.minimum(fac, 1.0))  # no growth straight after a rejection
+        dt_next = jnp.clip(dt_step * fac, dt_min, dt_max)
+        # an accepted step that was shortened to land on t1 keeps the controller's size for what follows
+        dt_next = jnp.where(accept & (dt_step < dt_ctrl), jnp.maximum(dt_next, dt_ctrl), dt_next)
+        return (t_new, u_new, dt_next, accept), (t_new, u_new)
 
-    (t_end, _u, _dt), (ts, us) = jax.lax.scan(body, (t0, u0, dt_start), None, length=int(max_steps))
+    init = (t0, u0, dt_start, jnp.asarray(True))
+    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)
