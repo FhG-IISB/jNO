@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794227332,"nonce":"hId0x0XN4tjXgIuhqZAOTQbFHqo=","message":"Fixed in 5e8040ac; test: test_embedded_pair_is_cheaper_than_step_doubling","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794227332,"nonce":"9KjqPJHJEwGsVVfw+5xb+47nBkE=","status":2}]}
