@@ -52,6 +52,13 @@ _TRACED_VERDICTS: list | None = None
 STALL_DROP = 0.01
 
 
+# Pseudo-transient continuation's safeguard (Kelley & Keyes 1998 use SER uncapped; uncapped, a flow that converged far
+# from the root reached full Newton at a residual where full Newton still diverges): an accepted step grows dtau by the
+# residual's fall, at most PTC_GROW; a step that raises the residual is rejected and dtau shrinks by PTC_SHRINK.
+PTC_GROW = 4.0
+PTC_SHRINK = 4.0
+
+
 def _ptc_check(ptc):
     """None, or the first pseudo-time step of ``ptc=`` as a float > 0; ValueError otherwise."""
     if ptc is None or ptc is False:
@@ -1031,8 +1038,10 @@ def newton_direct(
     raises saying it stalled (see :func:`jno.solve.newton`); a step rejected on a stale tangent counts as one.
 
     ``ptc=dtau0`` (> 0) is **pseudo-transient continuation**: each step solves ``(V / dtau_k + J) delta = -r``
-    with ``V = |diag J|`` and ``dtau_k = dtau0 * ||r0|| / ||r_k||`` (switched evolution relaxation; Kelley &
-    Keyes, SIAM J. Numer. Anal. 35(2), 1998, Sec. 2; Mulder & van Leer 1985). See :func:`jno.solve.newton`.
+    with ``V = |diag J|``, starting at ``dtau0``; an accepted step grows ``dtau`` by the residual's fall (switched
+    evolution relaxation; Kelley & Keyes, SIAM J. Numer. Anal. 35(2), 1998, Sec. 2; Mulder & van Leer 1985), at
+    most ``PTC_GROW``, and a step that does not lower the residual is rejected with ``dtau / PTC_SHRINK``. See
+    :func:`jno.solve.newton`.
     Not with ``reuse=True`` (the shifted tangent changes every step)."""
     stall = _stall_check(stall)
     ptc = _ptc_check(ptc)
@@ -1074,14 +1083,10 @@ def newton_direct(
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
         return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
-    def _step_tangent(u, rn, r0n):
-        """The tangent a step solves: J, or with ptc the pseudo-time shifted J + |diag J| / dtau_k."""
+    def _step_tangent(u, dtau):
+        """The tangent a step solves: J, or with ptc the pseudo-time shifted J + |diag J| / dtau."""
         J = J_fwd(u)
-        if ptc is None:
-            return J
-        # SER: dtau grows as the residual falls; 1/dtau -> 0 is plain Newton (a NaN norm stays NaN and is caught
-        # by the caller's non-finite check)
-        return _ptc_shift(J, rn / (ptc * jnp.maximum(r0n, jnp.finfo(r0n.dtype).tiny)))
+        return J if ptc is None else _ptc_shift(J, 1.0 / dtau)
 
     def _forward(x0):
         # ONE residual evaluation per step: the one taken at the new iterate is carried to the next step
@@ -1098,7 +1103,7 @@ def newton_direct(
         forcing = _FORCING[0] and not _LINEAR_FORM[0] and getattr(linear_solve, "accepts_rtol", False)
 
         def body(state):
-            u, r, k, rn_prev, eta_prev, best, since = state
+            u, r, k, rn_prev, eta_prev, dtau, best, since = state
             rn = jnp.linalg.norm(r)
             # The Newton STEP is not gated (see `_step_and_tangent`: the outer residual is the contract,
             # judged by `_convergence_check`); only custom_root's tangent below is. Gating it here also put a
@@ -1112,21 +1117,43 @@ def newton_direct(
                     # never tighter than half the outer target over the current residual (the last step need
                     # not out-solve the bound the loop stops on). The loop still stops on the TRUE residual.
                     eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
-                    delta = linear_solve(_step_tangent(u, rn, r0n), -r, rtol=eta)
+                    delta = linear_solve(_step_tangent(u, dtau), -r, rtol=eta)
                 else:
                     eta = eta_prev
-                    delta = linear_solve(_step_tangent(u, rn, r0n), -r)  # solve of the assembled tangent
+                    delta = linear_solve(_step_tangent(u, dtau), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, rn) if line_search else damping
-            u = u + alpha * delta
-            r_new = f_fwd(u)
+            u_try = u + alpha * delta
+            r_try = f_fwd(u_try)
+            if ptc is None:
+                u_new, r_new = u_try, r_try
+            else:
+                # PTC safeguard: a step that does not lower the residual (or is non-finite) is REJECTED -- the iterate
+                # stays -- and dtau shrinks; an accepted one grows dtau by the residual's fall, at most PTC_GROW.
+                # The FIRST step is always taken: it satisfies every linear constraint (a row with no time term, e.g.
+                # continuity), and a constraint the start violates fixes its part of the step whatever dtau is, so a
+                # smaller dtau would only make that step's residual larger, never smaller.
+                rn_try = jnp.linalg.norm(r_try)
+                accept = (rn_try < rn) | ((k == 0) & jnp.isfinite(rn_try))  # False for a NaN norm
+                u_new, r_new = jnp.where(accept, u_try, u), jnp.where(accept, r_try, r)
+                grow = jnp.clip(rn / jnp.maximum(rn_try, jnp.finfo(rn.dtype).tiny), 1.0, PTC_GROW)
+                dtau = jnp.where(accept, dtau * grow, dtau / PTC_SHRINK)
             if beacon.active():  # nothing is traced unless the solve has log=
                 rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
                 last = (rn_new <= target) | (k + 1 >= max_steps)
                 beacon.emit("newton", k + 1, rn_new, target, eta, step=k + 1, last=last)
-            return (u, r_new, k + 1, rn, jnp.asarray(eta, rn.dtype), *_stall_step(jnp.linalg.norm(r_new), best, since))
+            return (
+                u_new,
+                r_new,
+                k + 1,
+                rn,
+                jnp.asarray(eta, rn.dtype),
+                dtau,
+                *_stall_step(jnp.linalg.norm(r_new), best, since),
+            )
 
         if not reuse:
-            init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype), r0n, jnp.asarray(0, jnp.int32))
+            dtau0 = jnp.asarray(ptc if ptc is not None else 1.0, r0n.dtype)
+            init = (x0, r_start, 0, r0n, jnp.asarray(_EW_ETA0, r0n.dtype), dtau0, r0n, jnp.asarray(0, jnp.int32))
             u, r, k, *_ = jax.lax.while_loop(cond, body, init)
             return u, k, k, jnp.linalg.norm(r), r0n, None  # a fresh tangent (one factorization) every step
 

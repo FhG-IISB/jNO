@@ -48,6 +48,16 @@ def test_plain_newton_diverges_on_atan_from_3_and_ptc_converges_to_the_root():
     assert LAST_NEWTON_STATS["converged"] and LAST_NEWTON_STATS["steps"] < 30
 
 
+def test_a_step_that_raises_the_residual_is_rejected_and_dtau_shrinks():
+    """atan from u0 = 3 with an over-large dtau0 = 10: the first steps are near-Newton and overshoot (|r| would grow);
+    the safeguard rejects them, shrinks dtau 4x each time, and still converges. Without rejection (the earlier SER
+    rule) dtau = 10 on atan from 3 diverges like plain Newton."""
+    u = newton_direct(
+        _atan, _atan_jac, jnp.array([3.0]), linear_solve=_dense, max_steps=60, ptc=10.0, rtol=1e-12, atol=1e-14
+    )
+    assert abs(float(u[0])) < 1e-12 and LAST_NEWTON_STATS["converged"]
+
+
 def test_a_row_with_no_diagonal_gets_no_pseudo_time():
     """r = (atan(u) + lam, u - 1/2): the constraint row has J = (1, 0); its update must solve the constraint exactly, so
     after the first step u = 1/2 whatever dtau is. A time term on that row would leave u short of 1/2."""
