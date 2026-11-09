@@ -145,15 +145,25 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     # a state the march discards (a rejected adaptive step) sends back. Measured before the guard: a rejected
     # step turned a finite gradient (FD -16.52) into NaN. A zero system has the zero solution; nothing else
     # changes (the guard is one norm, and the transpose has the same diagonal for the Jacobi scaling).
-    def guarded(warm):
+    #
+    # The result of either side goes through the residual gate: a step solve that did not converge (a NaN
+    # from a BiCGStab breakdown the GMRES rescue could not repair, or a stalled residual) is recorded and
+    # raised at the end of the enclosing solve, instead of marching a NaN or a wrong state on in silence.
+    from .solver_api import residual_gate
+
+    def guarded(warm, side):
         def solve(op, b):
-            return jax.lax.cond(
+            x = jax.lax.cond(
                 jnp.any(b != 0), lambda: _krylov_step_solve(op, b, warm, inv, krylov), lambda: jnp.zeros_like(b)
             )
+            return residual_gate(op, b, x, _STEP_SOLVE_NAME, side=side)
 
         return solve
 
-    return jax.lax.custom_linear_solve(step_op, rhs, guarded(x0), transpose_solve=guarded(None))
+    return jax.lax.custom_linear_solve(step_op, rhs, guarded(x0, "forward"), transpose_solve=guarded(None, "adjoint"))
+
+
+_STEP_SOLVE_NAME = "the default time-step solve (Jacobi BiCGStab with a GMRES rescue)"
 
 
 def _krylov_step_solve(step_op, rhs, x0, inv, krylov):

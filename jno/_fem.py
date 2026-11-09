@@ -1582,6 +1582,26 @@ def _default_direct(fem_obj):
     return lu(backend="cudss") if _preferred_direct_backend() == "cudss" else None
 
 
+def _default_saddle_step_solve(fem_obj):
+    """``jno.solve.lu()`` for a linear transient whose step operator is a SADDLE (an index-2 row: zero mass and
+    a zero diagonal, the incompressibility row), else ``None`` (the Krylov step default). Jacobi has nothing to
+    scale on those rows and the Schur complement shrinks with dt, so the Krylov default broke down: measured
+    on unsteady Stokes (P2/P1), fine at dt = 1e-3 and NaN at dt = 1e-4 and below. A moving mesh and a periodic
+    reduction keep their own drivers."""
+    if fem_obj._mode != "transient" or not fem_obj.is_linear or getattr(fem_obj, "_geometry", None):
+        return None
+    periodic = fem_obj._periodic_2n if fem_obj._complex_n is not None else fem_obj._periodic
+    if periodic is not None:
+        return None
+    from .utils.solver.solver_api import _is_saddle_block
+
+    if not _is_saddle_block(fem_obj._op):
+        return None
+    from .solve import lu
+
+    return lu()
+
+
 def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
     """One line naming the route a ``solve()`` actually took.
 
@@ -3332,6 +3352,8 @@ class FEM:
             for a_ in (solve_fn, adapt, checkpoint, contact, continuation, x0, nonlinear, precond, time, tau, basis, shard)
         ):
             linear = _default_direct(self)
+        if linear is None and precond is None and solve_fn is None:
+            linear = _default_saddle_step_solve(self)
         linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 

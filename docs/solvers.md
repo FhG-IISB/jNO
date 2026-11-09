@@ -1650,6 +1650,13 @@ formed **once** and the preconditioner materialized **once before the time loop*
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state (so `x0=` is rejected).
 
+With no `linear=`/`precond=`, a linear block's step is solved by Jacobi-BiCGStab with a GMRES rescue, except
+on a **saddle**: a row with zero mass and a zero diagonal (the incompressibility row of unsteady Stokes)
+gets `jno.solve.lu()` instead. Jacobi has nothing to scale on those rows and the Schur complement shrinks
+with `dt`; measured on unsteady Stokes (P2/P1), the Krylov step was right at `dt = 1e-3` and NaN at
+`dt = 1e-4`. A Krylov step that does not converge raises at the end of the solve, naming the step solve,
+instead of returning a NaN trajectory.
+
 !!! measured "A constant step operator factorizes once, not once per step"
     The step matrix is
     formed once (above), and the host factorization is cached on the operator's *content*, so a march
