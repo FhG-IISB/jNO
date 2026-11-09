@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794227332,"nonce":"JBdyqCs1SIDvMft8owIQ5mC6cKA=","message":"Fixed in 6b1adca7; tests: test_index2_rows_do_not_collapse_the_step, test_index2_rows_are_found_on_a_nonlinear_block","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794227332,"nonce":"loiFpuTNJ5Ip34VnDgVooAEwHy0=","status":2}]}
