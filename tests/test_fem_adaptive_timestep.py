@@ -548,3 +548,94 @@ def test_embedded_adaptive_is_differentiable(name, scheme, q):
     g = float(jax.grad(loss)(0.8))
     fd = float((loss(0.8 + 1e-5) - loss(0.8 - 1e-5)) / 2e-5)
     assert np.isfinite(g) and abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"{name}: AD {g} vs FD {fd}"
+
+
+def _stokes(nsteps, t1=0.3, convective=False):
+    """Unsteady Stokes on the unit square, P2 velocity / P1 pressure, no-slip walls, a pressure pin, driven
+    by an oscillating body force with a gradient part (so the pressure is non-trivial). The pressure has no
+    time derivative and its row has a zero diagonal: an index-2 algebraic variable."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, t1, nsteps))
+    d.point_region("ppin", (0.0, 0.0))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xp, yp, _ = d.variable("ppin", split=True)
+    ci = d.variable("initial", split=True)
+    gu, gv = jno.np.grad(u, [xi, yi]), jno.np.grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    amp = 20.0 * jno.np.cos(30.0 * ti)
+    mom = (
+        jno.np.inner(ui.t, vi, n_contract=1)
+        + jno.np.inner(gu, gv, n_contract=2)
+        - pp * jno.np.trace(gv)
+        - amp * (jno.np.sin(PI * yi) + xi) * vi[0]
+        - amp * xi * yi * vi[1]
+    )
+    if convective:
+        mom = mom + jno.np.inner(jno.np.inner(gu, ui, n_contract=1), vi, n_contract=1)
+    return jno.fem(
+        [
+            mom,
+            -qq * jno.np.trace(gu),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            p(xp, yp) - 0.0,
+            u(ci[0], ci[1])[0] - 0.0,
+            u(ci[0], ci[1])[1] - 0.0,
+        ]
+    )
+
+
+def test_error_norm_leaves_out_index2_rows_only():
+    """The pressure rows of a saddle problem (zero mass, zero diagonal) leave the error norm; the velocity
+    Dirichlet rows and the pressure pin (zero mass, but they fix their own unknown) stay in it."""
+    from jno.utils.solver.backend_blocks import _algebraic_rows
+    from jno.utils.solver.timeschemes import _error_rows
+
+    fem = _stokes(4)
+    blk = fem.operator
+    nu, n = fem.offsets[1], blk.M.shape[0]
+    rows = np.asarray(_error_rows(blk, {}, jnp.zeros(n)))
+    alg = np.asarray(_algebraic_rows(blk.M, n, jnp.float64))
+    assert alg[:nu].sum() > 0 and rows[:nu].all()  # velocity Dirichlet rows: algebraic, but counted
+    assert rows[nu:].sum() == 1  # every pressure row left out but the pin
+
+
+def test_index2_rows_do_not_collapse_the_step(monkeypatch):
+    """Counting the pressure's local error, which converges an order lower, drove sdirk3 to the step floor
+    at rtol = 1e-5 (measured: 1063 attempts, 47 rejected, error 4e-4 from accepting floor steps over the
+    tolerance); left out, 422 attempts and 4.5e-7."""
+    from jno.utils.solver import timeschemes as ts
+
+    # a fresh problem per run: a traced march is cached per block, and would keep the first run's rows
+    run = lambda scheme, n=4: np.asarray(_stokes(n).solve(time=scheme, linear=jno.solve.lu()).fn())[-1]  # noqa: E731
+    nu = _stokes(4).offsets[1]
+    ref = run(jno.solve.sdirk(3), 301)
+    err = lambda w: np.linalg.norm(w[:nu] - ref[:nu]) / np.linalg.norm(ref[:nu])  # noqa: E731
+    calls = _count_steps(monkeypatch, ts._SDIRKScheme)
+    sch = jno.solve.sdirk(3).adaptive(rtol=1e-5, atol=1e-8, max_steps=2000)
+    e_kept = err(run(sch))
+    n_kept = len(calls)
+    monkeypatch.setattr(ts, "_error_rows", lambda *a: None)
+    calls.clear()
+    e_all = err(run(sch))
+    n_all = len(calls)
+    assert e_kept < 1e-5, e_kept
+    assert n_kept < 0.6 * n_all and e_kept < e_all, (n_kept, n_all, e_kept, e_all)
+
+
+def test_index2_rows_are_found_on_a_nonlinear_block():
+    """Navier-Stokes carries its mass as a callable and its operator as a tangent; the pressure rows are still
+    left out of the error norm. Measured at rtol = 1e-4: 194 sdirk3 steps left out; counted, the march used
+    its whole 3000-step budget and returned NaN."""
+    from jno.utils.solver import timeschemes as ts
+
+    fem = _stokes(4, convective=True)
+    assert not fem.is_linear
+    nu = fem.offsets[1]
+    rows = np.asarray(ts._error_rows(fem.operator, {}, jnp.zeros(fem.operator.state0.shape[0])))
+    assert rows[:nu].all() and rows[nu:].sum() == 1
+    out = np.asarray(fem.solve(time=jno.solve.sdirk(3).adaptive(rtol=1e-4, atol=1e-7, max_steps=400)).fn())
+    assert np.isfinite(out).all()

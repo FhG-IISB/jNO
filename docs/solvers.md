@@ -1635,7 +1635,10 @@ Both expose a stepper, so `.adaptive()` works, and both refuse second-order-in-t
 SDIRK and ROS34PW2 carry an embedded lower-order solution built from the same stages (order 2 for SDIRK3
 and ROS34PW2, order 1 for SDIRK2), so the controller gets its error estimate without extra solves; every
 other base is sized by step doubling (one step against two half-steps). A step over the tolerance is
-rejected and retried smaller; the step sizes are treated as constants in the gradient. On the 2-D heat
+rejected and retried smaller; the step sizes are treated as constants in the gradient. The error norm
+leaves out index-2 rows (zero mass and a zero diagonal, the incompressibility row of a saddle problem),
+whose error converges an order lower: counted, they drove SDIRK3 on unsteady Stokes to the step floor.
+Dirichlet rows and pressure pins stay in. On the 2-D heat
 test of `tests/test_fem_adaptive_timestep.py` at `rtol=1e-5`, the embedded pair needed about 40% fewer
 base steps than step doubling for an error no larger.
 On a nonlinear heat problem, ROS34PW2 reached a given accuracy in the least wall time of the schemes

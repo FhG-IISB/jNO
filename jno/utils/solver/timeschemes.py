@@ -868,11 +868,31 @@ class _AdaptiveScheme(_TimeScheme):
             dt0=self.dt0,
             order=base.embedded_order if embedded is not None else base.step_order,
             embedded=embedded,
+            error_rows=_error_rows(block, args, u0),
         )
 
     def __repr__(self):
         base = "" if self.base is None else f"{self.base!r}."
         return f"{base}adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps}, dt0={self.dt0})"
+
+
+def _error_rows(block, args, u0):
+    """``1`` on the rows the adaptive error norm counts, ``0`` on the rows it leaves out, or ``None`` (count
+    every row).
+
+    Left out: algebraic rows (zero mass) whose own diagonal of the operator is zero, so the row does not
+    determine its own unknown: the incompressibility row of a saddle problem, whose pressure is an
+    index-2 variable. Its local error converges one order lower than the differential rows', so counting
+    it shrinks the steps without bound (Hairer & Wanner, *Solving ODEs II*, Sec. VII.3 and VII.4; SUNDIALS
+    IDA leaves such rows out with ``IDASetSuppressAlg``). Kept: an algebraic row that fixes its own unknown
+    (a Dirichlet row, a pressure pin, a stabilised pressure row), whose error is controlled like a state.
+    ``None`` when the block carries no mass matrix of the state's size (a state-dependent mass residual)."""
+    from .backend_blocks import _block_index2_rows
+
+    leave_out = _block_index2_rows(block, args, u0)
+    if leave_out is None or leave_out.shape[0] != u0.shape[0]:
+        return None
+    return (~leave_out).astype(jnp.real(u0).dtype)
 
 
 def _theta_order(theta: float) -> int:
@@ -907,6 +927,7 @@ def adaptive_march(
     dt0=None,
     order=1,
     embedded=None,
+    error_rows=None,
     safety=0.9,
     min_factor=0.2,
     max_factor=5.0,
@@ -923,7 +944,9 @@ def adaptive_march(
       ``dt/2``, three steps per attempt (Hairer, Norsett & Wanner I, Sec. II.4); ``order`` is the step's order
       ``p`` and the exponent ``1/(p+1)``. Kept for the theta-steps, which have no embedded pair.
 
-    The error is the RMS of ``(u_new - u_hat) / (atol + rtol * max(|u_new|, |u_hat|))``. An attempt with error
+    The error is the RMS of ``(u_new - u_hat) / (atol + rtol * max(|u_new|, |u_hat|))`` over the rows
+    ``error_rows`` marks (all rows when ``None``; the caller leaves out index-2 rows such as the
+    incompressibility row, see ``_error_rows``). An attempt with error
     above 1 is REJECTED -- the state and time stay, the step shrinks -- unless it is already at the floor
     ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march is a fixed-length
     ``lax.scan`` of ``max_steps`` attempts (rejections count) -- a static trip count, so it stays reverse
@@ -946,10 +969,20 @@ def adaptive_march(
     # the few attempts it takes to grow (at most `max_factor` each) and never one wasted rejection.
     dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
 
+    # ``error_rows`` (1 counted, 0 left out; see ``_error_rows``): the mean runs over the counted rows, so the
+    # tolerance keeps its meaning.
+    weight = None
+    if error_rows is not None:
+        weight = jax.lax.stop_gradient(jnp.asarray(error_rows, rt).reshape(-1))
+        n_counted = jnp.maximum(jnp.sum(weight), 1.0)
+
     def _err(a, b):  # normalized RMS of the two estimates' difference (mixed absolute / relative tolerance)
         a, b = jax.lax.stop_gradient(a), jax.lax.stop_gradient(b)
         scale = atol + rtol * jnp.maximum(jnp.abs(a), jnp.abs(b))
-        return jnp.sqrt(jnp.mean(jnp.abs((a - b) / scale) ** 2))
+        r2 = jnp.abs((a - b) / scale) ** 2
+        if weight is None:
+            return jnp.sqrt(jnp.mean(r2))
+        return jnp.sqrt(jnp.sum(weight * r2) / n_counted)
 
     def _take(operand):
         u, _t, _dt = operand

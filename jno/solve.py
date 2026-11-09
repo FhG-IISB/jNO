@@ -2185,7 +2185,10 @@ def adaptive(
     with the embedded lower-order solution of the same stages, so an attempt costs one step. Every other
     base (the θ-steps, ``rosenbrock("ros2")``) uses **step doubling** (Richardson): one full step against
     two half-steps, 3 steps per attempt. A step whose error exceeds the tolerance is **rejected** and
-    retried smaller, unless it is already at the smallest allowed step.
+    retried smaller, unless it is already at the smallest allowed step. The error norm leaves out the
+    rows of an index-2 variable (zero mass and a zero diagonal, as the incompressibility row of a saddle
+    problem): their error converges an order lower and would shrink the step without bound. Dirichlet
+    rows and pins stay in.
 
     Built on the block's own implicit θ-step, so it inherits the DAE (Dirichlet) handling and works for a
     **linear or nonlinear**, **scalar or vector**, **plain, periodic, or complex** transient. It is a

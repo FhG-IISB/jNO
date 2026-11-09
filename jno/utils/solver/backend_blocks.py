@@ -48,6 +48,56 @@ def _algebraic_rows(M, n, dtype):
     return mass == 0
 
 
+def _index2_rows(M, A, n, dtype):
+    """``True`` on the rows with zero mass AND a zero diagonal in the operator ``A``: algebraic rows that do
+    not determine their own unknown, as the incompressibility row of a saddle problem (the pressure is an
+    index-2 variable). A Dirichlet row or a pressure pin has zero mass but fixes its own unknown, so it is
+    not one."""
+    import jax.numpy as jnp
+
+    if hasattr(A, "todense"):  # BCOO: duplicates are summed
+        i, j = A.indices[:, 0], A.indices[:, 1]
+        diag = jnp.zeros((n,), dtype).at[i].add(jnp.where(i == j, jnp.abs(A.data), 0).astype(dtype))
+    else:
+        diag = jnp.abs(jnp.diagonal(jnp.asarray(A))).astype(dtype)
+    return _algebraic_rows(M, n, dtype) & (diag == 0)
+
+
+def _block_index2_rows(block, args=None, state=None):
+    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
+    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+    import jax.numpy as jnp
+
+    args = {} if args is None else args
+    if getattr(block, "mass_fn", None) is not None:
+        M = block.mass_fn(block.t0, args)
+    elif getattr(block, "M", None) is not None:
+        M = block.M
+    elif getattr(block, "mass", None) is not None:  # a nonlinear block carries its mass as a callable
+        M = block.mass(block.t0, args)
+    else:
+        return None
+    if M is None or not hasattr(M, "shape") or len(M.shape) != 2:
+        return None
+    n = M.shape[0]
+    # the runtime operator when the arguments are at hand; else the assembled one (same sparsity and zero
+    # pattern -- the static placeholder of a parametric block)
+    if getattr(block, "operator_fn", None) is not None and args:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "A", None) is not None:
+        A = block.A
+    elif getattr(block, "operator_fn", None) is not None:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "jacobian", None) is not None:
+        u = state if state is not None else block.state0
+        if u is None:
+            return None
+        A = block.jacobian(jnp.asarray(u).reshape(-1), block.t0, args)
+    else:
+        return None
+    return _index2_rows(M, A, n, jnp.zeros((), M.dtype).real.dtype)
+
+
 def _row_scaled(A, w):
     """``diag(w) · A`` for a BCOO or dense ``A``."""
     import jax.numpy as jnp
