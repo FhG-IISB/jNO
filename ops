@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794245160,"nonce":"c5wX0zbdpWJllwDaY49XnAbKoDk=","added":["branch:feat/rcwa-jax-field","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794245161,"nonce":"2Xj9rTq/w+MfOSFCHNS6uQcsJZs=","message":"Fixed in the working tree (not yet committed); the test above passes.","files":null}]}
