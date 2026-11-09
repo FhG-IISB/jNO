@@ -618,11 +618,22 @@ def amg(
 
 def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
-    reuse=False, anderson=0, stall=None,
+    reuse=False, anderson=0, stall=None, ptc=None,
 ) -> NonlinearSolver:  # fmt: skip
-    from .utils.solver.newton_krylov import _stall_check
+    from .utils.solver.newton_krylov import _ptc_check, _stall_check
 
     stall = _stall_check(stall)
+    ptc = _ptc_check(ptc)
+    if ptc is not None and direct is False:
+        raise ValueError(
+            f"jno.solve.{name}(ptc=...) scales its pseudo-time term by the diagonal of the ASSEMBLED tangent; the "
+            f"matrix-free mode (direct=False) never assembles one: use direct=True or the default direct=None."
+        )
+    if ptc is not None and reuse:
+        raise ValueError(
+            f"jno.solve.{name}(ptc=...) shifts the tangent by a new pseudo-time step every step, so there is no "
+            f"tangent to reuse: drop reuse=True."
+        )
     if reuse and direct is False:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED tangent between steps (and, for the sparse-direct "
@@ -637,6 +648,13 @@ def _root_driver(
         # with reuse=True and an assembled tangent. `info` (a dict) receives the solve's own residual norms
         # and, with reuse, its last tangent; see newton_direct.
         carry = {"info": info} if jacobian is not None and direct is not False else {}
+        if ptc is not None:
+            if jacobian is None and not direct:
+                raise ValueError(
+                    f"jno.solve.{name}(ptc=...) needs the assembled tangent, and this problem has none (a residual-only "
+                    f"operator): use direct=True, which materialises it, or drop ptc."
+                )
+            carry["ptc"] = ptc
         if reuse and jacobian is not None and direct is not False:
             carry["tangent0"] = tangent0
         if direct is None and jacobian is not None:
@@ -721,6 +739,8 @@ def _root_driver(
         config["reuse"] = reuse
     if stall is not None:
         config["stall"] = stall
+    if ptc is not None:
+        config["ptc"] = ptc
     return NonlinearSolver(
         _fn,
         name=name,
@@ -768,6 +788,7 @@ def newton(
     direct: bool | None = None,
     reuse: bool = False,
     stall: int | None = None,
+    ptc: float | None = None,
 ) -> NonlinearSolver:
     """Newton root-find, as a configurable slot. Three inner-solve modes:
 
@@ -821,7 +842,20 @@ def newton(
     ``line_search``) that meets a minimum of ``||r||`` that is no root, or a tangent that does not match the
     residual, can sit there for every remaining step, each a full assembly and factorization; a caller with a
     fallback (another damping, a continuation) gets to it at once. ``None`` (the default) runs to ``max_steps``
-    as before. A converging solve is unchanged: every step that lowers the residual 1% resets the count."""
+    as before. A converging solve is unchanged: every step that lowers the residual 1% resets the count.
+
+    ``ptc=dtau0`` (a number > 0) is **pseudo-transient continuation**, for a steady problem whose Newton diverges
+    from where it starts (a buoyant flow from rest, a stiff source): each step solves
+    ``(V / dtau_k + J) delta = -r`` with ``V = |diag J|`` and ``dtau_k = dtau0 * ||r0|| / ||r_k||`` (switched
+    evolution relaxation; Kelley & Keyes, SIAM J. Numer. Anal. 35(2), 1998, Sec. 2; Mulder & van Leer, J.
+    Comput. Phys. 59, 1985). Far from the root the pseudo-time term damps and stabilises the step per row; as
+    the residual falls ``dtau_k`` grows and the step becomes Newton's, with its quadratic convergence. The
+    residual is unchanged, so the root and its implicit gradient are too. ``V = |diag J|`` makes the term
+    unit-free (rows in different units each get their own scale) and leaves rows with a zero diagonal alone --
+    a Taylor-Hood pressure, a multiplier: constraints get no time term. ``dtau0 = 1`` doubles the first step's
+    diagonal; smaller is more cautious. It composes with ``damping`` and ``line_search``. It needs an assembled
+    tangent (``direct=True`` or the default; refused with ``direct=False``) and a fresh one each step (refused
+    with ``reuse=True``)."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -836,6 +870,7 @@ def newton(
         direct=direct,
         reuse=reuse,
         stall=stall,
+        ptc=ptc,
     )
 
 

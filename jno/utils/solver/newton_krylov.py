@@ -52,6 +52,35 @@ _TRACED_VERDICTS: list | None = None
 STALL_DROP = 0.01
 
 
+def _ptc_check(ptc):
+    """None, or the first pseudo-time step of ``ptc=`` as a float > 0; ValueError otherwise."""
+    if ptc is None or ptc is False:
+        return None
+    if isinstance(ptc, bool) or not isinstance(ptc, (int, float)) or not np.isfinite(ptc) or ptc <= 0:
+        raise ValueError(
+            f"ptc={ptc!r}: the first pseudo-time step must be a number > 0 (1.0 is a usual start: the first step is "
+            f"Newton's with its diagonal doubled), or None for plain Newton"
+        )
+    return float(ptc)
+
+
+def _ptc_shift(J, s):
+    """``J + s * diag(|diag J|)`` for a dense array or a ``BCOO`` (duplicate diagonal entries summed first, then the
+    shift split among them, so it is added once). A row whose diagonal is 0 (a constraint) is left alone."""
+    from jax.experimental.sparse import BCOO
+
+    if isinstance(J, BCOO):
+        i, j = J.indices[:, 0], J.indices[:, 1]
+        n = J.shape[0]
+        on = i == j
+        d = jax.ops.segment_sum(jnp.where(on, J.data, 0.0), i, num_segments=n)
+        c = jax.ops.segment_sum(on.astype(J.data.dtype), i, num_segments=n)
+        add = jnp.where(on, s * jnp.abs(d[i]) / jnp.maximum(c[i], 1.0), 0.0)
+        return BCOO((J.data + add.astype(J.data.dtype), J.indices), shape=J.shape)
+    J = jnp.asarray(J)
+    return J + jnp.diag(s * jnp.abs(jnp.diagonal(J)))
+
+
 def _stall_check(stall):
     """``stall`` as given to a driver: None (off) or a positive int; anything else raises."""
     if stall is None:
@@ -935,6 +964,7 @@ def newton_direct(
     tangent0=None,
     info=None,
     stall=None,
+    ptc=None,
 ):
     """Root-find ``residual_fn(u) = 0`` with a **sparse-direct** Newton: each step solves against the
     ASSEMBLED Jacobian ``jacobian_fn(u)`` (a ``jax.experimental.sparse.BCOO``) instead of the
@@ -998,8 +1028,19 @@ def newton_direct(
     its gradient (the implicit gradient re-assembles at the root).
 
     ``stall=N`` stops the loop once N steps in a row have not brought the residual 1% below its best, and
-    raises saying it stalled (see :func:`jno.solve.newton`); a step rejected on a stale tangent counts as one."""
+    raises saying it stalled (see :func:`jno.solve.newton`); a step rejected on a stale tangent counts as one.
+
+    ``ptc=dtau0`` (> 0) is **pseudo-transient continuation**: each step solves ``(V / dtau_k + J) delta = -r``
+    with ``V = |diag J|`` and ``dtau_k = dtau0 * ||r0|| / ||r_k||`` (switched evolution relaxation; Kelley &
+    Keyes, SIAM J. Numer. Anal. 35(2), 1998, Sec. 2; Mulder & van Leer 1985). See :func:`jno.solve.newton`.
+    Not with ``reuse=True`` (the shifted tangent changes every step)."""
     stall = _stall_check(stall)
+    ptc = _ptc_check(ptc)
+    if ptc is not None and reuse:
+        raise ValueError(
+            "newton_direct(ptc=...) shifts the tangent by a new pseudo-time step every step, so there is no "
+            "tangent to reuse: drop reuse=True"
+        )
     if linear_solve is None:
         from .linear import sparse_lu_solve
 
@@ -1033,6 +1074,15 @@ def newton_direct(
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
         return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
+    def _step_tangent(u, rn, r0n):
+        """The tangent a step solves: J, or with ptc the pseudo-time shifted J + |diag J| / dtau_k."""
+        J = J_fwd(u)
+        if ptc is None:
+            return J
+        # SER: dtau grows as the residual falls; 1/dtau -> 0 is plain Newton (a NaN norm stays NaN and is caught
+        # by the caller's non-finite check)
+        return _ptc_shift(J, rn / (ptc * jnp.maximum(r0n, jnp.finfo(r0n.dtype).tiny)))
+
     def _forward(x0):
         # ONE residual evaluation per step: the one taken at the new iterate is carried to the next step
         # (and to the convergence test) instead of being evaluated again. Every residual is a full pass
@@ -1062,10 +1112,10 @@ def newton_direct(
                     # never tighter than half the outer target over the current residual (the last step need
                     # not out-solve the bound the loop stops on). The loop still stops on the TRUE residual.
                     eta = _ew_forcing(rn, rn_prev, eta_prev, k, atol + rtol * r0n)
-                    delta = linear_solve(J_fwd(u), -r, rtol=eta)
+                    delta = linear_solve(_step_tangent(u, rn, r0n), -r, rtol=eta)
                 else:
                     eta = eta_prev
-                    delta = linear_solve(J_fwd(u), -r)  # solve of the assembled tangent
+                    delta = linear_solve(_step_tangent(u, rn, r0n), -r)  # solve of the assembled tangent
             alpha = _backtrack(u, delta, rn) if line_search else damping
             u = u + alpha * delta
             r_new = f_fwd(u)
