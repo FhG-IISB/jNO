@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794222870,"nonce":"JNgJgFhY5tfQRlc9yiHgGdBr4mI=","message":"Not changed: pypardiso is an optional extra (jax-numerical-operators[pardiso], x86-64 only), so the CPU default stays backend='device'; PARDISO is opt-in with lu(backend='pardiso').","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794222870,"nonce":"B1s81eJdTo6wFZC6ASdWDHxz+ZM=","status":2}]}
