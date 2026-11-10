@@ -2786,7 +2786,13 @@ class domain(MeshIOMixin):
                         "(and a `default` subtracted twice). A group that spans other groups cannot be "
                         "mixed with them in one call -- pass the parts, or pass the span, not both."
                     )
-        expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
+
+        def _mask(region, _dom=self):  # the mask remembers its domain, so it can be read at any point
+            m = RegionMask(region)
+            m._domain = _dom
+            return m
+
+        expr = _masked_sum(values, _mask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
         get_logger().debug(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")

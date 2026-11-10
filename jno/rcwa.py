@@ -1003,9 +1003,13 @@ def _z_ambient_faces(domain):
     zmin, zmax = float(pts[:, 2].min()), float(pts[:, 2].max())
     normals = getattr(domain, "normals_by_tag", {})
     bottom = top = None
+    tol = 1e-6 * max(float(np.ptp(pts, axis=0).max()), 1.0)
     for tag, br in getattr(domain, "_boundary_regions", {}).items():
         if tag == "boundary" or br is None or len(getattr(br, "points", [])) == 0:
             continue
+        bz = np.asarray(br.points)[:, 2]
+        if not (np.all(np.abs(bz - zmin) < tol) or np.all(np.abs(bz - zmax) < tol)):
+            continue  # an ambient face lies in the bottom or top plane; interfaces and side faces do not
         if tag not in normals:
             # A MISSING normal used to read as a zero vector, and `0 < 0.8*(0+1e-30)` is True — so an
             # untagged-normal face was silently *disqualified* and the search failed with "could not
@@ -1698,10 +1702,26 @@ def _eval_coeff_points(coeff_node, pts, params):
             mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
         table[mc.model.layer_id] = mod
     from jno._fem import _is_normal_variable
+    from jno.trace import RegionMask, region_mask_key
 
     pts = jnp.asarray(pts)
     ctx = {}
     for v in _walk_nodes(coeff_node):
+        if isinstance(v, RegionMask):
+            # a region-attached coefficient (`.attach(eps=...)`): membership of the sample points, by the
+            # same geometric rule the FEM assembly applies to cell centroids
+            from jno.utils.solver.fem_utils import region_membership_at
+
+            dom = getattr(v, "_domain", None)
+            m = None if dom is None else region_membership_at(dom, v.region, np.asarray(pts)[:, : int(dom.dimension)])
+            if m is None:
+                raise RcwaError(
+                    f"the permittivity reads region {v.region!r}, which has no point membership here (a "
+                    "mesh-file volume region is known per cell only). Build the region with jno.shape, a "
+                    "geometry part or a domain.tag predicate so RCWA can sample it."
+                )
+            ctx[region_mask_key(v.region)] = jnp.asarray(m, dtype=float)
+            continue
         if not isinstance(v, Variable) or v.tag in ctx:
             continue
         if _is_normal_variable(v):  # a source on a flat ambient face reads its (constant) outward normal
