@@ -1539,6 +1539,10 @@ def assemble_fem_nonnodal(
     def _signed(x, sign):  # fold a −1 summand sign into the extracted coefficient/source
         return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
 
+    # The host surface assembly integrates on the FIRST H(curl) field only (`_n1e_surface_precompute`), so
+    # a trace term of any other field, or one coupling two fields (trial E_i, test v_r), takes the general
+    # boundary path; on the fast path it would land in the first field's diagonal block, silently.
+    _hcurl_key = next((f["field_key"] for f, sp in zip(fields, spaces) if sp in ("N1E", "N2E")), None)
     pressure_terms, surface_terms, incident_terms, gsurf_terms = {}, {}, {}, {}
     faceop_terms: dict = {}  # region -> [(leg wrap, signed summand)]: a face operator `S(trace)`, one dense block
     _body_owned = set(getattr(domain, "_tag_regions", {}) or {})
@@ -1558,9 +1562,19 @@ def assemble_fem_nonnodal(
                 # host-assembled patterns (those walk boundary facets only)
                 elif region in _body_owned or _reads_across(sub_w):
                     gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
-                elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None and mass[1] == region:
+                elif (
+                    dim == 3
+                    and (mass := _n1e_surface_mass_spec(sub_w)) is not None
+                    and mass[1] == region
+                    and mass[2] == mass[3] == _hcurl_key
+                ):
                     surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
-                elif dim == 3 and (load := _n1e_surface_load_spec(sub_w)) is not None and load[1] == region:
+                elif (
+                    dim == 3
+                    and (load := _n1e_surface_load_spec(sub_w)) is not None
+                    and load[1] == region
+                    and load[2] == _hcurl_key
+                ):
                     # a trial-free term enters b as -term, like every other source (the list sums to zero)
                     incident_terms.setdefault(region, []).append(_signed(load[0], -sign))
                 elif _legacy_natural(sub_w, field_index, spaces):
@@ -2859,9 +2873,10 @@ def _build_general_surface(
 def _n1e_tangential_cross(x, which):
     """``x`` is the tangential trace ``cross(f, n)`` or ``cross(n, f)`` of the field ``f`` (a bare ``which``
     -- TrialFunction or TestFunction -- instance) with a boundary-normal Variable ``n_<region>``: return
-    ``(sign, region)``, ``+1`` for ``f×n`` (what the host surface assembly integrates) and ``-1`` for
-    ``n×f = -f×n``. ``None`` for anything else (another vector, a curl, a nested cross), which then goes
-    to the general boundary path that evaluates the integrand as written."""
+    ``(sign, region, field_key)``, ``+1`` for ``f×n`` (what the host surface assembly integrates) and ``-1``
+    for ``n×f = -f×n``; ``field_key`` names the field ``f`` belongs to. ``None`` for anything else (another
+    vector, a curl, a nested cross), which then goes to the general boundary path that evaluates the
+    integrand as written."""
     from ..._fem import _is_normal_variable
     from ...trace import FunctionCall
 
@@ -2869,16 +2884,18 @@ def _n1e_tangential_cross(x, which):
         return None
     a, b = x.args
     if isinstance(a, which) and _is_normal_variable(b):
-        return 1.0, b.tag[2:]
+        return 1.0, b.tag[2:], getattr(a, "field_key", a.op_id)
     if isinstance(b, which) and _is_normal_variable(a):
-        return -1.0, a.tag[2:]
+        return -1.0, a.tag[2:], getattr(b, "field_key", b.op_id)
     return None
 
 
 def _n1e_surface_mass_spec(bare):
     """Recognise a tangential-trace surface-mass boundary term ``[c *] inner(n×u, n×v)`` (the natural
-    N1E impedance / first-order absorbing BC for Maxwell) → a 1-tuple ``(coeff_node,)`` (``coeff_node``
-    is ``None`` when the coefficient is 1); ``None`` if the term is not of this form.
+    N1E impedance / first-order absorbing BC for Maxwell) → ``(coeff_node, region, trial_key, test_key)``
+    (``coeff_node`` is ``None`` when the coefficient is 1; the keys name the trial's and the test's field,
+    which differ in a cross-field block such as the real pair of a complex field); ``None`` if the term is
+    not of this form.
 
     The tangential trace ``n×u`` is authored as ``u.vector.cross(nvec)`` (a ``cross`` FunctionCall over
     the trial and the region normal), paired with the test's ``n×v`` inside an ``inner`` FunctionCall,
@@ -2912,12 +2929,12 @@ def _n1e_surface_mass_spec(bare):
     if wrap is not None:  # fold the leg's Re/Im into the coefficient: Re(i·k₀)=0, Im(i·k₀)=k₀
         base = coeff if coeff is not None else Literal(1.0)
         coeff = base.real if wrap == "real" else base.imag
-    return (coeff, tu[1])
+    return (coeff, tu[1], tu[2], tv[2])
 
 
 def _n1e_surface_load_spec(bare):
     """Recognise an N1E trial-free surface term ``[c *] inner(g, v×n)`` (or ``n×v``, with its sign) → a
-    1-tuple ``(g_node,)`` with ``∫ g·(v×n)`` the term as written; ``None`` otherwise. ``g`` may read the
+    ``(g_node, region, test_key)`` with ``∫ g·(v×n)`` the term as written; ``None`` otherwise. ``g`` may read the
     face normal: the incident source of an absorbing face is ``inner(cross(E_inc, n), v×n) = E_inc,t·v_t``.
     The cross must be the bare test function with the face's normal Variable; any other form goes to the
     general boundary path. Distinct from the bilinear impedance mass (which carries the trial as well)."""
@@ -2952,7 +2969,7 @@ def _n1e_surface_load_spec(bare):
         g = (-1.0) * g
     if wrap is not None:  # complex leg split: Re/Im of the (complex) source
         g = g.real if wrap == "real" else g.imag
-    return (g, tv[1])
+    return (g, tv[1], tv[2])
 
 
 def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim, dofmaps=None):
