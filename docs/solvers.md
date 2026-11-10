@@ -1599,7 +1599,7 @@ A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
 (the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
 rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
-damped), and `.adaptive()` (step doubling sizes a one-step method).
+damped), and `.adaptive()` (the controller sizes one-step methods only).
 
 Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
 as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
@@ -1632,6 +1632,15 @@ sol = fem.solve(time=jno.solve.rosenbrock().adaptive(rtol=1e-4))
 ```
 
 Both expose a stepper, so `.adaptive()` works, and both refuse second-order-in-time (`u_tt`) blocks.
+SDIRK and ROS34PW2 carry an embedded lower-order solution built from the same stages (order 2 for SDIRK3
+and ROS34PW2, order 1 for SDIRK2), so the controller gets its error estimate without extra solves; every
+other base is sized by step doubling (one step against two half-steps). A step over the tolerance is
+rejected and retried smaller; the step sizes are treated as constants in the gradient. The error norm
+leaves out index-2 rows (zero mass and a zero diagonal, the incompressibility row of a saddle problem),
+whose error converges an order lower: counted, they drove SDIRK3 on unsteady Stokes to the step floor.
+Dirichlet rows and pressure pins stay in. On the 2-D heat
+test of `tests/test_fem_adaptive_timestep.py` at `rtol=1e-5`, the embedded pair needed about 40% fewer
+base steps than step doubling for an error no larger.
 On a nonlinear heat problem, ROS34PW2 reached a given accuracy in the least wall time of the schemes
 compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so compare on yours.
 
@@ -1640,6 +1649,13 @@ compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so co
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state (so `x0=` is rejected).
+
+With no `linear=`/`precond=`, a linear block's step is solved by Jacobi-BiCGStab with a GMRES rescue, except
+on a **saddle**: a row with zero mass and a zero diagonal (the incompressibility row of unsteady Stokes)
+gets `jno.solve.lu()` instead. Jacobi has nothing to scale on those rows and the Schur complement shrinks
+with `dt`; measured on unsteady Stokes (P2/P1), the Krylov step was right at `dt = 1e-3` and NaN at
+`dt = 1e-4`. A Krylov step that does not converge raises at the end of the solve, naming the step solve,
+instead of returning a NaN trajectory.
 
 !!! measured "A constant step operator factorizes once, not once per step"
     The step matrix is

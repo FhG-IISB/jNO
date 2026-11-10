@@ -104,18 +104,11 @@ def test_adaptive_real_scalar_is_time_converged_and_beats_coarse_fixed():
     assert off_analytic < 1.2 * floor, f"off analytic {off_analytic:.2e} vs mesh floor {floor:.2e}"
 
 
-def test_adaptive_starts_from_below_not_from_the_output_grid():
-    """Regression: ``dt0`` must NOT default to the output grid's ``dt``.
-
-    There is no step rejection (a discarded state would zero the per-step solve adjoint's cotangent and
-    return a NaN gradient), so an over-large first step is committed permanently — only the *next* one
-    shrinks, and by at most 5x per attempt. Seeding from the caller's output grid therefore bakes the
-    first few attempts' error into the answer for good: on this problem attempt 1 lands ~740x over
-    tolerance and attempt 2 ~34x. Growing from the floor instead cannot commit an out-of-tolerance step,
-    because an under-sized step costs work, not accuracy.
-
-    Measured against a Richardson-extrapolated semi-discrete reference (same mesh, dt -> 0, so this is
-    PURE time error with no spatial contamination): 1.23e-2 seeded from the grid vs 2.94e-3 from below."""
+def test_an_oversized_first_step_is_rejected_not_kept():
+    """Seeding ``dt0`` from the output grid lands the first attempts far over tolerance (~740x on this problem).
+    Those attempts are now REJECTED and retried smaller, so the grid-seeded march is as accurate as one grown
+    from the floor. Before rejection existed they were committed for good: measured 1.23e-2 grid-seeded vs
+    2.94e-3 from below, against the Richardson-extrapolated semi-discrete reference (pure time error)."""
     d, fem = _heat(mesh_size=0.15, nsteps=11, coeff=1.0)
     save = jnp.linspace(0.0, 0.05, 11)
     block = fem.operator
@@ -127,9 +120,9 @@ def test_adaptive_starts_from_below_not_from_the_output_grid():
     from_below = adaptive(**kw).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
     from_grid = adaptive(**kw, dt0=float(block.dt)).integrate(block, {}, save, linear_solve=None, nonlinear_solve=None)
     e_below, e_grid = time_err(from_below), time_err(from_grid)
-    assert not np.any(np.isnan(np.asarray(from_below)))
-    assert e_below < 0.5 * e_grid, f"growing from below must beat grid-seeded: {e_below:.2e} vs {e_grid:.2e}"
-    assert e_below < 5e-3, f"time error from below regressed: {e_below:.2e}"
+    assert not np.any(np.isnan(np.asarray(from_grid)))
+    assert e_grid < 2e-3 and e_below < 2e-3, f"grid-seeded {e_grid:.2e}, from below {e_below:.2e}"
+    assert e_grid < 1.5 * e_below
 
 
 def test_adaptive_second_order_base_is_far_cheaper_per_digit():
@@ -189,19 +182,14 @@ def test_adaptive_composes_onto_a_base_scheme():
         jno.solve.exponential().adaptive()
 
 
-def test_adaptive_rejection_would_break_the_gradient():
-    """Documents WHY every attempt is accepted, so nobody "fixes" it back.
-
-    The no-rejection design is load-bearing for AD, not for stability: rejecting means discarding an
-    attempt's state, whose cotangent is then exactly zero, so the matrix-free per-step solve adjoint runs
-    on ``b = 0`` and its relative-residual test divides 0/0. This test pins the *property that makes
-    rejection unavailable* — that the accepted state is the one the gradient flows through — by checking
-    the gradient stays finite and matches a finite difference at a tolerance loose enough to make the
-    controller work hard (many attempts, wide dt range)."""
+def test_rejected_steps_keep_the_gradient():
+    """A rejected attempt's state is discarded, so its step solves receive an exactly zero cotangent. JAX's
+    BiCGStab divides 0/0 on a zero right-hand side, and the adjoint came back NaN (FD -16.52). The step solve
+    now returns 0 for a zero right-hand side. An oversized ``dt0`` forces rejections here."""
     d, fem = _heat(mesh_size=0.2, nsteps=6, param=True)
     (name,) = fem.operator.runtime_parameter_exprs
     save = jnp.linspace(0.0, 0.05, 6)
-    sch = adaptive(rtol=1e-6, atol=1e-9, max_steps=1200)
+    sch = adaptive(rtol=1e-5, atol=1e-8, max_steps=1200, dt0=0.02)
 
     def loss(kv):
         return jnp.sum(
@@ -210,7 +198,7 @@ def test_adaptive_rejection_would_break_the_gradient():
 
     g = float(jax.grad(loss)(0.8))
     fd = float((loss(0.8 + 1e-5) - loss(0.8 - 1e-5)) / 2e-5)
-    assert np.isfinite(g), "gradient must stay finite — a discarded state would make it NaN"
+    assert np.isfinite(g), "a rejected step must not turn the gradient into NaN"
     assert abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"AD {g} vs FD {fd}"
 
 
@@ -481,3 +469,173 @@ def test_exhausted_budget_poison_reaches_the_adjoint():
     fed = float(jax.grad(lambda p: march(p, 200))(1.0))
     assert np.isfinite(float(march(1.0, 200))), "a march that reaches t1 must not be poisoned"
     assert np.isfinite(fed), "and its gradient must stay finite — the poison is a no-op when reached"
+
+
+_EMBEDDED = [("sdirk3", lambda: jno.solve.sdirk(3), 2), ("sdirk2", lambda: jno.solve.sdirk(2), 1),
+             ("ros34pw2", lambda: jno.solve.rosenbrock(), 2)]  # fmt: skip
+
+
+@pytest.mark.parametrize("name,scheme,q", _EMBEDDED, ids=[e[0] for e in _EMBEDDED])
+def test_embedded_estimate_has_its_order(name, scheme, q):
+    """``u_new - u_hat`` from one step is a local error estimate of order ``q + 1``: halving dt divides it by
+    ``2**(q+1)`` (SDIRK3 and ROS34PW2 carry an order-2 solution, SDIRK2 an order-1 one). Measured where the
+    mesh's stiff modes are resolved: at dt = 2e-3 the ratio is still 5.4 for q = 2, rising to 7.5 at 2.5e-4."""
+    _, fem = _heat(mesh_size=0.3, nsteps=6)
+    step = scheme().embedded_stepper(fem.operator, {})
+    u0 = jnp.asarray(fem.operator.state0).reshape(-1)
+    est = [float(jnp.linalg.norm(jnp.subtract(*step(u0, 0.0, dt)))) for dt in (2.5e-4, 1.25e-4)]
+    ratio = est[0] / est[1]
+    assert 0.88 * 2 ** (q + 1) < ratio < 1.1 * 2 ** (q + 1), f"{name}: estimate ratio {ratio:.2f}, want {2 ** (q + 1)}"
+
+
+def _count_steps(monkeypatch, cls):
+    """Count the base scheme's steps the march actually runs (a host callback per executed step)."""
+    calls = []
+    real = cls._one_step
+
+    def counted(self, *a, **k):
+        jax.debug.callback(lambda: calls.append(1))
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(cls, "_one_step", counted)
+    return calls
+
+
+@pytest.mark.parametrize("name,scheme,q", _EMBEDDED[:1] + _EMBEDDED[2:], ids=["sdirk3", "ros34pw2"])
+def test_embedded_pair_is_cheaper_than_step_doubling(monkeypatch, name, scheme, q):
+    """One step per attempt instead of three. The embedded controller sizes steps on the LOWER-order estimate, so
+    it takes more attempts than doubling, but each costs one step, and it keeps the higher-order solution:
+    at rtol = 1e-5 it is at least as accurate on far fewer base steps. Measured (time error, base steps):
+    sdirk3 2.6e-6 / 31 vs doubling 5.9e-6 / 51; ros34pw2 5.0e-6 / 25 vs 5.9e-6 / 51."""
+    from jno.utils.solver import timeschemes as ts
+
+    cls = type(scheme())
+    _, fem = _heat(mesh_size=0.15, nsteps=11)
+    save = jnp.linspace(0.0, 0.05, 11)
+    ref = _semidiscrete(0.15, 0.05)
+    err = lambda traj: np.linalg.norm(np.asarray(traj)[-1] - ref) / np.linalg.norm(ref)  # noqa: E731
+    run = lambda: (
+        scheme()
+        .adaptive(rtol=1e-5, atol=1e-8, max_steps=2000)
+        .integrate(  # noqa: E731
+            fem.operator, {}, save, linear_solve=None, nonlinear_solve=None
+        )
+    )
+
+    calls = _count_steps(monkeypatch, cls)
+    e_emb = err(run())
+    n_emb = len(calls)
+    monkeypatch.setattr(ts._AdaptiveScheme, "_embedded_of", staticmethod(lambda base: None))
+    calls.clear()
+    e_dbl = err(run())
+    n_dbl = len(calls)
+    assert e_emb <= 1.2 * e_dbl, f"{name}: embedded {e_emb:.2e} vs doubling {e_dbl:.2e}"
+    assert n_emb < 0.7 * n_dbl, f"{name}: {n_emb} steps embedded vs {n_dbl} doubling"
+
+
+@pytest.mark.parametrize("name,scheme,q", _EMBEDDED[:1] + _EMBEDDED[2:], ids=["sdirk3", "ros34pw2"])
+def test_embedded_adaptive_is_differentiable(name, scheme, q):
+    d, fem = _heat(mesh_size=0.2, nsteps=6, param=True)
+    (pname,) = fem.operator.runtime_parameter_exprs
+    save = jnp.linspace(0.0, 0.05, 6)
+    sch = scheme().adaptive(rtol=1e-5, atol=1e-8, max_steps=600, dt0=0.02)  # oversized: rejections happen
+
+    def loss(kv):
+        return jnp.sum(
+            sch.integrate(fem.operator, {pname: jnp.asarray([kv])}, save, linear_solve=None, nonlinear_solve=None) ** 2
+        )
+
+    g = float(jax.grad(loss)(0.8))
+    fd = float((loss(0.8 + 1e-5) - loss(0.8 - 1e-5)) / 2e-5)
+    assert np.isfinite(g) and abs(g - fd) <= 1e-2 * max(abs(fd), 1.0), f"{name}: AD {g} vs FD {fd}"
+
+
+def _stokes(nsteps, t1=0.3, convective=False):
+    """Unsteady Stokes on the unit square, P2 velocity / P1 pressure, no-slip walls, a pressure pin, driven
+    by an oscillating body force with a gradient part (so the pressure is non-trivial). The pressure has no
+    time derivative and its row has a zero diagonal: an index-2 algebraic variable."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, t1, nsteps))
+    d.point_region("ppin", (0.0, 0.0))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xp, yp, _ = d.variable("ppin", split=True)
+    ci = d.variable("initial", split=True)
+    gu, gv = jno.np.grad(u, [xi, yi]), jno.np.grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    amp = 20.0 * jno.np.cos(30.0 * ti)
+    mom = (
+        jno.np.inner(ui.t, vi, n_contract=1)
+        + jno.np.inner(gu, gv, n_contract=2)
+        - pp * jno.np.trace(gv)
+        - amp * (jno.np.sin(PI * yi) + xi) * vi[0]
+        - amp * xi * yi * vi[1]
+    )
+    if convective:
+        mom = mom + jno.np.inner(jno.np.inner(gu, ui, n_contract=1), vi, n_contract=1)
+    return jno.fem(
+        [
+            mom,
+            -qq * jno.np.trace(gu),
+            u(xb, yb)[0] - 0.0,
+            u(xb, yb)[1] - 0.0,
+            p(xp, yp) - 0.0,
+            u(ci[0], ci[1])[0] - 0.0,
+            u(ci[0], ci[1])[1] - 0.0,
+        ]
+    )
+
+
+def test_error_norm_leaves_out_index2_rows_only():
+    """The pressure rows of a saddle problem (zero mass, zero diagonal) leave the error norm; the velocity
+    Dirichlet rows and the pressure pin (zero mass, but they fix their own unknown) stay in it."""
+    from jno.utils.solver.backend_blocks import _algebraic_rows
+    from jno.utils.solver.timeschemes import _error_rows
+
+    fem = _stokes(4)
+    blk = fem.operator
+    nu, n = fem.offsets[1], blk.M.shape[0]
+    rows = np.asarray(_error_rows(blk, {}, jnp.zeros(n)))
+    alg = np.asarray(_algebraic_rows(blk.M, n, jnp.float64))
+    assert alg[:nu].sum() > 0 and rows[:nu].all()  # velocity Dirichlet rows: algebraic, but counted
+    assert rows[nu:].sum() == 1  # every pressure row left out but the pin
+
+
+def test_index2_rows_do_not_collapse_the_step(monkeypatch):
+    """Counting the pressure's local error, which converges an order lower, drove sdirk3 to the step floor
+    at rtol = 1e-5 (measured: 1063 attempts, 47 rejected, error 4e-4 from accepting floor steps over the
+    tolerance); left out, 422 attempts and 4.5e-7."""
+    from jno.utils.solver import timeschemes as ts
+
+    # a fresh problem per run: a traced march is cached per block, and would keep the first run's rows
+    run = lambda scheme, n=4: np.asarray(_stokes(n).solve(time=scheme, linear=jno.solve.lu()).fn())[-1]  # noqa: E731
+    nu = _stokes(4).offsets[1]
+    ref = run(jno.solve.sdirk(3), 301)
+    err = lambda w: np.linalg.norm(w[:nu] - ref[:nu]) / np.linalg.norm(ref[:nu])  # noqa: E731
+    calls = _count_steps(monkeypatch, ts._SDIRKScheme)
+    sch = jno.solve.sdirk(3).adaptive(rtol=1e-5, atol=1e-8, max_steps=2000)
+    e_kept = err(run(sch))
+    n_kept = len(calls)
+    monkeypatch.setattr(ts, "_error_rows", lambda *a: None)
+    calls.clear()
+    e_all = err(run(sch))
+    n_all = len(calls)
+    assert e_kept < 1e-5, e_kept
+    assert n_kept < 0.6 * n_all and e_kept < e_all, (n_kept, n_all, e_kept, e_all)
+
+
+def test_index2_rows_are_found_on_a_nonlinear_block():
+    """Navier-Stokes carries its mass as a callable and its operator as a tangent; the pressure rows are still
+    left out of the error norm. Measured at rtol = 1e-4: 194 sdirk3 steps left out; counted, the march used
+    its whole 3000-step budget and returned NaN."""
+    from jno.utils.solver import timeschemes as ts
+
+    fem = _stokes(4, convective=True)
+    assert not fem.is_linear
+    nu = fem.offsets[1]
+    rows = np.asarray(ts._error_rows(fem.operator, {}, jnp.zeros(fem.operator.state0.shape[0])))
+    assert rows[:nu].all() and rows[nu:].sum() == 1
+    out = np.asarray(fem.solve(time=jno.solve.sdirk(3).adaptive(rtol=1e-4, atol=1e-7, max_steps=400)).fn())
+    assert np.isfinite(out).all()

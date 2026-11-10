@@ -2278,6 +2278,18 @@ def _plan_step_tangent_merge(block, state=None):
     return (jnp.asarray(idx), jnp.asarray(inverse), int(nse)), (int(J.nse), int(S.nse), tuple(J.shape))
 
 
+def _is_saddle_block(block, state=None) -> bool:
+    """Whether the block's step operator has an index-2 row (see ``backend_blocks._index2_rows``). Eager:
+    read from the assembled mass and operator, or from the tangent at ``state`` for a nonlinear block."""
+    from .backend_blocks import _block_index2_rows
+
+    try:
+        rows = _block_index2_rows(block, None, state)
+    except (KeyError, TypeError):  # an operator or tangent that needs runtime arguments: keep the default
+        return False
+    return rows is not None and not isinstance(rows, jax.core.Tracer) and bool(jnp.any(rows))
+
+
 def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, scheme=None, state=None):
     """Compose the slots into per-step solvers for the transient integrator.
 
@@ -2334,11 +2346,19 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
 
     if linear is None and precond is None:
-        # No linear/precond slots: defer to SemidiscreteTimeBlock.step's built-in per-step solve, a
-        # Jacobi-preconditioned BiCGStab at tol=1e-10. The historic default here was a *bare* bicgstab()
-        # with NO preconditioner, which silently under-converged each step — invisible on homogeneous
-        # decay (the warm-start is already near the answer) but corrupting any forced/growing solution.
-        return None, None
+        if not _is_saddle_block(block, state):
+            # No linear/precond slots: defer to SemidiscreteTimeBlock.step's built-in per-step solve, a
+            # Jacobi-preconditioned BiCGStab at tol=1e-10. The historic default here was a *bare* bicgstab()
+            # with NO preconditioner, which silently under-converged each step — invisible on homogeneous
+            # decay (the warm-start is already near the answer) but corrupting any forced/growing solution.
+            return None, None
+        # A SADDLE step operator (an index-2 row: zero mass and a zero diagonal, the incompressibility row)
+        # gets a sparse-direct solve. Jacobi has nothing to scale on those rows and the Schur complement
+        # shrinks with dt, so the Krylov default broke down: measured on unsteady Stokes (P2/P1), fine at
+        # dt = 1e-3 and NaN at dt = 1e-4 and below -- where an adaptive march starts.
+        from ... import solve as _solve_ns
+
+        linear = _solve_ns.lu()
 
     if linear is None:
         from ... import solve as _solve_ns

@@ -48,6 +48,56 @@ def _algebraic_rows(M, n, dtype):
     return mass == 0
 
 
+def _index2_rows(M, A, n, dtype):
+    """``True`` on the rows with zero mass AND a zero diagonal in the operator ``A``: algebraic rows that do
+    not determine their own unknown, as the incompressibility row of a saddle problem (the pressure is an
+    index-2 variable). A Dirichlet row or a pressure pin has zero mass but fixes its own unknown, so it is
+    not one."""
+    import jax.numpy as jnp
+
+    if hasattr(A, "todense"):  # BCOO: duplicates are summed
+        i, j = A.indices[:, 0], A.indices[:, 1]
+        diag = jnp.zeros((n,), dtype).at[i].add(jnp.where(i == j, jnp.abs(A.data), 0).astype(dtype))
+    else:
+        diag = jnp.abs(jnp.diagonal(jnp.asarray(A))).astype(dtype)
+    return _algebraic_rows(M, n, dtype) & (diag == 0)
+
+
+def _block_index2_rows(block, args=None, state=None):
+    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
+    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+    import jax.numpy as jnp
+
+    args = {} if args is None else args
+    if getattr(block, "mass_fn", None) is not None:
+        M = block.mass_fn(block.t0, args)
+    elif getattr(block, "M", None) is not None:
+        M = block.M
+    elif getattr(block, "mass", None) is not None:  # a nonlinear block carries its mass as a callable
+        M = block.mass(block.t0, args)
+    else:
+        return None
+    if M is None or not hasattr(M, "shape") or len(M.shape) != 2:
+        return None
+    n = M.shape[0]
+    # the runtime operator when the arguments are at hand; else the assembled one (same sparsity and zero
+    # pattern -- the static placeholder of a parametric block)
+    if getattr(block, "operator_fn", None) is not None and args:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "A", None) is not None:
+        A = block.A
+    elif getattr(block, "operator_fn", None) is not None:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "jacobian", None) is not None:
+        u = state if state is not None else block.state0
+        if u is None:
+            return None
+        A = block.jacobian(jnp.asarray(u).reshape(-1), block.t0, args)
+    else:
+        return None
+    return _index2_rows(M, A, n, jnp.zeros((), M.dtype).real.dtype)
+
+
 def _row_scaled(A, w):
     """``diag(w) · A`` for a BCOO or dense ``A``."""
     import jax.numpy as jnp
@@ -87,10 +137,43 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     import jax
     import jax.numpy as jnp
 
+    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+
+    # The solve is linear in ``rhs``, so its derivative is another solve -- with the TRANSPOSED operator for
+    # reverse mode. Both go through `_krylov_step_solve` behind a guard that returns 0 for a zero right-hand
+    # side: JAX's BiCGStab divides 0/0 there (``omega``) and returns NaN, and a zero cotangent is exactly what
+    # a state the march discards (a rejected adaptive step) sends back. Measured before the guard: a rejected
+    # step turned a finite gradient (FD -16.52) into NaN. A zero system has the zero solution; nothing else
+    # changes (the guard is one norm, and the transpose has the same diagonal for the Jacobi scaling).
+    #
+    # The result of either side goes through the residual gate: a step solve that did not converge (a NaN
+    # from a BiCGStab breakdown the GMRES rescue could not repair, or a stalled residual) is recorded and
+    # raised at the end of the enclosing solve, instead of marching a NaN or a wrong state on in silence.
+    from .solver_api import residual_gate
+
+    def guarded(warm, side):
+        def solve(op, b):
+            x = jax.lax.cond(
+                jnp.any(b != 0), lambda: _krylov_step_solve(op, b, warm, inv, krylov), lambda: jnp.zeros_like(b)
+            )
+            return residual_gate(op, b, x, _STEP_SOLVE_NAME, side=side)
+
+        return solve
+
+    return jax.lax.custom_linear_solve(step_op, rhs, guarded(x0, "forward"), transpose_solve=guarded(None, "adjoint"))
+
+
+_STEP_SOLVE_NAME = "the default time-step solve (Jacobi BiCGStab with a GMRES rescue)"
+
+
+def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
+    """The Krylov solve behind :func:`_default_step_solve` (``inv`` is the Jacobi scaling)."""
+    import jax
+    import jax.numpy as jnp
+
     from .krylov import gmres as _scaled_gmres  # scale-invariant: JAX's Arnoldi zeroes a tiny ||b||
 
     n = rhs.shape[0]
-    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
     # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
     # the default and is right for the symmetric real blocks; the complex real-equivalent block
     # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
