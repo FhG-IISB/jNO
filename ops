@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794312763,"nonce":"LkX2eNrAh+gYiK/ICQ2J+DGQCd8=","added":["branch:perf/fdm-march-cache","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794312763,"nonce":"HYiA6EhwRLFRY/Y7Lzamia2vNi0=","message":"Fixed in 7fc7b5bc (the cache is used only outside a trace); tests as above.","files":null}]}
