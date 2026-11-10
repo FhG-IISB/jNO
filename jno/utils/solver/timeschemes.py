@@ -155,13 +155,10 @@ class _BDF2Scheme(_TimeScheme):
         dt = float(block.dt)
         return (dt, 2.0 * dt / 3.0)
 
-    def adaptive(self, **kwargs):
-        raise NotImplementedError(
-            "jno.solve.bdf2().adaptive(...) is not available: the adaptive controller sizes a ONE-step "
-            "method by step doubling, and BDF2 needs two previous states, so its step cannot be "
-            "re-sized that way (a multistep method wants a BDF2/BDF1 difference estimate instead). "
-            "Use jno.solve.theta(0.5).adaptive(...) for an adaptively-sized second-order march."
-        )
+    def adaptive(self, *, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, dt0: float | None = None):
+        """BDF2 on error-controlled variable steps: :func:`jno.solve.bdf` at ``order=2`` (plain BDF, no NDF
+        term, so the formula is the one this fixed-grid scheme takes)."""
+        return _BDFScheme(2, ndf=False).adaptive(rtol=rtol, atol=atol, max_steps=max_steps, dt0=dt0)
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         import jax
@@ -877,6 +874,288 @@ class _AdaptiveScheme(_TimeScheme):
     def __repr__(self):
         base = "" if self.base is None else f"{self.base!r}."
         return f"{base}adaptive(rtol={self.rtol}, atol={self.atol}, max_steps={self.max_steps}, dt0={self.dt0})"
+
+
+# Klopfenstein-Shampine NDF constants kappa_k, k = 1..5 (Shampine & Reichelt, SIAM J. Sci. Comput. 18 (1997),
+# Table 1; NDF5 is BDF5). Index 0 is unused.
+_NDF_KAPPA = (0.0, -0.1850, -1.0 / 9.0, -0.0823, -0.0415, 0.0)
+_BDF_MAX_ORDER = 5
+
+
+class _BDFScheme(_TimeScheme):
+    """Variable-step, variable-order BDF / NDF; see :func:`jno.solve.bdf`.
+
+    Each step solves ``sum_j alpha_j u^{n+1-j} - (kappa*gamma_k/h)(u^{n+1} - P(t_{n+1})) = f(t_{n+1}, u^{n+1})``,
+    ``alpha_j`` the derivative at ``t_{n+1}`` of the Lagrange basis through the ACTUAL past step times
+    (variable-coefficient BDF), ``P`` the predictor through the ``k + 1`` past states and ``kappa`` the NDF
+    constant (0 = plain BDF). It is linear in ``u^{n+1}``, so -- as for :class:`_BDF2Scheme` -- it is EXACTLY a
+    backward-Euler step of size ``1/alpha_0'`` from a shifted state ``psi``, and reuses the block's step
+    unchanged: Dirichlet / algebraic rows, Newton, the solver slots and the implicit adjoint.
+
+    ``tol`` is ``(rtol, atol, max_steps, dt0)`` for the error-controlled march (:func:`bdf_march`), or
+    ``None`` for the domain's fixed grid, offered for ``order`` 1 (backward Euler) and 2 (BDF2) only."""
+
+    def __init__(self, order=None, ndf=True, tol=None):
+        self.order = order
+        self.ndf = bool(ndf)
+        self.tol = tol
+
+    @property
+    def step_order(self):
+        return _BDF_MAX_ORDER if self.order is None else int(self.order)
+
+    def _fixed(self):
+        """The fixed-grid scheme this stands for, or ``None`` when the march is error-controlled."""
+        if self.tol is not None:
+            return None
+        return _ThetaScheme(1.0) if self.order == 1 else _BDF2Scheme()
+
+    def step_scales(self, block):
+        fixed = self._fixed()
+        return fixed.step_scales(block) if fixed is not None else ()  # a traced step: nothing to pre-build
+
+    def adaptive(self, *, rtol: float = 1e-4, atol: float = 1e-6, max_steps: int = 1000, dt0: float | None = None):
+        """Set the tolerances and the step budget of the error-controlled march (see :func:`jno.solve.bdf`)."""
+        return _BDFScheme(self.order, self.ndf, (float(rtol), float(atol), int(max_steps), dt0))
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        fixed = self._fixed()
+        if fixed is not None:
+            return fixed.integrate(block, args, save_ts, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+        if (block.metadata or {}).get("second_order"):
+            raise NotImplementedError(
+                f"{self!r}: a second-order-in-time (u_tt) block is assembled with theta=1/2 because it must NOT "
+                "be damped, and BDF is L-stable at orders 1-2 and strongly damping above -- it would damp an "
+                "undamped wave silently. Use the block's own scheme, or jno.solve.theta(0.5)."
+            )
+        rtol, atol, max_steps, dt0 = self.tol
+        s0f = getattr(block, "state0_fn", None)
+        u0 = jnp.asarray(s0f(args) if s0f is not None else block.state0).reshape(-1)
+        be = _ThetaScheme(1.0).stepper(block, args, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve)
+        return bdf_march(
+            be,
+            u0,
+            float(block.t0),
+            float(block.t1),
+            save_ts,
+            rtol=rtol,
+            atol=atol,
+            max_steps=max_steps,
+            dt0=dt0,
+            max_order=self.step_order,
+            vary_order=self.order is None,
+            ndf=self.ndf,
+            error_rows=_error_rows(block, args, u0),
+        )
+
+    def __repr__(self):
+        tol = "" if self.tol is None else f".adaptive(rtol={self.tol[0]}, atol={self.tol[1]}, max_steps={self.tol[2]})"
+        return f"jno.solve.bdf(order={self.order}, ndf={self.ndf}){tol}"
+
+
+def _lagrange_derivative_at_first(tau):
+    """``l_j'(tau_0)`` for the Lagrange basis on the nodes ``tau = (tau_0, ..., tau_k)`` (distinct)."""
+    k1 = len(tau)
+    out = []
+    for j in range(k1):
+        if j == 0:
+            out.append(sum(1.0 / (tau[0] - tau[m]) for m in range(1, k1)))
+            continue
+        num = 1.0
+        for m in range(1, k1):
+            if m != j:
+                num = num * (tau[0] - tau[m])
+        den = 1.0
+        for m in range(k1):
+            if m != j:
+                den = den * (tau[j] - tau[m])
+        out.append(num / den)
+    return out
+
+
+def _extrapolation_weights(x, tau):
+    """Lagrange basis weights of the nodes ``tau`` at ``x`` (the predictor through past states)."""
+    out = []
+    for j in range(len(tau)):
+        w = 1.0
+        for m in range(len(tau)):
+            if m != j:
+                w = w * (x - tau[m]) / (tau[j] - tau[m])
+        out.append(w)
+    return out
+
+
+def bdf_march(
+    be_step,
+    u0,
+    t0,
+    t1,
+    save_ts,
+    *,
+    rtol,
+    atol,
+    max_steps,
+    dt0=None,
+    max_order=_BDF_MAX_ORDER,
+    vary_order=True,
+    ndf=True,
+    error_rows=None,
+    safety=0.9,
+    min_factor=0.2,
+    max_factor=2.0,
+    deadband=1.2,
+):
+    """Error-controlled variable-step, variable-order BDF / NDF march, reverse-mode differentiable.
+
+    ``be_step(w, t, dt)`` is the block's backward-Euler step ``(M + dt J) u = M w + dt f(t + dt)``. A BDF step
+    of order ``k`` to ``t_{n+1} = t_n + h`` is ``be_step(psi, t_{n+1} - g, g)`` with ``g = 1/alpha_0'`` and
+    ``psi`` the combination of the past states the formula fixes (see :class:`_BDFScheme`).
+
+    **Error.** The local error of order ``k`` is ``(kappa_k gamma_k + 1/(k+1)) (u^{n+1} - P_k(t_{n+1}))``,
+    ``P_k`` the predictor through the ``k + 1`` past states (the ``k+1``-th backward difference on equal
+    steps; Shampine & Reichelt 1997, Sec. 2-3). Its RMS in the mixed tolerance over ``error_rows`` decides:
+    above 1 the attempt is REJECTED (state kept, step shrunk, no growth on the next attempt), as in
+    :func:`adaptive_march`, whose differentiability argument this shares (zero cotangent for a rejected
+    state, the controller ``stop_gradient``-ed).
+
+    **Order** (``vary_order``): after ``k + 1`` steps at order ``k``, the errors the orders ``k - 1`` and
+    ``k + 1`` would have made are estimated the same way (predictors through ``k`` and ``k + 2`` past states)
+    and the order allowing the largest next step is taken, ``k +- 1`` handicapped by ``1.2``. The march
+    starts at order 1 from the floor step and grows from there, so no starting procedure is needed.
+
+    **Step.** Factor ``safety * err^(-1/(k+1))`` clipped to ``[min_factor, max_factor]``; a factor in
+    ``[1, deadband]`` keeps the step (variable-coefficient BDF is zero-stable under bounded step ratios, and an
+    unchanged step keeps the step operator). Fixed-length ``lax.scan`` of ``max_steps`` attempts; an exhausted
+    budget NaN-poisons the result. Output at ``save_ts``: degree-``max_order`` interpolation through the
+    accepted states (:func:`_dense_sample`)."""
+    u0 = jnp.asarray(u0).reshape(-1)
+    rt = jnp.real(u0).dtype
+    t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
+    span = jnp.abs(t1 - t0)
+    dt_min, dt_max = 1e-4 * span, span
+    dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
+    K = int(max_order)
+    if not 1 <= K <= _BDF_MAX_ORDER:
+        raise ValueError(f"BDF order must be in 1..{_BDF_MAX_ORDER}; got {K}.")
+    H = K + 2  # history slots: the current state and K + 1 before it (the order-(K+1) estimate needs K + 2)
+    kap = [(_NDF_KAPPA[k] if ndf and k < len(_NDF_KAPPA) else 0.0) for k in range(K + 2)]  # order K+1: an estimate only
+    gam = [sum(1.0 / m for m in range(1, k + 1)) for k in range(K + 3)]
+    err_c = [0.0] + [kap[k] * gam[k] + 1.0 / (k + 1) for k in range(1, K + 2)]
+
+    weight = None
+    if error_rows is not None:
+        weight = jax.lax.stop_gradient(jnp.asarray(error_rows, rt).reshape(-1))
+        n_counted = jnp.maximum(jnp.sum(weight), 1.0)
+
+    def _rms(e, a, b):
+        a, b, e = jax.lax.stop_gradient(a), jax.lax.stop_gradient(b), jax.lax.stop_gradient(e)
+        r2 = jnp.abs(e / (atol + rtol * jnp.maximum(jnp.abs(a), jnp.abs(b)))) ** 2
+        if weight is None:
+            return jnp.sqrt(jnp.mean(r2))
+        return jnp.sqrt(jnp.sum(weight * r2) / n_counted)
+
+    def _formula(k, t_new, h, hist_t, n_hist):
+        """Row weights over the history (``H`` slots) of ``psi``, the step ``g``, and whether the predictor
+        exists, for the static order ``k``."""
+        tau = [t_new] + [hist_t[j] for j in range(k)]
+        a = _lagrange_derivative_at_first(tau)
+        have_pred = n_hist >= k + 1
+        kp = jnp.where(have_pred, kap[k], 0.0) * gam[k] / h  # NDF term, plain BDF until the predictor exists
+        beta = _extrapolation_weights(t_new, [hist_t[j] for j in range(k + 1)])
+        a0 = a[0] - kp
+        c = [0.0] * H
+        for j in range(1, k + 1):
+            c[j - 1] = c[j - 1] - a[j] / a0
+        for j in range(k + 1):
+            c[j] = c[j] - kp * beta[j] / a0
+        return jnp.stack([jnp.asarray(x, rt) for x in c]), 1.0 / a0
+
+    def _pred_gap(q, u_new, t_new, hist_t, hist_u):
+        """``u_new - P_q(t_new)``, ``P_q`` through the ``q + 1`` newest past states."""
+        beta = _extrapolation_weights(t_new, [hist_t[j] for j in range(q + 1)])
+        return u_new - sum(beta[j] * hist_u[j] for j in range(q + 1))
+
+    def _attempt(operand):
+        k, t, h, hist_t, hist_u, n_hist = operand
+        t_new = t + h
+
+        def _one(kk):
+            c, g = _formula(kk, t_new, h, hist_t, n_hist)
+            psi = jnp.tensordot(c, hist_u, axes=1)
+            u_new = be_step(psi, t_new - g, g)
+            gap = _pred_gap(kk, u_new, t_new, hist_t, hist_u)
+            err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * gap, u_new, hist_u[0]), 0.0)
+            # the neighbouring orders' errors, for the order choice (inf where they cannot be estimated)
+            lo = (
+                _rms(err_c[kk - 1] * _pred_gap(kk - 1, u_new, t_new, hist_t, hist_u), u_new, hist_u[0])
+                if kk > 1
+                else jnp.inf
+            )
+            hi = (
+                jnp.where(
+                    n_hist >= kk + 2,
+                    _rms(err_c[kk + 1] * _pred_gap(kk + 1, u_new, t_new, hist_t, hist_u), u_new, hist_u[0]),
+                    jnp.inf,
+                )
+                if kk < K
+                else jnp.asarray(jnp.inf, rt)
+            )
+            return u_new, err, jnp.asarray(lo, rt), jnp.asarray(hi, rt)
+
+        return jax.lax.switch(k - 1, [lambda kk=kk: _one(kk) for kk in range(1, K + 1)])
+
+    def body(carry, _):
+        t, hist_t, hist_u, n_hist, k, n_at_k, dt, grow_ok = carry
+        u = hist_u[0]
+        n_prev = n_hist  # past states this attempt's formula and estimate could read
+        remaining = t1 - t
+        done = remaining <= dt_min
+        dt_step = jnp.clip(jnp.minimum(jnp.clip(dt, dt_min, dt_max), remaining), dt_min, dt_max)
+        _t, _h = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
+        _ht = jax.lax.stop_gradient(hist_t)
+        skip = (u, jnp.asarray(0.0, rt), jnp.asarray(jnp.inf, rt), jnp.asarray(jnp.inf, rt))
+        u_try, err, err_lo, err_hi = jax.lax.cond(done, lambda o: skip, _attempt, (k, _t, _h, _ht, hist_u, n_hist))
+        at_floor = _h <= dt_min * (1.0 + 1e-9)
+        accept = done | (err <= 1.0) | at_floor
+        moved = accept & ~done
+        # history: the new state in front on an accepted step
+        hist_u = jnp.where(moved, jnp.concatenate([u_try[None, :], hist_u[:-1]], axis=0), hist_u)
+        hist_t = jnp.where(moved, jnp.concatenate([(t + _h)[None], hist_t[:-1]]), hist_t)
+        n_hist = jnp.where(moved, jnp.minimum(n_hist + 1, H), n_hist)
+        t_new = jnp.where(moved, t + _h, t)
+
+        def fac_of(e, q):
+            return jnp.clip(safety * jnp.maximum(e, 1e-12) ** (-1.0 / (q + 1)), min_factor, max_factor)
+
+        f_k = jnp.where(n_prev >= k + 1, fac_of(err, k), max_factor)  # before the estimate exists: grow
+        k_new, fac = k, f_k
+        if vary_order:
+            ready = moved & (n_at_k >= k + 1)
+            f_lo = jnp.where(ready & (k > 1), fac_of(err_lo, k - 1) / 1.2, 0.0)
+            f_hi = jnp.where(ready & (k < K) & (n_prev >= k + 2), fac_of(err_hi, k + 1) / 1.2, 0.0)
+            down, up = f_lo > jnp.maximum(f_k, f_hi), f_hi > jnp.maximum(f_k, f_lo)
+            k_new = jnp.where(down, k - 1, jnp.where(up, k + 1, k))
+            fac = jnp.where(down, f_lo, jnp.where(up, f_hi, f_k))
+        fac = jnp.where(grow_ok & accept, fac, jnp.minimum(fac, 1.0))
+        fac = jnp.where((fac >= 1.0) & (fac <= deadband), 1.0, fac)
+        if not vary_order:  # fixed order: climb to it as the history fills
+            k_new = jnp.where(moved & (n_hist >= k + 1) & (k < K), k + 1, k)
+        dt_next = jnp.clip(_h * fac, dt_min, dt_max)
+        dt_next = jnp.where(accept & (_h < dt), jnp.maximum(dt_next, dt), dt_next)  # a step cut to land on t1
+        n_at_k = jnp.where(k_new != k, 0, jnp.where(moved, n_at_k + 1, n_at_k))
+        new = (t_new, hist_t, hist_u, n_hist, k_new.astype(jnp.int32), n_at_k, dt_next, accept)
+        return new, (t_new, hist_u[0])
+
+    hist_t0 = t0 - span * jnp.arange(H, dtype=rt)  # distinct placeholders before t0 (never read: n_hist gates them)
+    hist_u0 = jnp.broadcast_to(u0, (H, u0.shape[0]))
+    init = (t0, hist_t0, hist_u0, jnp.asarray(1, jnp.int32), jnp.asarray(1, jnp.int32), jnp.asarray(0, jnp.int32),
+            dt_start, jnp.asarray(True))  # fmt: skip
+    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+    ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))
+    us = jnp.concatenate([u0[None, :], us], axis=0)
+    out = _dense_sample(jnp.asarray(save_ts, rt), ts, us, K)
+    reached = t_end >= t1 - 2.0 * dt_min
+    return out * jnp.where(reached, jnp.asarray(1.0, rt), jnp.asarray(jnp.nan, rt))
 
 
 def _error_rows(block, args, u0):

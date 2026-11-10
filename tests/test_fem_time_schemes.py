@@ -372,13 +372,6 @@ def test_bdf2_marches_a_nonsymmetric_block():
     assert float(np.linalg.norm(got - ref) / np.linalg.norm(ref)) < 5e-2
 
 
-def test_bdf2_refuses_an_adaptive_step():
-    """Step doubling sizes a ONE-step method; BDF2 needs two previous states. Refused by name rather
-    than falling through to the base class's generic message."""
-    with pytest.raises(NotImplementedError, match="two previous states"):
-        jno.solve.bdf2().adaptive(rtol=1e-5)
-
-
 def test_bdf2_refuses_a_steady_problem():
     """The `time=` slot itself checks this, so BDF2 gets it for free."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
