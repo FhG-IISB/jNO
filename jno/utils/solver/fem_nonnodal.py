@@ -1676,17 +1676,6 @@ def assemble_fem_nonnodal(
     def _surf_mass_dense():
         return None if surf_mass is None else jnp.asarray(surf_mass.todense())
 
-    if surf_mass is not None or incident_terms:
-        # The surface mass is a fixed LINEAR block added to the spatial operator A (and the incident load to
-        # b), so it composes with the steady AND transient linear problem (M u̇ + A u = c: the impedance is a
-        # boundary contribution to A, the incident source rides the forcing). A NONLINEAR form is not wired —
-        # the surface block is not re-linearised per Newton step. Raise rather than silently drop it.
-        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
-            raise NotImplementedError(
-                "jno.fem (non-nodal): the N1E tangential-trace surface terms (impedance / absorbing / incident BC) "
-                "compose with the steady and transient LINEAR problem, but not a NONLINEAR form yet (the surface "
-                "mass is a fixed linear block, not re-linearised per step). (Raises rather than silently dropping it.)"
-            )
     pins = (
         _flux_bc_pins(
             flux_bcs,
@@ -2077,12 +2066,35 @@ def assemble_fem_nonnodal(
     # a separate question about the residual too, not something a storage change may decide quietly.
     _pin_dofs_j, _, _pin_project = dirichlet_projection(pins) if pins else (None, None, None)
 
-    def _sparse_tangent(asm, u, args=None):
+    def _sparse_tangent(asm, u, args=None, surface=False):
         # At the PROJECTED state and eliminated on both sides, matching `_apply_dirichlet_projected`.
+        # `surface=True` keeps the N1E tangential-trace surface mass in J, for a residual built by
+        # `_plus_surface` (which carries `S u`).
         _u = jnp.asarray(u).reshape(-1)
         _u = _u if _pin_project is None else _pin_project(_u)
-        J = asm(args, surface=False, u_flat=_u)
+        J = asm(args, surface=surface, u_flat=_u)
         return J if _pin_dofs_j is None else bcoo_eliminate_dirichlet(J, _pin_dofs_j)
+
+    _nl_surface = surf_mass is not None or bool(incident_terms)
+
+    def _plus_surface(res):
+        """A Newton residual ``res(u, args)`` with the N1E tangential-trace terms added: ``+ S(args) u`` for
+        the surface mass (impedance / absorbing face) and the parametric change of the incident load (its
+        constant part is already in ``nat_load``). Both are LINEAR in ``u``, so the tangent only has to keep
+        ``S`` (``_sparse_tangent(..., surface=True)``); nothing is re-linearised per step."""
+        if not _nl_surface:
+            return res
+
+        def r(u, args=None):
+            out = res(u, args)
+            sm = _surf_mass_of(args, sparse=True)
+            if sm is not None:
+                out = out + sm @ jnp.asarray(u).reshape(-1)
+            if incident_terms and args is not None:
+                out = out - (_incident_of(args) - _incident_const)
+            return out
+
+        return r
 
     #
     # Defined BEFORE the transient branch below: that branch returns early, and its Jacobian closures call
@@ -2321,12 +2333,13 @@ def assemble_fem_nonnodal(
                 else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
             )
             if runtime_parameter_tags or neural_param_names:  # transient inverse: thread args through res + jac
+                _res_pt = _plus_surface(lambda uu, a=None: spatial_res(uu, a) - nat_load)
 
                 def res_pt(u, t, args=None):
-                    return _apply_dirichlet_projected(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
+                    return _apply_dirichlet_projected(lambda uu: _res_pt(uu, args), pins)(jnp.asarray(u))
 
                 def jac_pt(u, t, args=None):
-                    return _sparse_tangent(_assemble_spatial, u, args)
+                    return _sparse_tangent(_assemble_spatial, u, args, surface=_nl_surface)
 
                 block = SemidiscreteTimeBlock(
                     mass=lambda t, args=None, _M=M_nl: _M,
@@ -2336,10 +2349,11 @@ def assemble_fem_nonnodal(
                     **common,
                 )
                 return block, "transient", offs
-            res_bc = _apply_dirichlet_projected(lambda u: spatial_res(u) - nat_load, pins)
+            _res_t = _plus_surface(lambda u, a=None: spatial_res(u) - nat_load)
+            res_bc = _apply_dirichlet_projected(_res_t, pins)
 
             def jac(u, _asm=_assemble_spatial):
-                return _sparse_tangent(_asm, u)
+                return _sparse_tangent(_asm, u, surface=_nl_surface)
 
             block = SemidiscreteTimeBlock(
                 mass=lambda t, args=None, _M=M_nl: _M,
@@ -2522,22 +2536,23 @@ def assemble_fem_nonnodal(
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
         if runtime_parameter_tags or neural_param_names:  # parametric (inverse): thread args through res + jac
+            _res_nl = _plus_surface(full_residual)
 
             def res_p(u, args=None):
-                return _apply_dirichlet_projected(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
+                return _apply_dirichlet_projected(lambda uu: _res_nl(uu, args), pins)(jnp.asarray(u))
 
             def jac_p(u, args=None):
-                return _sparse_tangent(_assemble_sparse_A, u, args)
+                return _sparse_tangent(_assemble_sparse_A, u, args, surface=_nl_surface)
 
             return (
                 FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
                 "nonlinear",
                 offs,
             )
-        res_bc = _apply_dirichlet_projected(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
+        res_bc = _apply_dirichlet_projected(_plus_surface(full_residual), pins)  # essential pins as rows R[d]=u[d]-g
 
         def jac(u):
-            return _sparse_tangent(_assemble_sparse_A, u)
+            return _sparse_tangent(_assemble_sparse_A, u, surface=_nl_surface)
 
         # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); non-parametric here, so
         # accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
