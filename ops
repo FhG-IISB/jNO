@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794305342,"nonce":"x7eK40EBvO4dBo1cSaUGZ8F+WIw=","status":2}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794305757,"nonce":"pL09365NqV9LlZx6hSml1jwAVx4=","message":"The commit was rebuilt before pushing; the fix is now de3676f7. Test: tests/test_solver_lu_backends.py::test_pardiso_ignores_padding_entries_as_jax_does.","files":null}]}
