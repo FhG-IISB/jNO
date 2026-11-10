@@ -350,10 +350,20 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
                     M = _unit_scaled(M, rhs)
                 # `maxiter` counts restart cycles, as it does for jax's (whose default is 10 n of them)
                 cycles = maxiter if maxiter is not None else 10 * rhs.shape[0]
-                record_iterations(None, f"jno.solve.{name}", side=_side)
-                return gmres_chunked(
-                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, restart=restart, maxiter=cycles * restart, side="left"
+                x, it = gmres_chunked(
+                    mv,
+                    rhs,
+                    M=M,
+                    x0=x0,
+                    tol=tol_,
+                    atol=atol,
+                    restart=restart,
+                    maxiter=cycles * restart,
+                    side="left",
+                    return_iters=True,
                 )
+                record_iterations(it, f"jno.solve.{name}", side=_side)
+                return x
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
             from .utils.solver.solver_api import record_iterations
