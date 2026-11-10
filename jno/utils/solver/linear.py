@@ -1027,7 +1027,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
         A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)
-        solver._check_A(A)
+        _pardiso_check_A(solver, A, _np)
         solver.set_phase(11)  # symbolic analysis: the half that survives a value change
         solver._call_pardiso(A, b)
         solver.set_phase(22)
@@ -1063,6 +1063,25 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     finally:
         solver.set_iparm(12, 0)
     return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+
+
+def _pardiso_check_A(solver, A, np):
+    """pypardiso's ``_check_A`` (square, CSR, sorted indices, no empty row), which also refuses any dtype
+    but float64. MKL PARDISO itself factors complex matrices (mtype 13, 6, -4), and ``_call_pardiso``
+    only passes the data pointer, so a complex operator is checked here and factored as itself rather
+    than as its real-equivalent ``2n`` block (half the factor memory)."""
+    if not np.iscomplexobj(A.data):
+        solver._check_A(A)
+        return
+    if A.shape[0] != A.shape[1] or A.format != "csr":
+        raise ValueError(f"MKL PARDISO needs a square CSR matrix, got {A.format} {A.shape}.")
+    solver.set_iparm(12, 0)
+    if not A.has_sorted_indices:
+        A.sort_indices()
+    if not np.diff(A.indptr).all():
+        raise ValueError("Matrix A is singular, because it contains empty row(s)")
+    if A.dtype != np.complex128:
+        raise TypeError(f"MKL PARDISO here takes float64 or complex128, got {A.dtype}.")
 
 
 def _pardiso_check_factorization(solver, A, b, np, shape):

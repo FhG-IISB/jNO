@@ -166,7 +166,11 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
             factorization **298 ms**, and a Newton re-factorization **296 ms -- 220x**, where cuDSS
             reaches 115x. Being on the CPU it is also the answer when a factorization will not fit in
             device memory. Its adjoint is cheaper than cuDSS's too: ``A^T x = b`` comes from the SAME
-            factorization rather than a second one. Needs ``pypardiso`` (x86-64).
+            factorization rather than a second one. On a COMPLEX steady form it factors the ``n x n`` complex
+            operator ``A_r + i A_i`` itself (MKL's complex matrix types) instead of LU on the real ``2n``
+            block: measured on a periodic Maxwell cell with exact faces (degree-2 N1E, 24k DOFs), half the
+            factor memory and fewer host copies. A runtime-parameter override (``fem.solve(values=...)``)
+            is refused on that route. Needs ``pypardiso`` (x86-64).
 
             **Choosing between the last two: pick by the phase your problem repeats.** A Newton loop
             re-FACTORIZES, so PARDISO wins. A shift-invert eigensolve or a constant-operator transient
@@ -273,6 +277,10 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
         "solver_context": backend == "cudss",
+        # factors a COMPLEX form's n x n operator itself (MKL complex mtypes), so fem.solve hands it the
+        # complex operator rather than the real-equivalent 2n block: half the factor memory, and the
+        # periodic reduction and host copies run on the n-sized legs
+        "complex_native": backend in ("pardiso", "cudss"),
     }
     return LinearSolver(_fn, name=name, direct=True, traits=traits, settings={"reuse": reuse})
 

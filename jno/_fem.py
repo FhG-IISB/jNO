@@ -2324,7 +2324,9 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
             idx, inverse, nse = plan
             data = jax.ops.segment_sum(data, inverse, num_segments=nse)
             return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
-        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+        # traced indices (a parametric solve under jit): `sum_duplicates` would need a static nse, and the
+        # duplicates are harmless -- a BCOO matvec and every direct backend's COO -> CSR sum them
+        return jsp.BCOO((data, indices), shape=A_r.shape)
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
     return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
@@ -2373,7 +2375,14 @@ def _solve_complex_block(
         # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
         # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
         A_c = _complex_operator(A_r, A_i)
-        u = complex_solve(A_c, b_r + 1j * b_i)
+        b_c = b_r + 1j * b_i
+        if periodic is not None:
+            # the reduction summed a prescribed tie target's row into its partners: put it back, as every
+            # reduced-space solve does (the values are real: Re g, as on the fused path's first leg)
+            from .utils.solver.fem_utils import impose_reduced_dirichlet
+
+            A_c, b_c = impose_reduced_dirichlet(periodic, A_c, b_c)
+        u = complex_solve(A_c, b_c)
         if periodic is None:
             return u
         if periodic.get("is_bloch"):
@@ -3995,15 +4004,20 @@ class FEM:
                 "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
                 "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
             )
-        if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
-            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
-            # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
-            # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+        _cn_linear = bool((getattr(linear, "traits", None) or {}).get("complex_native"))
+        if from_slots and (getattr(precond, "complex_native", False) or _cn_linear) and self._complex_legs is not None:
+            # A complex-native preconditioner (AMS), or a direct backend that factors complex matrices
+            # (MKL PARDISO), solves the sparse COMPLEX operator ``A_r + i·A_i`` directly, never the
+            # real-equivalent block — so it wants the Re/Im legs the fusion retained, not the fused 2n
+            # system. The direct case halves the factor memory, and the periodic reduction and the host
+            # copies run on n-sized legs instead of a 2n block with four times the entries. Real-equivalent
+            # preconditioners (form/jacobi/…) stay on the block.
             if kwargs.get("values"):
                 raise NotImplementedError(
-                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
-                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
-                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                    "fem.solve(<complex-native linear or precond>, <parameter>=...): the complex-native solve works "
+                    "on the assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent solver (e.g. jno.solve.lu(backend='host')), or build the form with the "
+                    "value fixed."
                 )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
