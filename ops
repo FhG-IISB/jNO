@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794354464,"nonce":"Q78hBtHRjnna5IExmB+kOcvTYfk=","added":["branch:feat/stiff-time-integration","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794354464,"nonce":"KTfb3jDludeCagMfNl4MgL8aQKY=","message":"Fixed in 729dedaf; test: tests/test_fem_time_schemes_every_element.py::test_symmetric_exponential_refuses_a_nonsymmetric_operator","files":null}]}
