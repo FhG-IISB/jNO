@@ -63,6 +63,7 @@ automatic, no authoring change. Composite/CSG and cut-cell geometry are planned.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 
 import jax.numpy as jnp
@@ -75,6 +76,8 @@ from .trace_evaluator import fd_grid
 from .utils.sets import unique_values
 
 __all__ = ["fdm", "laplacian", "gradient"]
+
+_MARCH_BLOCKS_KEPT = 4  # march blocks kept per problem: the configurations solved in turn (schemes, solver slots)
 
 
 def _rtol(dtype=None) -> float:
@@ -3192,10 +3195,74 @@ class _TraceFDM:
         ``c = −R(0)``), so every step is one preconditioned linear solve and an AMG or LU setup is built
         once before the march; a nonlinear ``R`` keeps the Newton step, with the assembled tangent
         available to a direct solver. A ``nonlinear=`` slot configures the per-step Newton."""
+        from .utils.solver.backend_blocks import _block_time_grid
+        from .utils.solver.solver_api import compose_transient_step_solvers
+
+        precond = slots["precond"]
+        # The block is kept per configuration: the march's trace and compiled program are cached ON the block
+        # (`backend_blocks._cached_march`), so a block built afresh on every call re-traced and re-compiled the
+        # whole march on every `solve()` -- measured on a 32x32 Brusselator, 2.5 s of a 5.2 s warm bdf2 solve.
+        # Only OUTSIDE a trace: under `jit`/`grad` (a `jno.core` inverse problem) the residual closes over the
+        # trace's parameter values, and a block kept from an earlier trace would march those -- a constant
+        # parameter with a ZERO gradient, measured as an inverse problem that never left its initial guess.
+        import jax
+        from jax._src import core as _core
+
+        if _core.trace_state_clean() and not isinstance(state0, jax.core.Tracer):
+            key = self._march_block_key(state0, window, metadata, slots)
+            cache = self.__dict__.setdefault("_march_blocks", collections.OrderedDict())
+            if key in cache:
+                cache.move_to_end(key)
+            else:
+                cache[key] = self._build_march_block(M, residual, state0, window, metadata, slots)
+                while len(cache) > _MARCH_BLOCKS_KEPT:
+                    cache.popitem(last=False)
+            block, nonlinear, linear = cache[key]
+        else:
+            block, nonlinear, linear = self._build_march_block(M, residual, state0, window, metadata, slots)
+        from .utils.solver.timeschemes import _ExponentialScheme
+
+        if isinstance(time, _ExponentialScheme):
+            # Measured: with a slot set the block is linear and the exponential scheme RUNS, but it came
+            # back 4.8e-3 off a converged reference where Crank-Nicolson at the same step was 2.0e-5. It
+            # forms exp(-dt M⁻¹A), and an FDM block is a DAE: its Dirichlet and flux rows are algebraic,
+            # with a zero mass. Refused rather than returned.
+            raise NotImplementedError(
+                "jno.fdm: the exponential time scheme integrates a LINEAR block with an invertible mass "
+                "matrix, and a strong-form "
+                "march is a DAE — its boundary rows are algebraic constraints with zero mass. Use a "
+                "θ-scheme: jno.solve.theta(0.5) (Crank–Nicolson) or the backward-Euler default."
+            )
+        steppers = (None, None)
+        if linear is not None or precond is not None or nonlinear is not None:
+            steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        return _integrate_transient(block, ts, time, *steppers)
+
+    def _march_block_key(self, state0, window, metadata, slots):
+        """What a march block is built from, by VALUE: the time window, the block metadata, the solver slots
+        (their repr is their value identity, as the compiled-solve caches use it), the device the solve runs on
+        (a default ``lu()`` picks its backend from it), and the data fields and networks the problem reads, by
+        object identity (a new value is a new object)."""
+        from .utils.solver.placement import solve_device
+
+        dev = solve_device()
+        models = tuple(sorted((str(k), id(v)) for k, v in self._referenced_models().items()))
+        return (
+            tuple(float(w) for w in window),
+            repr(sorted(metadata.items())),
+            tuple(None if slots[k] is None else repr(slots[k]) for k in ("nonlinear", "linear", "precond")),
+            int(state0.size),
+            (dev.platform, dev.id),
+            models,
+        )
+
+    def _build_march_block(self, M, residual, state0, window, metadata, slots):
+        """The :class:`SemidiscreteTimeBlock` of a march, with the per-step ``nonlinear`` and ``linear``
+        solvers it composes with (see :meth:`_run_block`)."""
         import jax
 
-        from .utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
-        from .utils.solver.solver_api import compose_transient_step_solvers
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock
 
         t0, t1, dt = window
         nonlinear, linear, precond = slots["nonlinear"], slots["linear"], slots["precond"]
@@ -3255,24 +3322,7 @@ class _TraceFDM:
             # a large compile and 7 GB. Measured, 50 heat steps: 0.55 s at 66k nodes and 1.6 s at 263k
             # (Δt = 1e-2), against 6.8 s and 16 s for the assembled `precond=gmg()` slot.
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
-        from .utils.solver.timeschemes import _ExponentialScheme
-
-        if isinstance(time, _ExponentialScheme):
-            # Measured: with a slot set the block is linear and the exponential scheme RUNS, but it came
-            # back 4.8e-3 off a converged reference where Crank-Nicolson at the same step was 2.0e-5. It
-            # forms exp(-dt M⁻¹A), and an FDM block is a DAE: its Dirichlet and flux rows are algebraic,
-            # with a zero mass. Refused rather than returned.
-            raise NotImplementedError(
-                "jno.fdm: the exponential time scheme integrates a LINEAR block with an invertible mass "
-                "matrix, and a strong-form "
-                "march is a DAE — its boundary rows are algebraic constraints with zero mass. Use a "
-                "θ-scheme: jno.solve.theta(0.5) (Crank–Nicolson) or the backward-Euler default."
-            )
-        steppers = (None, None)
-        if linear is not None or precond is not None or nonlinear is not None:
-            steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
-        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        return _integrate_transient(block, ts, time, *steppers)
+        return block, nonlinear, linear
 
     def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots):
         """March ``m·u_tt + c·u_t + R_spatial(u) = 0`` as the first-order augmented system in

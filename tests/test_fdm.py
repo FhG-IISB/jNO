@@ -2322,6 +2322,38 @@ def test_coupled_nonlinear_march(monkeypatch):
     assert np.isfinite(a).all() and np.abs(a - b).max() < 1e-12
 
 
+@pytest.mark.parametrize("scheme", [None, "bdf2"])
+def test_repeated_march_is_traced_once(monkeypatch, scheme):
+    """Solving the same transient problem again reuses the traced march: fresh scheme and solver specs that are
+    equal by value hit the cache, the answer is identical, and a different slot traces anew. Each solve()
+    used to build a new block and so re-trace and re-compile the whole march (half of a warm 32x32
+    Brusselator solve)."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    problem = jno.fdm(
+        [
+            ui.t - 0.1 * (ui.xx + ui.yy) + ui**3,  # nonlinear: the per-step Newton with an assembled tangent
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+        ]
+    )
+    traces = []
+    real = jax.make_jaxpr
+    monkeypatch.setattr(jax, "make_jaxpr", lambda *a, **k: traces.append(1) or real(*a, **k))
+    kw = lambda: dict(time=jno.solve.bdf2() if scheme else None, linear=jno.solve.lu())  # noqa: E731
+    first = np.asarray(problem.solve(**kw()))
+    n_first = len(traces)
+    again = np.asarray(problem.solve(**kw()))
+    assert n_first > 0 and len(traces) == n_first
+    assert np.array_equal(first, again)
+    np.asarray(problem.solve(time=kw()["time"], linear=jno.solve.lu(), nonlinear=jno.solve.newton(direct=True, rtol=1e-10)))
+    assert len(traces) > n_first
+
+
 def test_coupled_march_inverse_recovers_the_coupling():
     """A trainable coupling strength ω in u_t = Δu − ωv, v_t = Δv + ωu, recovered through jno.core."""
     import optax
