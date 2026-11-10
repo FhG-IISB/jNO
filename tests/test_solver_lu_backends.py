@@ -765,3 +765,26 @@ def test_the_gate_sits_orders_clear_of_both_signatures_it_separates():
 
     assert _SINGULAR_REL / _CLEAN_REL >= 1e3  # a wide usable band between the two questions
     assert 1.0 / _SINGULAR_REL >= 1e3  # and far below the O(1) a real null space leaves
+
+
+# --------------------------------------------------------------------------------------
+# BCOO padding: entries parked at the out-of-bounds index (n, n)
+# --------------------------------------------------------------------------------------
+
+
+def _padded(A, n_pad=3):
+    """``A`` with ``n_pad`` extra entries at the padding index ``(n, n)``, as jax.experimental.sparse
+    leaves them when a fixed-length BCOO drops entries."""
+    n = A.shape[0]
+    pad = jnp.full((n_pad, 2), n, dtype=A.indices.dtype)
+    return jsp.BCOO((jnp.concatenate([A.data, jnp.full(n_pad, 9.0)]), jnp.concatenate([A.indices, pad])), shape=A.shape)
+
+
+@pytest.mark.skipif(not _pardiso_available(), reason="pypardiso not installed")
+def test_pardiso_ignores_padding_entries_as_jax_does():
+    """JAX's own sparse conversion sorts padding past the last row and never reads it; the PARDISO host
+    solve must do the same rather than hand scipy an out-of-range index."""
+    A, b = _spd(60), jnp.asarray(np.random.default_rng(2).normal(size=60))
+    x_ref = np.linalg.solve(np.asarray(A.todense()), np.asarray(b))
+    x = np.asarray(pardiso_lu_solve(_padded(A), b))
+    np.testing.assert_allclose(x, x_ref, rtol=1e-10, atol=1e-12)
