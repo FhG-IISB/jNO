@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794305342,"nonce":"/60vHNYXLbmfjhpS3bojG9AS2ec=","added":["branch:feat/soft-cover-enrichment","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794305342,"nonce":"Cb6Yb+hjmWDUZ+oSauYekOX5lAY=","message":"Fixed in 29a760d5; test: tests/test_solver_lu_backends.py::test_pardiso_ignores_padding_entries_as_jax_does","files":null}]}
