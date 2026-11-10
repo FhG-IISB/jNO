@@ -8926,6 +8926,21 @@ def _fem_impl(
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
+    _cd = getattr(getattr(domain, "mesh", None), "cells_dict", None) or {}
+    if _nonnodal_families and ("quad" in _cd or "hexahedron" in _cd):
+        # The non-nodal (push-forward) assembler is built on simplices; on a tensor-product mesh it failed with a bare
+        # KeyError 'triangle'. Name what routed the form there instead.
+        _why = (
+            f"a term on a tag inside the mesh ({', '.join(sorted(r for r in boundary_terms if r in _iface))}: d.tag(..., region=...) "
+            "over an interface)"
+            if _nonnodal_families == {"Lagrange (interior faces)"}
+            else f"the element famil{'y' if len(_nonnodal_families) == 1 else 'ies'} {sorted(_nonnodal_families)}"
+        )
+        raise NotImplementedError(
+            f"jno.fem: {_why} is assembled by the non-nodal path, which works on triangles and tetrahedra only; this mesh "
+            "has quadrilaterals or hexahedra. Mesh with triangles (no .quad()), or write the condition on the domain "
+            "boundary."
+        )
     if _nonnodal_families and not _hermite_1d:
         # The push-forward assembler is built on triangles/tets, so a non-nodal family on a LINE mesh
         # died with a bare ``KeyError: 'triangle'`` from the topology lookup — a cryptic failure for a

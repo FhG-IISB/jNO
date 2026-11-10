@@ -54,3 +54,41 @@ def test_cavity_radiation_on_quads_matches_the_concentric_cylinders(cell, tmp_pa
     F12 = float((A[core, None] * F[np.ix_(core, shell)]).sum() / A[core].sum())
     assert F12 == pytest.approx(1.0, abs=0.02)
     assert F21 == pytest.approx(R1 / R2, abs=0.02)
+
+
+def _two_parts(quad):
+    plan = jno.shape.rect(0, 0, 0.1, 0.2).name("a").attach(k=2.0) + jno.shape.rect(0.1, 0, 0.2, 0.2).name("b").attach(
+        k=20.0
+    )
+    d = (plan.quad() if quad else plan).sized(0.02).domain()
+    d.tag("e", lambda x, y: (np.abs(x - 0.1) < 1e-9) & (y > 0.05) & (y < 0.15), region="a")
+    return d
+
+
+@pytest.mark.parametrize("quad", [False, True])
+def test_the_faces_of_a_part_inside_the_mesh_are_found_on_quads(quad):
+    """The facets between part a and part b: the interface x = 0.1, 0.2 long (on quads these were never found)."""
+    d = _two_parts(quad)
+    d.variable("interior")
+    f = d._region_surface_facets("a")
+    assert f.shape[1:] == (2, 2)
+    assert np.linalg.norm(f[:, 1] - f[:, 0], axis=1).sum() == pytest.approx(0.2, rel=1e-12)
+    assert np.allclose(f[..., 0], 0.1)
+
+
+def test_a_term_on_a_tag_inside_a_quad_mesh_is_refused_by_name():
+    """It used to integrate over nothing (no facet found), then failed with a bare KeyError; the assembler that
+    integrates interior faces works on simplices only."""
+    d = _two_parts(True)
+    T = d.unknown.scalar("T")
+    v = T.test()
+    x, y, _ = d.variable("interior", split=True)
+    xs, ys, _ = d.variable("e", split=True)
+    with pytest.raises(NotImplementedError, match="tag inside the mesh .*e:"):
+        jno.fem(
+            [
+                d.k * (T.bind(x=x, y=y).d(x) * v.bind(x=x, y=y).d(x)) - v.bind(x=x, y=y),
+                10.0 * T.bind(x=xs, y=ys) * v.bind(x=xs, y=ys),
+                T(*d.variable("right", split=True)[:2]) - 0.0,
+            ]
+        )

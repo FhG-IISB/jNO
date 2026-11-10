@@ -3396,12 +3396,21 @@ class domain(MeshIOMixin):
         memb = mesh_cell_region_membership(mesh, dim).get(str(region))
         if memb is None:
             return None
-        cells = np.asarray(p1_cells_dict(mesh)[volume_cell_type(mesh, dim)], dtype=np.int64)
+        kind = volume_cell_type(mesh, dim)
+        cells = np.asarray(p1_cells_dict(mesh)[kind], dtype=np.int64)
         memb = np.asarray(memb, dtype=bool)
         k = cells.shape[1]
-        loc = [tuple(j for j in range(k) if j != i) for i in range(k)]  # local facet = all vertices but one
+        # the local facets in meshio's vertex order: a simplex's are all its vertices but one; a quadrilateral's its four
+        # sides; a hexahedron's its six quadrilaterals. ("All but one" on a quad gave three-vertex rows that are no facet,
+        # so no interior facet was ever found and a term on such a tag integrated over nothing.)
+        if kind == "quad":
+            loc = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        elif kind == "hexahedron":
+            loc = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+        else:
+            loc = [tuple(j for j in range(k) if j != i) for i in range(k)]
         fac = np.sort(np.concatenate([cells[:, list(lf)] for lf in loc]), axis=1)
-        owner = np.tile(np.arange(len(cells)), k)
+        owner = np.tile(np.arange(len(cells)), len(loc))
         _u, inv, cnt = np.unique(fac, axis=0, return_inverse=True, return_counts=True)
         inv = inv.reshape(-1)
         n_in = np.bincount(inv, weights=memb[owner].astype(float), minlength=len(_u))
