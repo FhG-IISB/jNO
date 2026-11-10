@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794354463,"nonce":"X442VZzVqxlhaBphL8TBMP0rOjY=","added":["branch:feat/stiff-time-integration","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794354463,"nonce":"K9cfHvFEZE6iYhGYysR3Ygg2xxI=","message":"Fixed in 729dedaf; test: tests/test_fem_time_schemes_every_element.py::test_an_argyris_plate_marches_adaptively_within_a_small_budget","files":null}]}
