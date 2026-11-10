@@ -244,6 +244,17 @@ net.optimizer(optax.sgd(1.0))   # lr=1 because line search handles step scale
 engd = jno.callbacks.engd(gram_terms=[...], gram_interval=5)
 ```
 
+**SPRING momentum and damping (`momentum=`, `damping=`):** SPRING (Goldshlager, Abrahamsen & Lin 2024, arXiv:2401.10190; for PINNs Jnini et al. 2026, arXiv:2604.05230, Sec. 2.3, eq. 26) adds momentum to the Gauss-Newton step, `φ_k = argmin ‖Jφ − r‖² + λ‖φ − μφ_{k−1}‖²`, solved here in the P × P form as `φ_k = μφ_{k−1} + (G + λI)⁻¹(∇L − μGφ_{k−1})`. `damping=λ > 0` is a Levenberg-Marquardt shift solved by Cholesky; `momentum=0` is plain (damped) ENGD.
+
+```python
+net.optimizer(jno.optimizers.engd(momentum=0.9, damping=1e-8))   # line_search=True by default
+```
+
+- With `damping=0`, momentum acts only in the null space of the Jacobian, i.e. only with more parameters than residual points. With fewer parameters than points and an invertible `G`, the step reduces to plain ENGD.
+- With the line search, the carried `φ_{k−1}` is the step actually taken, `α_{k−1}φ_{k−1}`. Carrying eq. 26's unscaled direction stalled at `momentum=0.9` (Poisson2D, P = 501 > N = 192: rel-L² 2.3e-3 against 1.7e-6).
+- On the small Poisson2D tests, SPRING reached the same accuracy as plain ENGD (1e-6 range), not better. The paper reports the two within a factor of two of each other on Helmholtz.
+- The P × P solve costs O(P³) per step. When P ≫ N, the paper's N × N kernel form would be cheaper and more accurate at small `λ`; it is not implemented.
+
 ### Explainability callbacks
 
 jNO also provides callbacks for analysing gradient conflict, cosine similarity, and the loss landscape during training. See [Explainability](../training/explainability.md).

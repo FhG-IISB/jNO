@@ -517,6 +517,8 @@ def make_engd_fn(
     trainable_template,
     rcond: float | None = None,
     min_consecutive: int = 1,
+    momentum: float = 0.0,
+    damping: float = 0.0,
 ):
     """Build JIT-friendly functions for Energy Natural Gradient Descent (ENGD).
 
@@ -535,11 +537,14 @@ def make_engd_fn(
 
     Returns a pair of JIT-friendly callables::
 
-        gram_and_solve_fn(trainable, context, rng, flat_model_grad)
+        gram_and_solve_fn(trainable, context, rng, flat_model_grad, phi_prev)
             -> (nat_flat, G)
 
-        cached_solve_fn(G, flat_model_grad)
+        cached_solve_fn(G, flat_model_grad, phi_prev)
             -> nat_flat
+
+    ``phi_prev`` is the previous direction (zeros on the first step); it only
+    enters when ``momentum > 0`` (SPRING, see :func:`engd_direction`).
 
     Use ``gram_and_solve_fn`` every ``gram_interval`` steps to recompute G
     and ``cached_solve_fn`` in between for cheap updates with the cached G.
@@ -563,6 +568,9 @@ def make_engd_fn(
             ``None`` (default) uses machine epsilon — correct for float64.
             Increase to regularise a near-singular G; but this floors accuracy.
         min_consecutive: Forwarded to each compiled expression.
+        momentum: SPRING momentum :math:`\\mu \\in [0, 1)`; ``0`` is plain ENGD.
+        damping: Levenberg-Marquardt damping :math:`\\lambda \\ge 0` added to G;
+            ``0`` keeps the ``lstsq`` pseudo-inverse.
     """
     from jno.trace_compiler import TraceCompiler
 
@@ -574,7 +582,11 @@ def make_engd_fn(
         compiled_fn = TraceCompiler.compile_multi_expression([expr], all_ops)
         compiled_fns.append((compiled_fn, float(w)))
 
-    def gram_and_solve_fn(trainable, context, rng, flat_model_grad):
+    def _direction(G, g, phi_prev):
+        d = engd_direction(G, g, phi_prev, momentum=momentum, damping=damping, rcond=rcond)
+        return jnp.where(jnp.any(jnp.isnan(d)), jnp.zeros_like(d), d)
+
+    def gram_and_solve_fn(trainable, context, rng, flat_model_grad, phi_prev):
         full_models = eqx.combine(trainable, frozen, static)
         G = jnp.zeros((P, P), dtype=flat_model_grad.dtype)
         for comp_fn, w in compiled_fns:
@@ -589,12 +601,40 @@ def make_engd_fn(
             J_flat = J.reshape(-1, J.shape[-1])  # (N_total, P)
             N = J_flat.shape[0]
             G = G + (w / N) * (J_flat.T @ J_flat)
-        nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
-        nat_flat = jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
-        return nat_flat, G
+        return _direction(G, flat_model_grad, phi_prev), G
 
-    def cached_solve_fn(G, flat_model_grad):
-        nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
-        return jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
+    def cached_solve_fn(G, flat_model_grad, phi_prev):
+        return _direction(G, flat_model_grad, phi_prev)
 
     return gram_and_solve_fn, cached_solve_fn
+
+
+def engd_direction(G, g, phi_prev, *, momentum: float = 0.0, damping: float = 0.0, rcond: float | None = None):
+    """One (SPRING-accelerated, damped) Gauss-Newton direction from the Gram matrix and the gradient.
+
+    .. math::
+
+        \\phi_k = \\mu\\,\\phi_{k-1} + (G + \\lambda I)^{-1}\\,(g - \\mu\\,G\\,\\phi_{k-1})
+
+    With :math:`G = J^\\top J` and :math:`g = J^\\top r` this is SPRING (Goldshlager, Abrahamsen &
+    Lin 2024, arXiv:2401.10190; Jnini et al. 2026, arXiv:2604.05230, Sec. 2.3, eq. 26),
+    :math:`\\phi_k = \\arg\\min_\\phi \\|J\\phi - r\\|^2 + \\lambda\\|\\phi - \\mu\\phi_{k-1}\\|^2`, written in
+    the P x P form via the push-through identity :math:`(J^\\top J + \\lambda I)^{-1} J^\\top =
+    J^\\top (J J^\\top + \\lambda I)^{-1}`, so only ``G`` and ``g`` are needed, not ``J`` and ``r``.
+    ``momentum=0`` is plain (damped) ENGD. ``damping > 0`` solves by Cholesky; ``damping=0`` uses the
+    ``lstsq`` pseudo-inverse with cutoff ``rcond``, the :math:`\\lambda \\to 0` limit, in which the
+    momentum survives only in the null space of :math:`J`.
+
+    Accuracy: with more parameters than residual points, :math:`G + \\lambda I` has eigenvalues equal
+    to :math:`\\lambda`, so this P x P solve loses about :math:`\\epsilon\\,\\sigma_{\\max}^2/\\lambda` relative
+    accuracy against the N x N form (measured: 1e-8 relative at :math:`\\lambda = 10^{-6}`, float64).
+    """
+    from jax.scipy.linalg import cho_factor, cho_solve
+
+    rhs = g if momentum == 0.0 else g - momentum * (G @ phi_prev)
+    if damping > 0.0:
+        c = cho_factor(G + damping * jnp.eye(G.shape[0], dtype=G.dtype))
+        step = cho_solve(c, rhs)
+    else:
+        step = jnp.linalg.lstsq(G, rhs, rcond=rcond)[0]
+    return step if momentum == 0.0 else momentum * phi_prev + step
