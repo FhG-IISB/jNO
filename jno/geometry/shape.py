@@ -1221,7 +1221,10 @@ class shape:
             d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.1).structured().quad().domain()   # hexes
 
         In 2-D gmsh meshes triangles and then recombines them, which works on arbitrary geometry — a
-        disk recombines to pure quads just as a rectangle does. Quadrilaterals cost fewer cells for
+        disk recombines to pure quads just as a rectangle does. Where it cannot pair every triangle (a
+        surface with an odd number of them), the plan is meshed again at twice the size and every cell
+        is split into quads (gmsh's subdivision), so the mesh is all quadrilaterals at about the size
+        asked for and covers the whole shape. Quadrilaterals cost fewer cells for
         the same nodes and are the element the topology-optimisation literature is written on; on
         bending-dominated elasticity they are markedly less stiff than linear triangles.
 

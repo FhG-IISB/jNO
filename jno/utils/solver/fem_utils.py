@@ -747,7 +747,9 @@ def _cell_region_mask(domain, region):
     else:
         mesh = domain.mesh
         pts = np.asarray(mesh.points)[:, :dim]
-        cells = np.asarray(mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+        from .fem_native import mesh_cell_type
+
+        cells = np.asarray(mesh.cells_dict[mesh_cell_type(domain, dim)])
     centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
     src = getattr(domain, "_source_regions", {}) or {}
     preds = getattr(domain, "_tag_predicates", {}) or {}

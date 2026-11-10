@@ -773,15 +773,33 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                 "general geometry (Recombine3DAll on a plain box returns 944 tetrahedra and no "
                 "hexahedra). Add .structured() -- `shape.box(...).structured().quad()`."
             )
-        if _cell == "quad":
-            # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
-            # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
-            # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
-            # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
-            # no hexes, which is why `shape.quad()` refuses a 3-D shape rather than quietly meshing
-            # it with tetrahedra.)
-            gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        # A quad mesh: triangles, then RECOMBINED into quadrilaterals. This is gmsh's only general
+        # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
+        # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
+        # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
+        # no hexes, which is why `shape.quad()` refuses a 3-D shape rather than quietly meshing
+        # it with tetrahedra.)
+        # Set on every build, not only for quads: gmsh keeps options between models of one session, so a quad
+        # build followed by a triangle build in an already-initialised gmsh would recombine the second too.
+        gmsh.option.setNumber("Mesh.RecombineAll", 1 if _cell == "quad" else 0)
+        gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeFactor", 1.0)
         gmsh.model.mesh.generate(dim)
+        if _cell == "quad" and dim == 2 and len(gmsh.model.mesh.getElementsByType(_TRI)[0]):
+            # Blossom cannot pair the triangles of a surface with an odd count (a plain triangle at
+            # h = 0.21 keeps some; tests/test_quad_mesh_completeness.py). Those would be lost to the quad
+            # block. Mesh again at twice the size and split every cell into quads (each quad into four,
+            # each leftover triangle into three): all quadrilaterals, at about the size asked for.
+            gmsh.model.mesh.clear()
+            gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
+            gmsh.option.setNumber("Mesh.MeshSizeFactor", 2.0)
+            gmsh.model.mesh.generate(dim)
+            left = len(gmsh.model.mesh.getElementsByType(_TRI)[0])
+            if left:
+                raise RuntimeError(
+                    f"shape.quad(): gmsh left {left} triangles after subdividing into quadrilaterals; "
+                    "the quad mesh would miss them."
+                )
         if int(order) > 1:
             # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
             # SYNTHESISES its higher-order nodes by interpolating reference points through the affine

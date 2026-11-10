@@ -28,19 +28,35 @@ import numpy as np
 from .mesh_utils import MeshUtils
 
 
-def _boundary_edge_third_vertex(triangles: np.ndarray):
-    """Map each boundary edge (a tuple of two global node indices, sorted) to the third vertex of its
-    one adjacent triangle. Boundary edges occur in exactly one triangle; the third vertex fixes the
-    outward (out-of-solid) normal direction."""
-    third: dict[tuple[int, int], int] = {}
-    seen: dict[tuple[int, int], int] = {}
-    for tri in triangles:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        for i0, i1, opp in ((a, b, c), (b, c, a), (c, a, b)):
-            key = (i0, i1) if i0 < i1 else (i1, i0)
-            seen[key] = seen.get(key, 0) + 1
-            third[key] = opp
-    return third, seen
+def _area_cells(mesh):
+    """``(cells, cell_type)``: the 2-D cells of the mesh in their P1 view, triangles or quadrilaterals (meshio
+    vertex order, so consecutive vertices of a row are the cell's edges), and their meshio name."""
+    from .mesh_utils import p1_cells_dict, volume_cell_type
+
+    name = volume_cell_type(mesh, 2)
+    if name is None:
+        raise NotImplementedError(
+            f"enclosure radiation needs a mesh of triangles or quadrilaterals; it has {sorted(mesh.cells_dict)}."
+        )
+    return np.asarray(p1_cells_dict(mesh)[name]), name
+
+
+def _cell_edges(cells: np.ndarray):
+    """``(i0, i1, cell)``: the edges of every k-gon cell (consecutive vertices), with the cell each one belongs to."""
+    k = cells.shape[1]
+    i0 = cells.reshape(-1)
+    i1 = np.roll(cells, -1, axis=1).reshape(-1)
+    return i0, i1, np.repeat(np.arange(cells.shape[0]), k)
+
+
+def _boundary_edge_inside_point(cells: np.ndarray, pts: np.ndarray):
+    """Map each edge (a tuple of two global node indices, sorted) to a point inside its adjacent cell (the
+    cell's centroid; on an interior edge, the last cell seen). A boundary edge lies in exactly one cell; the
+    point fixes the outward (out-of-solid) normal direction. Any cell type with straight edges (triangles,
+    quadrilaterals): the centroid of a convex cell is on the same side of each of its edges as the cell."""
+    cent = pts[cells].mean(axis=1)
+    i0, i1, c = _cell_edges(cells)
+    return {(int(a), int(b)) if a < b else (int(b), int(a)): cent[int(ci)] for a, b, ci in zip(i0, i1, c)}
 
 
 def _element_visibility(mids: np.ndarray, own_edge: np.ndarray, occ0: np.ndarray, occ1: np.ndarray):
@@ -902,8 +918,8 @@ def build_enclosure(
 
     mesh = domain.mesh
     pts = np.asarray(mesh.points)[:, :2]
-    triangles = np.asarray(mesh.cells_dict["triangle"])
-    boundary_edges = np.asarray(MeshUtils.extract_boundary_edges(jnp.asarray(triangles), pts.shape[0]))
+    cells, cell_type = _area_cells(mesh)
+    boundary_edges = np.asarray(MeshUtils._get_boundary_elements(cells, cell_type))
 
     # Per-tag node masks (global node indices on each radiating surface). Prefer the spatial predicate
     # registered by ``domain.tag`` (it takes coordinate arrays); fall back to a geometry-part node set.
@@ -927,7 +943,7 @@ def build_enclosure(
     elem_tag: List[str] = []
     if medium_tags is None:
         # Boundary mode: radiating elements are domain boundary edges whose endpoints lie on a tag.
-        third, _ = _boundary_edge_third_vertex(triangles)
+        inside = _boundary_edge_inside_point(cells, pts)
         tag_masks = {tag: _tag_mask(tag) for tag in tags}
         for a, b in boundary_edges:
             a, b = int(a), int(b)
@@ -942,18 +958,16 @@ def build_enclosure(
     else:
         # Interface mode: radiating elements are internal solid|medium interface edges. ``tags`` are
         # solid geometry-part names; ``medium_tags`` are the transparent (meshed) media. The normal of
-        # each element points out of the solid into the medium (its solid-side third vertex sets it).
+        # each element points out of the solid into the medium (a point inside its solid-side cell sets it).
         medium_set = {str(m) for m in medium_tags}
         tag_set = set(tags)
-        tri_region = _classify_triangles(domain, triangles, pts)
+        cell_region = _classify_triangles(domain, cells, pts)
+        cent = pts[cells].mean(axis=1)
         edge_adj: dict = {}
-        for ti in range(triangles.shape[0]):
-            a, b, c = int(triangles[ti, 0]), int(triangles[ti, 1]), int(triangles[ti, 2])
-            rg = tri_region[ti]
-            for i0, i1, opp in ((a, b, c), (b, c, a), (c, a, b)):
-                key = (i0, i1) if i0 < i1 else (i1, i0)
-                edge_adj.setdefault(key, []).append((rg, opp))
-        third = {}
+        for a, b, ci in zip(*_cell_edges(cells)):
+            key = (int(a), int(b)) if a < b else (int(b), int(a))
+            edge_adj.setdefault(key, []).append((cell_region[int(ci)], cent[int(ci)]))
+        inside = {}
         for key, adj in edge_adj.items():
             if len(adj) != 2:
                 continue
@@ -961,11 +975,11 @@ def build_enclosure(
             if r0 in tag_set and r1 in medium_set:
                 elem_nodes_list.append(key)
                 elem_tag.append(r0)
-                third[key] = t0
+                inside[key] = t0
             elif r1 in tag_set and r0 in medium_set:
                 elem_nodes_list.append(key)
                 elem_tag.append(r1)
-                third[key] = t1
+                inside[key] = t1
         if not elem_nodes_list:
             raise ValueError(
                 f"build_enclosure: no solid|medium interface elements found between tags {tags} and "
@@ -980,17 +994,17 @@ def build_enclosure(
     edge_vec = e1 - e0
     length = np.linalg.norm(edge_vec, axis=1)
 
-    # Into-enclosure normals: perpendicular to the edge, pointing away from the adjacent triangle's
-    # third vertex (i.e. out of the solid -> into the gap).
+    # Into-enclosure normals: perpendicular to the edge, pointing away from a point inside the adjacent
+    # cell (i.e. out of the solid -> into the gap).
     normals = np.zeros_like(mids)
     for k in range(elem_nodes.shape[0]):
         a, b = int(elem_nodes[k, 0]), int(elem_nodes[k, 1])
         key = (a, b) if a < b else (b, a)
-        c = third.get(key)
+        c = inside.get(key)
         t = edge_vec[k]
         n = np.array([-t[1], t[0]])
         n = n / (np.linalg.norm(n) + 1e-30)
-        if c is not None and np.dot(mids[k] - pts[c], n) < 0:
+        if c is not None and np.dot(mids[k] - c, n) < 0:
             n = -n  # ensure it points away from the solid interior
         normals[k] = n
     if inward and medium_tags is None:
@@ -1025,17 +1039,17 @@ def build_enclosure(
             # the cg furnace, one Quartz.1->WallO pair read 0.024 unoccluded against 0.363 occluded, and
             # the coupled solve landed 620 K cold.
             #
-            # The mesh already carries the answer: `tri_region` labels every cell, so each opaque
+            # The mesh already carries the answer: `cell_region` labels every cell, so each opaque
             # region's meridian outline is the union of its own cells. Exact for straight-edged regions
             # (the cells tile them), and it needs no shapely geometry from the caller.
             from shapely.geometry import Polygon as _SPoly
             from shapely.ops import unary_union as _uu
 
-            for _name in sorted({str(x) for x in tri_region if x is not None} - _transparent):
-                _sel = np.where(tri_region == _name)[0]
+            for _name in sorted({str(x) for x in cell_region if x is not None} - _transparent):
+                _sel = np.where(cell_region == _name)[0]
                 if not len(_sel):
                     continue
-                _g = _uu([_SPoly(pts[triangles[t]][:, :2]) for t in _sel]).buffer(0)
+                _g = _uu([_SPoly(pts[cells[t]][:, :2]) for t in _sel]).buffer(0)
                 if not _g.is_empty:
                     solid_geoms.append(_g)
 
@@ -1212,7 +1226,7 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     modelled)."""
     import re
 
-    from .mesh_utils import mesh_cell_region_membership, p1_cells_dict
+    from .mesh_utils import mesh_cell_region_membership
 
     mesh = domain.mesh
     regions = mesh_cell_region_membership(mesh, int(domain.dimension))
@@ -1220,8 +1234,8 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     unknown = [m for m in medium_regions if m not in regions]
     if unknown:
         raise ValueError(f"d.irradiation: {unknown} are not volume regions of this mesh; known: {sorted(regions)}.")
-    tri = np.asarray(p1_cells_dict(mesh)["triangle"])
-    nodes = {m: set(np.unique(tri[regions[m]]).tolist()) for m in medium_regions}
+    cells2, _cell_type = _area_cells(mesh)
+    nodes = {m: set(np.unique(cells2[regions[m]]).tolist()) for m in medium_regions}
 
     # connected media: regions sharing a node belong to one medium
     parent = {m: m for m in medium_regions}
@@ -1262,8 +1276,8 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
                 neighbours[tuple(g)].add(a)
 
     # a medium must be closed: its cells may touch the domain boundary only on the axis (axisymmetric)
-    edges = np.sort(np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]]), axis=1)
-    owner = np.tile(np.arange(len(tri)), 3)
+    i0, i1, owner = _cell_edges(cells2)
+    edges = np.sort(np.stack([i0, i1], axis=1), axis=1)
     uniq, inv, cnt = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
     bnd = cnt[inv.reshape(-1)] == 1
     pts = np.asarray(mesh.points)
@@ -1271,7 +1285,7 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     on_axis = np.all(pts[edges[:, :], 0] <= axis_tol, axis=1) if options.get("axisymmetric") else np.zeros(len(edges), bool)
     parts = []
     for g in media:
-        cells = np.zeros(len(tri), bool)
+        cells = np.zeros(len(cells2), bool)
         for m in g:
             cells |= np.asarray(regions[m])
         leak = bnd & cells[owner] & ~on_axis
