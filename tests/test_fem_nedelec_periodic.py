@@ -166,3 +166,44 @@ def test_edges_on_tag_matches_on_a_real_mesh():
         ids = np.flatnonzero(np.abs(pts[:, 0] - lo_hi) < 1e-9)
         assert ids.size > 0
         assert np.array_equal(_edges_on_tag(ev, ids), _edges_on_tag_reference(ev, ids))
+
+
+def test_periodic_remesh_pairs_each_face_piece_with_its_own_partner():
+    """A side face split into several surfaces (a stack of layers, each its own region) is made periodic
+    surface by surface: each secondary piece is meshed as the translate of the main piece it lands on.
+    gmsh pairs the two lists by POSITION, so they must be matched by geometry first -- an arbitrary order
+    failed ("No corresponding point ... for periodic connection") as soon as the stack had four layers."""
+    Bx = jno.shape.box
+    P = 0.8
+    d = (
+        (
+            Bx(0.3, 0.3, 0, 0.5, 0.5, 0.2).name("hole").size(0.1)
+            + Bx(0, 0, 0, P, P, 0.05).name("skin").size(0.08)
+            + Bx(0, 0, 0, P, P, 0.2).name("film")
+            + Bx(0, 0, -0.3, P, P, 0).name("below")
+            + Bx(0, 0, 0.2, P, P, 0.5).name("above")
+        )
+        .sized(0.2)
+        .domain()
+    )
+    e = 1e-6
+    for nm, f in {
+        "left": lambda x, y, z: x < e,
+        "right": lambda x, y, z: x > P - e,
+        "front": lambda x, y, z: y < e,
+        "back": lambda x, y, z: y > P - e,
+    }.items():
+        d.tag(nm, f)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+
+    def face(nm):
+        cc = d.variable(nm, split=True)
+        return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+    vol = inner(u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)) + inner(
+        u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    )
+    fem = jno.fem([vol, face("left") - face("right"), face("front") - face("back")])
+    per = fem._periodic
+    assert per is not None and per["n_red"] < per["n_full"]
