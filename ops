@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794351263,"nonce":"gitcJIPYBV+1lZYWwwhGhZif+T4=","added":["branch:feat/stiff-time-integration","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794351263,"nonce":"AZ7nEHep5izH8ocmTFFNLzjZCfU=","message":"Fixed in 7fbee7a8; test: tests/test_fem_bdf.py::test_bdf_refuses_a_second_order_in_time_block","files":null}]}
