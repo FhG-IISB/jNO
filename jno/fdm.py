@@ -3233,6 +3233,17 @@ class _TraceFDM:
                 "march is a DAE — its boundary rows are algebraic constraints with zero mass. Use a "
                 "θ-scheme: jno.solve.theta(0.5) (Crank–Nicolson) or the backward-Euler default."
             )
+        if (
+            nonlinear is None
+            and (linear is not None or precond is not None)
+            and block.is_nonlinear()
+            and not getattr(time, "needs_linear_step", False)
+        ):
+            # A FRESH assembled tangent per Newton iteration, not the composer's kept one
+            # (`newton(reuse=True)`): an FDM tangent is cheap to assemble, and a kept one costs extra
+            # iterations on a stiff reaction (measured, a Brusselator march: slower than refreshing it).
+            # A linearly implicit scheme (Rosenbrock) takes no Newton, so it is left to the composer.
+            nonlinear = _solve.newton(direct=True)
         steppers = (None, None)
         if linear is not None or precond is not None or nonlinear is not None:
             steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
@@ -3310,7 +3321,8 @@ class _TraceFDM:
                 )
                 # The block carries its assembled tangent, so the per-step Newton uses it (as the steady
                 # solve does): a matrix-free JVP has no diagonal for jacobi, nor a matrix for amg or lu.
-                nonlinear = nonlinear or _solve.newton(direct=True)
+                # The default Newton is filled in by `_run_block`, which knows the scheme: none for a linearly
+                # implicit one (Rosenbrock), which would refuse it.
                 if self._time_order == 1:
                     with jax.ensure_compile_time_eval():
                         linear = self._newton_linear(linear, "march", lambda: frozen, state0)
