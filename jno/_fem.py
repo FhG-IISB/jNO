@@ -1252,8 +1252,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
         return _normalize_quad_tag(tag, _bregions)
 
     def _is_across(tag) -> bool:
-        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
-        return isinstance(tag, str) and tag.startswith("across_")
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on; a face
+        # operator's symbol `S(trace)` (`faceop_*`) belongs to the face its trace is bound to
+        return isinstance(tag, str) and tag.startswith(("across_", "faceop_"))
 
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
@@ -1416,7 +1417,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_", "faceop_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -7886,6 +7887,8 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # a face operator (`jno.np.sqrtm(L)`) reads the Bloch phase of the ties across its face
+    domain._faceop_ties = list(periodic_ties)
     # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
     # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
     # off before classification -- neither names a region the classifier could read.
@@ -8651,8 +8654,9 @@ def _fem_impl(
     # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
     # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
     # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    # A face operator `jno.np.sqrtm(L)(trace)` (`faceop_*`, a dense block over one face) is assembled there too.
     _reads_across = any(
-        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith(("across_", "faceop_"))
         for c in constraints
         for n in _walk(_bare(c))
     )
