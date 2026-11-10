@@ -300,8 +300,9 @@ class _Sol:
         smi = fm.stack_s_matrices_interior(self._layers, self._thick)
         amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
         efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
-        E = np.asarray(efield)  # (3, nx, ny, nz, 1)
-        return np.sum(np.abs(E) ** 2, axis=0)[..., 0], np.asarray(x), np.asarray(y), np.asarray(z)
+        # JAX all the way: |E|^2 stays differentiable in the design (permittivity grids), so it can feed a
+        # coupled objective (absorbed power -> heat). NumPy callers (plotting) accept the JAX array as is.
+        return jnp.sum(jnp.abs(efield) ** 2, axis=0)[..., 0], x, y, z  # efield: (3, nx, ny, nz, 1)
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
@@ -313,7 +314,7 @@ class _Sol:
 
         See :meth:`field3d` for the whole volume rather than one slice."""
         inten, _x, y, z = self._field_volume(nx=nx, density=density)
-        j = int(np.argmin(np.abs(y[0, :] - y_frac * self._period[1])))
+        j = int(jnp.argmin(jnp.abs(y[0, :] - y_frac * self._period[1])))
         slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
         zc = z.reshape(-1)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
@@ -328,9 +329,10 @@ class _Sol:
         unit-thick slabs (see :meth:`field`), so ``z`` starts at 0 at the top of the superstrate, not at
         any coordinate of the authored geometry — ``layer_z`` gives the interfaces in the same frame.
 
-        NumPy, like :meth:`field`: this is the visualisation path. A differentiable ``|E|²`` for a
-        coupled (e.g. thermal) objective needs the JAX-valued volume, which this deliberately does not
-        return — see the roadmap in ``docs/rcwa.md``."""
+        A JAX array, differentiable in the design (the layers' permittivity grids): ``jax.grad`` of a
+        functional of it (e.g. the absorbed power ``½ ω ε₀ Im ε |E|²`` heating a coupled thermal solve) flows
+        back through the interior-field reconstruction and the modal solve. The grid sizes (``nx``, the
+        per-layer ``nz`` from ``density``) and the layer thicknesses are static."""
         inten, x, y, z = self._field_volume(nx=nx, density=density)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return inten, (x[:, 0], y[0, :], z.reshape(-1)), layer_z

@@ -682,3 +682,58 @@ def test_detect_layers_measures_between_interfaces():
     # a locator gets heights inside the two neighbouring layers and returns the interface between them
     exact = lambda lo, hi: 0.312 if hi < 0.6 else 0.648  # noqa: E731
     assert detect_layers(E, z, locate=exact)[1][0] == pytest.approx(0.336, abs=1e-12)
+
+
+def _absorbed_fraction(sol, im_eps, nx=8, density=200.0):
+    """Absorbed fraction of the incident power, from the interior field: (1/2) k0 Im eps |E|^2 over the
+    patterned layer (layer 1), trapezoid in z (each layer's samples include both of its ends)."""
+    import jax.numpy as jnp
+
+    inten, (_x, _y, z), lz = sol.field3d(nx=nx, density=density)
+    z = np.asarray(z)
+    zin = (z >= lz[0] - 1e-12) & (z <= lz[1] + 1e-12)
+    prof = jnp.mean(im_eps * inten[:, :, zin], axis=(0, 1))
+    k0 = 2 * np.pi / WL
+    return 0.5 * k0 * jnp.trapezoid(prof, jnp.asarray(z[zin])) / sol._Pin
+
+
+@needs_fmmax
+def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
+    """Energy balance through the interior field: the power absorbed in a uniform lossy slab,
+    (1/2) k0 Im eps integral |E|^2 dV per unit incident power, equals 1 - R - T of the same solve."""
+    from jno.rcwa import Rcwa
+
+    eps = 2.0 + 0.5j
+    layers = [(0.5, 1.0), (0.2, eps * np.ones((24, 24))), (0.5, 2.25)]
+    sol = Rcwa(layers, period=(0.6, 0.6), orders=9, wavelength=WL, assume_periodic=True).solve()
+    absorbed = float(_absorbed_fraction(sol, eps.imag))
+    balance = 1.0 - float(sol.efficiency("R")) - float(sol.efficiency("T"))
+    assert 0.1 < balance < 0.9
+    assert absorbed == pytest.approx(balance, rel=1e-3)
+
+
+@needs_fmmax
+def test_field3d_is_differentiable_in_the_design():
+    """field3d returns a JAX |E|^2: jax.grad of the absorbed power in a patterned lossy layer w.r.t. the
+    layer's loss matches a central finite difference."""
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa
+
+    P, ng = 0.6, 24
+    xs = (np.arange(ng) + 0.5) / ng * P
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    disk = jnp.asarray((((X - P / 2) ** 2 + (Y - P / 2) ** 2) < 0.18**2) * 1.0)
+    stack = lambda a: [(0.5, 1.0), (0.2, 1.0 + (3.0 + 1j * a) * disk), (0.5, 2.25)]  # noqa: E731
+    rc = Rcwa(stack(1.0), period=(P, P), orders=9, wavelength=WL, assume_periodic=True)
+
+    def absorbed(a):
+        sol = rc.solve(layers=stack(a))
+        inten, _xyz, _lz = sol.field3d(nx=ng, density=100.0)
+        return jnp.sum(a * disk[:, :, None] * inten)
+
+    g = float(jax.grad(absorbed)(1.0))
+    h = 1e-4
+    fd = float((absorbed(1.0 + h) - absorbed(1.0 - h)) / (2 * h))
+    assert np.isfinite(g) and g != 0.0
+    assert g == pytest.approx(fd, rel=1e-5)
