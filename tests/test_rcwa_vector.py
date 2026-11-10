@@ -110,7 +110,7 @@ def _vector_constraints():
     return [
         inner(cu, cv) - K0**2 * eps * inner(ui, vi),  # vector Maxwell volume
         1j * K0 * inner(tut, tvt),  # absorbing top
-        1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),  # absorbing bottom + incident
+        1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),  # absorbing bottom + incident
         face("left") - face("right"),  # Floquet ties
         face("front") - face("back"),
     ]
@@ -204,7 +204,7 @@ def _vector_inverse_rc():
         [
             inner(cu, cv) - K0**2 * eps * inner(ui, vi),
             1j * K0 * inner(tut, tvt),
-            1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+            1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),
             face("left") - face("right"),
             face("front") - face("back"),
         ],

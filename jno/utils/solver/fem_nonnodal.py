@@ -1287,10 +1287,11 @@ def assemble_fem_nonnodal(
                 # host-assembled patterns (those walk boundary facets only)
                 if region in _body_owned or _reads_across(sub_w):
                     gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
-                elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None:
+                elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None and mass[1] == region:
                     surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
-                elif dim == 3 and (load := _n1e_surface_load_spec(sub_w)) is not None:
-                    incident_terms.setdefault(region, []).append(_signed(load[0], sign))
+                elif dim == 3 and (load := _n1e_surface_load_spec(sub_w)) is not None and load[1] == region:
+                    # a trial-free term enters b as -term, like every other source (the list sums to zero)
+                    incident_terms.setdefault(region, []).append(_signed(load[0], -sign))
                 elif _legacy_natural(sub_w, field_index, spaces):
                     pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
                 else:  # anything else: the general boundary-integrand path
@@ -1363,7 +1364,7 @@ def assemble_fem_nonnodal(
         else None
     )
 
-    def _incident_of(params):  # N1E incident forcing ∫ g·(n×v) → b
+    def _incident_of(params):  # N1E trial-free surface term: b gets -∫ g·(v×n)
         if not incident_terms:
             return jnp.zeros(total)
         return _assemble_n1e_surface_load(total, _inc_static, params=params)
@@ -2552,6 +2553,25 @@ def _build_general_surface(
     return groups
 
 
+def _n1e_tangential_cross(x, which):
+    """``x`` is the tangential trace ``cross(f, n)`` or ``cross(n, f)`` of the field ``f`` (a bare ``which``
+    -- TrialFunction or TestFunction -- instance) with a boundary-normal Variable ``n_<region>``: return
+    ``(sign, region)``, ``+1`` for ``f×n`` (what the host surface assembly integrates) and ``-1`` for
+    ``n×f = -f×n``. ``None`` for anything else (another vector, a curl, a nested cross), which then goes
+    to the general boundary path that evaluates the integrand as written."""
+    from ..._fem import _is_normal_variable
+    from ...trace import FunctionCall
+
+    if not (isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2):
+        return None
+    a, b = x.args
+    if isinstance(a, which) and _is_normal_variable(b):
+        return 1.0, b.tag[2:]
+    if isinstance(b, which) and _is_normal_variable(a):
+        return -1.0, a.tag[2:]
+    return None
+
+
 def _n1e_surface_mass_spec(bare):
     """Recognise a tangential-trace surface-mass boundary term ``[c *] inner(n×u, n×v)`` (the natural
     N1E impedance / first-order absorbing BC for Maxwell) → a 1-tuple ``(coeff_node,)`` (``coeff_node``
@@ -2579,25 +2599,25 @@ def _n1e_surface_mass_spec(bare):
     if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
         return None
 
-    def _is_cross(x, which):
-        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, which)
-
     a0, a1 = node.args
-    ok = (_is_cross(a0, TrialFunction) and _is_cross(a1, TestFunction)) or (
-        _is_cross(a0, TestFunction) and _is_cross(a1, TrialFunction)
-    )
-    if not ok:
+    tu = _n1e_tangential_cross(a0, TrialFunction) or _n1e_tangential_cross(a1, TrialFunction)
+    tv = _n1e_tangential_cross(a1, TestFunction) or _n1e_tangential_cross(a0, TestFunction)
+    if tu is None or tv is None or tu[1] != tv[1]:  # both traces, on the same face's normal
         return None
+    if tu[0] * tv[0] < 0:  # (n×u)·(v×n) = -(u×n)·(v×n): one reversed cross flips the term
+        coeff = Literal(-1.0) if coeff is None else (-1.0) * coeff
     if wrap is not None:  # fold the leg's Re/Im into the coefficient: Re(i·k₀)=0, Im(i·k₀)=k₀
         base = coeff if coeff is not None else Literal(1.0)
         coeff = base.real if wrap == "real" else base.imag
-    return (coeff,)
+    return (coeff, tu[1])
 
 
 def _n1e_surface_load_spec(bare):
-    """Recognise an N1E incident/forcing surface term ``inner(g, n×v)`` (trial-FREE, into ``b``) → a
-    1-tuple ``(g_node,)`` (the prescribed tangential source, e.g. the incident wave ``2 i k₀ E_inc``);
-    ``None`` otherwise. Distinct from the bilinear impedance mass (which carries the trial as well)."""
+    """Recognise an N1E trial-free surface term ``[c *] inner(g, v×n)`` (or ``n×v``, with its sign) → a
+    1-tuple ``(g_node,)`` with ``∫ g·(v×n)`` the term as written; ``None`` otherwise. ``g`` may read the
+    face normal: the incident source of an absorbing face is ``inner(cross(E_inc, n), v×n) = E_inc,t·v_t``.
+    The cross must be the bare test function with the face's normal Variable; any other form goes to the
+    general boundary path. Distinct from the bilinear impedance mass (which carries the trial as well)."""
     from ..._fem import _contains
     from ...trace import BinaryOp, FunctionCall, TestFunction, TrialFunction
 
@@ -2616,21 +2636,20 @@ def _n1e_surface_load_spec(bare):
     if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
         return None
 
-    def _cross_test(x):
-        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, TestFunction)
-
     a0, a1 = node.args
-    if _cross_test(a0) and _source(a1):
-        g = a1
-    elif _cross_test(a1) and _source(a0):
+    if (tv := _n1e_tangential_cross(a1, TestFunction)) is not None and _source(a0):
         g = a0
+    elif (tv := _n1e_tangential_cross(a0, TestFunction)) is not None and _source(a1):
+        g = a1
     else:
         return None
-    if coeff is not None:  # fold the scalar coefficient into the source: c·inner(g, n×v) = inner(c·g, n×v)
+    if coeff is not None:  # fold the scalar coefficient into the source: c·inner(g, v×n) = inner(c·g, v×n)
         g = coeff * g
+    if tv[0] < 0:  # inner(g, n×v) = -inner(g, v×n)
+        g = (-1.0) * g
     if wrap is not None:  # complex leg split: Re/Im of the (complex) source
         g = g.real if wrap == "real" else g.imag
-    return (g,)
+    return (g, tv[1])
 
 
 def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim, dofmaps=None):
@@ -2741,7 +2760,7 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
     in ONE batched op instead of one per face.
 
     Returns ``(groups, fqw)`` with ``groups = [(coeff_node, gdofs(n,n_dof), tens(n,nq,...), xq(n,nq,3),
-    measure(n,)), ...]``."""
+    measure(n,), normals(n,nq,3)), ...]``."""
     from .fem_1d import _region_node_ids
 
     fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges, dm = _n1e_surface_precompute(
@@ -2762,15 +2781,24 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
         else:
             tens = np.cross(phi, nhat[:, None, None, :])  # φ_a × n (the authored `v.vector.cross(nvec)`)
         gdofs = np.asarray(offs[fidx] + np.asarray(cell_edges)[c], dtype=np.int64)
+        nq_ = xq.shape[1]
         for node in nodes:
-            g = groups.setdefault(id(node), [node, [], [], [], []])
+            g = groups.setdefault(id(node), [node, [], [], [], [], []])
             g[1].append(gdofs)
             g[2].append(tens)
             g[3].append(xq)
             g[4].append(measure)
+            g[5].append(np.broadcast_to(nhat[:, None, :], (nhat.shape[0], nq_, nhat.shape[1])))
     out = [
-        (node, np.concatenate(gd), np.concatenate(tn), np.concatenate(xq), np.concatenate(ms).astype(float))
-        for node, gd, tn, xq, ms in groups.values()
+        (
+            node,
+            np.concatenate(gd),
+            np.concatenate(tn),
+            np.concatenate(xq),
+            np.concatenate(ms).astype(float),
+            np.concatenate(nr),
+        )
+        for node, gd, tn, xq, ms, nr in groups.values()
     ]
     return out, fqw
 
@@ -2790,13 +2818,14 @@ def _assemble_n1e_surface_mass(total, static, params=None, sparse=False):
         return None if sparse else jnp.zeros((total, total))
     nq = len(fqw)
     rows_l, cols_l, data_l = [], [], []
-    for node, gd, tn, xq, ms in groups:
+    for node, gd, tn, xq, ms, nr in groups:
         n = gd.shape[0]
         pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
+        nrm_flat = jnp.asarray(nr).reshape(-1, nr.shape[-1])
         cval = (
             jnp.ones((n, nq))
             if node is None
-            else _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq)
+            else _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params, normals=nrm_flat), n, nq)
         )
         wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None] * cval  # (n, nq) quad weight x measure x c
         blk = jnp.einsum("nq,nqab->nab", wq, jnp.asarray(tn))  # (n, 6, 6) element surface-mass blocks
@@ -2814,8 +2843,8 @@ def _assemble_n1e_surface_mass(total, static, params=None, sparse=False):
 
 
 def _assemble_n1e_surface_load(total, static, params=None):
-    """Tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)`` RHS of the
-    Silver-Müller ABC) as a ``(total,)`` load to ADD to ``b``. Pure JAX over the host-static structure,
+    """Trial-free surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (``inner(g, v×n)``) as a ``(total,)`` vector to ADD to
+    ``b``; the caller hands in ``g`` already negated, so ``b`` gets ``-term`` like every other source. Pure JAX over the host-static structure,
     so a runtime parameter in ``g`` stays differentiable (inverse design of an incident source)."""
     from ..._fem import _eval_value_node_at
 
@@ -2824,10 +2853,11 @@ def _assemble_n1e_surface_load(total, static, params=None):
         return jnp.zeros(total)
     nq = len(fqw)
     idx_l, val_l = [], []
-    for node, gd, tn, xq, ms in groups:
+    for node, gd, tn, xq, ms, nr in groups:
         n = gd.shape[0]
         pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
-        gval = _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq, comp=3)
+        nrm_flat = jnp.asarray(nr).reshape(-1, nr.shape[-1])
+        gval = _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params, normals=nrm_flat), n, nq, comp=3)
         integrand = jnp.einsum("nqi,nqai->nqa", gval, jnp.asarray(tn))  # g·(φ_a×n)
         wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None]  # (n, nq)
         idx_l.append(jnp.asarray(gd).reshape(-1))
@@ -3413,8 +3443,8 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     count, fcell, flocal = facet_owners(dm)
     normals = facet_outward_normals(dm, pts_np, cells, fcell, flocal)
 
-    def _g(X, comp):
-        v = np.asarray(_eval_value_node_at(value_node, jnp.asarray(X)))
+    def _g(X, comp, N):  # N: the facet's outward normal at X, read by a normal Variable inside the value
+        v = np.asarray(_eval_value_node_at(value_node, jnp.asarray(X), normals=jnp.asarray(N)))
         if np.iscomplexobj(v):
             if np.abs(v.imag).max() > 0.0:
                 raise NotImplementedError(
@@ -3439,22 +3469,22 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     if kind == "value":
 
         def fn(X, N):
-            return _g(X, 1)
+            return _g(X, 1, N)
 
     elif kind == "normal":
 
         def fn(X, N):
-            return _g(X, 1) * N
+            return _g(X, 1, N) * N
 
     elif tdim == 2:
 
         def fn(X, N):  # u×n = u_x n_y - u_y n_x = g  <=  u = g·(n_y, -n_x)
-            return _g(X, 1) * np.stack([N[:, 1], -N[:, 0]], axis=1)
+            return _g(X, 1, N) * np.stack([N[:, 1], -N[:, 0]], axis=1)
 
     else:
 
         def fn(X, N):  # u×n = g  <=  u_tan = n×g
-            return np.cross(N, _g(X, 3))
+            return np.cross(N, _g(X, 3, N))
 
     dofs, vals = interpolate_tasks(dm, pts_np[:, :tdim], cells, tasks, fn, normals=normals)
     return [(int(base + d_), float(v_)) for d_, v_ in zip(dofs, vals)]

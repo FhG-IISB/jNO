@@ -1348,27 +1348,31 @@ def _extract_source_coeff(term):
     test factor, distribute the coefficient into additive terms, and keep those with no trial. Returns the
     source expression (an evaluable coefficient), or None if the term carries no forcing (e.g. a purely
     absorbing boundary ``-i k0 u v``)."""
+    from jno.jnp_ops import cross as jno_cross
     from jno.trace import FunctionCall, TestFunction
 
-    def _vector_load_source(f):  # a factor `inner(g, n×v)` (trial-free g) -> the source g; else None
+    def _vector_load_source(f):
+        """A factor ``inner(g, v×n)`` (trial-free ``g``) -> the tangential forcing it applies, ``n×g`` (so
+        ``inner(cross(E_inc, n), v×n)`` gives ``E_inc,t``, the incident polarization); ``n×v`` flips the
+        sign. ``None`` for any other factor."""
+        from jno.utils.solver.fem_nonnodal import _n1e_tangential_cross
+
         if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
             return None
         a0, a1 = f.args
-
-        def _cross_test(x):
-            return isinstance(x, FunctionCall) and getattr(x, "_name", None) == "cross" and _contains_test(x)
-
-        if _cross_test(a0) and not (_contains_trial(a1) or _contains_test(a1)):
-            return a1
-        if _cross_test(a1) and not (_contains_trial(a0) or _contains_test(a0)):
-            return a0
+        for g, tr in ((a0, a1), (a1, a0)):
+            tv = _n1e_tangential_cross(tr, TestFunction)
+            if tv is not None and not (_contains_trial(g) or _contains_test(g)):
+                nvar = tr.args[1] if tv[0] > 0 else tr.args[0]
+                force = jno_cross(nvar, g)
+                return force if tv[0] > 0 else (-1.0) * force
         return None
 
     expr = getattr(term, "expr", term)
     parts = []
     for tsign, summand in _add_split(expr):
         fac = _mul_factors(summand)
-        # vector Maxwell incident source: a factor inner(g, n×v); source = (other factors) · g
+        # vector Maxwell incident source: a factor inner(g, v×n); source = (other factors) · n×g
         vinner = next((f for f in fac if _vector_load_source(f) is not None), None)
         if vinner is not None:
             part = _vector_load_source(vinner)
@@ -1395,7 +1399,7 @@ def _kin_from_source(src_coeff, period, z0, params):
     """Transverse wavevector k_in = ∇⊥(phase) of the incident wave, read from the source coefficient by a
     small phase difference across the illuminated face -- differentiable in a source ANGLE parameter.
 
-    Works for a scalar source (Helmholtz) and a VECTOR source (Maxwell, ``inner(g, n×v)``): a plane wave is
+    Works for a scalar source (Helmholtz) and a VECTOR source (Maxwell, ``inner(cross(E_inc, n), v×n)``): a plane wave is
     ``E_inc·e^{i k⊥·r}``, so every component carries the same transverse phase — read it off the dominant
     component (avoids the N1E edge-sign corruption that a b-based read suffers)."""
     dx, dy = period[0] * 1e-3, period[1] * 1e-3
@@ -1658,6 +1662,25 @@ def _bary_weights(node_coords, grid_pts):
     return nodes, w
 
 
+def _flat_face_normal(domain, tag):
+    """Outward unit normal of the flat boundary face ``tag``: the normal of the plane through its points
+    (least squares), pointing away from the mesh centroid. Raises if the face is not flat."""
+    fp = np.asarray(_boundary_points(domain, tag), dtype=float)
+    c = fp.mean(0)
+    _, sv, vt = np.linalg.svd(fp - c, full_matrices=False)
+    if sv[-1] > 1e-8 * max(1.0, sv[0]):
+        raise RcwaError(f"the source reads the normal of face {tag!r}, which is not flat.")
+    n = vt[-1]
+    return n if np.dot(c - np.asarray(domain.mesh.points, dtype=float)[:, : len(n)].mean(0), n) > 0 else -n
+
+
+def _boundary_points(domain, tag):
+    br = getattr(domain, "_boundary_regions", {}).get(tag)
+    if br is None or len(getattr(br, "points", [])) == 0:
+        raise RcwaError(f"boundary region {tag!r} has no points; cannot locate it.")
+    return br.points
+
+
 def _eval_coeff_points(coeff_node, pts, params):
     """Evaluate the permittivity coefficient at ``pts``, substituting trainable parameters from
     ``params`` (jax values). Returns a JAX array -- differentiable in the design parameters."""
@@ -1672,8 +1695,17 @@ def _eval_coeff_points(coeff_node, pts, params):
         if name is not None and name in params:
             mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
         table[mc.model.layer_id] = mod
-    tags = {v.tag for v in _walk_nodes(coeff_node) if isinstance(v, Variable)}
-    ctx = {t: jnp.asarray(pts) for t in tags} if tags else {}
+    from jno._fem import _is_normal_variable
+
+    pts = jnp.asarray(pts)
+    ctx = {}
+    for v in _walk_nodes(coeff_node):
+        if not isinstance(v, Variable) or v.tag in ctx:
+            continue
+        if _is_normal_variable(v):  # a source on a flat ambient face reads its (constant) outward normal
+            ctx[v.tag] = jnp.broadcast_to(jnp.asarray(_flat_face_normal(v._domain, v.tag[2:])), (pts.shape[0], 3))
+        else:
+            ctx[v.tag] = pts
     return TraceEvaluator(table).evaluate(coeff_node, context=ctx)
 
 
@@ -1970,7 +2002,7 @@ def _build_emitter_problem(
 
 
 def _source_jones(src_coeff, period, z0, params):
-    """The incident transverse Jones vector ``(E_x, E_y)`` of a VECTOR source (``inner(E_inc, n×v)``), or
+    """The incident transverse Jones vector ``(E_x, E_y)`` of a VECTOR source (``inner(cross(E_inc, n), v×n)``), or
     None for a scalar one. Read at the face centre; the plane-wave phase is common to every component."""
     pt = np.array([[period[0] * 0.5, period[1] * 0.5, z0]])
     v = np.asarray(_eval_coeff_points(src_coeff, pt, params)).reshape(-1)

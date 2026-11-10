@@ -2045,7 +2045,9 @@ def _refuse_stale_position(variables, where="a condition's value"):
             )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
+def _eval_value_node_at(
+    value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False, normals: Any = None
+) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -2066,10 +2068,22 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
     with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
     a constant. A matrix-valued condition therefore needs this.
+
+    ``normals`` ``(n_points, gdim)`` is the outward unit normal at ``points``, read by a boundary-normal
+    Variable ``n_<region>`` (``domain.variable(region, normals=True)``) inside the value -- a source
+    ``cross(E_inc, n)`` on a face. Without it such a value raises: the normal is not a function of the
+    point, and handing it the coordinates (what every other tag reads) gives a silently wrong vector.
     """
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    normal_tags = {v.tag for v in variables if _is_normal_variable(v)}
+    if normal_tags and normals is None:
+        raise ValueError(
+            f"jno.fem: a value or source reads the boundary normal ({sorted(normal_tags)}) where only the point "
+            "coordinates are known, so it cannot be evaluated. Write the value without the normal (for a flat "
+            "face, the constant normal vector), or as a boundary term the face assembly evaluates."
+        )
     _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
@@ -2079,8 +2093,9 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             "condition and in an initial condition (read at the start time); anywhere else write it without "
             "the time variable."
         )
-    tags = {v.tag for v in variables} - temporal
+    tags = {v.tag for v in variables} - temporal - normal_tags
     pts = jnp.atleast_2d(jnp.asarray(points))
+    nrm = None if normals is None else jnp.reshape(jnp.asarray(normals), (pts.shape[0], -1))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
     # it, so the coefficient stays differentiable in the design variable; else use the stored module
@@ -2105,18 +2120,32 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             table[m.layer_id] = mod
     if pointwise:
 
-        def _at(p):
+        def _at(p, nv):
             ctx = {tag: p[None, :] for tag in tags}
             for tag in temporal:
                 ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            for tag in normal_tags:
+                ctx[tag] = nv[None, :]
             return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
 
-        vals = jax.vmap(_at)(pts)
+        vals = jax.vmap(_at)(pts, pts if nrm is None else nrm)
         return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
+    for tag in normal_tags:
+        context[tag] = nrm
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
     return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
+
+
+def _is_normal_variable(v: Any) -> bool:
+    """Is ``v`` a boundary-normal Variable ``n_<region>`` (``domain.variable(region, normals=True)``)?"""
+    tag = getattr(v, "tag", None)
+    if not (isinstance(tag, str) and tag.startswith("n_")):
+        return False
+    dom = getattr(v, "_domain", None)
+    names = set(getattr(dom, "_boundary_regions", {}) or {}) | set(getattr(dom, "context", {}) or {})
+    return dom is None or tag[2:] in names
 
 
 def _coord_value_fn(value_node: Any) -> Callable:

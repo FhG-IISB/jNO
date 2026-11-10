@@ -60,7 +60,7 @@ def _common(d):
 
     bcs = [
         1j * K0 * inner(tut, tvt),
-        1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+        1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),
         face("left") - face("right"),
         face("front") - face("back"),
     ]
