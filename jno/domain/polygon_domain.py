@@ -1641,6 +1641,25 @@ class PolygonDomain(domain):
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag
             reverse_normals: If True, flip the sign of the normal vectors
+            follow_normals: If True, the normal is the **deformed** surface's normal, recomputed from
+                ``x = X + u`` each time the residual is evaluated, instead of the reference surface's.
+                That is the difference between a **dead** load and a **follower** load: gravity still
+                points down after a body tips over (reference), while pressure stays perpendicular to
+                the skin however the skin moves (deformed). Contact belongs with pressure — the contact
+                force is normal to the surfaces that are actually touching.
+
+                **Use it with finite-strain kinematics, not with** ``sym(grad u)``. The reference and
+                deformed normals differ by ``O(theta)`` for a surface rotation ``theta``, and that is
+                exactly the regime where the small-strain measure also fails: ``sym(grad u)`` is not
+                rotation invariant, so a pure rotation manufactures ``cos(theta) - 1`` of strain out of
+                nothing. Measured on a sheet-forming march at 38 degrees, ``||sym(grad u)|| = 0.300``
+                against a Green-Lagrange strain of ``1.9e-17``. Following the normal there buys a better
+                force *direction* applied to a materially wrong *stress*, which is worse than either
+                mistake alone because it looks more correct. Write ``F = I + grad u``,
+                ``E = (F^T F - I)/2`` and a PK stress, and then follow the normal.
+
+                It makes the form **nonlinear**: the traction direction now depends on the solution, so
+                a form that assembles as ``linear`` without it needs a Newton solve with it.
             view_factor: If True, also compute the diffuse view-factor matrix of this boundary point set
                 (and its visibility matrix), stored as the tensor tags ``f_<tag>`` and ``v_<tag>``. Not
                 supported on batched domains.
@@ -1651,6 +1670,8 @@ class PolygonDomain(domain):
             return_indices: Whether to also return the indices of the selected mesh points.
             time_value: For a time-dependent domain, the time at which an ``"initial"`` or fixed-time
                 slice is taken (default: the start time).
+            region: With ``where=``, restrict the new tag to one body or region -- the way to pick a
+                single side of a non-conforming interface.
 
         Returns:
             For point sets: Tuple of Variable placeholders, one per dimension.
