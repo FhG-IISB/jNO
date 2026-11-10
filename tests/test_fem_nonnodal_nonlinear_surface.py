@@ -144,3 +144,58 @@ def test_the_newton_tangent_carries_the_surface_block():
     J = np.asarray(op.jacobian(u0).todense())
     J_ad = np.asarray(jax.jacfwd(op.residual)(u0))
     np.testing.assert_allclose(J, J_ad, rtol=0, atol=1e-9 * np.abs(J_ad).max())
+
+
+def _periodic_joule():
+    """N1E E + P1 T with a Joule source, tied periodic in x and y: a multi-field reduction whose N1E block
+    is not a plain selection."""
+    d = jno.shape.box(0, 0, 0, 1, 1, 1).sized(0.5).domain()
+    e = 1e-6
+    for nm, f in {
+        "bottom": lambda x, y, z: z < e,
+        "left": lambda x, y, z: x < e,
+        "right": lambda x, y, z: x > 1 - e,
+        "front": lambda x, y, z: y < e,
+        "back": lambda x, y, z: y > 1 - e,
+    }.items():
+        d.tag(nm, f)
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    E, v = d.fem_symbols(value_shape=(3,), names=("E", "v"), space="N1E")
+    T, s = d.fem_symbols(names=("T", "s"), space="Lagrange")
+    Eb, vb, Tb, sb = (f.bind(x=xi, y=yi, z=zi) for f in (E, v, T, s))
+
+    def on(n, f):
+        return f.bind(**dict(zip("xyz", d.variable(n, split=True)[:3])))
+
+    ties = [on("left", f) - on("right", f) for f in (E, T)] + [on("front", f) - on("back", f) for f in (E, T)]
+    fem = jno.fem(
+        [
+            inner(E.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi))
+            + inner(Eb, vb)
+            - inner(vec(1.0 + 0 * xi, 0 * xi, 0 * xi), vb),
+            inner(jno.np.grad(Tb, [xi, yi, zi]), jno.np.grad(sb, [xi, yi, zi]), n_contract=1) - inner(Eb, Eb) * sb,
+            on("bottom", T) - 0.0,
+            *ties,
+        ]
+    )
+    return d, fem, T, on
+
+
+def test_a_periodic_multifield_tangent_stays_sparse_inside_the_newton_trace():
+    """P^T J P is formed inside the traced Newton body. Without the block-diagonal P cached while the
+    prolongations are concrete it fell onto the dense n x n path, and the Dirichlet elimination that
+    follows then crashed on the dense array."""
+    from jax.experimental import sparse as jsparse
+
+    from jno.utils.solver.fem_utils import reduce_matrix_periodic
+
+    d, fem, T, on = _periodic_joule()
+    per = fem._periodic
+    J = fem.operator.jacobian(jnp.zeros(fem.operator.size))
+    red = jax.jit(lambda data: reduce_matrix_periodic(per, jsparse.BCOO((data, J.indices), shape=J.shape)))(J.data)
+    assert isinstance(red, jsparse.BCOO), type(red)
+
+    node = fem.solve(nonlinear=jno.solve.newton(direct=True))
+    crux = jno.core([node.mean], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    sol = np.asarray(crux.eval([node])).reshape(-1)
+    assert np.isfinite(sol).all() and np.abs(sol).max() > 1e-3

@@ -6086,14 +6086,7 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": red["is_bloch"],
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6148,14 +6141,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": is_bloch,
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6222,7 +6208,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
@@ -6286,7 +6272,7 @@ def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cel
         )
         off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
         off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, region: str) -> Dict[int, np.ndarray]:
@@ -6562,6 +6548,21 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
     }
 
 
+def _multifield_reduction(blocks, off_full, off_red, **extra) -> dict:
+    """The multi-field periodic reduction dict, with its block-diagonal ``P`` built HERE, while the block
+    prolongations are concrete. ``reduce_matrix_periodic`` runs inside the traced Newton body; without the
+    cached ``P_blockdiag`` a non-selection block (an N1E tie, a Bloch phase) cannot be rebuilt there, and
+    ``PᵀJP`` silently falls onto the dense ``n x n`` path -- the slip builder has cached it for that reason."""
+    from .utils.solver.fem_utils import _blockdiag_bcoo
+
+    out = {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    Pg = _blockdiag_bcoo([b["P"] for b in blocks], off_full, off_red) if len(blocks) > 1 else None
+    if Pg is not None:
+        out["P_blockdiag"] = Pg
+    out.update(extra)
+    return out
+
+
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any, exclude_dofs: Any = None
 ) -> dict:
@@ -6616,7 +6617,7 @@ def _build_periodic_reduction_multifield(
             )
             off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
             off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-        return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+        return _multifield_reduction(blocks, off_full, off_red)
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
     blocks, off_full, off_red = [], [0], [0]
@@ -6639,7 +6640,7 @@ def _build_periodic_reduction_multifield(
         blocks.append({"P": P_i, "kept": kept_i, "vec": v_i, "is_selection": sel_i})
         off_full.append(off_full[-1] + int(P_i.shape[0]))
         off_red.append(off_red[-1] + int(P_i.shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _complex_recombine(n: int):
