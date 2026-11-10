@@ -302,7 +302,7 @@ class _BDF2Scheme(_TimeScheme):
                 if _judge:
                     _verdict(np.zeros((0,)), np.zeros((0,)), 0, True, None)
                 traj = jnp.concatenate([s0[None, :], s1[None, :]], axis=0)
-                return np.asarray(_resample_trajectory(traj, grid_ts, save_ts, dtype))
+                return np.asarray(_resample_trajectory(traj, grid_ts, save_ts, dtype, self.step_order))
             return _march_to_host(
                 block,
                 args,
@@ -316,6 +316,7 @@ class _BDF2Scheme(_TimeScheme):
                 prefix_ts=grid_ts[:2],
                 prefix_states=[s0, s1],
                 judge=_verdict if _judge else None,
+                degree=self.step_order,
             )
 
         # Traced ONCE per block and configuration (see `_cached_march`): an eager BDF2 march used to re-trace
@@ -336,7 +337,7 @@ class _BDF2Scheme(_TimeScheme):
                 advice=_TRANSIENT_ADVICE,
             )
         traj = jnp.concatenate([s0[None, :], s1[None, :], ys], axis=0)
-        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype, self.step_order)
 
     def __repr__(self):
         return "jno.solve.bdf2()"
@@ -524,6 +525,7 @@ class _SDIRKScheme(_TimeScheme):
             return _march_to_host(
                 block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
                 state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0], judge=_verdict if judge else None,
+                degree=self.step_order,
             )  # fmt: skip
         ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         if judge:
@@ -541,7 +543,7 @@ class _SDIRKScheme(_TimeScheme):
                 advice=_TRANSIENT_ADVICE,
             )
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
-        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype, self.step_order)
 
     def __repr__(self):
         return f"jno.solve.sdirk(order={self.order})"
@@ -786,11 +788,11 @@ class _RosenbrockScheme(_TimeScheme):
             grid_np = np.asarray(grid_ts, dtype=float)
             return _march_to_host(
                 block, args, cfg, make_step, s0, grid_np, dtype, save_ts,
-                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0],
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0], degree=self.step_order,
             )  # fmt: skip
         ys = _split_cached_march(block, args, cfg, lambda *a: march(*a)[1], s0, grid_ts, args)
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
-        return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+        return _resample_trajectory(traj, grid_ts, save_ts, dtype, self.step_order)
 
     def __repr__(self):
         return f"jno.solve.rosenbrock(method={self.method!r})"
@@ -867,6 +869,7 @@ class _AdaptiveScheme(_TimeScheme):
             max_steps=self.max_steps,
             dt0=self.dt0,
             order=base.embedded_order if embedded is not None else base.step_order,
+            dense_degree=base.step_order,
             embedded=embedded,
             error_rows=_error_rows(block, args, u0),
         )
@@ -902,16 +905,43 @@ def _theta_order(theta: float) -> int:
     return 2 if abs(float(theta) - 0.5) < 1e-12 else 1
 
 
-def _safe_interp(x, xp, fp):
-    """Piecewise-linear interpolation that stays gradient-safe when ``xp`` has repeated (flat) values.
-    A rejected or settled adaptive step records a **duplicate** time, and ``jnp.interp`` divides by the
-    zero gap in its VJP → ``NaN``; here a flat gap contributes zero slope, so ``∂/∂fp`` stays finite."""
-    n = xp.shape[0]
-    i = jnp.clip(jnp.searchsorted(xp, x, side="right") - 1, 0, n - 2)
-    x0, x1, f0, f1 = xp[i], xp[i + 1], fp[i], fp[i + 1]
-    gap = x1 - x0
-    w = jnp.where(gap > 0, (x - x0) / jnp.where(gap > 0, gap, 1.0), 0.0)  # zero slope on a flat gap (no 0/0)
-    return f0 + w * (f1 - f0)
+def _dense_sample(save, ts, us, degree):
+    """Sample a march's stored states ``us`` (at the nondecreasing times ``ts``) at ``save``, by piecewise
+    Lagrange interpolation of ``degree`` through neighbouring DISTINCT step times (Hairer, Norsett & Wanner I,
+    Sec. II.6: a continuous extension of the method's order needs an interpolant of that order).
+
+    ``degree = 1`` is the linear blend; a scheme of order ``p`` passes ``p``, whose interpolation error
+    ``O(h^(p+1))`` stays below the step's own ``O(h^p)``. A rejected or settled adaptive attempt records a
+    DUPLICATE time; each distinct time is read at its first index, so no node repeats and no weight divides by
+    a zero gap. The weights depend only on the (``stop_gradient``-ed) times: the result is linear in ``us`` and
+    differentiable through it. Fewer distinct times than ``degree + 1`` fall back to the linear blend. Times
+    outside ``[ts[0], ts[-1]]`` are clamped to the end states, as before. The fixed-grid paths use the same
+    weights (:func:`jno.utils.solver.backend_blocks._resample_trajectory`)."""
+    from .backend_blocks import _lagrange_weights
+
+    ts = jax.lax.stop_gradient(ts)
+    m = ts.shape[0]
+    p = max(1, int(degree))
+    # rank of every stored time among the distinct ones; first stored index of every rank
+    rank = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum((ts[1:] > ts[:-1]).astype(jnp.int32))])
+    n_distinct = rank[-1] + 1
+    first = jnp.searchsorted(rank, jnp.arange(m, dtype=jnp.int32), side="left")  # rank -> index (valid below n_distinct)
+    x = jnp.clip(save, ts[0], ts[-1])
+    left = rank[jnp.clip(jnp.searchsorted(ts, x, side="right") - 1, 0, m - 1)]  # rank of the left bracket
+
+    def _sample(q):
+        """Degree-``q`` interpolant on the ``q + 1`` ranks around each save time (start clipped into range)."""
+        start = jnp.clip(left - (q - 1) // 2, 0, jnp.maximum(n_distinct - 1 - q, 0))
+        idx = first[jnp.clip(start[:, None] + jnp.arange(q + 1)[None, :], 0, n_distinct - 1)]  # (S, q+1)
+        out = 0.0
+        for j, wj in enumerate(_lagrange_weights(ts[idx], x)):
+            out = out + wj[:, None] * us[idx[:, j]]
+        return out
+
+    if p == 1:
+        return _sample(1)
+    # too few distinct times for degree p (a march of one or two steps): the linear blend
+    return jnp.where(n_distinct > p, _sample(p), _sample(1))
 
 
 def adaptive_march(
@@ -926,6 +956,7 @@ def adaptive_march(
     max_steps,
     dt0=None,
     order=1,
+    dense_degree=1,
     embedded=None,
     error_rows=None,
     safety=0.9,
@@ -951,7 +982,9 @@ def adaptive_march(
     ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march is a fixed-length
     ``lax.scan`` of ``max_steps`` attempts (rejections count) -- a static trip count, so it stays reverse
     differentiable -- where the settled tail consumes attempts without solving. The trajectory is sampled at
-    ``save_ts`` by interpolation; an exhausted budget NaN-poisons the result (raise ``max_steps``).
+    ``save_ts`` by a degree-``dense_degree`` interpolant through the accepted states (:func:`_dense_sample`;
+    the caller passes the base step's order, so output between steps keeps it); an exhausted budget
+    NaN-poisons the result (raise ``max_steps``).
 
     Rejection is differentiable because a discarded attempt's states receive an exactly ZERO cotangent, and
     the step solves return 0 for a zero right-hand side (``backend_blocks._default_step_solve``) instead of
@@ -1023,7 +1056,7 @@ def adaptive_march(
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)
-    out = jax.vmap(lambda col: _safe_interp(save, ts, col), in_axes=1, out_axes=1)(us)
+    out = _dense_sample(save, ts, us, dense_degree)
     reached = t_end >= t1 - 2.0 * dt_min  # the last real step lands within dt_min of t1 (see ``done``)
     # Fail loud if max_steps was too small -- and fail loud in the ADJOINT too. ``where(reached, out, nan)``
     # would poison only the value: the VJP of ``where`` w.r.t. its taken branch is ``where(c, g, 0)``, so an
@@ -1264,8 +1297,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
             block, args, ("exponential", order, mass, symmetric, dt), make_step, w0, grid_np, dtype, save_ts,
             state_of=to_field, prefix_ts=grid_np[:1], prefix_states=[to_field(w0)],
             cache=False,  # the step closes over the source evaluated at THIS call's args
+            degree=2,  # ETD2: second order in time
         )  # fmt: skip
     _, ws = jax.lax.scan(step, w0, grid[1:])
     traj_u = jax.vmap(to_field)(jnp.concatenate([w0[None, :], ws], axis=0))  # each row → the full field u
-    save_ts = jnp.asarray(save_ts, dtype)
-    return jax.vmap(lambda col: jnp.interp(save_ts, grid, col), in_axes=1, out_axes=1)(traj_u)
+    from .backend_blocks import _resample_trajectory
+
+    return _resample_trajectory(traj_u, grid, save_ts, dtype, 2)  # ETD2: second order in time

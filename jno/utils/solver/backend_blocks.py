@@ -937,11 +937,17 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
     return _np.concatenate(out, axis=0) if all(isinstance(o, _np.ndarray) for o in out) else jnp.concatenate(out, axis=0)
 
 
+def _theta_degree(theta):
+    """Order of the theta-step (``None`` = backward Euler): 2 at theta = 1/2 (Crank-Nicolson), else 1. The
+    interpolation degree of its off-grid output."""
+    return 2 if theta is not None and abs(float(theta) - 0.5) < 1e-12 else 1
+
+
 def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
     """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
     advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by
-    linear interpolation, so the integration step is always the assembled ``dt`` and never an
-    accident of how the output is sampled.
+    interpolation of the step's order (linear for backward Euler, quadratic for Crank-Nicolson), so the
+    integration step is always the assembled ``dt`` and never an accident of how the output is sampled.
 
     * **Linear** block -- the implicit scheme the transient assembly is built for::
 
@@ -1067,6 +1073,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
             prefix_states=[s0],
             judge=_verdict if _judge else None,
             skip_first_compare=True,  # the one-scan guard compared the produced states, not s0
+            degree=_theta_degree(theta),
         )
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
@@ -1096,7 +1103,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
         )
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
-    return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+    return _resample_trajectory(traj, grid_ts, save_ts, dtype, _theta_degree(theta))
 
 
 _PER_STEP_CALLABLES = ("forcing_vector_fn", "operator_fn", "mass_fn", "mass")
@@ -1464,12 +1471,53 @@ def _march_eagerly(args, save_ts):
     return not any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((args, save_ts)))
 
 
-def _needed_steps(grid_np, save):
+def _lagrange_weights(tn, x):
+    """Lagrange basis weights ``w[:, j] = prod_{k != j} (x - t_k)/(t_j - t_k)`` of the nodes ``tn`` (S, q+1) at
+    ``x`` (S,); a zero node gap (never produced by the callers) gives weight factor 1 instead of 0/0. Works on
+    NumPy or JAX arrays (the operations are shared)."""
+    q1 = tn.shape[1]
+    cols = []
+    for j in range(q1):
+        wj = 1.0
+        for k in range(q1):
+            if k != j:
+                gap = tn[:, j] - tn[:, k]
+                safe = gap + (gap == 0)  # 1 where the gap is 0
+                wj = wj * (x - tn[:, k]) / safe
+        cols.append(wj * (x == x))  # broadcast a scalar 1.0 to (S,)
+    return cols
+
+
+def _lagrange_window(nodes, x, degree, xp):
+    """Indices ``(S, q+1)`` of the ``q + 1`` nodes around each of ``x`` and their Lagrange weights, for the
+    strictly increasing ``nodes`` (static length ``m``) and ``q = min(degree, m - 1)``. The window is centred
+    on the bracketing interval and shifted inside ``[0, m)`` at the ends; ``x`` is clamped to the node range
+    (the end state holds beyond it). ``xp`` is ``numpy`` or ``jax.numpy``."""
+    m = int(nodes.shape[0])
+    q = max(0, min(int(degree), m - 1))
+    x = xp.clip(x, nodes[0], nodes[-1])
+    left = xp.clip(xp.searchsorted(nodes, x, side="right") - 1, 0, max(m - 2, 0))
+    start = xp.clip(left - (q - 1) // 2, 0, m - 1 - q)
+    idx = start[:, None] + xp.arange(q + 1)[None, :]
+    return idx, _lagrange_weights(nodes[idx], x)
+
+
+def _sample_on_grid(traj, grid, save, degree, xp):
+    """``traj`` (rows at the strictly increasing ``grid``) at ``save`` by the degree-``degree`` interpolant."""
+    idx, w = _lagrange_window(grid, save, degree, xp)
+    out = 0.0
+    for j, wj in enumerate(w):
+        out = out + wj[:, None] * traj[idx[:, j]]
+    return out
+
+
+def _needed_steps(grid_np, save, degree=1):
     """The steps of a march over ``grid_np`` whose states the frames at ``save`` read.
 
     Index 0 is the march's start state, ``j >= 1`` the state after step ``j``. A save time on a grid point
-    reads that point; one between two reads both (the blend of :func:`_resample_trajectory`); one past the
-    end reads the last state. Save times at or before ``grid_np[0]`` belong to whatever came before."""
+    reads that point; one between two reads the ``degree + 1`` points of its interpolation window (the two
+    bracketing ones for ``degree = 1``; :func:`_resample_trajectory`); one past the end reads the last state.
+    Save times at or before ``grid_np[0]`` belong to whatever came before."""
     import numpy as np
 
     n = int(grid_np.size) - 1
@@ -1479,6 +1527,10 @@ def _needed_steps(grid_np, save):
     on_grid = grid_np[lo] == s
     past_end = s >= grid_np[n]
     need = np.concatenate([lo[on_grid & ~past_end], hi[~on_grid | past_end], lo[~on_grid & ~past_end]])
+    off = s[~on_grid & ~past_end]
+    if int(degree) > 1 and off.size:  # every node of the interpolation window of an off-grid frame
+        idx, _w = _lagrange_window(np.asarray(grid_np, dtype=float), off, degree, np)
+        need = np.concatenate([need, idx.reshape(-1)])
     return unique_values(need[need >= 1])
 
 
@@ -1516,6 +1568,7 @@ def _march_to_host(
     judge=None,
     skip_first_compare=False,
     cache=True,
+    degree=1,
 ):
     """Run a march and return its frames at ``save_ts`` as a HOST array; the device keeps no past steps.
 
@@ -1540,7 +1593,13 @@ def _march_to_host(
     one-scan guard compared).
 
     ``cache=False`` compiles the chunk afresh for this call instead of through :func:`_cached_march`, for a
-    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's)."""
+    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's).
+
+    ``degree`` is the interpolation degree of off-grid frames (the scheme's order; see
+    :func:`_resample_trajectory`). Each frame is made in the chunk holding the last state its window reads,
+    with the ``degree`` states before that chunk kept on the device, so a chunked march samples exactly as
+    the one-scan path. Only a march resumed from a checkpoint reads one-sided windows just after its resume
+    point (the states before it are not stored)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1548,7 +1607,22 @@ def _march_to_host(
     save = np.asarray(save_ts, dtype=float).reshape(-1)
     n = int(grid_np.size) - 1
     n_dofs = int(jnp.shape(state_of(carry0))[-1])
-    needed = _needed_steps(grid_np, save)
+    # Prefix states before grid_np[0] (BDF2's start-up state) join the window of the first frames, so the
+    # needed steps are found on the prefix + grid axis and shifted back to grid indices.
+    pre_ts = np.asarray(prefix_ts, dtype=float)[:-1]
+    npre = int(pre_ts.size)
+    needed = _needed_steps(np.concatenate([pre_ts, grid_np]) if npre else grid_np, save, degree) - npre
+    needed = needed[needed >= 1]
+    depth = int(degree) if int(degree) > 1 else 0  # states kept from before a chunk for its first windows
+    # Every frame is made in the chunk holding the LAST step its window reads (`owner`, a grid step index;
+    # <= 0 for a frame read from the prefix alone), so a window never misses a later state; the `depth`
+    # states kept from before the chunk cover its earlier ones. Degree 1: the step closing its interval.
+    ext = np.concatenate([pre_ts, grid_np]) if npre else grid_np
+    xs = np.clip(save, ext[0], ext[-1])
+    pos = np.searchsorted(ext, xs)
+    on = (pos < ext.size) & (ext[np.minimum(pos, ext.size - 1)] == xs)
+    win, _w = _lagrange_window(ext, xs, degree, np)
+    owner = np.where(on, pos, win.max(axis=1)) - npre
     # The device's budget in states (`_offload_chunk`: all of them where the device is the host memory).
     chunks, n_slots = _frame_chunks(n, needed, _offload_chunk(n, n_dofs, dtype))
     judged = judge is not None
@@ -1582,15 +1656,18 @@ def _march_to_host(
         fr.copy_to_host_async()
         landed.append((rows, (fr,), None))
 
-    def _ship_states(rows, prev, buf, k, ts_local):
+    def _ship_states(rows, head, buf, k, ts_local):
         """A chunk's frames, made on the HOST from its raw slot buffer: the device keeps no copy of them.
+        ``head`` are the states before the slots (the history kept for the first windows, then the chunk's
+        start state), at the first ``len(head)`` times of ``ts_local``.
 
         Sampling them on the device -- the start state concatenated before the slots, then gathered or
         blended -- held THREE copies of the frames there next to the march's own memory, and a 442k-DOF
         stabilised flow saving 81 frames ran the 8 GB card out of memory landing them."""
-        prev.copy_to_host_async()
+        for h in head:
+            h.copy_to_host_async()
         buf.copy_to_host_async()
-        landed.append((rows, (prev, buf), (k, ts_local)))
+        landed.append((rows, (head, buf), (k, ts_local)))
 
     def _land():
         for rows, arrs, how in landed:
@@ -1598,8 +1675,8 @@ def _march_to_host(
                 out[rows] = np.asarray(arrs[0])
                 continue
             k, ts_local = how
-            states = np.concatenate([np.asarray(arrs[0])[None, :], np.asarray(arrs[1])[:k]], axis=0)
-            out[rows] = _sample_host(states, ts_local, save[rows])
+            states = np.concatenate([np.stack([np.asarray(h) for h in arrs[0]]), np.asarray(arrs[1])[:k]], axis=0)
+            out[rows] = _sample_host(states, ts_local, save[rows], degree)
         landed.clear()
 
     def _sample(states, ts_local, rows):
@@ -1608,7 +1685,7 @@ def _march_to_host(
         hit = np.searchsorted(ts_local, ts)
         if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
             return states[jnp.asarray(hit)]
-        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype)
+        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype, degree)
 
     t_prev = float(grid_np[0])
     res, res_dev, flags = [], None, []
@@ -1625,11 +1702,16 @@ def _march_to_host(
             res = [tuple(ck.resumed[f"res_{i}"] for i in range(int(ck.resumed["n_res"])))]
             flags = [bool(ck.resumed["same"])]
     else:
-        rows = np.flatnonzero(save <= t_prev)
+        rows = np.flatnonzero(owner <= 0)  # read from the prefix states alone
         if rows.size:
             pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
             _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
         carry = carry0
+    if start:
+        hist_ts, hist = [], []  # a resumed chunk boundary: the windows before it are one-sided
+    else:
+        hist_ts = list(pre_ts[-depth:]) if depth else []
+        hist = [jnp.asarray(p, dtype) for p in prefix_states[:-1]][-depth:] if depth else []
     prev = state_of(carry) if start else jnp.asarray(prefix_states[-1], dtype)
     run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
     for ci, (a, b) in enumerate(chunks):
@@ -1650,9 +1732,15 @@ def _march_to_host(
         else:
             (carry, buf, same), r = run(ext, g, jnp.asarray(slots), jnp.asarray(compare))
         last = ci == len(chunks) - 1
-        rows = np.flatnonzero((save > t_prev) & ((save <= grid_np[b]) | last))
+        rows = np.flatnonzero((owner > max(a, start)) & ((owner <= b) | last))
+        ts_local = np.concatenate([np.asarray(hist_ts, dtype=float), [t_prev], grid_np[mine]])
         if rows.size:
-            _ship_states(rows, prev, buf, int(mine.size), np.concatenate([[t_prev], grid_np[mine]]))
+            _ship_states(rows, [*hist, prev], buf, int(mine.size), ts_local)
+        if depth:  # the last `depth` states before the next chunk's start, for its first windows
+            head = [*hist, prev]
+            pick = [i for i in range(ts_local.size) if ts_local[i] < grid_np[b]][-depth:]
+            hist_ts = [float(ts_local[i]) for i in pick]
+            hist = [head[i] if i < len(head) else buf[i - len(head)] for i in pick]  # slices only these rows
         if judged:
             for x in (*r, same):
                 x.copy_to_host_async()
@@ -1732,20 +1820,16 @@ def _open_transient_checkpoint(block, args, config, carry0, grid_np, save, n_dof
     return FixedMarchCheckpoint(spec, kind="transient", meta=meta, shape=(save.size, n_dofs), dtype=dtype)
 
 
-def _sample_host(states, ts_local, ts):
+def _sample_host(states, ts_local, ts, degree=1):
     """Rows of ``states`` (a trajectory on the grid times ``ts_local``) at the times ``ts``, on the host:
-    picked where a time is a grid point, else the linear blend of the two bracketing states with
-    :func:`_resample_trajectory`'s clamping."""
+    picked where a time is a grid point, else the degree-``degree`` interpolant of
+    :func:`_resample_trajectory` (same weights, same clamping)."""
     import numpy as np
 
     hit = np.searchsorted(ts_local, ts)
     if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
         return states[hit]
-    hi = np.clip(np.searchsorted(ts_local, ts, side="right"), 1, ts_local.size - 1)
-    lo = hi - 1
-    span = ts_local[hi] - ts_local[lo]
-    w = np.clip(np.where(span > 0, (ts - ts_local[lo]) / np.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
-    return states[lo] * (1.0 - w[:, None]) + states[hi] * w[:, None]
+    return _sample_on_grid(states, np.asarray(ts_local, dtype=float), np.asarray(ts, dtype=float), degree, np)
 
 
 def _stack_residuals(res):
@@ -1755,9 +1839,13 @@ def _stack_residuals(res):
     return tuple(np.concatenate([r[i] for r in res], axis=0) for i in range(len(res[0])))
 
 
-def _resample_trajectory(traj, grid_ts, save_ts, dtype):
+def _resample_trajectory(traj, grid_ts, save_ts, dtype, degree=1):
     """Sample a march's own-grid trajectory at ``save_ts``. Shared by every scheme's ``integrate``,
-    so they cannot drift apart on the fast path or the clamping convention."""
+    so they cannot drift apart on the fast path or the clamping convention.
+
+    A save time between grid points is the degree-``degree`` Lagrange interpolant of the neighbouring
+    states (Hairer, Norsett & Wanner I, Sec. II.6). Each scheme passes its order, so output between its
+    steps keeps that order instead of the linear blend's second (``degree = 1``, backward Euler's choice)."""
     import jax.numpy as jnp
     import numpy as np
 
@@ -1776,10 +1864,6 @@ def _resample_trajectory(traj, grid_ts, save_ts, dtype):
         return traj
 
     # Otherwise interpolate ONCE for all DOFs rather than once per column: locate each save time in
-    # the grid, then blend the two bracketing states. Matches ``jnp.interp``'s clamping outside the
-    # grid (weight clipped to [0, 1] holds the endpoint state).
-    hi = jnp.clip(jnp.searchsorted(grid_ts, save_ts, side="right"), 1, grid_ts.size - 1)
-    lo = hi - 1
-    span = grid_ts[hi] - grid_ts[lo]
-    w = jnp.clip(jnp.where(span > 0, (save_ts - grid_ts[lo]) / jnp.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
-    return traj[lo] * (1.0 - w[:, None]) + traj[hi] * w[:, None]
+    # the grid and combine the ``degree + 1`` states of its window (degree 1: the two bracketing states).
+    # The end state holds outside the grid, as ``jnp.interp``'s clamping did.
+    return _sample_on_grid(traj, jnp.asarray(grid_ts), save_ts, degree, jnp)
