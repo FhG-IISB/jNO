@@ -946,6 +946,8 @@ def assemble_fem_1d(
             vec=vec,
             quad_degree=quad_degree,
             order=order,
+            space=space,
+            rotation_bcs=rotation_bcs,
         )
 
     if ic_residuals:
@@ -1039,6 +1041,41 @@ def _stack_initial_conditions_1d(domain, ic_residuals, pts, ndof: int, vec: int)
     return state0
 
 
+def _hermite_initial_state_1d(domain, ic_residuals, quad_degree: int):
+    """The initial state on the Hermite (value, slope) DOFs: the L2 projection of the initial value.
+
+    A Hermite DOF pair is ``(w, dw/dx)``, so reading ``g`` at the vertices would fill only the value DOFs
+    and leave every slope at zero -- a kinked start whose stiff modes a time march then has to damp. The
+    projection ``M s0 = (g, N_i)`` takes the slopes from ``g`` as well, and reproduces any cubic exactly."""
+    from jax.experimental import sparse as _jsp
+
+    from ..._fem import _bare, _ic_value_at_nodes
+    from .linear import sparse_lu_solve
+
+    verts = jnp.asarray(domain.mesh.points)[:, 0]
+    cells = jnp.asarray(domain.mesh.cells_dict["line"], dtype=jnp.int32)
+    n_vert = int(verts.shape[0])
+    gp, gw = _line_quadrature(max(int(quad_degree), 8))
+    element = _hermite_element_1d(cells, n_vert, gp)
+    x0, h = verts[cells[:, 0]], verts[cells[:, 1]] - verts[cells[:, 0]]
+    xq = (x0[:, None] + h[:, None] * gp[None, :]).reshape(-1)  # (n_elem * n_quad,)
+    g = jnp.zeros_like(xq)
+    for ic in ic_residuals:
+        g = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, xq[:, None], int(xq.shape[0]), 1), xq.dtype)
+    g = g.reshape(cells.shape[0], -1)
+    N = jax.vmap(lambda hh: element.shape_at(hh)[0])(h)  # (n_elem, n_quad, 4)
+    wq = gw[None, :] * h[:, None]
+    Me = jnp.einsum("eq,eqi,eqj->eij", wq, N, N)
+    be = jnp.einsum("eq,eq,eqi->ei", wq, g, N)
+    dofs = element.elem_nodes  # (n_elem, 4)
+    rows = jnp.broadcast_to(dofs[:, :, None], Me.shape).reshape(-1)
+    cols = jnp.broadcast_to(dofs[:, None, :], Me.shape).reshape(-1)
+    ndof = element.n_dof_nodes
+    M = _jsp.BCOO((Me.reshape(-1), jnp.stack([rows, cols], axis=1)), shape=(ndof, ndof)).sum_duplicates()
+    b = jnp.zeros(ndof, xq.dtype).at[dofs.reshape(-1)].add(be.reshape(-1))
+    return sparse_lu_solve(M, b)
+
+
 def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]):
     """Apply Dirichlet to a semidiscrete linear block ``M u̇ + A u = c``.
 
@@ -1053,7 +1090,17 @@ def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]
 
 
 def _assemble_1d_transient(
-    domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, *, vec, quad_degree, order=1
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_values,
+    ic_residuals,
+    *,
+    vec,
+    quad_degree,
+    order=1,
+    space="Lagrange",
+    rotation_bcs=None,
 ):
     """Assemble a first-order transient 1D weak form into a ``SemidiscreteTimeBlock``.
 
@@ -1061,7 +1108,8 @@ def _assemble_1d_transient(
     temporal part becomes the mass matrix ``M`` (rewriting ``u_t`` -> ``u`` via
     ``_strip_temporal_trial_derivative``); the spatial part + boundary terms become
     the operator. Linear -> ``M``/``A`` payload; nonlinear -> ``mass``/``residual``/
-    ``jacobian`` callables."""
+    ``jacobian`` callables. ``space="Hermite"`` marches the C1 beam element: its (value, slope) DOFs, the
+    beam supports of :func:`hermite_dirichlet_dofs`, and an L2-projected initial state."""
     from ..._fem import _bare
     from .backend_blocks import SemidiscreteTimeBlock
     from .solver_helper import max_temporal_derivative_order as _mto
@@ -1076,10 +1124,25 @@ def _assemble_1d_transient(
     # P2 adds a midpoint dof per element, so the dof count is NOT the vertex count. Publishing the
     # dof coordinates is what makes `fem.points` line up with the solution vector (the same
     # contract the 2D/3D P2 path already has).
-    n_nodes, dof_coords = dof_layout_1d(domain, order)
+    hermite = space == "Hermite"
+    # The C1 beam is the 1-D vertex family: its step takes the sparse-direct solve, as Hermite/Argyris/Morley
+    # do in 2-D (see `compose_transient_step_solvers`); the Krylov default returned NaN on a u_tt beam.
+    domain._fem_prefer_direct = hermite
+    n_nodes, dof_coords = dof_layout_1d(domain, order, space=space)
     ndof = n_nodes * vec
     domain._fem_native_dof_points = dof_coords
     _tags, _fields, _neural, _param_exprs = _param_context(volume_terms, boundary_terms)
+    _res_kw = dict(n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order, space=space)
+
+    def _essential_pairs():
+        if hermite:
+            return hermite_dirichlet_dofs(domain, dirichlet_values, rotation_bcs)
+        return _dirichlet_dofs(domain, dirichlet_values, vec)
+
+    def _initial(ics):
+        if hermite:
+            return _hermite_initial_state_1d(domain, ics, quad_degree)
+        return _stack_initial_conditions_1d(domain, ics, jnp.asarray(dof_coords), ndof, vec)
 
     # Split each weak constraint into additive sub-terms first, so the temporal
     # term (u_t * phi) can be separated from the spatial terms in the same sum.
@@ -1123,23 +1186,17 @@ def _assemble_1d_transient(
         z = jnp.zeros(ndof)
         m2_terms = [_strip_n(t, 2) for t in temporal_terms if _mto(t) >= 2]  # u_tt·φ ⇒ mass M2
         d_terms = [_strip_n(t, 1) for t in temporal_terms if _mto(t) == 1]  # u_t·φ ⇒ damping C (optional)
-        M2 = _make_residual(
-            domain, m2_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
-        ).sparse_jacobian(z)
+        M2 = _make_residual(domain, m2_terms, {}, **_res_kw).sparse_jacobian(z)
         from jax.experimental import sparse as _jsp
 
         Cmat = (
-            _make_residual(
-                domain, d_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
-            ).sparse_jacobian(z)
+            _make_residual(domain, d_terms, {}, **_res_kw).sparse_jacobian(z)
             if d_terms
             # an absent damping term is the EMPTY BCOO, not a dense zero block — a dense (ndof, ndof)
             # of zeros would reintroduce the O(N²) allocation this whole path exists to avoid
             else _jsp.BCOO((jnp.zeros((0,), z.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(ndof, ndof))
         )
-        spatial_res2 = _make_residual(
-            domain, spatial_terms, boundary_terms, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order
-        )
+        spatial_res2 = _make_residual(domain, spatial_terms, boundary_terms, **_res_kw)
         # Compose the augmented 2n system SPARSELY. M2/C/K are BCOO (per-element scatter), so ``jnp.block``
         # and ``.at[]`` are both unavailable here — the former cannot mix sparse with dense at all, and
         # BCOO has no ``.at[]``. Reuse the same three helpers the native u_tt path uses, so the 1D and
@@ -1150,7 +1207,7 @@ def _assemble_1d_transient(
 
         n = ndof
         M_aug = _bcoo_block([(M2, 0, 0, 1.0), (M2, n, n, 1.0)], (2 * n, 2 * n), z.dtype)
-        dpairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+        dpairs = _essential_pairs()
         dd = dg = aug_d = None
         if dpairs:  # u[d]=g (constant) on displacement rows, v[d]=0 on velocity rows
             dd = jnp.asarray([p[0] for p in dpairs], dtype=jnp.int32)
@@ -1160,9 +1217,8 @@ def _assemble_1d_transient(
         # the initial state lives on the DOF nodes, which for P2 include the element midpoints
         # displacement IC u(0)=u0 and optional velocity IC u̇(0)=v0, each split by temporal order and
         # then combined per addressed component (a vector field carries one IC per component)
-        pts = jnp.asarray(dof_coords)
-        u0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) < 1], pts, ndof, vec)
-        v0 = _stack_initial_conditions_1d(domain, [ic for ic in ic_residuals if _mto(_bare(ic)) >= 1], pts, ndof, vec)
+        u0 = _initial([ic for ic in ic_residuals if _mto(_bare(ic)) < 1])
+        v0 = _initial([ic for ic in ic_residuals if _mto(_bare(ic)) >= 1])
         u0, v0 = jnp.asarray(u0, z.dtype), jnp.asarray(v0, z.dtype)
         if dpairs:
             u0, v0 = u0.at[dd].set(dg), v0.at[dd].set(0.0)
@@ -1219,9 +1275,9 @@ def _assemble_1d_transient(
 
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
 
-    dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
+    dirichlet_pairs = _essential_pairs()
     # the initial state lives on the DOF nodes, which for P2 include the element midpoints
-    state0 = _stack_initial_conditions_1d(domain, ic_residuals, jnp.asarray(dof_coords), ndof, vec)
+    state0 = _initial(ic_residuals)
     t0, t1, dt = _infer_time_window(domain)
 
     # The MASS must be parameter-free. It is assembled once, outside the per-args re-forming, so a
@@ -1235,15 +1291,12 @@ def _assemble_1d_transient(
             "assembled once, so a parameter there would be silently frozen. Put the parameter on the "
             "spatial operator or the load instead."
         )
-    mass_res = _make_residual(domain, mass_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree, order=order)
+    mass_res = _make_residual(domain, mass_terms, {}, **_res_kw)
     spatial_res = _make_residual(
         domain,
         spatial_terms,
         boundary_terms,
-        n_nodes=n_nodes,
-        vec=vec,
-        quad_degree=quad_degree,
-        order=order,
+        **_res_kw,
         runtime_parameter_tags=_tags,
         field_param_names=_fields,
         neural_slots=_neural,

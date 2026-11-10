@@ -1405,12 +1405,58 @@ def _refuse_what_the_mask_would_zero(Aop, mask, s0, forcings):
             )
 
 
+def _refuse_nonsymmetric(A, mask):
+    """``symmetric=True`` runs Lanczos, which is exact only for a symmetric free block; refuse any other.
+
+    Measured on two coupled P2/P1 heat fields with a one-way coupling term: the Lanczos result was 1.4e-4
+    off with no warning, where ``symmetric=False`` (Arnoldi) is exact. Checked on concrete values only."""
+    data, idx = getattr(A, "data", None), getattr(A, "indices", None)
+    if data is None or idx is None or any(isinstance(x, jax.core.Tracer) for x in (data, idx, mask)):
+        return
+    import scipy.sparse as _sp
+
+    free = np.asarray(mask) > 0.5
+    i, j, v = np.asarray(idx)[:, 0], np.asarray(idx)[:, 1], np.asarray(data)
+    keep = free[i] & free[j]
+    S = _sp.coo_matrix((v[keep], (i[keep], j[keep])), shape=A.shape).tocsr()
+    gap = abs(S - S.T).max() if S.nnz else 0.0
+    if gap > 1e-10 * max(abs(S).max() if S.nnz else 0.0, 1e-300):
+        raise NotImplementedError(
+            "jno.solve.exponential(symmetric=True): the operator is not symmetric on the free DOFs (relative "
+            f"asymmetry {gap / abs(S).max():.1e}: advection, or a one-way coupling between fields), and the "
+            "symmetric Lanczos path would return a wrong answer. Use jno.solve.exponential(symmetric=False)."
+        )
+
+
+def _row_abs_sum(M):
+    """``sum_j |M_ij|`` per row: zero exactly on a structurally empty (algebraic) row of the mass."""
+    data, idx = getattr(M, "data", None), getattr(M, "indices", None)
+    if data is not None and idx is not None:
+        return jnp.zeros(M.shape[0], jnp.asarray(data).dtype).at[idx[:, 0]].add(jnp.abs(data))
+    return jnp.sum(jnp.abs(jnp.asarray(M.todense() if hasattr(M, "todense") else M)), axis=1)
+
+
+def _refuse_nonpositive_lumping(d, mask):
+    """Row-sum lumping needs a positive row sum on every unknown; refuse where the basis does not give one."""
+    if isinstance(d, jax.core.Tracer) or isinstance(mask, jax.core.Tracer):
+        return
+    d, free = np.asarray(d), np.asarray(mask) > 0.5
+    bad = free & (d <= 1e-12 * np.max(np.abs(d)))
+    if bad.any():
+        raise NotImplementedError(
+            f"jno.solve.exponential(mass='lumped'): row-sum lumping gives a zero or negative mass on {int(bad.sum())} "
+            "of the unknowns -- the row sums of this basis are not positive (a P2 vertex, a Hermite slope or an "
+            "edge DOF). Use jno.solve.exponential(mass='consistent'), which integrates the system the other "
+            "schemes solve."
+        )
+
+
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
     ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
 
     * ``lumped`` — symmetric ``L̃ = D^{-1/2} A D^{-1/2}`` (``D`` = row-sum mass); integrate ``w = D^{1/2} u``
-      with the Euclidean Lanczos of :func:`applyfun`. Matrix-free.
+      with a fully re-orthogonalized Euclidean Lanczos (:func:`m_inner_funm`). Matrix-free.
     * ``consistent`` — ``L = M⁻¹A`` applied by a **matrix-free M-inner-product Lanczos** (:func:`m_inner_funm`,
       an M-solve per matvec via CG). No lumping error, no factorization.
 
@@ -1418,7 +1464,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     held at 0 by *masking* (a multiply — trace-safe), never a host-side extraction."""
     from .backend_blocks import _block_time_grid
     from .mass import lumped_diagonal, m_inner_funm
-    from .matfun import applyfun, expmv
+    from .matfun import expmv
     from .solver_api import LinearOperator
 
     if not block.is_linear():
@@ -1469,8 +1515,21 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
         z = -dt * lam
         return jnp.where(jnp.abs(z) < 1e-5, 0.5 + z / 6.0, (jnp.expm1(z) - z) / (z * z))
 
-    d = lumped_diagonal(Mop)  # Dirichlet DOFs carry NO mass (d=0) — algebraic (u=0), not ODEs
-    mask = (d > 1e-12 * jnp.max(d)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
+    d = lumped_diagonal(Mop)
+    # Dirichlet DOFs carry NO mass: their whole row of M is empty -- algebraic (u=0), not ODEs. Read off the
+    # ABSOLUTE row sum, never the row sum ``d``: the row sum of a higher-order or derivative basis vanishes
+    # on unknowns that do carry mass (a P2 vertex, a Hermite slope, an edge DOF), and the mask then held them
+    # at 0 -- refused as a "pressure row" on P2, Hermite and Nedelec fields that have no algebraic row at all.
+    d_abs = _row_abs_sum(Mop)
+    mask = (d_abs > 1e-12 * jnp.max(d_abs)).astype(dtype)  # 1 interior / 0 boundary — a *multiply* (trace-safe)
+    if mass == "lumped":
+        _refuse_nonpositive_lumping(d, mask)
+    if symmetric:
+        _refuse_nonsymmetric(Aop, mask)
+    # A Krylov space cannot outgrow the problem: cap the size at the number of unknowns (the free ones, when
+    # the mask is concrete). Past it the Arnoldi of `expmv` raised outright ("num_matvecs=40 exceeds ... 31").
+    n_free = int(np.sum(np.asarray(mask))) if not isinstance(mask, jax.core.Tracer) else n
+    order = max(1, min(int(order), n_free))
     _refuse_what_the_mask_would_zero(Aop, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else []))
 
     def _consistent_m_solve():
@@ -1524,16 +1583,21 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
             return wn, wn
     else:
         if mass == "lumped":
-            # symmetric L̃ = D^{-1/2} A D^{-1/2}; integrate w = D^{1/2} u with the Euclidean Lanczos of applyfun
+            # symmetric L̃ = D^{-1/2} A D^{-1/2}; integrate w = D^{1/2} u with a Euclidean Lanczos
             s = jnp.sqrt(d)
             s_inv = jnp.where(mask > 0, 1.0 / jnp.where(mask > 0, s, 1.0), 0.0)  # 0 on the boundary
-            Ctil = LinearOperator.from_matvec(lambda w: s_inv * (Aop @ (s_inv * w)), shape=(n, n))
-            e0 = mask / jnp.linalg.norm(mask)
 
-            def apply_f(vec, fun):  # f(L̃)·vec, on the *normalised* vector (Lanczos divides by ‖·‖ → NaN at 0)
-                nrm = jnp.linalg.norm(vec)
-                unit = jnp.where(nrm > 1e-300, vec / jnp.where(nrm > 1e-300, nrm, 1.0), e0)
-                return nrm * applyfun(Ctil, unit, fun=fun, order=order)
+            def Ctil_mv(w):
+                return s_inv * (Aop @ (s_inv * w))
+
+            e0 = mask / jnp.maximum(jnp.linalg.norm(mask), 1.0)  # no free DOF at all: 0, never 0/0
+
+            def apply_f(vec, fun):
+                # f(L̃)·vec by a fully re-orthogonalized Lanczos (the consistent path's, with the Euclidean
+                # inner product). A pinned DOF adds an eigenvalue 0 to L̃ and a symmetric mesh repeats
+                # eigenvalues, so the subspace can run out before `order` steps; the unrecovered Lanczos of
+                # `applyfun` then broke down to NaN (a 3-D P1 heat block), where this one carries on.
+                return m_inner_funm(Ctil_mv, lambda a, b: a @ b, e0, vec, fun, order)
 
             w0, solve_c = s * s0, lambda x: s_inv * x  # forcing in the scaled system: D^{-1/2}·rhs
             to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
@@ -1541,7 +1605,7 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
             m_solve = _consistent_m_solve()
             L_mv = lambda x: m_solve(Aop @ x)  # M⁻¹A x (interior)
             m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
-            e0 = mask / jnp.sqrt(m_inner(mask, mask))  # a fixed M-unit interior vector
+            e0 = mask / jnp.sqrt(jnp.maximum(m_inner(mask, mask), 1e-300))  # a fixed M-unit interior vector (0 if none)
             apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
             w0, solve_c = mask * s0, m_solve  # integrate u directly (homogeneous boundary); forcing M⁻¹·rhs
             to_field = lambda u: u

@@ -3733,6 +3733,19 @@ class FEM:
             _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
             if _values:
                 kwargs["values"] = _values
+        if (
+            self._mode == "transient"
+            and solve_fn is None
+            and linear is None
+            and precond is None
+            and getattr(self.domain, "_fem_prefer_direct", False)
+        ):
+            # The C0/C1 vertex families (Hermite/Argyris/Morley, the 1-D beam) march on a sparse-direct step,
+            # as their steady solve does: the Krylov default returned NaN on a u_tt beam, and its noise pins
+            # an adaptive controller at its smallest step (see `compose_transient_step_solvers`).
+            from . import solve as _solve_ns
+
+            linear = _solve_ns.lu()
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)

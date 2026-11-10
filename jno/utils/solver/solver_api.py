@@ -2346,14 +2346,19 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
 
     if linear is None and precond is None:
-        if not _is_saddle_block(block, state):
+        # The C0/C1 vertex families (Hermite/Argyris/Morley) take a sparse-direct step, as their steady solve
+        # does: the mass carries derivative DOFs (on Argyris its free block has a condition number near 1e9),
+        # and the Krylov default leaves noise in the step that does not shrink with dt. An adaptive march
+        # then takes every step at its floor: measured, all four controllers pinned at dt_min on a transient
+        # Argyris plate that a sparse-direct step finishes in under 250 attempts.
+        if not _is_saddle_block(block, state) and not getattr(getattr(fem, "domain", None), "_fem_prefer_direct", False):
             # No linear/precond slots: defer to SemidiscreteTimeBlock.step's built-in per-step solve, a
             # Jacobi-preconditioned BiCGStab at tol=1e-10. The historic default here was a *bare* bicgstab()
             # with NO preconditioner, which silently under-converged each step — invisible on homogeneous
             # decay (the warm-start is already near the answer) but corrupting any forced/growing solution.
             return None, None
-        # A SADDLE step operator (an index-2 row: zero mass and a zero diagonal, the incompressibility row)
-        # gets a sparse-direct solve. Jacobi has nothing to scale on those rows and the Schur complement
+        # A SADDLE step operator (an index-2 row: zero mass and a zero diagonal, the incompressibility row),
+        # or a C0/C1 vertex family (above), gets a sparse-direct solve. Jacobi has nothing to scale on those rows and the Schur complement
         # shrinks with dt, so the Krylov default broke down: measured on unsteady Stokes (P2/P1), fine at
         # dt = 1e-3 and NaN at dt = 1e-4 and below -- where an adaptive march starts.
         from ... import solve as _solve_ns

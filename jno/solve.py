@@ -2191,11 +2191,14 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     **time-varying** source ``f(t)`` is integrated by **ETD2** (the exponential trapezoidal rule) — sampled
     at both step ends with a ``φ₂`` ramp weight, so it is **exact for a source affine in time** and
     second-order for a general one (Hochbruck & Ostermann, *Exponential integrators*, Acta Numerica 19
-    (2010) 209–286, §2.3). ``order`` is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal
-    — cheapest, discrete maximum principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via
-    a matrix-free M-inner-product Lanczos.
+    (2010) 209–286, §2.3). ``order`` is the Krylov size (capped at the number of free unknowns).
+    ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, but a different spatial discretisation
+    from the consistent one the other schemes integrate (4e-2 apart on P1 triangles, 8e-2 on Q1 hexes), and
+    refused where the row sums are not positive (P2 vertices, Hermite slopes, edge DOFs).
+    ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free M-inner-product Lanczos.
 
-    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
+    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos, and is refused on an operator that is not symmetric on
+    its free DOFs (checked eagerly). ``symmetric=False`` handles a **non-symmetric**
     operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
     matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying

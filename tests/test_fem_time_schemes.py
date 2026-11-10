@@ -143,7 +143,7 @@ def test_m_inner_product_lanczos_matches_dense_and_differentiates():
 def test_exponential_nonsymmetric_advection_diffusion():
     """``symmetric=False`` advances a **non-symmetric** advection–diffusion operator with an Arnoldi + Padé
     exponential: exact in time (step-independent) and closer to the time-converged reference than backward
-    Euler. The symmetric path is *invalid* here (it assumes ``A = Aᵀ``), so it must be visibly worse."""
+    Euler. The symmetric path is *invalid* here (it assumes ``A = Aᵀ``), so it is refused rather than run."""
     ns = jno.solve.exponential(symmetric=False, order=40)
     e3 = _final(_advection_diffusion(3), time=ns)
     e9 = _final(_advection_diffusion(9), time=ns)
@@ -152,11 +152,9 @@ def test_exponential_nonsymmetric_advection_diffusion():
     ref = _final(_advection_diffusion(300))  # fine backward-Euler reference
     exp_err = np.linalg.norm(_final(_advection_diffusion(4), time=ns) - ref) / np.linalg.norm(ref)
     be_err = np.linalg.norm(_final(_advection_diffusion(4)) - ref) / np.linalg.norm(ref)
-    sym_err = np.linalg.norm(_final(_advection_diffusion(4), time=jno.solve.exponential(order=40)) - ref) / np.linalg.norm(
-        ref
-    )
     assert exp_err < be_err  # exact-in-time beats backward Euler at coarse steps
-    assert sym_err > 3 * exp_err  # the symmetric path is wrong on a non-symmetric operator
+    with pytest.raises(NotImplementedError, match="symmetric=False"):  # it used to run and return a wrong answer
+        _final(_advection_diffusion(4), time=jno.solve.exponential(order=40))
 
 
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")

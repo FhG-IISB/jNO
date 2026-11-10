@@ -1579,7 +1579,7 @@ the tangent within a step but not across steps (the reverse pass would store one
 | `jno.solve.bdf(order=None\|1..5)` | 1–5, chosen per step | L-stable to 2, A(α) above | stiff transients on error-controlled steps: one implicit solve per step |
 | `jno.solve.sdirk(order=2\|3)` | 2 or 3 | **L-stable**, stiffly accurate | higher order where BDF2 is not enough; state-dependent mass allowed |
 | `jno.solve.rosenbrock("ros34pw2"\|"ros2")` | 3 or 2 | **L-stable** | nonlinear blocks **without Newton**: one linear solve per stage |
-| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
+| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks (`mass="consistent"` for the system the other schemes solve) |
 | `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
 
 `bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
@@ -1630,6 +1630,18 @@ Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `
 as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
 `u_t` inside a nonlinear function, is refused: it used to be marched with `(u − u_prev)²/Δt` where `/Δt²`
 belonged. The `u_t⊗u_t` piece of a residual-based VMS Reynolds stress is such a term — drop that piece.
+
+### The exponential scheme on every element
+
+`exponential(mass="consistent")` integrates the same semidiscrete system as every other scheme, exactly in
+time: on each element family's heat-type test problem (Lagrange P1–P3, Q1/Q2, tets, hexes, lines, vector,
+coupled, Hermite, cover, Morley, N1E in 2-D and 3-D) it lands within 1e-8 to 1e-10 of a tight adaptive SDIRK3,
+and within 7e-4 on Argyris, whose mass is too ill-conditioned for its CG mass solve. The default `mass="lumped"`
+replaces `M` by its row sums: a different spatial discretisation (4e-2 off the consistent one on P1 triangles,
+8e-2 on Q1 hexes), refused where the row sums are not positive (a P2 vertex, a Hermite slope, an edge DOF).
+`symmetric=True` (Lanczos) is refused on an operator that is not symmetric on its free DOFs, such as a one-way
+coupling between fields; pass `symmetric=False`. Algebraic rows other than walls (a pressure, an RT flux) are
+refused as before.
 
 ### Higher order — `sdirk` and `rosenbrock`
 
