@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794312762,"nonce":"/e3BJgTHSdU4D9ySPnIzJZPbwaA=","message":"Fixed in 7fc7b5bc; test: test_repeated_march_is_traced_once (trace count unchanged on a repeated solve).","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794312762,"nonce":"oudtojqQSvsvOB/F3BM0kbplVHY=","status":2}]}
