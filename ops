@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794310544,"nonce":"AqzfMlzSvKOP2vbsCRS1GdQH8R4=","message":"Fixed in 50a203b2; test: tests/test_rcwa_vector.py::test_a_region_attached_permittivity_matches_the_same_coordinate_function","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794310544,"nonce":"h4h70YW5wQybabk+xhWhDjoaFfE=","status":2}]}
