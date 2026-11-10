@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794310544,"nonce":"tt9e2evpB65G7VDqWvL497utbdo=","message":"Fixed in 99fc18c8; test: tests/test_structured_rectilinear.py","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794310545,"nonce":"xr18DqpFBCO48O6ixi/nS7OFT/g=","status":2}]}
