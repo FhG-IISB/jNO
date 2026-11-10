@@ -636,7 +636,8 @@ Three things follow from changing the space instead of the mesh, and each shows 
   identical throughout — only how many coefficients each node carries changes.
 
 The [adaptivity tutorial](../tutorials/08-fem-and-varpinns/adaptive-l-shape.md) compares h, r and p on
-the same problem. Compose with `refine`/`remesh` across successive `fem.solve` calls for **hp**: h where the solution is
+the same problem; the [soft-enrichment tutorial](../tutorials/08-fem-and-varpinns/soft-enrichment-l-shape.md)
+replaces the boolean mask by a differentiable per-node weight and chooses the enriched nodes by gradient. Compose with `refine`/`remesh` across successive `fem.solve` calls for **hp**: h where the solution is
 rough, p where it is smooth.
 
 **Scope**, refused by name rather than discovered: the field must be declared `space="cover"` (there is
