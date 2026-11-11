@@ -7998,11 +7998,13 @@ def _fem_impl(
         for c in _net_trial_only:
             support, _rg = _region_and_support(c, domain)
             _comp, _val, _vnode = _dirichlet_spec(_bare(c))
-            if support not in ("boundary", "initial") or not _is_bare_neural_value_node(_vnode):
+            if support == "initial":
+                continue  # any expression: the initial state is re-formed from the runtime args (`state0_fn`)
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
                 raise NotImplementedError(
                     "jno.fem: a network in an essential (trial-only) constraint must be a *bare* net(x) value "
-                    "on a boundary region (a Dirichlet profile) or the 'initial' region (an initial "
-                    "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
+                    "on a boundary region (a Dirichlet profile), or any expression in an initial condition "
+                    "on the 'initial' region — a compound Dirichlet value (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
             if _trial_spaces(constraints) - _NATIVE_SPACES:
@@ -8319,6 +8321,7 @@ def _fem_impl(
         the values they were assembled with.
         """
         out = _finalize_core(fem_obj)
+        _refuse_frozen_ic_trainables(out, ic_residuals)
         if _mean_gauge_fields:
             out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
         # Structural, so it is known here for every mode -- and being known at BUILD time is what
@@ -9752,6 +9755,52 @@ def _ic_component(bare: Any) -> Any:
     return None if trial_side is None else _component_index_of(trial_side)
 
 
+def _ic_trainable_names(ic_residuals: List[Any]) -> List[str]:
+    """Names of the trainable parameters and networks an initial condition's value reads.
+
+    An optimizer-less nodal DATA field (a known initial state handed in as a field) is not a trainable."""
+    from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs, _collect_runtime_parameter_exprs
+
+    names: List[str] = []
+    for ic in ic_residuals:
+        trial_side = _ic_trial_side(ic)
+        if trial_side is None:
+            continue
+        value = ic.right if trial_side is ic.left else ic.left
+        for pn, pd in _collect_runtime_parameter_exprs(value, {}).items():
+            pm = getattr(pd, "model", None)
+            if (
+                getattr(pm, "_opt_fn", None) is None
+                and np.asarray(getattr(getattr(pm, "module", None), "value", 0.0)).size > 1
+            ):
+                continue
+            names.append(pn)
+        names.extend(_collect_neural_coefficient_exprs(_bare(value)))
+    return names
+
+
+def _refuse_frozen_ic_trainables(fem_obj: Any, ic_residuals: List[Any]) -> None:
+    """A trainable in an initial condition that the built operator does not take as a runtime argument
+    would be read once, at its stored value: a silently frozen trainable (and one ``jno.core`` never sees).
+    The paths that re-form the initial state from the runtime arguments publish its name; refuse the rest."""
+    if not ic_residuals:
+        return
+    names = _ic_trainable_names(ic_residuals)
+    if not names:
+        return
+    taken = set(getattr(getattr(fem_obj, "_op", None), "runtime_parameter_exprs", None) or {})
+    missing = sorted(set(names) - taken)
+    if missing:
+        raise NotImplementedError(
+            f"jno.fem: the initial condition reads the trainable(s) {missing}, but this form's assembly path "
+            "fixes the initial state at build time, so they would never train. A trainable initial condition "
+            "is wired on a first-order-in-time (u_t) transient on 2-D/3-D Lagrange fields, single or coupled. "
+            "Not on: 1-D line domains, the non-nodal families (Hermite, Argyris, Morley, Nedelec, RT), "
+            "second-order-in-time (u_tt) forms, complex transients. There, put the trainable in a source "
+            "term or a Dirichlet value, or give the initial condition as a fixed value."
+        )
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -9768,17 +9817,17 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
-    from .utils.solver.parametric_helpers import _is_neural_coefficient
-
-    if _is_neural_coefficient(_bare(value_node)):
-        # A net-valued IC threads its weights only on the real, first-order-in-time transient path
-        # (``state0_fn`` re-forms the initial state from ``args``). This routine bakes the IC at assembly
-        # (complex-transient / second-order-in-time), so the weights would silently NOT train — reject it.
+    _trainables = _ic_trainable_names([bare])
+    if _trainables:
+        # A trainable IC (a network, or a ``jno.np.parameter`` anywhere in the value) threads only where the
+        # initial state is re-formed from the runtime args (``state0_fn``). This routine bakes the IC at
+        # assembly (1-D, complex-transient, second-order-in-time), so it would silently NOT train -- reject it.
         raise NotImplementedError(
-            "jno.fem: a net-valued initial condition u(initial) - net(x) is wired on a real, "
-            "first-order-in-time transient form (its weights thread the initial state); this path "
-            "(complex-transient or second-order-in-time) bakes the IC at assembly and cannot thread the "
-            "weights. Use a real first-order transient form, or a constant/field initial condition here."
+            f"jno.fem: the initial condition reads the trainable(s) {sorted(_trainables)}, and this form's "
+            "path (a 1-D line, a complex transient or a second-order-in-time u_tt form) fixes the initial state "
+            "at build time, so they would never train. A trainable initial condition is wired on a real "
+            "first-order (u_t) transient on 2-D/3-D Lagrange fields. Here, put the trainable in a source term "
+            "or a Dirichlet value, or give the initial condition as a fixed value."
         )
     comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
     n_nodes = int(jnp.asarray(pts).shape[0])
