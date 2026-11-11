@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794393138,"nonce":"zgOBguaVxajhl8auvNklMqNJYWQ=","message":"Fixed in 5da98bce; test: tests/test_fem_transient_trainable_ic.py::test_a_parameter_in_the_initial_condition_trains","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794393138,"nonce":"mv7He7TCiprc5FRsUUT2PTWL48k=","status":2}]}
