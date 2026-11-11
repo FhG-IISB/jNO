@@ -8831,8 +8831,19 @@ def _fem_impl(
         # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
         # 1D complex *inverse* rides the same path.
         _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        from .utils.solver.fem_1d import complex_dirichlet_regions
+
+        if not (_bares_have_complex_coeff(volume_terms) or _cx_bd) and (
+            _cx_real := complex_dirichlet_regions(domain, dirichlet_values)
+        ):
+            # A complex essential value on a REAL 1-D form reached `float(g)` in the Dirichlet assembly and
+            # failed with a bare TypeError; 2-D/3-D refuse it by name, so does 1-D now.
+            raise NotImplementedError(
+                f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_real))} of a real 1D form is "
+                "not supported -- the Dirichlet rows hold real values. Use a real essential value and carry the "
+                "complex part in the operator or the source (a `1j` there makes the form complex)."
+            )
         if _bares_have_complex_coeff(volume_terms) or _cx_bd:
-            from .utils.solver.fem_1d import complex_dirichlet_regions
             from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
 
