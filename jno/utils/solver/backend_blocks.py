@@ -435,7 +435,10 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None):
+    def step(
+        self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None,
+        guess=None,
+    ):  # fmt: skip
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -472,11 +475,16 @@ class SemidiscreteTimeBlock:
         whose element integrand is long (a stabilised flow: 220 of ~300 ms per Newton iteration). The data
         rides the step-merge plan's fixed pattern (``step_merge_plan``); a path that has no such tangent (a
         user ``nonlinear=`` slot, a matrix-free residual, a linear block) hands ``tangent`` back unchanged.
-        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step."""
+        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step.
+
+        ``guess`` is the initial iterate of the step's solve (the Krylov warm start of a linear step, Newton's
+        start of a nonlinear one); ``None`` starts from ``u``. It changes how fast the solve converges, not
+        what it converges to: a multistep scheme hands its predictor, which is ``O(dt^(k+1))`` from the answer
+        where ``u`` is ``O(dt)``."""
         box = {}
         out = self._step(
             u, t, dt, args, theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=report,
-            tangent=tangent, _box=box,
+            tangent=tangent, _box=box, guess=guess,
         )  # fmt: skip
         if tangent is None:
             return out
@@ -538,13 +546,14 @@ class SemidiscreteTimeBlock:
         return wn
 
     def _step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False,
-              tangent=None, _box=None):  # fmt: skip
+              tangent=None, _box=None, guess=None):  # fmt: skip
         """The body of :meth:`step`; see there."""
         import jax.numpy as jnp
 
         args = args or {}
         u = jnp.asarray(u).reshape(-1)
         dtype = u.dtype
+        x0 = u if guess is None else jnp.asarray(guess, dtype).reshape(-1)  # the solve's initial iterate
         t_next = t + dt
 
         # A `jno.derived(..., every="step")` field is evaluated ONCE per step, from the state this step
@@ -616,9 +625,9 @@ class SemidiscreteTimeBlock:
                                 plan=_merge_plan,
                             )
 
-                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        wn = self._slot_newton(nonlinear_solve, G, x0, jac_step, tangent, _merge_plan, dtype, _box)
                         return _verdict(G, u, wn, report, _box.get("norms"))
-                    return _verdict(G, u, nonlinear_solve(G, u), report)
+                    return _verdict(G, u, nonlinear_solve(G, x0), report)
                 # default Newton: on the assembled step tangent when both Jacobians exist
                 if self.jacobian is not None and self.mass_residual_jac is not None:
                     from .solver_api import _add_step_operator
@@ -631,9 +640,9 @@ class SemidiscreteTimeBlock:
                             plan=_merge_plan,
                         )
 
-                    wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                    wn = self._default_newton(G, x0, jac_default, tangent, _merge_plan, dtype, _box)
                     return _verdict(G, u, wn, report, _box.get("norms"))
-                return _verdict(G, u, newton_krylov(G, u), report)
+                return _verdict(G, u, newton_krylov(G, x0), report)
 
             M_t = _operand(self.mass(t_next, args))
             # θ per row: the zero-mass (constraint) rows are imposed at t+dt; see `_theta_row_weights`.
@@ -663,9 +672,9 @@ class SemidiscreteTimeBlock:
 
                     # theta on the rows with mass; a zero-mass row (a prescribed one: outside every subdomain) takes 1
                     with step_form(1.0 / dt, thn, t_next):
-                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        wn = self._slot_newton(nonlinear_solve, G, x0, jac_step, tangent, _merge_plan, dtype, _box)
                     return _verdict(G, u, wn, report, _box.get("norms"))
-                return _verdict(G, u, nonlinear_solve(G, u), report)
+                return _verdict(G, u, nonlinear_solve(G, x0), report)
             # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
             if self.jacobian is not None:
                 from .solver_api import _add_step_operator
@@ -674,9 +683,9 @@ class SemidiscreteTimeBlock:
                     J = self.jacobian(wn, t_next, args)
                     return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                wn = self._default_newton(G, x0, jac_default, tangent, _merge_plan, dtype, _box)
                 return _verdict(G, u, wn, report, _box.get("norms"))
-            return _verdict(G, u, newton_krylov(G, u), report)
+            return _verdict(G, u, newton_krylov(G, x0), report)
 
         from .linear import matrix_diagonal, sparse_matvec
 
@@ -735,11 +744,11 @@ class SemidiscreteTimeBlock:
                         if jnp.ndim(a_scale) == 0
                         else _add_step_operator(M, _row_scaled(A, w), dt)
                     )
-                return linear_solve(step_op, rhs, u, _diag, scale=th * dt, **kw)
-            return linear_solve(step_op, rhs, u, _diag)
+                return linear_solve(step_op, rhs, x0, _diag, scale=th * dt, **kw)
+            return linear_solve(step_op, rhs, x0, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
-        return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
+        return _default_step_solve(step_op, rhs, x0, d, krylov=(self.metadata or {}).get("krylov"))
 
     def solve(self, solve_fn=None, *, save_ts=None, values=None, checkpoint=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a

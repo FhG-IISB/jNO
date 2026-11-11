@@ -68,10 +68,11 @@ class _ThetaScheme(_TimeScheme):
         return _theta_order(self.theta)
 
     def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
-        def step_fn(u, t, dt):
+        def step_fn(u, t, dt, guess=None):
             return block.step(
-                u, t, dt, args=args, theta=self.theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
-            )
+                u, t, dt, args=args, theta=self.theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve,
+                guess=guess,
+            )  # fmt: skip
 
         return step_fn
 
@@ -1019,7 +1020,7 @@ def bdf_march(
 ):
     """Error-controlled variable-step, variable-order BDF / NDF march, reverse-mode differentiable.
 
-    ``be_step(w, t, dt)`` is the block's backward-Euler step ``(M + dt J) u = M w + dt f(t + dt)``. A BDF step
+    ``be_step(w, t, dt, guess=None)`` is the block's backward-Euler step ``(M + dt J) u = M w + dt f(t + dt)``. A BDF step
     of order ``k`` to ``t_{n+1} = t_n + h`` is ``be_step(psi, t_{n+1} - g, g)`` with ``g = 1/alpha_0'`` and
     ``psi`` the combination of the past states the formula fixes (see :class:`_BDFScheme`).
 
@@ -1082,10 +1083,14 @@ def bdf_march(
             c[j] = c[j] - kp * beta[j] / a0
         return jnp.stack([jnp.asarray(x, rt) for x in c]), 1.0 / a0
 
-    def _pred_gap(q, u_new, t_new, hist_t, hist_u):
-        """``u_new - P_q(t_new)``, ``P_q`` through the ``q + 1`` newest past states."""
+    def _predictor(q, t_new, hist_t, hist_u):
+        """``P_q(t_new)``, the polynomial through the ``q + 1`` newest past states."""
         beta = _extrapolation_weights(t_new, [hist_t[j] for j in range(q + 1)])
-        return u_new - sum(beta[j] * hist_u[j] for j in range(q + 1))
+        return sum(beta[j] * hist_u[j] for j in range(q + 1))
+
+    def _pred_gap(q, u_new, t_new, hist_t, hist_u):
+        """``u_new - P_q(t_new)``."""
+        return u_new - _predictor(q, t_new, hist_t, hist_u)
 
     def _attempt(operand):
         k, t, h, hist_t, hist_u, n_hist = operand
@@ -1094,8 +1099,11 @@ def bdf_march(
         def _one(kk):
             c, g = _formula(kk, t_new, h, hist_t, n_hist)
             psi = jnp.tensordot(c, hist_u, axes=1)
-            u_new = be_step(psi, t_new - g, g)
-            gap = _pred_gap(kk, u_new, t_new, hist_t, hist_u)
+            # The step's solve starts from the predictor, O(h^(k+1)) from the answer, not from psi, which is
+            # O(h) from it (CVODE / ode15s start Newton there too); before the predictor exists, from u^n.
+            pred = _predictor(kk, t_new, hist_t, hist_u)
+            u_new = be_step(psi, t_new - g, g, guess=jnp.where(n_hist >= kk + 1, pred, hist_u[0]))
+            gap = u_new - pred
             err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * gap, u_new, hist_u[0]), 0.0)
             # the neighbouring orders' errors, for the order choice (inf where they cannot be estimated)
             lo = (

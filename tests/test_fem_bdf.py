@@ -203,3 +203,23 @@ def test_bdf_refuses_a_bad_order():
     for bad in (0, 6, 2.5, True):
         with pytest.raises(ValueError, match="order must be"):
             jno.solve.bdf(order=bad)
+
+
+def test_the_step_solve_starts_from_the_predictor():
+    """Each BDF step's solve starts from the predictor P(t_{n+1}), O(h^(k+1)) from the answer, not from the
+    shifted state psi the formula forms, O(h) from it. The warm start's relative residual is then near the
+    local error (measured ~4e-7 at rtol 1e-6) instead of ~1e-2, and the Krylov solve has less to do."""
+    from jno.utils.solver.backend_blocks import _default_step_solve
+
+    seen = []
+
+    def counting(matvec, rhs, x0, diag_fn):
+        r0 = jnp.linalg.norm(rhs - matvec(x0)) / jnp.linalg.norm(rhs)
+        jax.debug.callback(lambda v: seen.append(float(v)), r0)
+        return _default_step_solve(matvec, rhs, x0, diag_fn())
+
+    fem = _form(6)
+    scheme = jno.solve.bdf().adaptive(rtol=1e-6, atol=1e-9, max_steps=150)
+    out = np.asarray(scheme.integrate(fem.operator, {}, SAVE[-1:], linear_solve=counting, nonlinear_solve=None))
+    assert not np.any(np.isnan(out)) and len(seen) > 20
+    assert np.median(seen) < 1e-4, f"median warm-start residual {np.median(seen):.1e}"
