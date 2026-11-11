@@ -2201,9 +2201,11 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     its free DOFs (checked eagerly). ``symmetric=False`` handles a **non-symmetric**
     operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
-    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
-    **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
-    :func:`theta`.
+    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable, also in a trainable
+    coefficient, network or initial condition, as long as the operator does not read time; time-varying
+    **coefficients** ``M(t)``/``A(t)``, a trainable or moving mass, or a nonlinear form → use :func:`theta`.
+    The structural refusals run once at ``fem.solve`` time, on the operator at the stored values, so they also
+    hold inside ``jno.core``.
 
     **Walls must be homogeneous.** Every zero-mass DOF is held at 0, which is a Dirichlet row with
     ``g = 0`` and nothing else. A non-zero or time-varying wall value, or an algebraic row that reaches an

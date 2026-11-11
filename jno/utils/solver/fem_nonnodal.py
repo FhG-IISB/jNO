@@ -2073,7 +2073,8 @@ def assemble_fem_nonnodal(
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,
                     runtime_parameter_exprs=dict(_param_and_neural_exprs),
-                    metadata={"nonaffine_operator": True},
+                    # A(args) and the source are assembled without the time: an autonomous parametric system
+                    metadata={"nonaffine_operator": True, "operator_reads_time": False, "forcing_reads_time": False},
                     **common,
                 ),
                 "transient",

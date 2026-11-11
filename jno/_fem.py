@@ -4469,6 +4469,12 @@ class FEM:
                 else compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
             )
 
+            # A scheme's structural refusals read concrete values; inside `jno.core` the march is traced and
+            # they would skip, so the scheme gets to run them once here, on the built operator.
+            _preflight = getattr(time, "preflight", None)
+            if _preflight is not None:
+                _preflight(self._op)
+
             def _stepper(block, args, save_ts):
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
                     return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)

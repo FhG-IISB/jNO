@@ -1365,6 +1365,8 @@ def _assemble_1d_transient(
         operator_fn=lambda t, args=None: _lin_sys(args)[1],
         forcing_vector_fn=lambda t, args=None: _lin_sys(args)[2],
         runtime_parameter_exprs=_param_exprs,
+        # A(args) and the load are assembled without the time: an autonomous parametric system
+        metadata={"operator_reads_time": False, "forcing_reads_time": False},
         **common,
     )
     return block, "transient"

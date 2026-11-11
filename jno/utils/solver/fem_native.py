@@ -1551,6 +1551,39 @@ def assemble_fem_native(
         for bare in _exprs:
             _gather_temporal_tags(bare, _temporal_tag_set)
     temporal_tags: Tuple[str, ...] = tuple(sorted(_temporal_tag_set))
+    # Does the OPERATOR read time, or only a source? A term reads time into the operator when it carries
+    # both the trial and a time Variable (conservative: ``k(t) grad u . grad v + f(t) v`` written as one term
+    # counts). A scheme that needs an autonomous operator (`jno.solve.exponential`) reads this flag.
+    from ..._fem import _contains as _contains_node
+    from ...trace import Hessian as _Hess
+    from ...trace import Jacobian as _Jac
+    from ...trace import TestFunction as _TestFn
+    from ...trace import TrialFunction as _TrialFn
+    from ...trace import Variable as _Var
+    from .solver_helper import iter_placeholder_children as _children
+
+    def _reads_time_as_value(node) -> bool:
+        """A time Variable read as a VALUE: not the variable of a derivative (``u.t``), not a symbol's own
+        binding (``u.bind(t=t)``)."""
+        seen, stack = set(), [node]
+        while stack:
+            nd = stack.pop()
+            if id(nd) in seen:
+                continue
+            seen.add(id(nd))
+            if isinstance(nd, _Var) and getattr(nd, "axis", None) == "temporal":
+                return True
+            if isinstance(nd, (_TrialFn, _TestFn)):
+                continue
+            if isinstance(nd, (_Jac, _Hess)):
+                stack.append(nd.target)
+                continue
+            stack.extend(_children(nd))
+        return False
+
+    _all_terms_t = list(volume_terms) + [b for _exprs in boundary_terms.values() for b in _exprs]
+    _operator_reads_time = any(_contains_node(b, _TrialFn) and _reads_time_as_value(b) for b in _all_terms_t)
+    _form_reads_time = any(_reads_time_as_value(b) for b in _all_terms_t)
 
     # Runtime parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown diffusivity
     # in an inverse problem). Their values arrive at solve time in an ``args`` dict; the builders pack
@@ -5484,6 +5517,9 @@ def assemble_fem_native(
                         + list(_dir_net_models)
                         + list(_ic_net_models),
                         "nonaffine_operator": True,
+                        "operator_reads_time": _operator_reads_time,
+                        # the forcing reads time through a source term or a time-varying essential value
+                        "forcing_reads_time": _form_reads_time or tv_dofs is not None,
                     },
                     **common,
                 ),

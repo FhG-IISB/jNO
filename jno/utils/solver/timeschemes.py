@@ -114,6 +114,18 @@ class _ExponentialScheme(_TimeScheme):
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
         return _exponential_integrate(block, args, save_ts, order=self.order, mass=self.mass, symmetric=self.symmetric)
 
+    def preflight(self, block):
+        """Run the structural refusals once, eagerly, on the built block (at ``fem.solve`` time).
+
+        Inside ``jno.core`` the march is traced, the values the guards read are tracers, and they would skip:
+        measured, a lumped Hermite march then returned NaN instead of the refusal it gets when solved eagerly."""
+        stored = _stored_runtime_args(block)
+        if stored is None:  # a trainable with no stored value to evaluate at: the in-trace checks are all there is
+            return
+        _exponential_integrate(
+            block, stored, None, order=self.order, mass=self.mass, symmetric=self.symmetric, check_only=True
+        )
+
     def __repr__(self):
         return f"jno.solve.exponential(order={self.order}, mass={self.mass!r}, symmetric={self.symmetric})"
 
@@ -1405,6 +1417,19 @@ def _refuse_what_the_mask_would_zero(Aop, mask, s0, forcings):
             )
 
 
+def _stored_runtime_args(block):
+    """The block's runtime args at the trainables' STORED values (a parameter's ``.value``, a network's
+    module), or ``None`` when one of them has no stored value to read."""
+    out = {}
+    for name, expr in (getattr(block, "runtime_parameter_exprs", None) or {}).items():
+        model = getattr(expr, "model", None)
+        module = getattr(model, "module", None)
+        if module is None:
+            return None
+        out[name] = jnp.asarray(module.value) if getattr(model, "_is_parameter", False) else module
+    return out
+
+
 def _refuse_nonsymmetric(A, mask):
     """``symmetric=True`` runs Lanczos, which is exact only for a symmetric free block; refuse any other.
 
@@ -1451,7 +1476,7 @@ def _refuse_nonpositive_lumping(d, mask):
         )
 
 
-def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
+def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, check_only=False):
     """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
     ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
 
@@ -1471,7 +1496,12 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
         raise NotImplementedError(
             "jno.solve.exponential integrates a LINEAR block only; use a θ-scheme for a nonlinear one."
         )
-    if block.operator_fn is not None or block.mass_fn is not None:
+    meta = getattr(block, "metadata", None) or {}
+    # A runtime-parametric operator A(args) (a trainable coefficient) is fine as long as it does not read
+    # time: the assembler says so per term (`operator_reads_time`). A parametric MASS is not (it would have to
+    # be re-lumped / re-solved per evaluation, and a trainable mass is refused upstream anyway).
+    _param_op = block.operator_fn is not None and meta.get("operator_reads_time") is False
+    if (block.operator_fn is not None and not _param_op) or block.mass_fn is not None:
         raise NotImplementedError(
             "jno.solve.exponential needs time-INDEPENDENT M and A (an autonomous system). For time-varying "
             "coefficients use jno.solve.theta(...)."
@@ -1479,8 +1509,18 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     if mass not in ("lumped", "consistent"):
         raise ValueError(f"jno.solve.exponential: mass={mass!r} — use 'lumped' or 'consistent'.")
 
-    Mop, Aop = block.M, block.A
-    s0 = jnp.asarray(block.state0).reshape(-1)
+    Mop = block.M
+    t_start = float(block.t0)
+    Aop = block.operator_fn(t_start, args or {}) if _param_op else block.A
+    # The structural guards below read concrete values. Under a training step the args are traced, so they
+    # run on the operator at the trainables' STORED values instead -- the structure (symmetry, which rows
+    # are constrained) does not depend on the coefficient's value.
+    A_check = Aop
+    if _param_op and isinstance(getattr(Aop, "data", None), jax.core.Tracer):
+        stored = _stored_runtime_args(block)
+        A_check = block.operator_fn(t_start, stored) if stored is not None else Aop
+    _s0f = getattr(block, "state0_fn", None)
+    s0 = jnp.asarray(_s0f(args) if _s0f is not None else block.state0).reshape(-1)
     dtype = s0.dtype
     n = s0.shape[0]
     dt = float(block.dt)
@@ -1496,6 +1536,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     if block.affine_bias is not None:
         c_aff = c_aff + jnp.asarray(block.affine_bias, dtype).reshape(-1)
     _time_varying = block.forcing_vector_fn is not None
+    if _time_varying and _param_op and meta.get("forcing_reads_time") is False:
+        # the parametric assembly hands every source over as f(t, args); one that reads no time is constant
+        c_aff = c_aff + jnp.asarray(block.forcing_vector_fn(t_start, args or {}), dtype).reshape(-1)
+        _time_varying = False
     has_forcing = bool(block.affine_bias is not None or _time_varying)
 
     def _f_of(t):  # total forcing vector at time t: constant affine_bias + the time-varying source
@@ -1525,12 +1569,16 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric):
     if mass == "lumped":
         _refuse_nonpositive_lumping(d, mask)
     if symmetric:
-        _refuse_nonsymmetric(Aop, mask)
+        _refuse_nonsymmetric(A_check, mask)
     # A Krylov space cannot outgrow the problem: cap the size at the number of unknowns (the free ones, when
     # the mask is concrete). Past it the Arnoldi of `expmv` raised outright ("num_matvecs=40 exceeds ... 31").
     n_free = int(np.sum(np.asarray(mask))) if not isinstance(mask, jax.core.Tracer) else n
     order = max(1, min(int(order), n_free))
-    _refuse_what_the_mask_would_zero(Aop, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else []))
+    _refuse_what_the_mask_would_zero(
+        A_check, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else [])
+    )
+    if check_only:
+        return None
 
     def _consistent_m_solve():
         """A masked, Jacobi-preconditioned CG solve for ``M⁻¹·(mask·rhs)`` — used by the consistent-mass

@@ -1643,6 +1643,12 @@ replaces `M` by its row sums: a different spatial discretisation (4e-2 off the c
 coupling between fields; pass `symmetric=False`. Algebraic rows other than walls (a pressure, an RT flux) are
 refused as before.
 
+A trainable coefficient, network or initial condition is fine as long as the operator does not read time
+(a time-dependent source is): `exponential()` then takes the operator at the runtime values and is reverse-mode
+differentiable on both mass treatments, matching finite differences to 1e-9. An operator that reads time is
+refused. The refusals above run once when `fem.solve(time=jno.solve.exponential(...))` is called, on the
+operator at the stored values, so they also hold inside `jno.core`, where the march itself is traced.
+
 ### Higher order — `sdirk` and `rosenbrock`
 
 `jno.solve.sdirk(order=3)` is Alexander's 3-stage, order-3 SDIRK method (order 2: 2 stages; SIAM J.
