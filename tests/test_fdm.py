@@ -2318,8 +2318,68 @@ def test_coupled_nonlinear_march(monkeypatch):
         v(xi, yi) - 0.25 * bump,
     ]
     a = np.asarray(jno.fdm(terms).solve())
-    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu(), nonlinear=jno.solve.newton(direct=True)))
     assert np.isfinite(a).all() and np.abs(a - b).max() < 1e-12
+    # the default per-step Newton with lu() refreshes its tangent every iteration (newton(direct=True)), not the
+    # kept tangent of newton(reuse=True), which needs more iterations on a stiff reaction: the same iterates
+    default = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    assert np.abs(default - b).max() < 1e-12
+
+
+@pytest.mark.parametrize("scheme", [None, "bdf2"])
+def test_repeated_march_is_traced_once(monkeypatch, scheme):
+    """Solving the same transient problem again reuses the traced march: fresh scheme and solver specs that are
+    equal by value hit the cache, the answer is identical, and a different slot traces anew. Each solve()
+    used to build a new block and so re-trace and re-compile the whole march (half of a warm 32x32
+    Brusselator solve)."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    problem = jno.fdm(
+        [
+            ui.t - 0.1 * (ui.xx + ui.yy) + ui**3,  # nonlinear: the per-step Newton with an assembled tangent
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+        ]
+    )
+    traces = []
+    real = jax.make_jaxpr
+    monkeypatch.setattr(jax, "make_jaxpr", lambda *a, **k: traces.append(1) or real(*a, **k))
+    kw = lambda: dict(time=jno.solve.bdf2() if scheme else None, linear=jno.solve.lu())  # noqa: E731
+    first = np.asarray(problem.solve(**kw()))
+    n_first = len(traces)
+    again = np.asarray(problem.solve(**kw()))
+    assert n_first > 0 and len(traces) == n_first
+    assert np.array_equal(first, again)
+    np.asarray(problem.solve(time=kw()["time"], linear=jno.solve.lu(), nonlinear=jno.solve.newton(direct=True, rtol=1e-10)))
+    assert len(traces) > n_first
+
+
+def test_rosenbrock_marches_a_nonlinear_problem_with_an_assembled_step():
+    """`time=rosenbrock(), linear=lu()` on a nonlinear march: the stages solve with the assembled stage matrix
+    (no Newton) and land on the fine BDF2 march. jno.fdm used to fill in `nonlinear=newton(...)` itself, so the
+    scheme refused the march ('nonlinear= has nothing to drive') though the caller passed none."""
+    terms_of = lambda n: _cubic_heat_terms(n)  # noqa: E731
+    ros = np.asarray(jno.fdm(terms_of(21)).solve(time=jno.solve.rosenbrock(), linear=jno.solve.lu()))
+    ref = np.asarray(jno.fdm(terms_of(321)).solve(time=jno.solve.bdf2(), linear=jno.solve.lu()))
+    assert np.abs(ros[-1] - ref[-1]).max() < 1e-4 * np.abs(ref[0]).max()
+
+
+def _cubic_heat_terms(n_times):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, n_times))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    return [
+        ui.t - 0.1 * (ui.xx + ui.yy) + ui**3,
+        u(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+    ]
 
 
 def test_coupled_march_inverse_recovers_the_coupling():
