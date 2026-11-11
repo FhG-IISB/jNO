@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794391327,"nonce":"og81rgFvQzqcNN1moHBxAplXUjM=","added":["branch:feat/stiff-time-integration","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794397793,"nonce":"TCJGUhz1F2Rt8Cybb8PHqSFlgIY=","message":"Fixed in f6d3108d; test: tests/test_fem_transient_trainable_ic.py::test_a_data_field_initial_condition_built_into_the_operator_is_not_zero","files":null}]}
