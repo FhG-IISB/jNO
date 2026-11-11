@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794393139,"nonce":"TP1EMIuaZqKbrFhQYNzUM5cNgag=","message":"Fixed in 71638966; test: test_exponential_refusals_hold_inside_jno_core","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794393139,"nonce":"3tGwUFVnAGOZjn0td47XDiMGl6U=","status":2}]}
