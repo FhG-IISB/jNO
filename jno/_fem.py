@@ -8416,7 +8416,9 @@ def _fem_impl(
             classification.append("initial")
         elif has_test:
             _retag_coords_for_quadrature(c, support, region)
-            bare = _bare(c)
+            bare = _clean_weak_summands(_bare(c), support)
+            if bare is None:  # the whole term is a structural zero (`0 * v`): nothing to assemble
+                continue
             if support == "volume":
                 if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
@@ -9753,6 +9755,57 @@ def _ic_component(bare: Any) -> Any:
     accumulates several ICs needs to know which stripe each owns."""
     trial_side = _ic_trial_side(bare)
     return None if trial_side is None else _component_index_of(trial_side)
+
+
+def _weak_summands(node: Any, sign: float = 1.0) -> List[Tuple[float, Any]]:
+    """``[(sign, summand)]`` of a term's top-level ``+``/``-`` tree. Products are NOT distributed."""
+    from .trace import BinaryOp
+
+    op = getattr(node, "op", None)
+    if isinstance(node, BinaryOp) and op in ("+", "-"):
+        return _weak_summands(node.left, sign) + _weak_summands(node.right, sign if op == "+" else -sign)
+    return [(sign, node)]
+
+
+def _clean_weak_summands(bare: Any, support: str = "volume") -> Any:
+    """A weak term with its structural-zero summands dropped, refusing a summand that has no test function.
+
+    Every additive piece of a weak form pairs with a test function. A piece without one has no equation to
+    go into, and the assemblers met it four different ways: 1-D integrated it into a SILENTLY wrong answer
+    (``2 + u' v'`` moved the solution by 0.48), a 1-D transient and the 2-D transient failed with an
+    unrelated TypeError, the non-nodal path refused even the harmless ``0`` that builtin ``sum()`` seeds,
+    and only the native steady path said what was wrong. Decided here, once, for every assembler: a
+    concrete real literal zero (``_is_structural_zero``) is dropped; anything else without a test is refused.
+    Returns ``None`` when every summand is a structural zero."""
+    from .trace import BinaryOp, Literal
+    from .utils.solver.fem_utils import _is_structural_zero
+
+    parts = _weak_summands(bare)
+    # A complex zero (`0j * u * v`) stays: it is what marks the form complex, and dropping it would assemble
+    # the real problem -- with a complex essential value then cast to float.
+    kept = [
+        (sg, t)
+        for sg, t in parts
+        if not (_is_structural_zero(t) and not any(_node_has_complex_literal(n) for n in _walk(t)))
+    ]
+    for _sg, t in kept:
+        if not _contains(t, TestFunction):
+            raise ValueError(
+                f"jno.fem: a {support} weak-form summand carries no test field, so it belongs to no "
+                f"equation -- {t!r}. Every additive piece of a weak form pairs with a test function: a "
+                "source term is `- f * v`, not `- f`."
+            )
+    if len(kept) == len(parts):
+        return bare
+    if not kept:
+        return None
+    out = None
+    for sg, t in kept:
+        if out is None:
+            out = t if sg > 0 else BinaryOp("*", Literal(-1.0), t)
+        else:
+            out = BinaryOp("+" if sg > 0 else "-", out, t)
+    return out
 
 
 def _initialized_parameter_values(node: Any) -> dict:
