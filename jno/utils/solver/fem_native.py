@@ -1581,8 +1581,17 @@ def assemble_fem_native(
             stack.extend(_children(nd))
         return False
 
+    def _summands(node):
+        """The ``+``/``-`` summands of a term: ``u_t v + k grad u . grad v - f(t) v`` is three, so a source that
+        reads time does not mark the operator beside it as reading time."""
+        if getattr(node, "op", None) in ("+", "-") and hasattr(node, "left") and hasattr(node, "right"):
+            return _summands(node.left) + _summands(node.right)
+        return [node]
+
     _all_terms_t = list(volume_terms) + [b for _exprs in boundary_terms.values() for b in _exprs]
-    _operator_reads_time = any(_contains_node(b, _TrialFn) and _reads_time_as_value(b) for b in _all_terms_t)
+    _operator_reads_time = any(
+        _contains_node(sm, _TrialFn) and _reads_time_as_value(sm) for b in _all_terms_t for sm in _summands(b)
+    )
     _form_reads_time = any(_reads_time_as_value(b) for b in _all_terms_t)
 
     # Runtime parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown diffusivity

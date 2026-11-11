@@ -116,3 +116,23 @@ def test_exponential_refusals_hold_inside_jno_core():
     Hermite march returned NaN there instead of the refusal it gets eagerly; they now run at fem.solve."""
     with pytest.raises(NotImplementedError, match="lumping gives a zero or negative mass"):
         jno.fem(_heat(k=_param("a", 1.3), space="Hermite")).solve(time=jno.solve.exponential())
+
+
+def test_exponential_takes_a_time_dependent_source_beside_a_trainable_operator():
+    """``u_t v + a grad u . grad v - f(t) v`` written as ONE expression: the operator is autonomous, only the
+    source reads time. The test for time was per term, so the source marked the operator and it was refused."""
+
+    def build(a):
+        d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(time=T)
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        X = [xi, yi]
+        ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        f = (1.0 + 4.0 * ti) * sin(PI * xi) * sin(PI * yi)
+        return [ui.t * vi + a * inner(grad(u, X), grad(v, X), 1) - f * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0]
+
+    g, fd, loss0 = _scalar_gradient(build, _EXP["consistent"])
+    assert loss0 > 0 and abs(g) > 0
+    assert _rel(g, fd) < 1e-6, f"crux {g:.10e} vs FD {fd:.10e}"
