@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794399424,"nonce":"RJCQVyR86zFNWqOZRfv738pFtr0=","added":["branch:feat/stiff-time-integration","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794399424,"nonce":"wLhkDFaq8/LcmI6WFWvFaW2R1uY=","message":"Fixed in 5d51d532; test: tests/test_fem_1d.py::test_complex_essential_value_on_a_real_1d_form_is_refused_by_name","files":null}]}
