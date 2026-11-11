@@ -9755,6 +9755,33 @@ def _ic_component(bare: Any) -> Any:
     return None if trial_side is None else _component_index_of(trial_side)
 
 
+def _initialized_parameter_values(node: Any) -> dict:
+    """``{name: value}`` for every parameter in ``node`` whose ``.initialize(...)`` has not been applied yet.
+
+    The initializer is LAZY -- the training loop applies it when it sets the models up -- so a value read at
+    build time is still the zeros the parameter is born with. An initial state baked at build (a nodal data
+    field handed in as ``u(initial) - g``) then started the march from 0, with nothing to flag it."""
+    from .geometry.parametric import initial_value
+
+    out = {}
+    for nd in _walk(node):
+        m = getattr(nd, "model", None)
+        if type(nd).__name__ != "ModelCall" or not getattr(m, "_is_parameter", False):
+            continue
+        name = getattr(m, "_parameter_name", None)
+        val = initial_value(nd)
+        if (
+            val is None
+            and getattr(m, "_weight_tree", None) is not None
+            and not hasattr(m._weight_tree, "__fspath__")
+            and not isinstance(m._weight_tree, str)
+        ):
+            val = jnp.asarray(m._weight_tree)
+        if name is not None and val is not None:
+            out[name] = jnp.reshape(jnp.asarray(val), jnp.shape(m.module.value))
+    return out
+
+
 def _ic_trainable_names(ic_residuals: List[Any]) -> List[str]:
     """Names of the trainable parameters and networks an initial condition's value reads.
 
@@ -9839,7 +9866,14 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     from .utils.solver.time_route import _infer_time_window
 
     # an initial condition sits at the start time: a value written with the time variable reads it there
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
+    vals = jnp.asarray(
+        _eval_value_node_at(
+            value_node,
+            jnp.asarray(pts),
+            params=_initialized_parameter_values(value_node) or None,
+            t=_infer_time_window(domain)[0],
+        )
+    ).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)

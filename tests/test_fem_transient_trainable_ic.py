@@ -93,3 +93,33 @@ def test_an_optimizerless_data_field_initial_condition_is_not_a_trainable():
     got = np.asarray(_evaluate(jno.fem(terms + [u(ci[0], ci[1]) - g]).solve()))
     ref = np.asarray(_evaluate(jno.fem(terms + [u(ci[0], ci[1]) - sin(PI * ci[0]) * sin(PI * ci[1])]).solve()))
     np.testing.assert_allclose(got, ref, atol=1e-10)
+
+
+def _data_ic_pair(d, X, t, Xb, ci, tt=False):
+    """The same march started from a nodal DATA field and from the closed-form initial value."""
+    u, v = d.fem_symbols()
+    ui, vi = u.bind(**dict(zip("xyz", X)), t=t), v.bind(**dict(zip("xyz", X)), t=t)
+    pts = np.asarray(d.mesh.points)[:, : len(X)]
+    vals = np.prod(np.sin(PI * pts), axis=1)
+    g = jno.np.parameter(v, name="u0").initialize(lambda *a, **k: jnp.asarray(vals))
+    g.dtype(jnp.float64)
+    lap = ui.x * vi.x if len(X) == 1 else ui.x * vi.x + ui.y * vi.y
+    terms = [(ui.tt if tt else ui.t) * vi + lap, u(*Xb) - 0.0]
+    u0 = sin(PI * ci[0]) if len(X) == 1 else sin(PI * ci[0]) * sin(PI * ci[1])
+    got = np.asarray(_evaluate(jno.fem(terms + [u(*ci[: len(X)]) - g]).solve()))
+    ref = np.asarray(_evaluate(jno.fem(terms + [u(*ci[: len(X)]) - u0]).solve()))
+    return got, ref
+
+
+@pytest.mark.parametrize("case", ["line_1d", "second_order"])
+def test_a_data_field_initial_condition_built_into_the_operator_is_not_zero(case):
+    """Where the initial state is fixed at build (a 1-D line, a ``u_tt`` form), a data-field initial value was
+    read before its lazy initializer ran, and the march started from 0."""
+    if case == "line_1d":
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=T)
+    else:
+        d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain(time=T)
+    co, cb = d.variable("interior", split=True), d.variable("boundary", split=True)
+    got, ref = _data_ic_pair(d, co[:-1], co[-1], cb[:-1], d.variable("initial", split=True), tt=case == "second_order")
+    assert np.abs(ref).max() > 0.1
+    np.testing.assert_allclose(got, ref, atol=1e-10)
