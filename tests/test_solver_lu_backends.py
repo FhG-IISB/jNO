@@ -158,9 +158,12 @@ def test_gradients_match_finite_differences_on_a_non_symmetric_system():
 @requires_cudss
 def test_composes_as_a_fem_linear_slot():
     """It must be a drop-in for the `linear=` slot, not a standalone function."""
-    d = jno.shape.rectangle(1.0, 1.0).domain(resolution=8)
-    u, phi = d.fem_symbols()
-    fem = jno.fem([jno.np.inner(jno.np.grad(u, d.coords), jno.np.grad(phi, d.coords)) - phi, u("boundary")])
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.125).domain()
+    u, v = d.fem_symbols()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
     sol = fem.solve(linear=jno.solve.lu(backend="cudss"))
     ref = fem.solve(linear=jno.solve.lu(backend="host"))
     np.testing.assert_allclose(np.asarray(sol), np.asarray(ref), rtol=1e-8, atol=1e-10)
@@ -765,3 +768,26 @@ def test_the_gate_sits_orders_clear_of_both_signatures_it_separates():
 
     assert _SINGULAR_REL / _CLEAN_REL >= 1e3  # a wide usable band between the two questions
     assert 1.0 / _SINGULAR_REL >= 1e3  # and far below the O(1) a real null space leaves
+
+
+# --------------------------------------------------------------------------------------
+# BCOO padding: entries parked at the out-of-bounds index (n, n)
+# --------------------------------------------------------------------------------------
+
+
+def _padded(A, n_pad=3):
+    """``A`` with ``n_pad`` extra entries at the padding index ``(n, n)``, as jax.experimental.sparse
+    leaves them when a fixed-length BCOO drops entries."""
+    n = A.shape[0]
+    pad = jnp.full((n_pad, 2), n, dtype=A.indices.dtype)
+    return jsp.BCOO((jnp.concatenate([A.data, jnp.full(n_pad, 9.0)]), jnp.concatenate([A.indices, pad])), shape=A.shape)
+
+
+@pytest.mark.skipif(not _pardiso_available(), reason="pypardiso not installed")
+def test_pardiso_ignores_padding_entries_as_jax_does():
+    """JAX's own sparse conversion sorts padding past the last row and never reads it; the PARDISO host
+    solve must do the same rather than hand scipy an out-of-range index."""
+    A, b = _spd(60), jnp.asarray(np.random.default_rng(2).normal(size=60))
+    x_ref = np.linalg.solve(np.asarray(A.todense()), np.asarray(b))
+    x = np.asarray(pardiso_lu_solve(_padded(A), b))
+    np.testing.assert_allclose(x, x_ref, rtol=1e-10, atol=1e-12)

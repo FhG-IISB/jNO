@@ -982,6 +982,11 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     idx = _np.ascontiguousarray(_np.asarray(indices))
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
     rows, cols = idx[:, 0], idx[:, 1]
+    # BCOO marks padding with an out-of-bounds index; JAX's own CSR conversion sorts it past the last row
+    # and never reads it, but scipy refuses it, so it is dropped here
+    keep = (rows < shape[0]) & (cols < shape[1])
+    if not keep.all():
+        data, rows, cols = data[keep], rows[keep], cols[keep]
 
     # MKL PARDISO does not defend itself against a non-finite operator: handed one it corrupts its
     # own heap and the PROCESS dies -- "double free or corruption", SIGABRT, no exception, nothing
