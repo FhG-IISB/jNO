@@ -120,11 +120,18 @@ jobs:
       # Keyed per shard and per lockfile (a new JAX invalidates every entry). A PR restores the newest
       # cache of its own earlier runs, else the nightly's on main; entries are keyed by the program's
       # hash, so a stale one is never loaded, only unused. Saved even when tests fail.
+      # XLA's CPU code is compiled for the runner's instruction set, and the cache key JAX uses does
+      # not include it: runners come with and without AVX-512, and loading another CPU's entries
+      # warns "could lead to execution errors such as SIGILL". So the cache is also keyed by the CPU
+      # flags; each kind of runner keeps its own.
+      - id: cpu
+        run: echo "id=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/cache/restore@v4
         with:
           path: ~/.cache/jno
-          key: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-
+          key: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-
 
       - name: Select this shard's files
         run: python3 .github/ci_plan.py files ${{ matrix.group }} ${{ matrix.shard }} ${{ matrix.of }} | tee files.txt
@@ -136,7 +143,7 @@ jobs:
         if: '!cancelled()'
         with:
           path: ~/.cache/jno
-          key: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - uses: actions/upload-artifact@v4
         if: '!cancelled()'
