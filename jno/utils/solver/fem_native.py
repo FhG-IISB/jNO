@@ -5317,12 +5317,22 @@ def assemble_fem_native(
                     # static-path trick) -- one extra single-point evaluation decides, shapes are static.
                     one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a_one)).reshape(-1)
                 if raw.shape == one.shape or not node_ids:
-                    gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
+                    gtab = jnp.broadcast_to(one.reshape(1, -1), (len(node_ids), one.size))
                 else:
-                    gvals = raw.reshape(len(node_ids), -1)[:, 0]
+                    gtab = raw.reshape(len(node_ids), -1)
+                # one column per clamped component, as the static path: a vector value used to be cut to its first
+                # component and imposed on all of them (`u(b) - (0, a y)` imposed 0 -- the parameter never arrived)
+                n_values = int(gtab.shape[1])
+                if n_values != 1 and not (comp is None and n_values == vt):
+                    _dirichlet_value_columns(np.zeros((1, n_values)), vt, comp, region)  # the shape error, if one
+                    raise NotImplementedError(
+                        f"jno.fem: the Dirichlet value on {region!r} holds a parameter and {n_values} values per point "
+                        "on a symmetric field; prescribe it per component, `u(region)[i] - g_i`."
+                    )
                 for i, nid in enumerate(node_ids):
                     for c in range(vt) if comp is None else [int(comp)]:
-                        pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, gvals[i])))
+                        g_ic = gtab[i, 0] if n_values == 1 else gtab[i, c]
+                        pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g_ic)))
                 continue
             if _vn is None or not _is_neural_coefficient(_vn):
                 continue

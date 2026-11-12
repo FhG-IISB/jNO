@@ -229,6 +229,24 @@ def test_vector_field_per_component_parametric_value():
     np.testing.assert_allclose(got, np.asarray(oracle.solve()), rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("profile", ["spatial", "constant"])
+def test_vector_field_all_component_parametric_value(profile):
+    """``u(b) - (g0, g1)`` with a parameter in it imposes every component: component 0 was imposed on all of them
+    (here 0 or 0.5, so the parameter never reached the solve -- silently)"""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    u, v = d.fem_symbols(value_shape=(2,))
+    inner, grad, vec = jno.np.inner, jno.np.grad, jno.np.vector
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    g = _param("g", 1.0)
+    value = (lambda s: vec(0.0 * xb, s * yb)) if profile == "spatial" else (lambda s: vec(0.0 * xb + 0.5, s + 0.0 * xb))
+    fem = jno.fem([inner(gu, gv, n_contract=2), u(xb, yb) - value(g)])
+    oracle = jno.fem([inner(gu, gv, n_contract=2), u(xb, yb) - value(4.0)])
+    got = _solve_at(fem, {"g": np.asarray([4.0])})
+    np.testing.assert_allclose(got, np.asarray(oracle.solve(linear=jno.solve.lu())), rtol=1e-10, atol=1e-10)
+
+
 def test_parametric_times_temporal_value_off_the_march_refuses_loudly():
     """`u(top) - g*tau` on a τ domain whose form reads no history: nothing marches the grid, so there is no
     step τ to hold the ramp at. It must refuse at build. (On a march the combination is supported --
