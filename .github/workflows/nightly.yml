@@ -4,9 +4,9 @@ name: Nightly (full suite)
 # safe: if a filter is scoped too narrowly, the miss surfaces here within a day rather than never.
 # Do not add path filters to this workflow -- running everything is its entire purpose.
 #
-# Scheduled only, deliberately NOT on push to main. The suite takes ~2 h, and anything arriving via
-# PR has already run its filtered subset, so a per-push run would mostly re-execute what just
-# passed. The trade is that a mis-scoped filter is caught within a day instead of within minutes;
+# Scheduled only, deliberately NOT on push to main. The suite takes ~5-6 h of runner time, and
+# anything arriving via PR has already run its filtered subset, so a per-push run would mostly
+# re-execute what just passed. The trade is that a mis-scoped filter is caught within a day instead of within minutes;
 # `workflow_dispatch` is there for when that wait is not acceptable -- run it by hand before a
 # release or after a risky merge.
 #
@@ -16,6 +16,10 @@ name: Nightly (full suite)
 # the last 24 h": if a scheduled run is ever dropped (GitHub does drop them under load), a time
 # window silently skips the commits that landed during the gap, whereas a SHA comparison still sees
 # them. `workflow_dispatch` always runs, so a manual trigger is never skipped.
+#
+# It runs as the same balanced shards as ci.yml (.github/ci_plan.py, every group). As one job it hit
+# the 240 min timeout and was cancelled on 2026-11-10, -11 and -12. Sharing the PR's split also makes
+# the compile caches it saves on main the ones a PR restores.
 #
 # Coverage is uploaded from HERE and not from a PR, because a filtered PR run only executes part of
 # the suite and would report every unexercised file as freshly uncovered.
@@ -39,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run: ${{ steps.check.outputs.run }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: check
@@ -60,12 +65,18 @@ jobs:
           else
             echo "main unchanged since the last attempt -> skipping"; echo "run=false" >> "$GITHUB_OUTPUT"
           fi
+      - id: plan
+        run: echo "matrix=$(python3 .github/ci_plan.py matrix)" >> "$GITHUB_OUTPUT"
 
   full:
+    name: full (${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }})
     needs: guard
     if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,11 +84,35 @@ jobs:
         with:
           cache: true
 
+      # Same keys as ci.yml. Saved on main, so every PR can restore it as its starting cache.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-
+
+      - name: Select this shard's files
+        run: python3 .github/ci_plan.py files ${{ matrix.group }} ${{ matrix.shard }} ${{ matrix.of }} | tee files.txt
+
       # One process per test FILE. The all-in-one run accumulates JAX device buffers and coverage
       # state across the suite and gets OOM-killed part-way through on a hosted runner.
-      - name: Full test suite
-        run: pixi run ci-test-cov
+      - name: Test ${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }}
+        run: pixi run -- env CI_COVERAGE=1 bash .github/ci_test_per_file.sh $(cat files.txt)
 
+      - uses: actions/cache/save@v4
+        if: '!cancelled()'
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-artifact@v4
+        if: '!cancelled()'
+        with:
+          name: file-times-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}
+          path: ci-file-times.tsv
+          retention-days: 14
+
+      # Codecov merges the uploads of one commit, so each shard sends its own part.
       - name: Upload coverage to Codecov
         if: '!cancelled()'
         uses: codecov/codecov-action@v4
