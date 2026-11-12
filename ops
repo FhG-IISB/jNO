@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":1,"timestamp":1794522390,"nonce":"6DnQxuwHSKzuMZ+rQDI9lX27Jrw=","title":"Dispatch-table count not updated for RegionMask","message":"TraceEvaluator._HANDLERS gained RegionMask; test_handlers_count still expected 26.","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794522390,"nonce":"9qIF9dUxfJZ51WZAeRbn/J7w/Es=","added":["branch:feat/rcwa-jax-field","bug"],"removed":null}]}
