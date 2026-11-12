@@ -113,3 +113,69 @@ def test_structural_zero_is_narrow():
     seen = []
     jax.jit(lambda z: seen.append(_is_structural_zero(Literal(z))) or z)(0.0)
     assert seen == [False], "a traced zero is not known to be zero at build time"
+
+
+# ---------------------------------------------------------------------------------------------------
+# The same rule on every assembler: it is decided once, where `jno.fem` classifies the terms.
+# 1-D integrated a test-free constant into a SILENTLY wrong answer (`2 + u' v'` moved the solution by
+# 0.48), a 1-D transient failed with a reshape TypeError on the `0` builtin `sum()` seeds, and the
+# non-nodal path refused that harmless `0`.
+# ---------------------------------------------------------------------------------------------------
+def _poisson(dim, transient, space, const):
+    from tests.test_fem_trainables_gaps import _evaluate
+
+    T = (0.0, 0.05, 4)
+    tkw = {"time": T} if transient else {}
+    if dim == 1:
+        d = jno.domain(constructor=jno.domain.line(mesh_size=0.2), **tkw)
+    else:
+        d = jno.shape.rect(0, 0, 1, 1, size=0.4).domain(**tkw)
+    u, v = d.fem_symbols() if space is None else d.fem_symbols(space=space)
+    co, cb = d.variable("interior", split=True), d.variable("boundary", split=True)
+    X, Xb = (co[:-1], cb[:-1]) if transient else (co[:dim], cb[:dim])
+    kw = dict(zip("xyz", X)) | ({"t": co[-1]} if transient else {})
+    ui, vi = u.bind(**kw), v.bind(**kw)
+    a = ui.x * vi.x if dim == 1 else ui.x * vi.x + ui.y * vi.y
+
+    def build(body):
+        terms = [(ui.t * vi + body) if transient else body, u(*Xb) - 0.0]
+        if transient:
+            terms.append(u(*d.variable("initial", split=True)[:dim]) - 0.0)
+        return terms
+
+    plain = np.asarray(_evaluate(jno.fem(build(a - 1.0 * vi)).solve()))
+    padded = build((const + a) - 1.0 * vi)
+    return plain, padded, _evaluate
+
+
+_PATHS = [
+    (1, False, None),
+    (1, True, None),
+    (1, False, "Hermite"),
+    (1, True, "Hermite"),
+    (2, True, None),
+    (2, False, "Hermite"),
+]
+
+
+@pytest.mark.parametrize("dim,transient,space", _PATHS)
+def test_a_zero_summand_changes_nothing_on_every_assembler(dim, transient, space):
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        plain, padded, evaluate = _poisson(dim, transient, space, 0)
+        np.testing.assert_allclose(np.asarray(evaluate(jno.fem(padded).solve())), plain, rtol=0, atol=1e-12)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+@pytest.mark.parametrize("dim,transient,space", _PATHS)
+def test_a_test_free_constant_is_refused_on_every_assembler(dim, transient, space):
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        _plain, padded, _ = _poisson(dim, transient, space, 2.0)
+        with pytest.raises(ValueError, match="carries no test field"):
+            jno.fem(padded)
+    finally:
+        jax.config.update("jax_enable_x64", prev)

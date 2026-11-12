@@ -1576,9 +1576,10 @@ the tangent within a step but not across steps (the reverse pass would store one
 | `jno.solve.theta(1.0)` | 1 | L-stable | the default — robust, damps everything |
 | `jno.solve.theta(0.5)` | 2 | A-stable only | smooth problems; **rings** on stiff modes |
 | `jno.solve.bdf2()` | 2 | **L-stable** | stiff / saddle-point systems — flow's workhorse |
+| `jno.solve.bdf(order=None\|1..5)` | 1–5, chosen per step | L-stable to 2, A(α) above | stiff transients on error-controlled steps: one implicit solve per step |
 | `jno.solve.sdirk(order=2\|3)` | 2 or 3 | **L-stable**, stiffly accurate | higher order where BDF2 is not enough; state-dependent mass allowed |
 | `jno.solve.rosenbrock("ros34pw2"\|"ros2")` | 3 or 2 | **L-stable** | nonlinear blocks **without Newton**: one linear solve per stage |
-| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
+| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks (`mass="consistent"` for the system the other schemes solve) |
 | `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
 
 `bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
@@ -1599,12 +1600,54 @@ A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
 (the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
 rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
-damped), and `.adaptive()` (the controller sizes one-step methods only).
+damped). `bdf2().adaptive(rtol=…)` is the variable-step march of `bdf(order=2)`, below.
+
+### Variable-step, variable-order BDF — `bdf()`
+
+`jno.solve.bdf()` is the stiff integrator of MATLAB's `ode15s` and SUNDIALS CVODE: backward differentiation
+formulas of order 1 to 5 on error-controlled steps, the order chosen per step for the largest step
+(Shampine & Reichelt, SIAM J. Sci. Comput. 18, 1997). Each step is ONE implicit solve, and the error
+estimate comes from the predictor, so no stage or step is taken twice. The coefficients are those of the
+actual, unequal past steps (variable-coefficient BDF), and the default `ndf=True` adds the
+Klopfenstein–Shampine correction, which keeps the stability and shrinks the error constant.
+
+```python
+sol = fem.solve(time=jno.solve.bdf())                                  # orders 1-5, rtol 1e-4
+sol = fem.solve(time=jno.solve.bdf().adaptive(rtol=1e-6, atol=1e-9))
+sol = fem.solve(time=jno.solve.bdf(order=2).adaptive(rtol=1e-5))       # order held at 2
+```
+
+The step is a backward-Euler step from a shifted state, so it carries what that step carries: Newton on a
+nonlinear block, the solver slots, Dirichlet and algebraic rows, a state-dependent mass (non-conservative
+form), complex and periodic fields, and reverse-mode gradients at the realized step schedule. Measured on a
+two-mode heat problem: the error at all save times follows `rtol` (1e-4 → 2e-4, 1e-6 → 5e-6), and at
+`rtol = 1e-6` the variable-order march needs about a quarter of the attempts of order 2 held.
+**Scope:** orders 3–5 are A(α)-stable only (α = 86°, 73°, 51°), so a lightly damped oscillation loses accuracy
+there; use `sdirk`, `theta(0.5)` or `bdf(order=2)` for it. A `u_tt` block is refused. Every attempt is kept
+for the gradient, so memory grows with `max_steps`.
 
 Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
 as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
 `u_t` inside a nonlinear function, is refused: it used to be marched with `(u − u_prev)²/Δt` where `/Δt²`
 belonged. The `u_t⊗u_t` piece of a residual-based VMS Reynolds stress is such a term — drop that piece.
+
+### The exponential scheme on every element
+
+`exponential(mass="consistent")` integrates the same semidiscrete system as every other scheme, exactly in
+time: on each element family's heat-type test problem (Lagrange P1–P3, Q1/Q2, tets, hexes, lines, vector,
+coupled, Hermite, cover, Morley, N1E in 2-D and 3-D) it lands within 1e-8 to 1e-10 of a tight adaptive SDIRK3,
+and within 7e-4 on Argyris, whose mass is too ill-conditioned for its CG mass solve. The default `mass="lumped"`
+replaces `M` by its row sums: a different spatial discretisation (4e-2 off the consistent one on P1 triangles,
+8e-2 on Q1 hexes), refused where the row sums are not positive (a P2 vertex, a Hermite slope, an edge DOF).
+`symmetric=True` (Lanczos) is refused on an operator that is not symmetric on its free DOFs, such as a one-way
+coupling between fields; pass `symmetric=False`. Algebraic rows other than walls (a pressure, an RT flux) are
+refused as before.
+
+A trainable coefficient, network or initial condition is fine as long as the operator does not read time
+(a time-dependent source is): `exponential()` then takes the operator at the runtime values and is reverse-mode
+differentiable on both mass treatments, matching finite differences to 1e-9. An operator that reads time is
+refused. The refusals above run once when `fem.solve(time=jno.solve.exponential(...))` is called, on the
+operator at the stored values, so they also hold inside `jno.core`, where the march itself is traced.
 
 ### Higher order — `sdirk` and `rosenbrock`
 

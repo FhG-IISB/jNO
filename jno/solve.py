@@ -68,6 +68,7 @@ __all__ = [
     "diagonal",
     "svd",
     "lstsq",
+    "bdf",
     "bdf2",
     "sdirk",
     "rosenbrock",
@@ -2060,6 +2061,49 @@ def theta(theta: float = 1.0):
     return _ThetaScheme(theta)
 
 
+def bdf(order: int | None = None, *, ndf: bool = True):
+    """**BDF / NDF** time scheme for ``fem.solve(time=...)``: backward differentiation formulas of order 1 to 5
+    on error-controlled variable steps, with the order chosen as the march goes -- the stiff integrator of
+    MATLAB's ``ode15s`` and of SUNDIALS CVODE / IDA. ONE implicit solve per step (SDIRK3 takes three), and the
+    local-error estimate comes free from the predictor, so no step is taken twice.
+
+    * ``order=None`` (default): orders 1-5, chosen per step to allow the largest step.
+    * ``order=k``: order ``k`` held (climbed to as the history fills). ``order=1`` and ``order=2`` without
+      ``.adaptive(...)`` march the domain's FIXED grid instead (backward Euler and :func:`bdf2`, which is this
+      scheme at ``order=2``); orders 3-5 need the error-controlled march, which starts at order 1 from a tiny step.
+    * ``ndf=True`` (default): the Klopfenstein-Shampine numerical differentiation formulas, BDF plus
+      ``kappa*gamma_k (u - u_predicted)``, the same stability with a smaller error constant (up to ~26% larger
+      steps at orders 1-4; NDF5 is BDF5). ``ndf=False``: plain BDF.
+
+    ``.adaptive(rtol=1e-4, atol=1e-6, max_steps=1000, dt0=None)`` sets the tolerances and the attempt budget
+    (the defaults apply without it). An exhausted budget returns NaN, never an under-resolved trajectory.
+    Output at ``save_ts`` is interpolated through the accepted states at the order of the method.
+
+    The step is a backward-Euler step from a shifted state, so everything a transient step carries composes:
+    linear or nonlinear blocks, ``linear=`` / ``precond=`` / ``nonlinear=`` slots, Dirichlet and algebraic
+    (index-1) rows, a state-dependent mass ``c(u) u_t`` (non-conservative form, as :func:`bdf2`), complex and
+    periodic fields, and reverse-mode gradients (the controller is ``stop_gradient``-ed; the gradient is the
+    derivative at the realized step schedule).
+
+    Scope: BDF3-5 are A(alpha)-stable, not A-stable (alpha 86, 73, 51 degrees): a lightly damped oscillation
+    -- eigenvalues near the imaginary axis -- loses accuracy at those orders; prefer :func:`sdirk` or
+    ``theta(0.5)`` there, or cap the order (``order=2``). Index-2 rows (incompressibility) are left out of the
+    error norm. A second-order-in-time (``u_tt``) block is refused, as by :func:`bdf2`.
+
+    References: Curtiss & Hirschfelder, PNAS 38 (1952); Byrne & Hindmarsh, ACM TOMS 1 (1975) (variable
+    coefficients); Shampine & Reichelt, SIAM J. Sci. Comput. 18 (1997) (NDF, the order and step control);
+    Hairer & Wanner, *Solving ODEs II*, Sec. III.5 and V.1."""
+    from .utils.solver.timeschemes import _BDF_MAX_ORDER, _BDFScheme
+
+    if order is not None and (isinstance(order, bool) or int(order) != order or not 1 <= int(order) <= _BDF_MAX_ORDER):
+        raise ValueError(
+            f"jno.solve.bdf(order={order!r}): order must be None (variable) or an integer 1..{_BDF_MAX_ORDER}."
+        )
+    if order is None or int(order) > 2:
+        return _BDFScheme(None if order is None else int(order), ndf).adaptive()
+    return _BDFScheme(int(order), ndf)
+
+
 def bdf2():
     """**BDF2** time scheme for ``fem.solve(time=...)``: the second-order backward differentiation
     formula ``(3u^{n+1} - 4u^n + u^{n-1})/(2 dt)``, and the workhorse for incompressible flow.
@@ -2147,16 +2191,21 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     **time-varying** source ``f(t)`` is integrated by **ETD2** (the exponential trapezoidal rule) — sampled
     at both step ends with a ``φ₂`` ramp weight, so it is **exact for a source affine in time** and
     second-order for a general one (Hochbruck & Ostermann, *Exponential integrators*, Acta Numerica 19
-    (2010) 209–286, §2.3). ``order`` is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal
-    — cheapest, discrete maximum principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via
-    a matrix-free M-inner-product Lanczos.
+    (2010) 209–286, §2.3). ``order`` is the Krylov size (capped at the number of free unknowns).
+    ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, but a different spatial discretisation
+    from the consistent one the other schemes integrate (4e-2 apart on P1 triangles, 8e-2 on Q1 hexes), and
+    refused where the row sums are not positive (P2 vertices, Hermite slopes, edge DOFs).
+    ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free M-inner-product Lanczos.
 
-    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
+    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos, and is refused on an operator that is not symmetric on
+    its free DOFs (checked eagerly). ``symmetric=False`` handles a **non-symmetric**
     operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
-    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
-    **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
-    :func:`theta`.
+    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable, also in a trainable
+    coefficient, network or initial condition, as long as the operator does not read time; time-varying
+    **coefficients** ``M(t)``/``A(t)``, a trainable or moving mass, or a nonlinear form → use :func:`theta`.
+    The structural refusals run once at ``fem.solve`` time, on the operator at the stored values, so they also
+    hold inside ``jno.core``.
 
     **Walls must be homogeneous.** Every zero-mass DOF is held at 0, which is a Dirichlet row with
     ``g = 0`` and nothing else. A non-zero or time-varying wall value, or an algebraic row that reaches an

@@ -3733,6 +3733,19 @@ class FEM:
             _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
             if _values:
                 kwargs["values"] = _values
+        if (
+            self._mode == "transient"
+            and solve_fn is None
+            and linear is None
+            and precond is None
+            and getattr(self.domain, "_fem_prefer_direct", False)
+        ):
+            # The C0/C1 vertex families (Hermite/Argyris/Morley, the 1-D beam) march on a sparse-direct step,
+            # as their steady solve does: the Krylov default returned NaN on a u_tt beam, and its noise pins
+            # an adaptive controller at its smallest step (see `compose_transient_step_solvers`).
+            from . import solve as _solve_ns
+
+            linear = _solve_ns.lu()
         has_slots = (
             (x0 is not None)
             or (nonlinear is not None)
@@ -4455,6 +4468,12 @@ class FEM:
                 if _cadence is not None
                 else compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
             )
+
+            # A scheme's structural refusals read concrete values; inside `jno.core` the march is traced and
+            # they would skip, so the scheme gets to run them once here, on the built operator.
+            _preflight = getattr(time, "preflight", None)
+            if _preflight is not None:
+                _preflight(self._op)
 
             def _stepper(block, args, save_ts):
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
@@ -7979,11 +7998,13 @@ def _fem_impl(
         for c in _net_trial_only:
             support, _rg = _region_and_support(c, domain)
             _comp, _val, _vnode = _dirichlet_spec(_bare(c))
-            if support not in ("boundary", "initial") or not _is_bare_neural_value_node(_vnode):
+            if support == "initial":
+                continue  # any expression: the initial state is re-formed from the runtime args (`state0_fn`)
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
                 raise NotImplementedError(
                     "jno.fem: a network in an essential (trial-only) constraint must be a *bare* net(x) value "
-                    "on a boundary region (a Dirichlet profile) or the 'initial' region (an initial "
-                    "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
+                    "on a boundary region (a Dirichlet profile), or any expression in an initial condition "
+                    "on the 'initial' region — a compound Dirichlet value (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
             if _trial_spaces(constraints) - _NATIVE_SPACES:
@@ -8300,6 +8321,7 @@ def _fem_impl(
         the values they were assembled with.
         """
         out = _finalize_core(fem_obj)
+        _refuse_frozen_ic_trainables(out, ic_residuals)
         if _mean_gauge_fields:
             out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
         # Structural, so it is known here for every mode -- and being known at BUILD time is what
@@ -8394,7 +8416,9 @@ def _fem_impl(
             classification.append("initial")
         elif has_test:
             _retag_coords_for_quadrature(c, support, region)
-            bare = _bare(c)
+            bare = _clean_weak_summands(_bare(c), support)
+            if bare is None:  # the whole term is a structural zero (`0 * v`): nothing to assemble
+                continue
             if support == "volume":
                 if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
@@ -8807,8 +8831,19 @@ def _fem_impl(
         # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
         # 1D complex *inverse* rides the same path.
         _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        from .utils.solver.fem_1d import complex_dirichlet_regions
+
+        if not (_bares_have_complex_coeff(volume_terms) or _cx_bd) and (
+            _cx_real := complex_dirichlet_regions(domain, dirichlet_values)
+        ):
+            # A complex essential value on a REAL 1-D form reached `float(g)` in the Dirichlet assembly and
+            # failed with a bare TypeError; 2-D/3-D refuse it by name, so does 1-D now.
+            raise NotImplementedError(
+                f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_real))} of a real 1D form is "
+                "not supported -- the Dirichlet rows hold real values. Use a real essential value and carry the "
+                "complex part in the operator or the source (a `1j` there makes the form complex)."
+            )
         if _bares_have_complex_coeff(volume_terms) or _cx_bd:
-            from .utils.solver.fem_1d import complex_dirichlet_regions
             from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
 
@@ -9733,6 +9768,132 @@ def _ic_component(bare: Any) -> Any:
     return None if trial_side is None else _component_index_of(trial_side)
 
 
+def _weak_summands(node: Any, sign: float = 1.0) -> List[Tuple[float, Any]]:
+    """``[(sign, summand)]`` of a term's top-level ``+``/``-`` tree. Products are NOT distributed."""
+    from .trace import BinaryOp
+
+    op = getattr(node, "op", None)
+    if isinstance(node, BinaryOp) and op in ("+", "-"):
+        return _weak_summands(node.left, sign) + _weak_summands(node.right, sign if op == "+" else -sign)
+    return [(sign, node)]
+
+
+def _clean_weak_summands(bare: Any, support: str = "volume") -> Any:
+    """A weak term with its structural-zero summands dropped, refusing a summand that has no test function.
+
+    Every additive piece of a weak form pairs with a test function. A piece without one has no equation to
+    go into, and the assemblers met it four different ways: 1-D integrated it into a SILENTLY wrong answer
+    (``2 + u' v'`` moved the solution by 0.48), a 1-D transient and the 2-D transient failed with an
+    unrelated TypeError, the non-nodal path refused even the harmless ``0`` that builtin ``sum()`` seeds,
+    and only the native steady path said what was wrong. Decided here, once, for every assembler: a
+    concrete real literal zero (``_is_structural_zero``) is dropped; anything else without a test is refused.
+    Returns ``None`` when every summand is a structural zero."""
+    from .trace import BinaryOp, Literal
+    from .utils.solver.fem_utils import _is_structural_zero
+
+    parts = _weak_summands(bare)
+    # A zero that marks the form stays. A complex zero (`0j * u * v`) marks it complex: dropping it would
+    # assemble the real problem, with a complex essential value then cast to float. A zero reading step
+    # history (`0 * s.i(-1) * v`) marks a load-path march: dropping it would turn the march into one solve.
+    from .trace import HistoryRef
+
+    def _marks_the_form(t):
+        return any(_node_has_complex_literal(n) or isinstance(n, HistoryRef) for n in _walk(t))
+
+    kept = [(sg, t) for sg, t in parts if not (_is_structural_zero(t) and not _marks_the_form(t))]
+    for _sg, t in kept:
+        if not _contains(t, TestFunction):
+            raise ValueError(
+                f"jno.fem: a {support} weak-form summand carries no test field, so it belongs to no "
+                f"equation -- {t!r}. Every additive piece of a weak form pairs with a test function: a "
+                "source term is `- f * v`, not `- f`."
+            )
+    if len(kept) == len(parts):
+        return bare
+    if not kept:
+        return None
+    out = None
+    for sg, t in kept:
+        if out is None:
+            out = t if sg > 0 else BinaryOp("*", Literal(-1.0), t)
+        else:
+            out = BinaryOp("+" if sg > 0 else "-", out, t)
+    return out
+
+
+def _initialized_parameter_values(node: Any) -> dict:
+    """``{name: value}`` for every parameter in ``node`` whose ``.initialize(...)`` has not been applied yet.
+
+    The initializer is LAZY -- the training loop applies it when it sets the models up -- so a value read at
+    build time is still the zeros the parameter is born with. An initial state baked at build (a nodal data
+    field handed in as ``u(initial) - g``) then started the march from 0, with nothing to flag it."""
+    from .geometry.parametric import initial_value
+
+    out = {}
+    for nd in _walk(node):
+        m = getattr(nd, "model", None)
+        if type(nd).__name__ != "ModelCall" or not getattr(m, "_is_parameter", False):
+            continue
+        name = getattr(m, "_parameter_name", None)
+        val = initial_value(nd)
+        if (
+            val is None
+            and getattr(m, "_weight_tree", None) is not None
+            and not hasattr(m._weight_tree, "__fspath__")
+            and not isinstance(m._weight_tree, str)
+        ):
+            val = jnp.asarray(m._weight_tree)
+        if name is not None and val is not None:
+            out[name] = jnp.reshape(jnp.asarray(val), jnp.shape(m.module.value))
+    return out
+
+
+def _ic_trainable_names(ic_residuals: List[Any]) -> List[str]:
+    """Names of the trainable parameters and networks an initial condition's value reads.
+
+    An optimizer-less nodal DATA field (a known initial state handed in as a field) is not a trainable."""
+    from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs, _collect_runtime_parameter_exprs
+
+    names: List[str] = []
+    for ic in ic_residuals:
+        trial_side = _ic_trial_side(ic)
+        if trial_side is None:
+            continue
+        value = ic.right if trial_side is ic.left else ic.left
+        for pn, pd in _collect_runtime_parameter_exprs(value, {}).items():
+            pm = getattr(pd, "model", None)
+            if (
+                getattr(pm, "_opt_fn", None) is None
+                and np.asarray(getattr(getattr(pm, "module", None), "value", 0.0)).size > 1
+            ):
+                continue
+            names.append(pn)
+        names.extend(_collect_neural_coefficient_exprs(_bare(value)))
+    return names
+
+
+def _refuse_frozen_ic_trainables(fem_obj: Any, ic_residuals: List[Any]) -> None:
+    """A trainable in an initial condition that the built operator does not take as a runtime argument
+    would be read once, at its stored value: a silently frozen trainable (and one ``jno.core`` never sees).
+    The paths that re-form the initial state from the runtime arguments publish its name; refuse the rest."""
+    if not ic_residuals:
+        return
+    names = _ic_trainable_names(ic_residuals)
+    if not names:
+        return
+    taken = set(getattr(getattr(fem_obj, "_op", None), "runtime_parameter_exprs", None) or {})
+    missing = sorted(set(names) - taken)
+    if missing:
+        raise NotImplementedError(
+            f"jno.fem: the initial condition reads the trainable(s) {missing}, but this form's assembly path "
+            "fixes the initial state at build time, so they would never train. A trainable initial condition "
+            "is wired on a first-order-in-time (u_t) transient on 2-D/3-D Lagrange fields, single or coupled. "
+            "Not on: 1-D line domains, the non-nodal families (Hermite, Argyris, Morley, Nedelec, RT), "
+            "second-order-in-time (u_tt) forms, complex transients. There, put the trainable in a source "
+            "term or a Dirichlet value, or give the initial condition as a fixed value."
+        )
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -9749,17 +9910,17 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
-    from .utils.solver.parametric_helpers import _is_neural_coefficient
-
-    if _is_neural_coefficient(_bare(value_node)):
-        # A net-valued IC threads its weights only on the real, first-order-in-time transient path
-        # (``state0_fn`` re-forms the initial state from ``args``). This routine bakes the IC at assembly
-        # (complex-transient / second-order-in-time), so the weights would silently NOT train — reject it.
+    _trainables = _ic_trainable_names([bare])
+    if _trainables:
+        # A trainable IC (a network, or a ``jno.np.parameter`` anywhere in the value) threads only where the
+        # initial state is re-formed from the runtime args (``state0_fn``). This routine bakes the IC at
+        # assembly (1-D, complex-transient, second-order-in-time), so it would silently NOT train -- reject it.
         raise NotImplementedError(
-            "jno.fem: a net-valued initial condition u(initial) - net(x) is wired on a real, "
-            "first-order-in-time transient form (its weights thread the initial state); this path "
-            "(complex-transient or second-order-in-time) bakes the IC at assembly and cannot thread the "
-            "weights. Use a real first-order transient form, or a constant/field initial condition here."
+            f"jno.fem: the initial condition reads the trainable(s) {sorted(_trainables)}, and this form's "
+            "path (a 1-D line, a complex transient or a second-order-in-time u_tt form) fixes the initial state "
+            "at build time, so they would never train. A trainable initial condition is wired on a real "
+            "first-order (u_t) transient on 2-D/3-D Lagrange fields. Here, put the trainable in a source term "
+            "or a Dirichlet value, or give the initial condition as a fixed value."
         )
     comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
     n_nodes = int(jnp.asarray(pts).shape[0])
@@ -9771,7 +9932,14 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     from .utils.solver.time_route import _infer_time_window
 
     # an initial condition sits at the start time: a value written with the time variable reads it there
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
+    vals = jnp.asarray(
+        _eval_value_node_at(
+            value_node,
+            jnp.asarray(pts),
+            params=_initialized_parameter_values(value_node) or None,
+            t=_infer_time_window(domain)[0],
+        )
+    ).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)
