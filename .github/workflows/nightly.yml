@@ -4,14 +4,14 @@ name: Nightly (full suite)
 # safe: if a filter is scoped too narrowly, the miss surfaces here within a day rather than never.
 # Do not add path filters to this workflow -- running everything is its entire purpose.
 #
-# Scheduled only, deliberately NOT on push to main. The suite takes ~2 h, and anything arriving via
+# Scheduled only, deliberately NOT on push to main. The suite takes ~6 h of runner time, and anything arriving via
 # PR has already run its filtered subset, so a per-push run would mostly re-execute what just
 # passed. The trade is that a mis-scoped filter is caught within a day instead of within minutes;
 # `workflow_dispatch` is there for when that wait is not acceptable -- run it by hand before a
 # release or after a risky merge.
 #
 # It skips itself when main has not moved since the last attempt -- re-running an identical tree
-# tells you nothing you did not already know, and this suite is ~2 h of runner time. The check
+# tells you nothing you did not already know, and this suite is ~6 h of runner time. The check
 # compares HEAD against the last completed run's head SHA rather than asking "were there commits in
 # the last 24 h": if a scheduled run is ever dropped (GitHub does drop them under load), a time
 # window silently skips the commits that landed during the gap, whereas a SHA comparison still sees
@@ -61,11 +61,21 @@ jobs:
             echo "main unchanged since the last attempt -> skipping"; echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # The suite run serially outgrew the 4 h job limit (the FEM files alone take over 4 h), so it runs
+  # as SHARDS: every test file, sorted, dealt round-robin to one of N parallel jobs. Round-robin over the
+  # sorted names spreads each family of files (test_fem_*, ...) across all shards. A new file lands in a
+  # shard by default; nothing is listed by hand. Raise N when one shard nears the limit.
   full:
     needs: guard
     if: needs.guard.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false   # one red shard must not cancel the others: the point is the whole picture
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      SHARDS: 6
     steps:
       - uses: actions/checkout@v4
 
@@ -73,10 +83,15 @@ jobs:
         with:
           cache: true
 
+      - name: Select this shard's files
+        run: |
+          find tests -name 'test_*.py' | sort | awk -v n="$SHARDS" -v k='${{ matrix.shard }}' '(NR - 1) % n == k' > files.txt
+          echo "--- shard ${{ matrix.shard }} of $SHARDS: $(wc -l < files.txt) file(s)"; cat files.txt
+
       # One process per test FILE. The all-in-one run accumulates JAX device buffers and coverage
       # state across the suite and gets OOM-killed part-way through on a hosted runner.
-      - name: Full test suite
-        run: pixi run ci-test-cov
+      - name: Full test suite (shard ${{ matrix.shard }})
+        run: pixi run -- bash .github/ci_test_per_file.sh $(cat files.txt)
 
       - name: Upload coverage to Codecov
         if: '!cancelled()'
