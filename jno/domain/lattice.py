@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..utils.sets import unique_values
+
 _AXIS_NAMES = {2: (("left", "right"), ("bottom", "top")), 3: (("left", "right"), ("front", "back"), ("bottom", "top"))}
 # facets of each cell kind, as local vertex indices
 _FACETS = {
@@ -101,7 +103,7 @@ def lattice_axes(plan, items, default_h, grading=None):
     leaves = plan.leaves()
     cuts = []
     for a in range(dim):
-        v = np.unique(np.concatenate([_bounds(p)[a] for p, _s, _k in leaves]))
+        v = unique_values(np.concatenate([_bounds(p)[a] for p, _s, _k in leaves]))
         span = float(v[-1] - v[0]) or 1.0
         cuts.append(v[np.concatenate([[True], np.diff(v) > 1e-9 * span])])
     mids = [0.5 * (c[1:] + c[:-1]) for c in cuts]
@@ -182,7 +184,7 @@ def lattice_mesh(axes, items, cell):
         owner[np.asarray(sub.contains(cent), dtype=bool) & (owner < 0)] = r
     keep = owner >= 0
     cells, owner, cent = cells[keep], owner[keep], cent[keep]
-    used = np.unique(cells)
+    used = unique_values(cells)
     remap = np.full(len(P), -1, dtype=np.int64)
     remap[used] = np.arange(len(used))
     P, cells = P[used], remap[cells]
