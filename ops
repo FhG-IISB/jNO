@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794522390,"nonce":"tERrp4OXE89M2u4FuSo20s2VGU4=","added":["branch:feat/rcwa-jax-field","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794522390,"nonce":"Oxr4MrOweXbDOMVJyJ5SmWRBW/c=","message":"Fixed in 6fe24ac9; test: tests/test_doc_snippets.py","files":null}]}
