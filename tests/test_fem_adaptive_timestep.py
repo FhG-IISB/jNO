@@ -409,11 +409,20 @@ def test_complex_transient_composes_solver_slots():
 def test_complex_transient_exponential_scheme_routes():
     """``jno.solve.exponential`` on a complex transient was refused outright ("wired for adaptive and θ
     only") because the bespoke complex marcher implemented just those two. The fused block routes into the
-    ordinary scheme dispatch, so the exponential integrator now reaches it like any real transient."""
+    ordinary scheme dispatch, so the exponential integrator now reaches it like any real transient.
+
+    A complex coefficient makes the real ``[Re; Im]`` block non-symmetric, so the default symmetric
+    (Lanczos) path refuses it and ``symmetric=False`` (Arnoldi) marches it. The oracle is a tight SDIRK3
+    march of the same form, so the mass is the consistent one (the default lumped mass differs from it in
+    space, not in time)."""
     pytest.importorskip("matfree", reason="jno.solve.exponential needs the optional matfree package")
     _, fem = _complex_heat(mesh_size=0.3)
-    out = np.asarray(fem.solve(time=jno.solve.exponential()))
+    with pytest.raises(NotImplementedError, match="symmetric=False"):
+        fem.solve(time=jno.solve.exponential())
+    out = np.asarray(fem.solve(time=jno.solve.exponential(symmetric=False, mass="consistent")))
     assert out.dtype == np.complex128 and not np.any(np.isnan(out))
+    ref = np.asarray(fem.solve(time=jno.solve.sdirk(3).adaptive(rtol=1e-7, atol=1e-10)))
+    assert np.max(np.abs(out - ref)) < 1e-6 * np.max(np.abs(ref))
 
 
 def test_complex_transient_adapt_composes():

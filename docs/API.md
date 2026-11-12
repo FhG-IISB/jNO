@@ -344,7 +344,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, interior modes nearest a shift with `sigma=`, or every eigenvalue inside a circle with `contour` (`FEM.eigs(contour=jno.solve.contour(...))`) |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
-| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `bdf` (variable-step, variable-order BDF/NDF 1–5), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
 
 ### Matrix functions — what `Ax = b` cannot express
 

@@ -1568,12 +1568,14 @@ class PolygonDomain(domain):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
         return_indices: Literal[False] = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -1584,12 +1586,14 @@ class PolygonDomain(domain):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
         return_indices: bool = False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any: ...
 
     # docstring-from: jno.domain.domain_class.domain.variable
@@ -1600,12 +1604,14 @@ class PolygonDomain(domain):
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
+        follow_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
         time_value: Optional[float] = None,
         where=None,
+        region=None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -1684,7 +1690,9 @@ class PolygonDomain(domain):
         """
         # Define-and-fetch: a predicate names the region here, then we return its coordinates.
         if where is not None:
-            self.tag(tag, where)
+            self.tag(tag, where, region=region)
+        elif region is not None:
+            raise TypeError("domain.variable: `region=` applies only with `where=`, which is what it restricts.")
         polygon_tag = self._is_polygon_tag(tag)
         if view_factor and polygon_tag:
             kind, _ = self._polygon_tags[tag]
@@ -1741,6 +1749,7 @@ class PolygonDomain(domain):
             resampling_strategy=resampling_strategy,
             normals=normals,
             reverse_normals=reverse_normals,
+            follow_normals=follow_normals,
             view_factor=False,
             point_data=point_data,
             split=split,

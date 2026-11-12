@@ -1551,6 +1551,48 @@ def assemble_fem_native(
         for bare in _exprs:
             _gather_temporal_tags(bare, _temporal_tag_set)
     temporal_tags: Tuple[str, ...] = tuple(sorted(_temporal_tag_set))
+    # Does the OPERATOR read time, or only a source? A term reads time into the operator when it carries
+    # both the trial and a time Variable (conservative: ``k(t) grad u . grad v + f(t) v`` written as one term
+    # counts). A scheme that needs an autonomous operator (`jno.solve.exponential`) reads this flag.
+    from ..._fem import _contains as _contains_node
+    from ...trace import Hessian as _Hess
+    from ...trace import Jacobian as _Jac
+    from ...trace import TestFunction as _TestFn
+    from ...trace import TrialFunction as _TrialFn
+    from ...trace import Variable as _Var
+    from .solver_helper import iter_placeholder_children as _children
+
+    def _reads_time_as_value(node) -> bool:
+        """A time Variable read as a VALUE: not the variable of a derivative (``u.t``), not a symbol's own
+        binding (``u.bind(t=t)``)."""
+        seen, stack = set(), [node]
+        while stack:
+            nd = stack.pop()
+            if id(nd) in seen:
+                continue
+            seen.add(id(nd))
+            if isinstance(nd, _Var) and getattr(nd, "axis", None) == "temporal":
+                return True
+            if isinstance(nd, (_TrialFn, _TestFn)):
+                continue
+            if isinstance(nd, (_Jac, _Hess)):
+                stack.append(nd.target)
+                continue
+            stack.extend(_children(nd))
+        return False
+
+    def _summands(node):
+        """The ``+``/``-`` summands of a term: ``u_t v + k grad u . grad v - f(t) v`` is three, so a source that
+        reads time does not mark the operator beside it as reading time."""
+        if getattr(node, "op", None) in ("+", "-") and hasattr(node, "left") and hasattr(node, "right"):
+            return _summands(node.left) + _summands(node.right)
+        return [node]
+
+    _all_terms_t = list(volume_terms) + [b for _exprs in boundary_terms.values() for b in _exprs]
+    _operator_reads_time = any(
+        _contains_node(sm, _TrialFn) and _reads_time_as_value(sm) for b in _all_terms_t for sm in _summands(b)
+    )
+    _form_reads_time = any(_reads_time_as_value(b) for b in _all_terms_t)
 
     # Runtime parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown diffusivity
     # in an inverse problem). Their values arrive at solve time in an ``args`` dict; the builders pack
@@ -1904,18 +1946,34 @@ def assemble_fem_native(
     # A net-valued INITIAL condition ``u(initial) - net(x)`` (a trainable starting state, recovered from a
     # trajectory): its weights join the runtime slots the same way, and the initial state is (re-)formed
     # from the runtime args in ``_state0_at`` so ``∂traj/∂weights`` flows through the IC.
+    # The same holds for a network or a trainable ``jno.np.parameter`` ANYWHERE in the value
+    # (``u(initial) - a*sin(pi x)``, ``u(initial) - (1 + net(x))``): a value read only at its stored
+    # weights here would be a silently frozen trainable, and crux would not even see it.
+    from .parametric_helpers import _collect_neural_coefficient_exprs
+
     _ic_net_models: Dict[str, Any] = {}
+    _ic_param_exprs: Dict[str, Any] = {}
     for _ic in ic_residuals:
         _icv = _essential_spec_node(_bare_node(_ic))[1]
-        _vn = _bare_node(_icv) if _icv is not None else None
-        if _vn is not None and _is_neural_coefficient(_vn):
-            _ic_net_models[_neural_coefficient_name(_vn)] = _vn.model
-    if _dir_net_models or _ic_net_models:
+        if _icv is None:
+            continue
+        for _nn, _nd in _collect_neural_coefficient_exprs(_bare_node(_icv)).items():
+            _ic_net_models[_nn] = _nd.model
+        # An optimizer-less nodal DATA field (a known initial state) rides the args too: its initializer is
+        # lazy (applied when jno.core sets the models up), so read at build it is still zero -- the march
+        # started from 0 with nothing to flag it.
+        _ic_param_exprs.update(_collect_runtime_parameter_exprs(_icv, {}))
+    if _dir_net_models or _ic_net_models or _ic_param_exprs:
         _param_and_neural_exprs = {
             **_param_and_neural_exprs,
             **{n: ModelWeights(m) for n, m in _dir_net_models.items()},
             **{n: ModelWeights(m) for n, m in _ic_net_models.items()},
+            **_ic_param_exprs,
         }
+    # stored-value args for the static initial state (the nets' modules, the parameters' values)
+    _ic_static_args = {n: m.module for n, m in _ic_net_models.items()} | {
+        n: jnp.asarray(nd.model.module.value) for n, nd in _ic_param_exprs.items()
+    }
     # A nodal FIELD parameter k(x) carries P1 (mesh-vertex) values and interpolates on the P1 basis --
     # see the tabulation of ``_p1_shape_vals`` above. Which field's terms mention it no longer decides
     # anything, so nothing needs resolving here. What IS worth saying out loud is when the surrounding
@@ -5181,10 +5239,11 @@ def assemble_fem_native(
                     s0 = s0.at[offs[fidx] : offs[fidx + 1]].set(u0_vals.reshape(-1))
             return s0
 
-        common["state0"] = _state0_at({n: m.module for n, m in _ic_net_models.items()} if _ic_net_models else None)
-        # re-formed from args when a net is the IC, or when the mesh moves under a position-dependent IC
+        common["state0"] = _state0_at(_ic_static_args or None)
+        # re-formed from args when a net or a trainable parameter is in the IC, or when the mesh moves under
+        # a position-dependent IC
         _ic_moves = bool(_coord_specs) and any(_reads_position(_essential_spec(_bare(ic))[1]) for ic in ic_residuals)
-        if _ic_net_models or _ic_moves:
+        if _ic_static_args or _ic_moves:
             common["state0_fn"] = _state0_at
 
         dirichlet_pairs = _build_dirichlet_pairs()
@@ -5308,12 +5367,8 @@ def assemble_fem_native(
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
         nonlinear = _nonlinear_mass or any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
-            if _ic_net_models:
-                raise NotImplementedError(
-                    "jno.fem: a net-valued initial condition u(initial) - net(x) on a *nonlinear transient* "
-                    "form is not wired yet (state0_fn threads only the linear stepper). Use a linear "
-                    "transient form (a net IC threads there)."
-                )
+            # (A net- or parameter-valued initial condition threads here too: every march re-forms the
+            # start from ``state0_fn(args)``, linear or Newton step alike.)
             if _dir_args_dependent and _nonlinear_mass:
                 raise NotImplementedError(
                     "jno.fem: a net-valued Dirichlet with a state-dependent (nonlinear) mass c(u)·u_t on a "
@@ -5419,7 +5474,7 @@ def assemble_fem_native(
         # falls to the static branch, where A and M are built once with ``args=None`` and
         # ``_apply_coord_params`` short-circuits -- so ``block.step(..., args={coord: X})`` silently ignores
         # X and ``du/dX`` is exactly ZERO. That is a wrong gradient with no symptom, not a missing feature.
-        if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_net_models or _coord_specs:
+        if runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_static_args or _coord_specs:
             if _dir_args_dependent:
                 if tv_dofs is not None:
                     raise NotImplementedError(
@@ -5482,8 +5537,11 @@ def assemble_fem_native(
                         "runtime_parameter_names": list(runtime_parameter_tags)
                         + list(neural_param_names)
                         + list(_dir_net_models)
-                        + list(_ic_net_models),
+                        + list(_ic_static_args),
                         "nonaffine_operator": True,
+                        "operator_reads_time": _operator_reads_time,
+                        # the forcing reads time through a source term or a time-varying essential value
+                        "forcing_reads_time": _form_reads_time or tv_dofs is not None,
                     },
                     **common,
                 ),
