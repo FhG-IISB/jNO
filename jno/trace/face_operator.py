@@ -102,7 +102,14 @@ class _PlaneWave:
 
 
 class FaceOperator:
-    """``f(L)`` for a linear constant-coefficient face operator ``L`` (see the module docstring)."""
+    """``f(L)`` for a linear constant-coefficient face operator ``L`` (see the module docstring).
+
+    Args:
+        fn: The operator in strong form, ``fn(w)`` -> ``L w``, linear in ``w`` (for example
+            ``lambda w: k**2 * w + w.x.x``). It is evaluated on plane waves to read its symbol.
+        power: The real power ``p`` in ``L ** p``; ``jno.np.sqrtm`` starts at ``0.5`` and
+            ``S ** q`` multiplies it.
+    """
 
     def __init__(self, fn, power: float = 1.0):
         if not callable(fn):
@@ -204,9 +211,20 @@ class FaceOpField(Variable):
         d[axis] += 1
         return FaceOpField._register(self._domain, self._faceop_base, tuple(d), self._faceop_comp)
 
-    x = property(lambda self: self._d(0))
-    y = property(lambda self: self._d(1))
-    z = property(lambda self: self._d(2))
+    @property
+    def x(self):
+        """``d/dx`` of ``S(arg)``, taken per Fourier mode."""
+        return self._d(0)
+
+    @property
+    def y(self):
+        """``d/dy`` of ``S(arg)``, taken per Fourier mode."""
+        return self._d(1)
+
+    @property
+    def z(self):
+        """``d/dz`` of ``S(arg)``, taken per Fourier mode."""
+        return self._d(2)
 
     def __getitem__(self, key):
         """``S(E)[i]``: component ``i`` (a per-point scalar), which keeps ``.x``/``.y`` -- so ``S(E).x[1]``
