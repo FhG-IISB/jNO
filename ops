@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794495259,"nonce":"2PSUlVVVx/df1FGQ4SAwAHIgK6U=","message":"Fixed in 909f449e: six parallel shards","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794495259,"nonce":"/ekCSWLkzASHLHLvQ45Jxrva5t8=","status":2}]}
