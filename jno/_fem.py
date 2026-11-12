@@ -9792,13 +9792,15 @@ def _clean_weak_summands(bare: Any, support: str = "volume") -> Any:
     from .utils.solver.fem_utils import _is_structural_zero
 
     parts = _weak_summands(bare)
-    # A complex zero (`0j * u * v`) stays: it is what marks the form complex, and dropping it would assemble
-    # the real problem -- with a complex essential value then cast to float.
-    kept = [
-        (sg, t)
-        for sg, t in parts
-        if not (_is_structural_zero(t) and not any(_node_has_complex_literal(n) for n in _walk(t)))
-    ]
+    # A zero that marks the form stays. A complex zero (`0j * u * v`) marks it complex: dropping it would
+    # assemble the real problem, with a complex essential value then cast to float. A zero reading step
+    # history (`0 * s.i(-1) * v`) marks a load-path march: dropping it would turn the march into one solve.
+    from .trace import HistoryRef
+
+    def _marks_the_form(t):
+        return any(_node_has_complex_literal(n) or isinstance(n, HistoryRef) for n in _walk(t))
+
+    kept = [(sg, t) for sg, t in parts if not (_is_structural_zero(t) and not _marks_the_form(t))]
     for _sg, t in kept:
         if not _contains(t, TestFunction):
             raise ValueError(
