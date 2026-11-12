@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794504088,"nonce":"u3JmxZ95pZBwjPxEyqvnu9ZWCfo=","message":"Fixed in b518ec35; test: tests/test_ci_plan.py (shards partition every file, balanced); verified on CI after push.","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794504088,"nonce":"cyb2L1H6gyQK5d32AyGTFUMNEO4=","status":2}]}
