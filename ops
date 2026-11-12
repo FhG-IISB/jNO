@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1794522390,"nonce":"uN66sNsnonLEgbzXhcC6sjGYOaA=","message":"Fixed in 6fe24ac9; test: tests/test_trace_evaluator.py::TestDispatchTable","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1794522390,"nonce":"rRqpVJ0sJLYpXIA2MtepffhG6pc=","status":2}]}
