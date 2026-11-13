@@ -8,6 +8,12 @@ name: CI
 # Runtimes that motivated the split: the all-in-one suite took 1h41m-2h07m per PR and was being
 # cancelled. Over half of the test files are test_fem_*, so a non-FEM change was paying for the FEM
 # suite and vice versa.
+#
+# Each group then runs as balanced shards in parallel (.github/ci_plan.py, from the per-file times
+# in .github/ci_file_times.tsv). Run one after the other, `fem` took 3h17m-4h12m and `core` 1h33m-
+# 2h12m on a single runner each; split to ~30 min per shard, the slowest shard sets the PR's wait.
+# The JAX compile cache is kept between runs per shard: with it warm, tests/test_fem_rosenbrock.py
+# went from 50 s to 29 s. PR runs take no coverage (see .github/ci_test_per_file.sh).
 
 on:
   pull_request:
@@ -22,12 +28,8 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      shared: ${{ steps.f.outputs.shared }}
-      fem: ${{ steps.f.outputs.fem }}
-      geometry: ${{ steps.f.outputs.geometry }}
-      rcwa: ${{ steps.f.outputs.rcwa }}
-      fdm: ${{ steps.f.outputs.fdm }}
-      core: ${{ steps.f.outputs.core }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -46,6 +48,7 @@ jobs:
               - 'pytest.ini'
               - '.github/workflows/ci.yml'
               - '.github/ci_test_per_file.sh'
+              - '.github/ci_plan.py'
             fem:
               - 'jno/_fem.py'
               - 'jno/fem*'
@@ -71,6 +74,21 @@ jobs:
               - 'jno/**'
               - 'tests/**'
 
+      # `shared` forces every group: a change under jno/trace, jno/np or the build files can break any
+      # area, and guessing which would be exactly the mis-scoping this design is trying to avoid.
+      - id: plan
+        run: |
+          # paths-filter's `changes` output is the JSON list of the filters that matched.
+          hits='${{ steps.f.outputs.changes }}'
+          groups=()
+          for g in fem geometry rcwa fdm core; do
+            if jq -e --arg g "$g" 'index("shared") or index($g)' <<< "$hits" > /dev/null; then groups+=("$g"); fi
+          done
+          echo "groups: ${groups[*]:-<none>}"
+          if [ "${#groups[@]}" -eq 0 ]; then echo "any=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "any=true" >> "$GITHUB_OUTPUT"
+          echo "matrix=$(python3 .github/ci_plan.py matrix "${groups[@]}")" >> "$GITHUB_OUTPUT"
+
   # ---------------------------------------------------------------- always
   style:
     runs-on: ubuntu-latest
@@ -82,70 +100,54 @@ jobs:
       - run: pixi run ci-fmt
       - run: pixi run ci-lint
 
-  # ---------------------------------------------------------------- targeted suites
-  #
-  # `shared` forces every group: a change under jno/trace, jno/np or the build files can break any
-  # area, and guessing which would be exactly the mis-scoping this design is trying to avoid.
+  # ---------------------------------------------------------------- targeted suites, sharded
   test:
+    name: test (${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }})
     needs: changes
-    if: >-
-      needs.changes.outputs.shared == 'true' || needs.changes.outputs.fem == 'true' ||
-      needs.changes.outputs.geometry == 'true' || needs.changes.outputs.rcwa == 'true' ||
-      needs.changes.outputs.fdm == 'true' || needs.changes.outputs.core == 'true'
+    if: needs.changes.outputs.any == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        group: [fem, geometry, rcwa, fdm, core]
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Should this group run?
-        id: want
-        run: |
-          shared='${{ needs.changes.outputs.shared }}'
-          case '${{ matrix.group }}' in
-            fem)      hit='${{ needs.changes.outputs.fem }}' ;;
-            geometry) hit='${{ needs.changes.outputs.geometry }}' ;;
-            rcwa)     hit='${{ needs.changes.outputs.rcwa }}' ;;
-            fdm)      hit='${{ needs.changes.outputs.fdm }}' ;;
-            core)     hit='${{ needs.changes.outputs.core }}' ;;
-          esac
-          if [ "$shared" = 'true' ] || [ "$hit" = 'true' ]; then echo "run=true" >> "$GITHUB_OUTPUT"
-          else echo "run=false" >> "$GITHUB_OUTPUT"; fi
-
       - uses: prefix-dev/setup-pixi@v0.8.1
-        if: steps.want.outputs.run == 'true'
         with:
           cache: true
 
-      - name: Select this group's files
-        if: steps.want.outputs.run == 'true'
-        id: files
-        run: |
-          # `core` is the COMPLEMENT of the named groups, computed rather than listed, so a new
-          # test file is covered by default instead of silently belonging to nothing.
-          #
-          # The stems deliberately do NOT require a trailing underscore. With `test_fdm_*.py` the
-          # group's own headline file, `tests/test_fdm.py`, matched nothing and fell into `core` --
-          # so a change to `jno/fdm.py` ran the two satellite files and not the main one, and every
-          # unrelated PR paid its 3m14s. Same for `tests/test_rcwa.py`.
-          named() { find tests -maxdepth 1 \( -name 'test_fem*.py' -o -name 'test_domain*.py' \
-                      -o -name 'test_shape*.py' -o -name 'test_polygon*.py' \
-                      -o -name 'test_mesh*.py' -o -name 'test_rcwa*.py' \
-                      -o -name 'test_fdm*.py' \) -printf '%p\n' | sort; }
-          case '${{ matrix.group }}' in
-            fem)      find tests -maxdepth 1 -name 'test_fem*.py' -printf '%p\n' | sort > files.txt ;;
-            geometry) find tests -maxdepth 1 \( -name 'test_domain*.py' -o -name 'test_shape*.py' \
-                        -o -name 'test_polygon*.py' -o -name 'test_mesh*.py' \) -printf '%p\n' | sort > files.txt ;;
-            rcwa)     find tests -maxdepth 1 -name 'test_rcwa*.py' -printf '%p\n' | sort > files.txt ;;
-            fdm)      find tests -maxdepth 1 -name 'test_fdm*.py' -printf '%p\n' | sort > files.txt ;;
-            core)     find tests -maxdepth 1 -name 'test_*.py' -printf '%p\n' | sort > all.txt
-                      named > named.txt; comm -23 all.txt named.txt > files.txt ;;
-          esac
-          echo "count=$(wc -l < files.txt)" >> "$GITHUB_OUTPUT"
-          echo "--- ${{ matrix.group }}: $(wc -l < files.txt) file(s)"; cat files.txt
+      # Keyed per shard and per lockfile (a new JAX invalidates every entry). A PR restores the newest
+      # cache of its own earlier runs, else the nightly's on main; entries are keyed by the program's
+      # hash, so a stale one is never loaded, only unused. Saved even when tests fail.
+      # XLA's CPU code is compiled for the runner's instruction set, and the cache key JAX uses does
+      # not include it: runners come with and without AVX-512, and loading another CPU's entries
+      # warns "could lead to execution errors such as SIGILL". So the cache is also keyed by the CPU
+      # flags; each kind of runner keeps its own.
+      - id: cpu
+        run: echo "id=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
-      - name: Test ${{ matrix.group }}
-        if: steps.want.outputs.run == 'true' && steps.files.outputs.count != '0'
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-
+
+      - name: Select this shard's files
+        run: python3 .github/ci_plan.py files ${{ matrix.group }} ${{ matrix.shard }} ${{ matrix.of }} | tee files.txt
+
+      - name: Test ${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }}
         run: pixi run -- bash .github/ci_test_per_file.sh $(cat files.txt)
+
+      - uses: actions/cache/save@v4
+        if: '!cancelled()'
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ steps.cpu.outputs.id }}-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-artifact@v4
+        if: '!cancelled()'
+        with:
+          name: file-times-${{ matrix.group }}-${{ matrix.shard }}of${{ matrix.of }}
+          path: ci-file-times.tsv
+          retention-days: 14
