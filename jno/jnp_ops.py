@@ -1,4 +1,5 @@
 import builtins
+import types
 import warnings
 from pathlib import Path
 from typing import List, Union
@@ -1204,12 +1205,28 @@ def sqrtm(x) -> FunctionCall:
     ``U = sqrtm(FᵀF)`` of a polar decomposition. Distinct from the element-wise
     scalar :func:`sqrt`.
 
+    With an OPERATOR -- a Python callable written in strong form, ``lambda w: k**2 * w + w.x.x + w.y.y`` --
+    it is the square root of that operator on a flat periodic boundary face, the exact non-reflecting
+    (Dirichlet-to-Neumann) boundary of a periodic half-space::
+
+        S = jno.np.sqrtm(lambda w: K0**2 * eps * w + w.x.x + w.y.y) ** -1   # (k² + Δ_Γ)^(-1/2)
+        top = -1j * (K0**2 * inner(S(tE), tF) - curlt(S(tE)) * curlt(tF))  # n x curl E on the face
+
+    ``S ** p`` takes a real power and ``S(trace)`` applies it to the unknown's trace on one face; the
+    term stays linear and adds one dense block over the face's DOFs. Scope and conventions:
+    :mod:`jno.trace.face_operator`.
+
     Args:
-        x: a symmetric positive-semidefinite tensor expression, ``(..., n, n)``.
+        x: a symmetric positive-semidefinite tensor expression, ``(..., n, n)``, or a face operator
+            (a callable).
 
     Returns:
-        FunctionCall: the principal square root.
+        FunctionCall: the principal square root (a ``FaceOperator`` for a callable).
     """
+    if isinstance(x, types.FunctionType):  # an operator in strong form, not an expression
+        from .trace.face_operator import FaceOperator
+
+        return FaceOperator(x, 0.5)
     from .trace.views import _spectral_matrix_function
 
     return _attach_coords(FunctionCall(lambda a: _spectral_matrix_function(a, "pow", 0.5), [_u(x)], name="sqrtm"), [x])
@@ -1660,7 +1677,7 @@ def cross(x, y) -> FunctionCall:
     Returns:
         FunctionCall: the cross product, ``(..., 3)``.
     """
-    return _binary_call(jnp.cross, x, y)
+    return _attach_coords(FunctionCall(jnp.cross, [_u(x), _u(y)], "cross"), [x, y])  # named, like VectorView.cross
 
 
 # ============================================================================

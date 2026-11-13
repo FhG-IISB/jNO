@@ -668,13 +668,34 @@ def _apply_periodic(dim, labels, periodic):
         bb = np.array([gmsh.model.getBoundingBox(bdim, t) for t in tags])  # (n, 6): (xlo,ylo,zlo,xhi,yhi,zhi)
         return 0.5 * (bb[:, :3].min(axis=0) + bb[:, 3:].max(axis=0))
 
+    def _exterior(tags):
+        # Only the OUTER boundary is made periodic. An inner body's own faces carry the same auto-names
+        # ("left" of a hole box), but they are interfaces between two volumes, not the cell's sides.
+        return [t_ for t_ in tags if len(gmsh.model.getAdjacencies(bdim, t_)[0]) == 1]
+
     for main, secondary in periodic:
-        m_tags, s_tags = by_name.get(main, []), by_name.get(secondary, [])
+        m_tags, s_tags = _exterior(by_name.get(main, [])), _exterior(by_name.get(secondary, []))
         if not m_tags or not s_tags:
             continue
         t = _centroid(s_tags) - _centroid(m_tags)  # translation main -> secondary
         affine = [1, 0, 0, t[0], 0, 1, 0, t[1], 0, 0, 1, t[2], 0, 0, 0, 1]  # row-major 4×4
-        gmsh.model.mesh.setPeriodic(bdim, s_tags, m_tags, affine)
+        # gmsh pairs the two lists by POSITION, and a face split into several surfaces (a layer stack)
+        # lists its pieces in no particular order: pair each secondary piece with the main piece its
+        # translated bounding box lands on.
+        m_bb = np.array([gmsh.model.getBoundingBox(bdim, m) for m in m_tags]) + np.concatenate([t, t])
+        span = float(np.ptp(m_bb.reshape(-1, 3), axis=0).max()) or 1.0
+        mains = []
+        for s in s_tags:
+            dist = np.abs(m_bb - np.array(gmsh.model.getBoundingBox(bdim, s))).max(axis=1)
+            k = int(np.argmin(dist))
+            if dist[k] > 1e-6 * span:
+                raise ValueError(
+                    f"periodic faces {main!r} / {secondary!r}: a piece of {secondary!r} has no translated "
+                    f"partner on {main!r} (nearest bounding box off by {dist[k]:.2e}); the two faces must be "
+                    "split into the same pieces (a conforming periodic geometry)."
+                )
+            mains.append(m_tags[k])
+        gmsh.model.mesh.setPeriodic(bdim, list(s_tags), mains, affine)
 
 
 #: gmsh's 3-D mesher. 10 is HXT, a parallel Delaunay kernel; gmsh's own default is 1 (serial

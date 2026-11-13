@@ -1252,8 +1252,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
         return _normalize_quad_tag(tag, _bregions)
 
     def _is_across(tag) -> bool:
-        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
-        return isinstance(tag, str) and tag.startswith("across_")
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on; a face
+        # operator's symbol `S(trace)` (`faceop_*`) belongs to the face its trace is bound to
+        return isinstance(tag, str) and tag.startswith(("across_", "faceop_"))
 
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
@@ -1416,7 +1417,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_", "faceop_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -2045,7 +2046,9 @@ def _refuse_stale_position(variables, where="a condition's value"):
             )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
+def _eval_value_node_at(
+    value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False, normals: Any = None
+) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -2066,10 +2069,22 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
     with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
     a constant. A matrix-valued condition therefore needs this.
+
+    ``normals`` ``(n_points, gdim)`` is the outward unit normal at ``points``, read by a boundary-normal
+    Variable ``n_<region>`` (``domain.variable(region, normals=True)``) inside the value -- a source
+    ``cross(E_inc, n)`` on a face. Without it such a value raises: the normal is not a function of the
+    point, and handing it the coordinates (what every other tag reads) gives a silently wrong vector.
     """
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    normal_tags = {v.tag for v in variables if _is_normal_variable(v)}
+    if normal_tags and normals is None:
+        raise ValueError(
+            f"jno.fem: a value or source reads the boundary normal ({sorted(normal_tags)}) where only the point "
+            "coordinates are known, so it cannot be evaluated. Write the value without the normal (for a flat "
+            "face, the constant normal vector), or as a boundary term the face assembly evaluates."
+        )
     _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
@@ -2079,8 +2094,9 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             "condition and in an initial condition (read at the start time); anywhere else write it without "
             "the time variable."
         )
-    tags = {v.tag for v in variables} - temporal
+    tags = {v.tag for v in variables} - temporal - normal_tags
     pts = jnp.atleast_2d(jnp.asarray(points))
+    nrm = None if normals is None else jnp.reshape(jnp.asarray(normals), (pts.shape[0], -1))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
     # it, so the coefficient stays differentiable in the design variable; else use the stored module
@@ -2105,18 +2121,32 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             table[m.layer_id] = mod
     if pointwise:
 
-        def _at(p):
+        def _at(p, nv):
             ctx = {tag: p[None, :] for tag in tags}
             for tag in temporal:
                 ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            for tag in normal_tags:
+                ctx[tag] = nv[None, :]
             return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
 
-        vals = jax.vmap(_at)(pts)
+        vals = jax.vmap(_at)(pts, pts if nrm is None else nrm)
         return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
+    for tag in normal_tags:
+        context[tag] = nrm
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
     return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
+
+
+def _is_normal_variable(v: Any) -> bool:
+    """Is ``v`` a boundary-normal Variable ``n_<region>`` (``domain.variable(region, normals=True)``)?"""
+    tag = getattr(v, "tag", None)
+    if not (isinstance(tag, str) and tag.startswith("n_")):
+        return False
+    dom = getattr(v, "_domain", None)
+    names = set(getattr(dom, "_boundary_regions", {}) or {}) | set(getattr(dom, "context", {}) or {})
+    return dom is None or tag[2:] in names
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
@@ -2324,7 +2354,9 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
             idx, inverse, nse = plan
             data = jax.ops.segment_sum(data, inverse, num_segments=nse)
             return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
-        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+        # traced indices (a parametric solve under jit): `sum_duplicates` would need a static nse, and the
+        # duplicates are harmless -- a BCOO matvec and every direct backend's COO -> CSR sum them
+        return jsp.BCOO((data, indices), shape=A_r.shape)
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
     return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
@@ -2373,7 +2405,14 @@ def _solve_complex_block(
         # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
         # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
         A_c = _complex_operator(A_r, A_i)
-        u = complex_solve(A_c, b_r + 1j * b_i)
+        b_c = b_r + 1j * b_i
+        if periodic is not None:
+            # the reduction summed a prescribed tie target's row into its partners: put it back, as every
+            # reduced-space solve does (the values are real: Re g, as on the fused path's first leg)
+            from .utils.solver.fem_utils import impose_reduced_dirichlet
+
+            A_c, b_c = impose_reduced_dirichlet(periodic, A_c, b_c)
+        u = complex_solve(A_c, b_c)
         if periodic is None:
             return u
         if periodic.get("is_bloch"):
@@ -4008,15 +4047,20 @@ class FEM:
                 "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
                 "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
             )
-        if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
-            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
-            # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
-            # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+        _cn_linear = bool((getattr(linear, "traits", None) or {}).get("complex_native"))
+        if from_slots and (getattr(precond, "complex_native", False) or _cn_linear) and self._complex_legs is not None:
+            # A complex-native preconditioner (AMS), or a direct backend that factors complex matrices
+            # (MKL PARDISO), solves the sparse COMPLEX operator ``A_r + i·A_i`` directly, never the
+            # real-equivalent block — so it wants the Re/Im legs the fusion retained, not the fused 2n
+            # system. The direct case halves the factor memory, and the periodic reduction and the host
+            # copies run on n-sized legs instead of a 2n block with four times the entries. Real-equivalent
+            # preconditioners (form/jacobi/…) stay on the block.
             if kwargs.get("values"):
                 raise NotImplementedError(
-                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
-                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
-                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                    "fem.solve(<complex-native linear or precond>, <parameter>=...): the complex-native solve works "
+                    "on the assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent solver (e.g. jno.solve.lu(backend='host')), or build the form with the "
+                    "value fixed."
                 )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -6061,14 +6105,7 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": red["is_bloch"],
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6123,14 +6160,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": is_bloch,
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6197,7 +6227,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
@@ -6261,7 +6291,7 @@ def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cel
         )
         off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
         off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, region: str) -> Dict[int, np.ndarray]:
@@ -6537,6 +6567,21 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
     }
 
 
+def _multifield_reduction(blocks, off_full, off_red, **extra) -> dict:
+    """The multi-field periodic reduction dict, with its block-diagonal ``P`` built HERE, while the block
+    prolongations are concrete. ``reduce_matrix_periodic`` runs inside the traced Newton body; without the
+    cached ``P_blockdiag`` a non-selection block (an N1E tie, a Bloch phase) cannot be rebuilt there, and
+    ``PᵀJP`` silently falls onto the dense ``n x n`` path -- the slip builder has cached it for that reason."""
+    from .utils.solver.fem_utils import _blockdiag_bcoo
+
+    out = {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    Pg = _blockdiag_bcoo([b["P"] for b in blocks], off_full, off_red) if len(blocks) > 1 else None
+    if Pg is not None:
+        out["P_blockdiag"] = Pg
+    out.update(extra)
+    return out
+
+
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any, exclude_dofs: Any = None
 ) -> dict:
@@ -6591,7 +6636,7 @@ def _build_periodic_reduction_multifield(
             )
             off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
             off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-        return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+        return _multifield_reduction(blocks, off_full, off_red)
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
     blocks, off_full, off_red = [], [0], [0]
@@ -6614,7 +6659,7 @@ def _build_periodic_reduction_multifield(
         blocks.append({"P": P_i, "kept": kept_i, "vec": v_i, "is_selection": sel_i})
         off_full.append(off_full[-1] + int(P_i.shape[0]))
         off_red.append(off_red[-1] + int(P_i.shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _complex_recombine(n: int):
@@ -7862,6 +7907,8 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # a face operator (`jno.np.sqrtm(L)`) reads the Bloch phase of the ties across its face
+    domain._faceop_ties = list(periodic_ties)
     # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
     # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
     # off before classification -- neither names a region the classifier could read.
@@ -8632,8 +8679,9 @@ def _fem_impl(
     # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
     # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
     # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    # A face operator `jno.np.sqrtm(L)(trace)` (`faceop_*`, a dense block over one face) is assembled there too.
     _reads_across = any(
-        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith(("across_", "faceop_"))
         for c in constraints
         for n in _walk(_bare(c))
     )

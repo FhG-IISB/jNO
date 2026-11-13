@@ -1069,9 +1069,19 @@ def assemble_fem_nonnodal(
             "morley": None if TS["morley"] is None else tuple(_sel(a) for a in TS["morley"]),
         }
 
-    def _facet_res(g, f, la, lbs, coeffs, rt_scalar, field_vals, nt, pts_dyn):
+    def _facet_res(g, f, la, lbs, coeffs, rt_scalar, field_vals, nt, pts_dyn, extra_ctx=None):
         """Residual (test DOFs of the group's field) of the group's terms on facet ``f`` from the owner
-        cell's all-field local DOFs ``la`` and, per ``across`` key, the main cells' DOF values ``lbs``."""
+        cell's all-field local DOFs ``la`` and, per ``across`` key, the main cells' DOF values ``lbs``.
+        ``extra_ctx`` (``xq -> {tag: (n_q, n) values}``) adds per-point symbols, e.g. a face operator's."""
+        local, w = _facet_local(g, f, la, lbs, rt_scalar, field_vals, nt, pts_dyn, extra_ctx)
+        r = None
+        for e in coeffs:
+            t_ = _integrate_term(domain, e, local, w)
+            r = t_ if r is None else r + t_
+        return r
+
+    def _facet_local(g, f, la, lbs, rt_scalar, field_vals, nt, pts_dyn, extra_ctx=None):
+        """The integrand evaluator's ``local`` on facet ``f`` and its quadrature weights (see `_facet_res`)."""
         c, k = g["cell"][f], g["kf"][f]
         tabs = _select_tabs(g["tabs"], k)
         cell_sols = [la[_all_splits[i] : _all_splits[i + 1]] for i in range(len(fields))]
@@ -1109,12 +1119,9 @@ def assemble_fem_nonnodal(
             local["frozen_fields"] = {fid: gg[c] for fid, gg in _frozen_gathered.items()}
         if nt is not None:
             local["neural_coefficients"] = nt
-        w = g["fqw"] * meas
-        r = None
-        for e in coeffs:
-            t_ = _integrate_term(domain, e, local, w)
-            r = t_ if r is None else r + t_
-        return r
+        if extra_ctx is not None:
+            dctx.update(extra_ctx(xq))
+        return local, g["fqw"] * meas
 
     def _unflatten_lbs(flat, shapes):
         """Inverse of the per-facet concatenation of the across blocks: ``{key: (n_q, n_dof_main)}``."""
@@ -1251,9 +1258,268 @@ def assemble_fem_nonnodal(
                     ),
                 )
                 R = R.at[cdofs[g["tfi"]][g["cell"]].reshape(-1)].add(elem.reshape(-1).astype(R.dtype))
+            if with_gsurf and _FACE is not None:  # face operator: a constant linear block, A_face u
+                _rt = jnp.result_type(_FACE_BCOO.dtype, u_flat.dtype)
+                _F = type(_FACE_BCOO)((_FACE_BCOO.data.astype(_rt), _FACE_BCOO.indices), shape=_FACE_BCOO.shape)
+                R = R + (_F @ jnp.asarray(u_flat).astype(_rt)).astype(R.dtype)
             return R
 
         return residual
+
+    def _nonzero_lines(X):
+        """Mask of the last-axis lines of ``X`` (modes x components x DOFs) above round-off of its largest."""
+        mx = np.asarray(jnp.max(jnp.abs(X), axis=tuple(range(X.ndim - 1))))
+        return mx > 1e-12 * max(float(mx.max(initial=0.0)), 1e-300)
+
+    def _faceop_block(fo_terms):
+        """The dense block of every face-operator term, ``A[i, j] = sum_m L_m[i] C_m[j]`` (see
+        :mod:`jno.trace.face_operator`): per Fourier mode ``e_m`` of the face, ``C_m`` projects the
+        trace ``arg(phi_j)`` onto ``e_m`` and ``L_m`` is the term tested with ``phi_i`` at
+        ``S(arg) = f(sigma_m) e_m``. Both come from one ``jacfwd`` per facet (of the term in the
+        symbol's values, of ``arg`` in the trial DOFs); the modes enter through an einsum."""
+        import logging
+
+        from ..._fem import _contains, _retag_coords_for_quadrature, _walk
+        from ...trace import TrialFunction as _TrF
+        from .fem_utils import _eval_integrand, _lower_statefield_to_trial
+
+        specs = getattr(domain, "_faceop_specs", {}) or {}
+        wraps = {w_ for terms_ in fo_terms.values() for w_, _e in terms_}
+        if len(wraps) != 1:
+            raise NotImplementedError(f"jno.fem: face-operator terms mixed across complex legs {sorted(map(str, wraps))}.")
+        wrap = wraps.pop()
+        # The block is built once. A parameter elsewhere in the form is fine (the block is constant in it);
+        # one inside a face-operator term, or a trainable geometry, would silently freeze.
+        _fo_par: dict = {}
+        for terms_ in fo_terms.values():
+            for _w, e in terms_:
+                _collect_runtime_parameter_exprs(e, _fo_par)
+        if _fo_par or _coord_specs:
+            raise NotImplementedError(
+                "jno.fem: a face-operator term (jno.np.sqrtm(L)) is assembled once as a constant block, so a runtime "
+                f"parameter in it ({sorted(_fo_par)}) or trainable mesh coordinates would be frozen. Keep the "
+                "parameters in the other terms."
+            )
+        P_ = np.asarray(pts)[:, :dim]
+
+        def _bloch_k(tang, ax_n, region):
+            """The Bloch wavevector along the face's tangential axes, from the phases of the periodic ties:
+            a tie ``u(A) - phi u(B)`` says ``u(A) = phi u(B)``, so a mode ``exp(i k_B x)`` has
+            ``k_B = arg(phi) / (x_A - x_B)`` along the axis separating A and B. The face modes are then
+            ``exp(i (k_m + k_B) . x)`` (Floquet); a plain tie gives ``k_B = 0``."""
+            kb = np.zeros(len(tang))
+            for t in getattr(domain, "_faceop_ties", ()) or ():
+                ph = t[4] if len(t) > 4 and t[4] is not None else 1.0
+                try:
+                    ph = complex(ph)
+                except TypeError as err:
+                    raise NotImplementedError(
+                        "jno.fem: a face operator needs the Bloch phase of a periodic tie as a number; this tie's "
+                        f"phase is {type(ph).__name__}."
+                    ) from err
+                if ph == 1.0:
+                    continue
+                if not np.isclose(abs(ph), 1.0):
+                    raise NotImplementedError(
+                        f"jno.fem: a face operator needs a unit-modulus Bloch phase e^(i k L); a tie has |phase| = {abs(ph):.6g}."
+                    )
+                xs = []
+                for tag in (t[1], t[0]):  # A (the scaled side's partner, u(A) = phi u(B)), then B
+                    m_ = domain.tag_node_mask(tag, np.asarray(domain.mesh.points), closure=True)
+                    if m_ is None or not np.asarray(m_).any():
+                        raise ValueError(f"jno.fem: the periodic tie face {tag!r} has no mesh nodes.")
+                    xs.append(P_[np.asarray(m_, dtype=bool).reshape(-1)].mean(axis=0))
+                dx = xs[0] - xs[1]
+                ax = int(np.argmax(np.abs(dx)))
+                if ax not in tang:
+                    raise NotImplementedError(
+                        f"jno.fem: a Bloch tie across the normal of face {region!r} (axis {'xyz'[ax]}) and a face "
+                        "operator on that face do not combine."
+                    )
+                kb[tang.index(ax)] += np.angle(ph) / dx[ax]
+            return kb
+
+        rows_all, cols_all, data_all = [], [], []
+        for region, items in fo_terms.items():
+            for _w, e in items:
+                if _contains(e, _TrF):
+                    raise NotImplementedError(
+                        "jno.fem: a boundary summand reads a face operator S(trace) AND the unknown directly; "
+                        "that product is not linear. Split it into separate summands."
+                    )
+            groups_ = _build_general_surface(
+                {region: [e for _w, e in items]},
+                domain,
+                dim,
+                _cell_name,
+                cells,
+                spaces,
+                field_index,
+                dofmaps,
+                offs,
+                quad_degree,
+                _dofmap_for,
+                _tabulate_at,
+            )
+            for g in groups_:
+                fkeys = sorted(
+                    {str(n.tag) for e in g["coeffs"] for n in _walk(e) if str(getattr(n, "tag", "")).startswith("faceop_")}
+                )
+                apps: dict = {}  # one application S(arg) (same operator, same trace) -> its symbol keys
+                for key in fkeys:
+                    sp_ = specs[key]
+                    if sp_["region"] not in (None, region):
+                        raise ValueError(
+                            f"jno.fem: a face operator applied to a trace on face {sp_['region']!r} is used in a term "
+                            f"on face {region!r}; it must be integrated on its own face."
+                        )
+                    apps.setdefault((id(sp_["op"]), id(sp_["arg"])), []).append(key)
+                # ---- face geometry: flat, normal to one axis; its extent is the period ----
+                cn = g["cell_np"]
+                lvk = np.asarray(g["lv"])[np.asarray(g["kf"])]  # (nf, dim) local vertex ids of each facet
+                fvx = np.take_along_axis(P_[np.asarray(cells)[cn]], lvk[:, :, None], axis=1)  # (nf, dim, dim)
+                lo, hi = fvx.reshape(-1, dim).min(0), fvx.reshape(-1, dim).max(0)
+                ext = hi - lo
+                ax_n = int(np.argmin(ext))
+                if ext[ax_n] > 1e-9 * max(1.0, float(ext.max())):
+                    raise NotImplementedError(
+                        f"jno.fem: a face operator needs a FLAT face normal to a coordinate axis; face {region!r} "
+                        f"spans {ext.tolist()} (no axis with zero extent)."
+                    )
+                tang = [a_ for a_ in range(dim) if a_ != ax_n]
+                edges = [np.linalg.norm(fvx[:, i] - fvx[:, j], axis=1) for i in range(dim) for j in range(i + 1, dim)]
+                h = float(np.mean(np.concatenate(edges)))
+                Mx = [max(1, int(np.floor(ext[a_] / (2.0 * h)))) for a_ in tang]
+                grid = np.stack(np.meshgrid(*[np.arange(-m_, m_ + 1) for m_ in Mx], indexing="ij"), -1).reshape(
+                    -1, len(tang)
+                )
+                kvec = 2.0 * np.pi * grid / ext[tang][None, :] + _bloch_k(tang, ax_n, region)[None, :]  # (M, n_tang)
+                area = float(np.prod(ext[tang]))
+                logging.getLogger("jno").info(
+                    "face operator on %r: %d Fourier modes (|m| <= %s, the face mesh's Nyquist limit, h = %.3g), "
+                    "periods %s",
+                    region,
+                    len(grid),
+                    Mx,
+                    h,
+                    ext[tang].tolist(),
+                )
+                kd = {"xyz"[a_]: kvec[:, i] for i, a_ in enumerate(tang)}
+                rr = np.asarray(cdofs[g["tfi"]])[cn]  # (nf, n_test) global test DOFs per facet
+                rows_u, rinv = np.unique(rr.reshape(-1), return_inverse=True)
+                blocks = []
+                for (_op_id, _arg_id), keys in apps.items():
+                    sp0 = specs[keys[0]]
+                    op_, n_c = sp0["op"], int(sp0["n"])
+                    s_m = jnp.asarray(op_.multiplier(kd))  # (M,)
+                    D = []
+                    for key in keys:
+                        dv = specs[key]["deriv"]
+                        if any(dv[a_] for a_ in range(len(dv)) if a_ not in tang):
+                            raise ValueError(
+                                f"jno.fem: S(trace) is differentiated along the normal of face {region!r} (axis "
+                                f"{'xyz'[ax_n]}); only the face's tangential derivatives are defined."
+                            )
+                        f_ = np.ones(len(grid), complex)
+                        for i, a_ in enumerate(tang):
+                            f_ = f_ * (1j * kvec[:, i]) ** dv[a_]
+                        D.append(f_)
+                    D = jnp.asarray(np.stack(D))  # (n_keys, M)
+                    fk_u = sp0["field_key"]
+                    fi_u = field_index.get(fk_u)
+                    if fi_u is None:
+                        raise ValueError(
+                            f"a face operator's trace reads field {fk_u!r}, which is not an unknown of this form."
+                        )
+                    arg_l = _lower_statefield_to_trial(sp0["arg"], {})
+                    _retag_coords_for_quadrature(arg_l, "boundary", region)
+                    kv = jnp.asarray(kvec)
+                    ta = jnp.asarray(tang)
+                    nl = int(_all_cdofs.shape[1])
+                    s0, s1 = int(_all_splits[fi_u]), int(_all_splits[fi_u + 1])
+                    cc = np.asarray(cdofs[fi_u])[cn]  # (nf, n_trial) global trial DOFs per facet
+                    cols_u, cinv = np.unique(cc.reshape(-1), return_inverse=True)
+
+                    def _per_facet(f, _g=g, _keys=tuple(keys), _arg=arg_l, _nc=n_c):
+                        la0 = jnp.zeros((nl,), jnp.asarray(pts).dtype)
+                        loc, w = _facet_local(_g, f, la0, {}, {}, {}, None, jnp.asarray(pts))
+                        xq = loc["physical_quad_points"]
+                        E = jnp.exp(1j * (xq[:, ta] @ kv.T))  # (n_q, M)
+                        nq = xq.shape[0]
+
+                        def _r(V):
+                            lc, ww = _facet_local(
+                                _g,
+                                f,
+                                la0,
+                                {},
+                                {},
+                                {},
+                                None,
+                                jnp.asarray(pts),
+                                lambda _x: {k_: V[i] for i, k_ in enumerate(_keys)},
+                            )
+                            r = None
+                            for e_ in _g["coeffs"]:
+                                t_ = _integrate_term(domain, e_, lc, ww)
+                                r = t_ if r is None else r + t_
+                            return r
+
+                        G = jax.jacfwd(_r)(jnp.zeros((len(_keys), nq, _nc)))  # (n_test, n_keys, n_q, n)
+                        L = jnp.einsum("ikqc,qm,km->mci", G, E, D) * s_m[:, None, None]
+
+                        def _a(la):
+                            lc, _ww = _facet_local(_g, f, la, {}, {}, {}, None, jnp.asarray(pts))
+                            v = jnp.asarray(_eval_integrand(domain, _arg, lc))
+                            return v.reshape(nq, -1)
+
+                        J = jax.jacfwd(_a)(la0)  # (n_q, n, n_local_all)
+                        C = jnp.einsum("q,qm,qcj->mcj", w, jnp.conj(E), J[:, :, s0:s1]) / area
+                        return L, C
+
+                    L_f, C_f = jax.vmap(_per_facet)(jnp.arange(g["n_facets"]))  # (nf, M, n, n_test) / (nf, M, n, n_trial)
+                    if C_f.shape[2] != n_c:
+                        raise ValueError(
+                            f"a face operator applied to a trace of {C_f.shape[2]} components declared {n_c}: apply it "
+                            "to a trace with the unknown's own shape (e.g. n x E for a vector field)."
+                        )
+                    M_ = len(grid)
+                    Lg = (
+                        jnp.zeros((M_, n_c, len(rows_u)), L_f.dtype)
+                        .at[:, :, rinv]
+                        .add(jnp.moveaxis(L_f, 0, 2).reshape(M_, n_c, -1))
+                    )
+                    Cg = (
+                        jnp.zeros((M_, n_c, len(cols_u)), C_f.dtype)
+                        .at[:, :, cinv]
+                        .add(jnp.moveaxis(C_f, 0, 2).reshape(M_, n_c, -1))
+                    )
+                    # The facet's owner cell lends ALL its DOFs, but only those of the facet's closure have
+                    # a trace on it; the others project to round-off (an N1E edge off the face: 1e-17).
+                    # Keep the block to the trace DOFs -- for degree-2 N1E 8 of a tet's 20, which made the
+                    # dense block ~6x bigger than the face and its factorisation front wider with it.
+                    kr = _nonzero_lines(Lg)
+                    kc = _nonzero_lines(Cg)
+                    blocks.append((rows_u[kr], cols_u[kc], jnp.einsum("mci,mcj->ij", Lg[:, :, kr], Cg[:, :, kc])))
+                for rows_u, cols_u, Ab in blocks:
+                    if wrap == "real":
+                        Ab = Ab.real
+                    elif wrap == "imag":
+                        Ab = Ab.imag
+                    elif jnp.iscomplexobj(Ab):
+                        big = float(jnp.max(jnp.abs(Ab)))
+                        if float(jnp.max(jnp.abs(Ab.imag))) > 1e-10 * max(big, 1e-300):
+                            raise NotImplementedError(
+                                "jno.fem: this face operator's block is COMPLEX but the form is real. Write the "
+                                "boundary term with its complex factor (e.g. -1j * ...), which makes the form complex."
+                            )
+                        Ab = Ab.real
+                    R_, C_ = np.meshgrid(rows_u, cols_u, indexing="ij")
+                    rows_all.append(R_.reshape(-1))
+                    cols_all.append(C_.reshape(-1))
+                    data_all.append(Ab.reshape(-1))
+        idx = jnp.asarray(np.stack([np.concatenate(rows_all), np.concatenate(cols_all)], 1), dtype=jnp.int32)
+        return idx, jnp.concatenate(data_all)
 
     # --- BCs computed once, separate from per-mode application: the natural BC (p_D·(v·n)) is a constant
     #     RHS load; the essential edge-trace BC is a set of (dof, value) pins (mirrors 1D Dirichlet). ---
@@ -1273,7 +1539,12 @@ def assemble_fem_nonnodal(
     def _signed(x, sign):  # fold a −1 summand sign into the extracted coefficient/source
         return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
 
+    # The host surface assembly integrates on the FIRST H(curl) field only (`_n1e_surface_precompute`), so
+    # a trace term of any other field, or one coupling two fields (trial E_i, test v_r), takes the general
+    # boundary path; on the fast path it would land in the first field's diagonal block, silently.
+    _hcurl_key = next((f["field_key"] for f, sp in zip(fields, spaces) if sp in ("N1E", "N2E")), None)
     pressure_terms, surface_terms, incident_terms, gsurf_terms = {}, {}, {}, {}
+    faceop_terms: dict = {}  # region -> [(leg wrap, signed summand)]: a face operator `S(trace)`, one dense block
     _body_owned = set(getattr(domain, "_tag_regions", {}) or {})
     for region, terms in (boundary_terms or {}).items():
         for t in terms:
@@ -1283,14 +1554,29 @@ def assemble_fem_nonnodal(
                 wrap, inner_expr = bt._name, bt.args[0]
             for sign, sub in _split_additive_terms(domain, inner_expr):
                 sub_w = sub if wrap is None else (sub.real if wrap == "real" else sub.imag)
+                if _reads_faceop(sub):
+                    # the operator's symbol is complex, so the leg part is taken of the ASSEMBLED block
+                    # (Re(L C) != Re(L) Re(C)): keep the summand unwrapped and remember the leg
+                    faceop_terms.setdefault(region, []).append((wrap, _apply_sign(domain, sign, sub)))
                 # non-local, or a body-owned tag that may lie INSIDE the mesh: never one of the
                 # host-assembled patterns (those walk boundary facets only)
-                if region in _body_owned or _reads_across(sub_w):
+                elif region in _body_owned or _reads_across(sub_w):
                     gsurf_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
-                elif dim == 3 and (mass := _n1e_surface_mass_spec(sub_w)) is not None:
+                elif (
+                    dim == 3
+                    and (mass := _n1e_surface_mass_spec(sub_w)) is not None
+                    and mass[1] == region
+                    and mass[2] == mass[3] == _hcurl_key
+                ):
                     surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
-                elif dim == 3 and (load := _n1e_surface_load_spec(sub_w)) is not None:
-                    incident_terms.setdefault(region, []).append(_signed(load[0], sign))
+                elif (
+                    dim == 3
+                    and (load := _n1e_surface_load_spec(sub_w)) is not None
+                    and load[1] == region
+                    and load[2] == _hcurl_key
+                ):
+                    # a trial-free term enters b as -term, like every other source (the list sums to zero)
+                    incident_terms.setdefault(region, []).append(_signed(load[0], -sign))
                 elif _legacy_natural(sub_w, field_index, spaces):
                     pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
                 else:  # anything else: the general boundary-integrand path
@@ -1310,6 +1596,12 @@ def assemble_fem_nonnodal(
             _dofmap_for,
             _tabulate_at,
         )
+    _FACE = _faceop_block(faceop_terms) if faceop_terms else None  # (indices, data) or None
+    _FACE_BCOO = None
+    if _FACE is not None:
+        import jax.experimental.sparse as _jsp_face
+
+        _FACE_BCOO = _jsp_face.BCOO((_FACE[1], _FACE[0]), shape=(total, total))
     # A runtime parameter in a host-assembled RT pressure / plate BC cannot be threaded differentiably
     # (the load is baked once); only the N1E surface/incident coefficient re-assembles per args. Reject the
     # former loudly (rather than silently freeze it) now that classification separates the two.
@@ -1363,7 +1655,7 @@ def assemble_fem_nonnodal(
         else None
     )
 
-    def _incident_of(params):  # N1E incident forcing ∫ g·(n×v) → b
+    def _incident_of(params):  # N1E trial-free surface term: b gets -∫ g·(v×n)
         if not incident_terms:
             return jnp.zeros(total)
         return _assemble_n1e_surface_load(total, _inc_static, params=params)
@@ -1384,17 +1676,6 @@ def assemble_fem_nonnodal(
     def _surf_mass_dense():
         return None if surf_mass is None else jnp.asarray(surf_mass.todense())
 
-    if surf_mass is not None or incident_terms:
-        # The surface mass is a fixed LINEAR block added to the spatial operator A (and the incident load to
-        # b), so it composes with the steady AND transient linear problem (M u̇ + A u = c: the impedance is a
-        # boundary contribution to A, the incident source rides the forcing). A NONLINEAR form is not wired —
-        # the surface block is not re-linearised per Newton step. Raise rather than silently drop it.
-        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
-            raise NotImplementedError(
-                "jno.fem (non-nodal): the N1E tangential-trace surface terms (impedance / absorbing / incident BC) "
-                "compose with the steady and transient LINEAR problem, but not a NONLINEAR form yet (the surface "
-                "mass is a fixed linear block, not re-linearised per step). (Raises rather than silently dropping it.)"
-            )
     pins = (
         _flux_bc_pins(
             flux_bcs,
@@ -1518,6 +1799,7 @@ def assemble_fem_nonnodal(
         # General boundary-integrand groups: rows = the owner cell's test DOFs, columns = the owner
         # cell's all-field DOFs followed by every across key's main-cell DOFs (per quadrature point).
         _sgs = list(_GS["groups"]) if with_gsurf else []
+        _sgs_face = bool(with_gsurf and _FACE is not None)
         _s_cols = []
         for _g in _sgs:
             _cc = [np.asarray(_cell_all_dofs)[_g["cell_np"]]]
@@ -1720,6 +2002,11 @@ def assemble_fem_nonnodal(
                     _tag_cols.append(jnp.broadcast_to(jnp.asarray(_s_cols[sgi])[:, None, :], Kf.shape).reshape(-1))
                     _tag_cells.append(jnp.broadcast_to(jnp.asarray(_g["cell"])[:, None, None], Kf.shape).reshape(-1))
             if elements:
+                if _sgs_face:
+                    raise NotImplementedError(
+                        "jno.fem: per-cell matrices of a form with a face operator (jno.np.sqrtm(L)) do not exist; "
+                        "its block couples every DOF of the face."
+                    )
                 if _surf_mass_of(args, sparse=True) is not None:
                     raise NotImplementedError(
                         "jno.fem (non-nodal): the per-cell matrices of a form with a tangential-trace surface mass "
@@ -1735,6 +2022,19 @@ def assemble_fem_nonnodal(
             # Tangential-trace surface mass (impedance BC), re-evaluated per args. Taken SPARSE: densifying it
             # would cost O(n_dof²) just to re-sparsify, the memory wall for a 3-D vector run.
             sm = _surf_mass_of(args, sparse=True) if surface else None
+            if _sgs_face:  # the face-operator block rides with the general boundary terms (not the surface flag:
+                # it is part of the spatial operator the residual carries, so the Newton tangent needs it too)
+                sm = (
+                    _FACE_BCOO
+                    if sm is None
+                    else _jsparse.BCOO(
+                        (
+                            jnp.concatenate([sm.data, _FACE_BCOO.data.astype(sm.data.dtype)]),
+                            jnp.concatenate([sm.indices, _FACE_BCOO.indices]),
+                        ),
+                        shape=sm.shape,
+                    )
+                )
             if _vinv is not None:
                 # values already landed in their FINAL slots inside the group loop; nothing to sort,
                 # nothing to collapse, and the flags let every matvec skip the lazy re-summation.
@@ -1766,12 +2066,35 @@ def assemble_fem_nonnodal(
     # a separate question about the residual too, not something a storage change may decide quietly.
     _pin_dofs_j, _, _pin_project = dirichlet_projection(pins) if pins else (None, None, None)
 
-    def _sparse_tangent(asm, u, args=None):
+    def _sparse_tangent(asm, u, args=None, surface=False):
         # At the PROJECTED state and eliminated on both sides, matching `_apply_dirichlet_projected`.
+        # `surface=True` keeps the N1E tangential-trace surface mass in J, for a residual built by
+        # `_plus_surface` (which carries `S u`).
         _u = jnp.asarray(u).reshape(-1)
         _u = _u if _pin_project is None else _pin_project(_u)
-        J = asm(args, surface=False, u_flat=_u)
+        J = asm(args, surface=surface, u_flat=_u)
         return J if _pin_dofs_j is None else bcoo_eliminate_dirichlet(J, _pin_dofs_j)
+
+    _nl_surface = surf_mass is not None or bool(incident_terms)
+
+    def _plus_surface(res):
+        """A Newton residual ``res(u, args)`` with the N1E tangential-trace terms added: ``+ S(args) u`` for
+        the surface mass (impedance / absorbing face) and the parametric change of the incident load (its
+        constant part is already in ``nat_load``). Both are LINEAR in ``u``, so the tangent only has to keep
+        ``S`` (``_sparse_tangent(..., surface=True)``); nothing is re-linearised per step."""
+        if not _nl_surface:
+            return res
+
+        def r(u, args=None):
+            out = res(u, args)
+            sm = _surf_mass_of(args, sparse=True)
+            if sm is not None:
+                out = out + sm @ jnp.asarray(u).reshape(-1)
+            if incident_terms and args is not None:
+                out = out - (_incident_of(args) - _incident_const)
+            return out
+
+        return r
 
     #
     # Defined BEFORE the transient branch below: that branch returns early, and its Jacobian closures call
@@ -2021,12 +2344,13 @@ def assemble_fem_nonnodal(
                 else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
             )
             if runtime_parameter_tags or neural_param_names:  # transient inverse: thread args through res + jac
+                _res_pt = _plus_surface(lambda uu, a=None: spatial_res(uu, a) - nat_load)
 
                 def res_pt(u, t, args=None):
-                    return _apply_dirichlet_projected(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
+                    return _apply_dirichlet_projected(lambda uu: _res_pt(uu, args), pins)(jnp.asarray(u))
 
                 def jac_pt(u, t, args=None):
-                    return _sparse_tangent(_assemble_spatial, u, args)
+                    return _sparse_tangent(_assemble_spatial, u, args, surface=_nl_surface)
 
                 block = SemidiscreteTimeBlock(
                     mass=lambda t, args=None, _M=M_nl: _M,
@@ -2036,10 +2360,11 @@ def assemble_fem_nonnodal(
                     **common,
                 )
                 return block, "transient", offs
-            res_bc = _apply_dirichlet_projected(lambda u: spatial_res(u) - nat_load, pins)
+            _res_t = _plus_surface(lambda u, a=None: spatial_res(u) - nat_load)
+            res_bc = _apply_dirichlet_projected(_res_t, pins)
 
             def jac(u, _asm=_assemble_spatial):
-                return _sparse_tangent(_asm, u)
+                return _sparse_tangent(_asm, u, surface=_nl_surface)
 
             block = SemidiscreteTimeBlock(
                 mass=lambda t, args=None, _M=M_nl: _M,
@@ -2223,22 +2548,23 @@ def assemble_fem_nonnodal(
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
         if runtime_parameter_tags or neural_param_names:  # parametric (inverse): thread args through res + jac
+            _res_nl = _plus_surface(full_residual)
 
             def res_p(u, args=None):
-                return _apply_dirichlet_projected(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
+                return _apply_dirichlet_projected(lambda uu: _res_nl(uu, args), pins)(jnp.asarray(u))
 
             def jac_p(u, args=None):
-                return _sparse_tangent(_assemble_sparse_A, u, args)
+                return _sparse_tangent(_assemble_sparse_A, u, args, surface=_nl_surface)
 
             return (
                 FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
                 "nonlinear",
                 offs,
             )
-        res_bc = _apply_dirichlet_projected(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
+        res_bc = _apply_dirichlet_projected(_plus_surface(full_residual), pins)  # essential pins as rows R[d]=u[d]-g
 
         def jac(u):
-            return _sparse_tangent(_assemble_sparse_A, u)
+            return _sparse_tangent(_assemble_sparse_A, u, surface=_nl_surface)
 
         # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); non-parametric here, so
         # accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
@@ -2308,6 +2634,13 @@ def assemble_fem_nonnodal(
     if pins:  # symmetric elimination; `_apply_dirichlet_symmetric` keeps a BCOO sparse
         A, b = _apply_dirichlet_symmetric(A, b, pins)
     return (compress_eager(A), b), "linear", offs
+
+
+def _reads_faceop(node) -> bool:
+    """Does a boundary term read a face operator's symbol ``S(trace)`` (a ``faceop_*`` Variable)?"""
+    from ...trace.face_operator import reads_faceop
+
+    return reads_faceop(node)
 
 
 def _reads_across(node) -> bool:
@@ -2564,10 +2897,32 @@ def _build_general_surface(
     return groups
 
 
+def _n1e_tangential_cross(x, which):
+    """``x`` is the tangential trace ``cross(f, n)`` or ``cross(n, f)`` of the field ``f`` (a bare ``which``
+    -- TrialFunction or TestFunction -- instance) with a boundary-normal Variable ``n_<region>``: return
+    ``(sign, region, field_key)``, ``+1`` for ``f×n`` (what the host surface assembly integrates) and ``-1``
+    for ``n×f = -f×n``; ``field_key`` names the field ``f`` belongs to. ``None`` for anything else (another
+    vector, a curl, a nested cross), which then goes to the general boundary path that evaluates the
+    integrand as written."""
+    from ..._fem import _is_normal_variable
+    from ...trace import FunctionCall
+
+    if not (isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2):
+        return None
+    a, b = x.args
+    if isinstance(a, which) and _is_normal_variable(b):
+        return 1.0, b.tag[2:], getattr(a, "field_key", a.op_id)
+    if isinstance(b, which) and _is_normal_variable(a):
+        return -1.0, a.tag[2:], getattr(b, "field_key", b.op_id)
+    return None
+
+
 def _n1e_surface_mass_spec(bare):
     """Recognise a tangential-trace surface-mass boundary term ``[c *] inner(n×u, n×v)`` (the natural
-    N1E impedance / first-order absorbing BC for Maxwell) → a 1-tuple ``(coeff_node,)`` (``coeff_node``
-    is ``None`` when the coefficient is 1); ``None`` if the term is not of this form.
+    N1E impedance / first-order absorbing BC for Maxwell) → ``(coeff_node, region, trial_key, test_key)``
+    (``coeff_node`` is ``None`` when the coefficient is 1; the keys name the trial's and the test's field,
+    which differ in a cross-field block such as the real pair of a complex field); ``None`` if the term is
+    not of this form.
 
     The tangential trace ``n×u`` is authored as ``u.vector.cross(nvec)`` (a ``cross`` FunctionCall over
     the trial and the region normal), paired with the test's ``n×v`` inside an ``inner`` FunctionCall,
@@ -2591,25 +2946,25 @@ def _n1e_surface_mass_spec(bare):
     if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
         return None
 
-    def _is_cross(x, which):
-        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, which)
-
     a0, a1 = node.args
-    ok = (_is_cross(a0, TrialFunction) and _is_cross(a1, TestFunction)) or (
-        _is_cross(a0, TestFunction) and _is_cross(a1, TrialFunction)
-    )
-    if not ok:
+    tu = _n1e_tangential_cross(a0, TrialFunction) or _n1e_tangential_cross(a1, TrialFunction)
+    tv = _n1e_tangential_cross(a1, TestFunction) or _n1e_tangential_cross(a0, TestFunction)
+    if tu is None or tv is None or tu[1] != tv[1]:  # both traces, on the same face's normal
         return None
+    if tu[0] * tv[0] < 0:  # (n×u)·(v×n) = -(u×n)·(v×n): one reversed cross flips the term
+        coeff = Literal(-1.0) if coeff is None else (-1.0) * coeff
     if wrap is not None:  # fold the leg's Re/Im into the coefficient: Re(i·k₀)=0, Im(i·k₀)=k₀
         base = coeff if coeff is not None else Literal(1.0)
         coeff = base.real if wrap == "real" else base.imag
-    return (coeff,)
+    return (coeff, tu[1], tu[2], tv[2])
 
 
 def _n1e_surface_load_spec(bare):
-    """Recognise an N1E incident/forcing surface term ``inner(g, n×v)`` (trial-FREE, into ``b``) → a
-    1-tuple ``(g_node,)`` (the prescribed tangential source, e.g. the incident wave ``2 i k₀ E_inc``);
-    ``None`` otherwise. Distinct from the bilinear impedance mass (which carries the trial as well)."""
+    """Recognise an N1E trial-free surface term ``[c *] inner(g, v×n)`` (or ``n×v``, with its sign) → a
+    ``(g_node, region, test_key)`` with ``∫ g·(v×n)`` the term as written; ``None`` otherwise. ``g`` may read the
+    face normal: the incident source of an absorbing face is ``inner(cross(E_inc, n), v×n) = E_inc,t·v_t``.
+    The cross must be the bare test function with the face's normal Variable; any other form goes to the
+    general boundary path. Distinct from the bilinear impedance mass (which carries the trial as well)."""
     from ..._fem import _contains
     from ...trace import BinaryOp, FunctionCall, TestFunction, TrialFunction
 
@@ -2628,21 +2983,20 @@ def _n1e_surface_load_spec(bare):
     if not (isinstance(node, FunctionCall) and node._name == "inner" and len(node.args) == 2):
         return None
 
-    def _cross_test(x):
-        return isinstance(x, FunctionCall) and x._name == "cross" and len(x.args) == 2 and _contains(x, TestFunction)
-
     a0, a1 = node.args
-    if _cross_test(a0) and _source(a1):
-        g = a1
-    elif _cross_test(a1) and _source(a0):
+    if (tv := _n1e_tangential_cross(a1, TestFunction)) is not None and _source(a0):
         g = a0
+    elif (tv := _n1e_tangential_cross(a0, TestFunction)) is not None and _source(a1):
+        g = a1
     else:
         return None
-    if coeff is not None:  # fold the scalar coefficient into the source: c·inner(g, n×v) = inner(c·g, n×v)
+    if coeff is not None:  # fold the scalar coefficient into the source: c·inner(g, v×n) = inner(c·g, v×n)
         g = coeff * g
+    if tv[0] < 0:  # inner(g, n×v) = -inner(g, v×n)
+        g = (-1.0) * g
     if wrap is not None:  # complex leg split: Re/Im of the (complex) source
         g = g.real if wrap == "real" else g.imag
-    return (g,)
+    return (g, tv[1], tv[2])
 
 
 def _n1e_surface_precompute(domain, top, quad_degree, spaces, dim, dofmaps=None):
@@ -2753,7 +3107,7 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
     in ONE batched op instead of one per face.
 
     Returns ``(groups, fqw)`` with ``groups = [(coeff_node, gdofs(n,n_dof), tens(n,nq,...), xq(n,nq,3),
-    measure(n,)), ...]``."""
+    measure(n,), normals(n,nq,3)), ...]``."""
     from .fem_1d import _region_node_ids
 
     fidx, cells, fc, fqp, fqw, face_rv, signs, cell_edges, dm = _n1e_surface_precompute(
@@ -2774,15 +3128,24 @@ def _n1e_surface_static(kind, terms, domain, spaces, top, pts_np, offs, quad_deg
         else:
             tens = np.cross(phi, nhat[:, None, None, :])  # φ_a × n (the authored `v.vector.cross(nvec)`)
         gdofs = np.asarray(offs[fidx] + np.asarray(cell_edges)[c], dtype=np.int64)
+        nq_ = xq.shape[1]
         for node in nodes:
-            g = groups.setdefault(id(node), [node, [], [], [], []])
+            g = groups.setdefault(id(node), [node, [], [], [], [], []])
             g[1].append(gdofs)
             g[2].append(tens)
             g[3].append(xq)
             g[4].append(measure)
+            g[5].append(np.broadcast_to(nhat[:, None, :], (nhat.shape[0], nq_, nhat.shape[1])))
     out = [
-        (node, np.concatenate(gd), np.concatenate(tn), np.concatenate(xq), np.concatenate(ms).astype(float))
-        for node, gd, tn, xq, ms in groups.values()
+        (
+            node,
+            np.concatenate(gd),
+            np.concatenate(tn),
+            np.concatenate(xq),
+            np.concatenate(ms).astype(float),
+            np.concatenate(nr),
+        )
+        for node, gd, tn, xq, ms, nr in groups.values()
     ]
     return out, fqw
 
@@ -2802,13 +3165,14 @@ def _assemble_n1e_surface_mass(total, static, params=None, sparse=False):
         return None if sparse else jnp.zeros((total, total))
     nq = len(fqw)
     rows_l, cols_l, data_l = [], [], []
-    for node, gd, tn, xq, ms in groups:
+    for node, gd, tn, xq, ms, nr in groups:
         n = gd.shape[0]
         pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
+        nrm_flat = jnp.asarray(nr).reshape(-1, nr.shape[-1])
         cval = (
             jnp.ones((n, nq))
             if node is None
-            else _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq)
+            else _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params, normals=nrm_flat), n, nq)
         )
         wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None] * cval  # (n, nq) quad weight x measure x c
         blk = jnp.einsum("nq,nqab->nab", wq, jnp.asarray(tn))  # (n, 6, 6) element surface-mass blocks
@@ -2826,8 +3190,8 @@ def _assemble_n1e_surface_mass(total, static, params=None, sparse=False):
 
 
 def _assemble_n1e_surface_load(total, static, params=None):
-    """Tangential incident/forcing surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (the ``inner(g, n×v)`` RHS of the
-    Silver-Müller ABC) as a ``(total,)`` load to ADD to ``b``. Pure JAX over the host-static structure,
+    """Trial-free surface term ``∑ ∫_Γ g·(φ_a×n) dS`` (``inner(g, v×n)``) as a ``(total,)`` vector to ADD to
+    ``b``; the caller hands in ``g`` already negated, so ``b`` gets ``-term`` like every other source. Pure JAX over the host-static structure,
     so a runtime parameter in ``g`` stays differentiable (inverse design of an incident source)."""
     from ..._fem import _eval_value_node_at
 
@@ -2836,10 +3200,11 @@ def _assemble_n1e_surface_load(total, static, params=None):
         return jnp.zeros(total)
     nq = len(fqw)
     idx_l, val_l = [], []
-    for node, gd, tn, xq, ms in groups:
+    for node, gd, tn, xq, ms, nr in groups:
         n = gd.shape[0]
         pts_flat = jnp.asarray(xq).reshape(-1, xq.shape[-1])
-        gval = _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params), n, nq, comp=3)
+        nrm_flat = jnp.asarray(nr).reshape(-1, nr.shape[-1])
+        gval = _bcast_surface_vals(_eval_value_node_at(node, pts_flat, params=params, normals=nrm_flat), n, nq, comp=3)
         integrand = jnp.einsum("nqi,nqai->nqa", gval, jnp.asarray(tn))  # g·(φ_a×n)
         wq = jnp.asarray(fqw)[None, :] * jnp.asarray(ms)[:, None]  # (n, nq)
         idx_l.append(jnp.asarray(gd).reshape(-1))
@@ -3425,8 +3790,8 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     count, fcell, flocal = facet_owners(dm)
     normals = facet_outward_normals(dm, pts_np, cells, fcell, flocal)
 
-    def _g(X, comp):
-        v = np.asarray(_eval_value_node_at(value_node, jnp.asarray(X)))
+    def _g(X, comp, N):  # N: the facet's outward normal at X, read by a normal Variable inside the value
+        v = np.asarray(_eval_value_node_at(value_node, jnp.asarray(X), normals=jnp.asarray(N)))
         if np.iscomplexobj(v):
             if np.abs(v.imag).max() > 0.0:
                 raise NotImplementedError(
@@ -3451,22 +3816,22 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     if kind == "value":
 
         def fn(X, N):
-            return _g(X, 1)
+            return _g(X, 1, N)
 
     elif kind == "normal":
 
         def fn(X, N):
-            return _g(X, 1) * N
+            return _g(X, 1, N) * N
 
     elif tdim == 2:
 
         def fn(X, N):  # u×n = u_x n_y - u_y n_x = g  <=  u = g·(n_y, -n_x)
-            return _g(X, 1) * np.stack([N[:, 1], -N[:, 0]], axis=1)
+            return _g(X, 1, N) * np.stack([N[:, 1], -N[:, 0]], axis=1)
 
     else:
 
         def fn(X, N):  # u×n = g  <=  u_tan = n×g
-            return np.cross(N, _g(X, 3))
+            return np.cross(N, _g(X, 3, N))
 
     dofs, vals = interpolate_tasks(dm, pts_np[:, :tdim], cells, tasks, fn, normals=normals)
     return [(int(base + d_), float(v_)) for d_, v_ in zip(dofs, vals)]

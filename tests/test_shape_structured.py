@@ -155,7 +155,10 @@ def test_an_unstructured_domain_has_no_grid():
 @pytest.mark.parametrize(
     "plan,match",
     [
-        pytest.param(lambda: shape.rect(0, 0, 1, 1) - shape.disk(0.5, 0.5, 0.2), "'cut' plan", id="csg"),
+        # CSG of rects/boxes is a rectilinear lattice (tests/test_structured_rectilinear.py); a disk in it is not
+        pytest.param(
+            lambda: shape.rect(0, 0, 1, 1) - shape.disk(0.5, 0.5, 0.2), "this plan has a disk", id="csg-with-a-disk"
+        ),
         pytest.param(lambda: shape.disk(0, 0, 1), "this is a disk", id="disk"),
         pytest.param(lambda: shape.rect(0, 0, 1, 1, size=lambda x, y: 0.1), "graded mesh", id="graded-size"),
     ],

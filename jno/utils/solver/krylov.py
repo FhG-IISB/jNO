@@ -195,7 +195,20 @@ def fgmres(matvec, b, *, M=None, x0=None, tol=1e-8, restart=30, maxiter=1000, re
     return (x, n_steps) if return_iters else x
 
 
-def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64, maxiter=1000, check_every=8, side="right"):
+def gmres_chunked(
+    matvec,
+    b,
+    *,
+    M=None,
+    x0=None,
+    tol=1e-8,
+    atol=0.0,
+    restart=64,
+    maxiter=1000,
+    check_every=8,
+    side="right",
+    return_iters=False,
+):
     """Restarted, preconditioned GMRES that asks the host only every ``check_every`` steps.
 
     Y. Saad & M. H. Schultz, *GMRES*, SIAM J. Sci. Stat. Comput. 7(3), 1986, with right
@@ -217,6 +230,10 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64,
     Each restart re-forms the residual from ``x``, so an Arnoldi estimate that has drifted cannot end
     the solve. Orthogonalisation is CGS2, vectorised
     over the whole fixed-shape basis (unbuilt rows are zero, so they contribute nothing).
+
+    ``return_iters=True`` returns ``(x, k)``, ``k`` the Arnoldi steps run over all restart cycles (each
+    one operator and one preconditioner application; whole blocks, so up to ``check_every - 1`` past
+    convergence).
     """
     M = M or _ident
     if side not in ("left", "right"):
@@ -267,7 +284,7 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64,
         return V, H, j + 1
 
     def cycle(state):
-        x, r, c = state
+        x, r, c, it = state
         beta = jnp.linalg.norm(r)
         V = jnp.zeros((m + 1, n), dt).at[0].set(r / jnp.maximum(beta, tiny))
         H = jnp.zeros((m + 1, m), dt)
@@ -284,14 +301,14 @@ def gmres_chunked(matvec, b, *, M=None, x0=None, tol=1e-8, atol=0.0, restart=64,
         y, _ = lsq(H, beta, j)
         dx = y @ V[:m]
         x = x + (M(dx) if right else dx)
-        return x, resid(x), c + 1
+        return x, resid(x), c + 1, it + j
 
     def go(state):
-        _, r, c = state
+        _, r, c, _it = state
         return (jnp.linalg.norm(r) > tol_abs) & (c < max_cycles)
 
-    x, _, _ = jax.lax.while_loop(go, cycle, (x0, resid(x0), 0))
-    return x
+    x, _, _, it = jax.lax.while_loop(go, cycle, (x0, resid(x0), 0, 0))
+    return (x, it) if return_iters else x
 
 
 __all__.append("gmres_chunked")

@@ -2355,6 +2355,12 @@ class RegionMask(Placeholder):
         return f"RegionMask({self.region})"
 
 
+def region_mask_key(region: str) -> str:
+    """The context key under which a point sampler hands :class:`RegionMask` ``region``'s 0/1 membership
+    to the trace evaluator."""
+    return f"__region_mask__{region}"
+
+
 class TagMask(Placeholder):
     """Per-**boundary-facet** indicator for a named tag — the surface mirror of :class:`RegionMask`,
     multiplied into a surface term by ``jno.fem`` so a coefficient can vary across ONE boundary term.

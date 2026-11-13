@@ -2786,7 +2786,13 @@ class domain(MeshIOMixin):
                         "(and a `default` subtracted twice). A group that spans other groups cannot be "
                         "mixed with them in one call -- pass the parts, or pass the span, not both."
                     )
-        expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
+
+        def _mask(region, _dom=self):  # the mask remembers its domain, so it can be read at any point
+            m = RegionMask(region)
+            m._domain = _dom
+            return m
+
+        expr = _masked_sum(values, _mask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
         get_logger().debug(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
@@ -3564,6 +3570,8 @@ class domain(MeshIOMixin):
 
         node = getattr(shape, "_node", None)
         prim = node[1] if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+        if prim is None and isinstance(node, tuple) and node and node[0] in ("regions", "cut", "fuse", "inter"):
+            return self._rectilinear_setup(shape)
         if not isinstance(prim, (Rect, Box)):
             _what = (
                 f"a {type(prim).__name__.lower()}"
@@ -3653,6 +3661,52 @@ class domain(MeshIOMixin):
                 return mesh, dim, ds
 
         return constructor, grid_meta
+
+    def _rectilinear_setup(self, shape):
+        """A :meth:`jno.shape.structured` plan of several axis-aligned rects/boxes: a rectilinear lattice
+        (:mod:`jno.domain.lattice`). Every primitive face is a grid plane and each slab between two planes
+        is spaced at the finest region size it crosses, so interfaces are exact and opposite faces match.
+        Returns ``(constructor, None)``: the spacing is not uniform, so there is no ``domain.grid`` for the
+        finite-difference stencils (``jno.fdm`` assembles on the mesh instead)."""
+        from . import lattice
+
+        if int(getattr(shape, "_mesh_order", 1)) > 1:
+            raise NotImplementedError(
+                "shape.structured().curved() is not supported: a lattice of straight boxes has nothing to curve. "
+                "Raise the basis order instead (order=2 on the field)."
+            )
+        if getattr(shape, "_structured", ()):
+            raise ValueError(
+                f"shape.structured(n={shape._structured!r}) on a plan of several boxes: cell counts cannot say which "
+                "slab between two box faces gets how many cells. Set the spacing with each region's size= "
+                "(`.size(h)` / `.sized(h)`) and call .structured() without n."
+            )
+        lattice.check_plan(shape)
+        cells = shape.cell_choices()
+        if len(cells) > 1:
+            raise NotImplementedError(
+                f"shape.structured(): this plan asks for more than one cell type ({', '.join(sorted(cells))})."
+            )
+        tensor = "quad" in cells
+        if shape._node[0] == "regions" or getattr(shape, "_region_name", None) is not None:
+            items = tuple(shape._region_items())
+        else:
+            items = ((None, shape),)
+        default_h = 0.1
+        if not any(s is not None for _p, s, _k in shape.leaves()):
+            self.log.info(f"shape.structured(): no size= anywhere in the plan; defaulting to spacing h={default_h}.")
+        axes, _owner = lattice.lattice_axes(shape, items, default_h, getattr(shape, "_grading", None))
+        cell = ("hex" if tensor else "tetra") if int(shape.dim) == 3 else ("quad" if tensor else "triangle")
+        self.log.info(
+            "shape.structured(): rectilinear lattice "
+            + " x ".join(str(len(x) - 1) for x in axes)
+            + f" cells ({cell}), spacing {min(np.diff(x).min() for x in axes):.3g}..{max(np.diff(x).max() for x in axes):.3g}"
+        )
+
+        def constructor(geo, _axes=axes, _items=items, _cell=cell):
+            return lattice.lattice_mesh(_axes, _items, _cell)
+
+        return constructor, None
 
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
@@ -3834,6 +3888,11 @@ class domain(MeshIOMixin):
         want = frozenset(frozenset(p) for p in pairs)
         if want <= getattr(self, "_periodic_meshed", frozenset()):
             return False  # already conforming for these face pairs
+        if getattr(src, "_structured", None) is not None:
+            # A lattice already matches node for node across opposite faces (the same planes, the same
+            # diagonals); a gmsh re-mesh here would silently replace the structured mesh with a free one.
+            self._periodic_meshed = getattr(self, "_periodic_meshed", frozenset()) | want
+            return False
         from ..geometry.emit import build as _emit_build
 
         mesh, _dim, ds = _emit_build(src, periodic=list(pairs))

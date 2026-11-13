@@ -429,7 +429,7 @@ def test_rcwa_info_before_and_after_solving():
         cons = [
             inner(cu, cv) - K0**2 * inner(eps @ ui, vi),
             1j * K0 * inner(tut, tvt),
-            1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+            1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),
             face("left") - face("right"),
             face("front") - face("back"),
         ]

@@ -1539,6 +1539,17 @@ def assemble_fem_native(
         jnp.asarray(_cell_region_mask(domain, r), dtype=qw_shared.dtype).reshape(-1) for r in region_mask_names
     ]
     _region_mask_index = {r: i for i, r in enumerate(region_mask_names)}  # O(1) lookup vs list().index() per cell
+    _extra_region_masks: Dict[str, Any] = {}
+
+    def _region_mask_array(r):
+        """The per-cell mask of region ``r``: the assembly's own, or -- for a test-free integrand
+        (``fem.eval``) reading a region no weak term restricts to -- built once on first use."""
+        i = _region_mask_index.get(r)
+        if i is not None:
+            return region_mask_arrays[i]
+        if r not in _extra_region_masks:
+            _extra_region_masks[r] = jnp.asarray(_cell_region_mask(domain, r), dtype=qw_shared.dtype).reshape(-1)
+        return _extra_region_masks[r]
 
     # Temporal variable tags (e.g. "__time__") used inside the weak form's coefficients -- a
     # time-dependent source s(x,t) or operator. The residual/Jacobian builders thread the runtime time
@@ -3136,8 +3147,7 @@ def assemble_fem_native(
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": rnames,
-            "volume_vars": _runtime_vals(c, t, args, local_all.dtype)
-            + tuple(region_mask_arrays[_region_mask_index[r]][c] for r in rnames),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + tuple(_region_mask_array(r)[c] for r in rnames),
             "trial_value_shape": fields[0]["value_shape"],
             "trial_vec": vecs[0],
         }
@@ -3897,8 +3907,11 @@ def assemble_fem_native(
             for expr in terms or ():
                 # n_test = 1 in the chunk estimate: there is no element block here, only one number per
                 # cell, so a test-DOF's worth of cost is the honest proxy (as in `state_readout`).
+                # a region-attached coefficient (`.attach`) restricts each value to its region's cells, as in
+                # the weak form: the integrand's masks go in with it
+                rn = tuple(sorted(_collect_region_mask_names(_lower_statefield_to_trial(expr, {}))))
                 per_cell = _elem_map(
-                    lambda c, la, _e=expr: _vol_elem_functional(c, la, _e, (), t, args, pts_dyn),
+                    lambda c, la, _e=expr, _r=rn: _vol_elem_functional(c, la, _e, _r, t, args, pts_dyn),
                     (jnp.arange(n_cells), local_all),
                     _cell_chunk(n_cells, 1, cell_all_dofs.shape[1]),
                 )

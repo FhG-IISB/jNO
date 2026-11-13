@@ -744,6 +744,9 @@ class shape:
     # per-axis CELL counts, or ``()`` for "derive them from ``size=``". Like ``_cell`` and ``_size``
     # this describes how to mesh the geometry, not what the geometry is, so it is not part of equality.
     _structured: Optional[tuple] = field(default=None, compare=False)
+    # Largest growth ratio between neighbouring lattice cells across slabs of different size, from
+    # :meth:`structured` (``None``: every slab uniform, the spacing jumps at the plane between slabs).
+    _grading: Optional[float] = field(default=None, compare=False)
 
     # ----- primitive constructors ------------------------------------------------
     @classmethod
@@ -1256,7 +1259,7 @@ class shape:
         """
         return replace(self, _cell="simplex")
 
-    def structured(self, n=None) -> "shape":
+    def structured(self, n=None, *, grading=None) -> "shape":
         """Return a copy meshed as a **regular lattice** instead of by gmsh::
 
             jno.shape.rect(0, 0, 1, 1, size=0.1).structured().domain()
@@ -1279,9 +1282,24 @@ class shape:
         scalar for every axis, a tuple per axis, or nothing at all to derive it from the shape's own
         ``size=`` (``n = max(2, round(extent / h))``), which keeps one resolution concept.
 
-        Refuses by name -- a CSG plan, a non-rectangular primitive, a graded ``size=`` callable --
-        rather than falling back to gmsh: a caller who then reads ``domain.grid`` or expects hexes
-        would fail somewhere else instead, having silently solved on a different mesh.
+        **Several boxes.** A plan built only from axis-aligned rects/boxes (named regions joined by
+        ``+``, and ``|``/``-``/``&``) becomes a *rectilinear* lattice: every box face is a grid plane and
+        each slab between two planes is split evenly at the finest ``size=`` of the regions it crosses,
+        so interfaces are exact and opposite faces still match node for node. ``n`` is refused there
+        (counts cannot say which slab gets how many cells), and ``domain.grid`` is ``None`` because the
+        spacing is not uniform. See :mod:`jno.domain.lattice`.
+
+        ``grading=r`` (``r > 1``) blends the spacing across slabs: away from every finer slab the cells
+        grow by at most about ``r`` per cell until they reach their own slab's size (the spacing is
+        ``min_j(h_j + (r - 1) * distance to slab j)``, the geometric growth the gmsh path builds into its
+        size bands at about 1.1). The box faces stay grid planes. ``None`` (the default) keeps every slab
+        uniform, so the spacing jumps at the plane between two slabs. A single box has one slab per axis
+        and nothing to grade.
+
+        Refuses by name -- a non-box primitive, a rotation, a graded ``size=`` callable,
+        ``regions(conforming=False)`` -- rather than falling back to gmsh: a caller who then reads
+        ``domain.grid`` or expects hexes would fail somewhere else instead, having silently solved on a
+        different mesh.
 
         Meshing is a property of the shape, which is why this lives beside :meth:`quad` and
         :meth:`curved` rather than on the domain -- by the time a domain exists it holds a mesh and
@@ -1299,7 +1317,17 @@ class shape:
             counts = tuple(int(a) for a in axes)
             if any(a < 1 for a in counts):
                 raise ValueError(f"shape.structured(n={n!r}): every axis needs at least one cell.")
-        return replace(self, _structured=counts)
+        if grading is not None:
+            try:
+                grading = float(grading)
+            except (TypeError, ValueError):
+                raise ValueError(f"shape.structured(grading={grading!r}): expected a growth ratio, a number > 1.") from None
+            if not (np.isfinite(grading) and grading > 1.0):
+                raise ValueError(
+                    f"shape.structured(grading={grading!r}): the growth ratio between neighbouring cells must be "
+                    "> 1 (e.g. 1.2-1.5); omit it for uniform slabs."
+                )
+        return replace(self, _structured=counts, _grading=grading)
 
     def cell_choices(self) -> FrozenSet[str]:
         """Every explicit cell choice (:meth:`quad` / :meth:`tri`) anywhere in this build plan.

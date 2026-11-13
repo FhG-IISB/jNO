@@ -37,6 +37,7 @@ from .trace import (
     OperationCall,
     OperationDef,
     Placeholder,
+    RegionMask,
     StateField,
     TemporalDerivative,
     TensorTag,
@@ -46,6 +47,7 @@ from .trace import (
     TunableModuleCall,
     Variable,
     collect_tags,
+    region_mask_key,
 )
 
 
@@ -729,7 +731,20 @@ class TraceEvaluator:
         (GroupedAssembly, "_eval_grouped_assembly"),
         (NetworkGradient, "_eval_network_gradient"),
         (Noise, "_eval_noise"),
+        (RegionMask, "_eval_region_mask"),
     ]
+
+    def _eval_region_mask(self, expr, ctx):
+        """A region indicator read at points: its 0/1 membership must be in the context (a sampler that
+        knows the points puts it there, e.g. RCWA's permittivity grid). ``jno.fem`` resolves it per cell
+        in its own kernels and never comes here."""
+        key = region_mask_key(expr.region)
+        if key in ctx.context:
+            return ctx.context[key]
+        raise ValueError(
+            f"RegionMask({expr.region!r}) is a per-cell region indicator: evaluating it at points needs the "
+            f"points' membership in the context under {key!r} (jno.utils.solver.fem_utils.region_membership_at)."
+        )
 
     def _dispatch(self, expr, ctx):
         """Look up handler in the dispatch table and call it -- once per node, context and trace.

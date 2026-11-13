@@ -110,7 +110,7 @@ def _vector_constraints():
     return [
         inner(cu, cv) - K0**2 * eps * inner(ui, vi),  # vector Maxwell volume
         1j * K0 * inner(tut, tvt),  # absorbing top
-        1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),  # absorbing bottom + incident
+        1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),  # absorbing bottom + incident
         face("left") - face("right"),  # Floquet ties
         face("front") - face("back"),
     ]
@@ -204,7 +204,7 @@ def _vector_inverse_rc():
         [
             inner(cu, cv) - K0**2 * eps * inner(ui, vi),
             1j * K0 * inner(tut, tvt),
-            1j * K0 * inner(tub, tvb) + 2j * K0 * inner(einc, tvb),
+            1j * K0 * inner(tub, tvb) - 2j * K0 * inner(jno.np.cross(einc, nb), tvb),
             face("left") - face("right"),
             face("front") - face("back"),
         ],
@@ -229,3 +229,91 @@ def test_vector_complex_parametric_inverse_matches_scalar_and_fd():
     tp = float(rcv.solve(params={"k": 0.5 + h}).efficiency("T"))
     tm = float(rcv.solve(params={"k": 0.5 - h}).efficiency("T"))
     assert gv == pytest.approx((tp - tm) / (2 * h), rel=3e-2, abs=1e-4), "vector dT/dk disagrees with finite difference"
+
+
+@needs_fmmax
+def test_internal_interfaces_are_not_mistaken_for_ambient_faces():
+    """A layered cell built from named regions carries interface tags (``"film|skin"``) between them. They are
+    internal, never ambient faces, so the z-ambient search must skip them -- it raised for want of their
+    normals. The stack is homogeneous (eps = 1 everywhere), so T = 1 is the oracle."""
+    Bx = jno.shape.box
+    d = (
+        (
+            Bx(0, 0, 1.0, P, P, 1.1).name("skin").attach(eps=1.0)
+            + Bx(0, 0, 1.0, P, P, 1.4).name("film").attach(eps=1.0)
+            + Bx(0, 0, 0, P, P, 1.0).name("below").attach(eps=1.0)
+            + Bx(0, 0, 1.4, P, P, LZ).name("above").attach(eps=1.0)
+        )
+        .sized(0.25)
+        .domain()
+    )
+    _tag_faces(d)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    nt, nb = d.variable("top", normals=True), d.variable("bottom", normals=True)
+    cb = d.variable("bottom", split=True)
+    einc = vec(1.0 + 0.0 * cb[0], 0.0 * cb[1], 0.0 * cb[2])
+
+    def face(n):
+        cc = d.variable(n, split=True)
+        return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+    cons = [
+        inner(u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi))
+        - K0**2 * d.eps * inner(u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)),
+        1j * K0 * inner(u.vector.cross(nt), v.vector.cross(nt)),
+        1j * K0 * inner(u.vector.cross(nb), v.vector.cross(nb))
+        - 2j * K0 * inner(jno.np.cross(einc, nb), v.vector.cross(nb)),
+        face("left") - face("right"),
+        face("front") - face("back"),
+    ]
+    assert any("|" in t for t in d._boundary_regions), "the stack must carry interface tags for this test"
+    sol = jno.rcwa(cons, orders=20, grid=16).solve()
+    assert float(sol.efficiency("T")) == pytest.approx(1.0, abs=1e-6)
+
+
+@needs_fmmax
+def test_a_region_attached_permittivity_matches_the_same_coordinate_function():
+    """``.attach(eps=...)`` on named regions gives RCWA the permittivity by geometric membership of its
+    sample points -- the rule jno.fem applies to cell centroids. A film with a square hole, eps = 4 by
+    region, must give the T of the same film written as a coordinate function."""
+    Bx = jno.shape.box
+    d = (
+        (
+            Bx(0.2, 0.2, 1.0, 0.4, 0.4, 1.4).name("hole").attach(eps=1.0)
+            + Bx(0, 0, 1.0, P, P, 1.4).name("film").attach(eps=4.0)
+            + Bx(0, 0, 0, P, P, 1.0).name("below").attach(eps=1.0)
+            + Bx(0, 0, 1.4, P, P, LZ).name("above").attach(eps=1.0)
+        )
+        .sized(0.25)
+        .domain()
+    )
+    _tag_faces(d)
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    nt, nb = d.variable("top", normals=True), d.variable("bottom", normals=True)
+    cb = d.variable("bottom", split=True)
+    einc = vec(1.0 + 0.0 * cb[0], 0.0 * cb[1], 0.0 * cb[2])
+
+    def face(n):
+        cc = d.variable(n, split=True)
+        return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+    def cons(eps):
+        return [
+            inner(u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi))
+            - K0**2 * eps * inner(u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)),
+            1j * K0 * inner(u.vector.cross(nt), v.vector.cross(nt)),
+            1j * K0 * inner(u.vector.cross(nb), v.vector.cross(nb))
+            - 2j * K0 * inner(jno.np.cross(einc, nb), v.vector.cross(nb)),
+            face("left") - face("right"),
+            face("front") - face("back"),
+        ]
+
+    film = lambda x, y, z: jnp.where(  # noqa: E731
+        (z > 1.0) & (z < 1.4) & ~((x > 0.2) & (x < 0.4) & (y > 0.2) & (y < 0.4)), 4.0, 1.0
+    )
+    T_region = float(jno.rcwa(cons(d.eps), orders=40, grid=40).solve().efficiency("T"))
+    T_fn = float(jno.rcwa(cons(jno.fn(film, [xi, yi, zi])), orders=40, grid=40).solve().efficiency("T"))
+    assert 0.05 < T_region < 0.98, "the film must scatter, or the comparison shows nothing"
+    assert T_region == pytest.approx(T_fn, abs=1e-6)
