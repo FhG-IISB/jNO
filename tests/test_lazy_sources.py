@@ -73,6 +73,16 @@ class TestAttach:
         dom.variable("_f", np.memmap(path, dtype=np.float32, mode="r", shape=(B, 1, N, D)))
         assert dom.context["_f"].shape == (B, 1, N, D)
 
+    def test_np_memmap_is_stored_as_the_handle(self, tmp_path):
+        """np.memmap subclasses np.ndarray, but it is the lazy source a dataset larger than memory comes as:
+        it must stay the handle, not be read whole into a JAX array (a second full copy in RAM)."""
+        path = tmp_path / "f.npy"
+        np.save(path, _arr(B, 1, N, D))
+        mm = np.load(path, mmap_mode="r")
+        dom, _ = _dom()
+        dom.variable("_f", mm)
+        assert dom.context["_f"] is mm
+
     def test_eager_arrays_still_take_the_eager_path(self):
         """np.ndarray satisfies the duck-type too — it must NOT be treated as lazy."""
         dom, _ = _dom()

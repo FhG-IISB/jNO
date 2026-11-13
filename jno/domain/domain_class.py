@@ -308,6 +308,8 @@ def _is_lazy_source(obj: Any) -> bool:
     ``np.ndarray`` / ``jnp.ndarray`` satisfies it too, so callers must test those first: they are
     cheaper handled eagerly and some downstream paths rely on their concreteness.
     """
+    if isinstance(obj, np.memmap):  # an np.ndarray subclass, but a file the batches are read from
+        return True
     if isinstance(obj, (np.ndarray, jnp.ndarray, tuple, list, str, bytes)):
         return False
     return hasattr(obj, "shape") and hasattr(type(obj), "__getitem__")

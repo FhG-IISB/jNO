@@ -1315,14 +1315,35 @@ class core:
                         f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})"
                     )
 
+        # Carried over by reference, read-only: a copy would duplicate the training data once per eval domain.
+        # A per-sample tag (leading axis = the training domain's samples) whose count differs from this domain's
+        # cannot be paired with its samples, so it is left out; an expression that reads it fails with the tag's name.
+        n_src = int(getattr(self.domain, "total_samples", 1) or 1)
+        n_dst = int(getattr(domain, "total_samples", 1) or 1)
+        per_sample = getattr(self.domain, "_param_tags", set())
+
+        def _shared(x):
+            if _is_lazy_source(x):
+                return x
+            v = np.asarray(x).view()
+            v.flags.writeable = False
+            return v
+
         for tag, value in source_context.items():
             if tag in target_context:
                 continue
-
+            if (
+                tag in per_sample
+                and n_src > 1
+                and n_dst != n_src
+                and getattr(value, "ndim", 0) >= 1
+                and int(value.shape[0]) == n_src
+            ):
+                continue
             if isinstance(value, dict):
-                target_context[tag] = jax.tree_util.tree_map(lambda x: np.asarray(x).copy(), value)
+                target_context[tag] = jax.tree_util.tree_map(_shared, value)
             else:
-                target_context[tag] = np.asarray(value).copy()
+                target_context[tag] = _shared(value)
 
         if hasattr(self.domain, "_param_tags") and hasattr(domain, "_param_tags"):
             domain._param_tags.update(tag for tag in self.domain._param_tags if tag in domain.context)
