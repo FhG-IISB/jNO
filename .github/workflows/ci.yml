@@ -48,6 +48,7 @@ jobs:
               - 'pytest.ini'
               - '.github/workflows/ci.yml'
               - '.github/ci_test_per_file.sh'
+              - '.github/ci_prune_cache.sh'
               - '.github/ci_plan.py'
             fem:
               - 'jno/_fem.py'
@@ -136,7 +137,11 @@ jobs:
       - name: Select this shard's files
         run: python3 .github/ci_plan.py files ${{ matrix.group }} ${{ matrix.shard }} ${{ matrix.of }} | tee files.txt
 
+      # Its own limit, below the job's: a JOB that times out is cancelled and skips the cache save and
+      # the file-time upload below, so the next run starts cold again. A STEP that times out fails,
+      # and those steps still run.
       - name: Test ${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }}
+        timeout-minutes: 100
         run: pixi run -- bash .github/ci_test_per_file.sh $(cat files.txt)
 
       - uses: actions/cache/save@v4
