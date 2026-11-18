@@ -1023,7 +1023,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     def _build(values, mtype):
         A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
         A.sum_duplicates()
-        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
+        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
 
     b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
 
@@ -1132,6 +1132,26 @@ def _pardiso_check_A(solver, A, np):
         raise TypeError(f"MKL PARDISO here takes float64 or complex128, got {A.dtype}.")
 
 
+#: the matrix types PARDISO is handed as an upper triangle (:func:`_pardiso_upper_with_diag`)
+_PARDISO_TRIANGLE_MTYPES = (-2, 6, -4, 2, 4)
+
+
+def _pardiso_apply(A, x, mtype):
+    """``M @ x`` for the operator ``M`` that PARDISO factored, given the matrix ``A`` it was handed.
+
+    For the symmetric and Hermitian types ``A`` is the upper triangle only, so ``A @ x`` is NOT the
+    operator: a residual taken with it is of order 1 for a correct solution. That is what the singularity
+    check did, so every symmetric system with a perturbed pivot was refused as singular -- a 3-D
+    Taylor-Hood saddle whose solution satisfied the full system to 7e-9 was reported with a relative
+    residual of 5.3.
+    """
+    if mtype not in _PARDISO_TRIANGLE_MTYPES:
+        return A @ x
+    lower = (A.conj().T if mtype in (-4, 4) else A.T) @ x
+    diagonal = A.diagonal()
+    return A @ x + lower - (diagonal[:, None] * x if x.ndim == 2 else diagonal * x)
+
+
 def _pardiso_check_factorization(solver, A, b, np, shape):
     """Raise if PARDISO silently factored a singular operator.
 
@@ -1153,7 +1173,7 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
     solver.set_phase(33)
     x = solver._call_pardiso(A, b)
     denom = np.linalg.norm(b)
-    rel = float(np.linalg.norm(A @ x - b) / (denom if denom > 0 else 1.0))
+    rel = float(np.linalg.norm(_pardiso_apply(A, x, solver.mtype) - b) / (denom if denom > 0 else 1.0))
     if rel > _SINGULAR_REL:  # the same singularity test as cuDSS; see _SINGULAR_REL
         raise RuntimeError(
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "

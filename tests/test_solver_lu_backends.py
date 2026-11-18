@@ -698,6 +698,55 @@ def test_pardiso_singular_operator_raises():
         pardiso_lu_solve(A, jnp.ones(4)).block_until_ready()
 
 
+def _saddle(m):
+    """``[[K, B^T], [B, 0]]`` on an ``m^3`` grid: a vector Laplacian with a full-rank difference constraint.
+    Symmetric indefinite with a zero diagonal block, and non-singular."""
+    import scipy.sparse as sp
+
+    eye, lap = sp.identity(m), sp.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(m, m))
+    diff = sp.diags([-1.0, 1.0], [0, 1], shape=(m, m))  # forward difference: triangular, so non-singular
+    k3 = lambda a, b, c: sp.kron(sp.kron(a, b), c)
+    L = k3(lap, eye, eye) + k3(eye, lap, eye) + k3(eye, eye, lap)
+    B = sp.hstack([k3(diff, eye, eye), k3(eye, diff, eye), k3(eye, eye, diff)])
+    return sp.bmat([[sp.block_diag([L, L, L]), B.T], [B, None]]).tocoo()
+
+
+def _as_bcoo(S):
+    return jsp.BCOO((jnp.asarray(S.data), jnp.asarray(np.c_[S.row, S.col])), shape=S.shape)
+
+
+@requires_pardiso
+def test_pardiso_does_not_call_a_solvable_saddle_point_system_singular():
+    """PARDISO perturbs pivots on a zero diagonal block (168 of 864 here) and still returns the solution.
+    The singularity check then took its residual with the stored UPPER TRIANGLE instead of the operator,
+    read 0.81, and refused the system."""
+    from jno.utils.solver.linear import _PARDISO_CACHE
+
+    _PARDISO_CACHE.clear()
+    S = _saddle(6)
+    b = np.cos(np.arange(S.shape[0], dtype=np.float64))
+    x = np.asarray(pardiso_lu_solve(_as_bcoo(S), jnp.asarray(b)))
+    (entry,) = _PARDISO_CACHE.values()
+    assert entry["mtype"] == -2, "the saddle was not factored as symmetric indefinite, so this tests nothing"
+    assert np.linalg.norm(S @ x - b) / np.linalg.norm(b) < 1e-10
+    _PARDISO_CACHE.clear()
+
+
+@requires_pardiso
+def test_pardiso_singular_saddle_point_system_still_raises():
+    """The control for the test above: the same saddle with one constraint stated twice is singular, and
+    the check must still say so now that it measures the residual on the full operator."""
+    import scipy.sparse as sp
+
+    S = _saddle(6).tolil()
+    n = S.shape[0]
+    S[n - 1, :] = S[n - 2, :]
+    S[:, n - 1] = S[:, n - 2]
+    S = sp.coo_matrix(S)
+    with pytest.raises((RuntimeError, ValueError), match="SINGULAR"):
+        pardiso_lu_solve(_as_bcoo(S), jnp.cos(jnp.arange(n, dtype=jnp.float64))).block_until_ready()
+
+
 # ---------------------------------------------------------------------------------------------
 # One threshold used to answer two different questions, and an 8-step budget used to end the loop
 # without saying so. A 165k Taylor-Hood saddle whose refinement reached 1.4e-6 -- four orders clear
