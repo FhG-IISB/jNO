@@ -24,18 +24,24 @@ set -uo pipefail
 
 # The compile cache lives under ~/.cache/jno, which the workflows save and restore
 # between runs: jNO's own default (`JNO_COMPILE_CACHE_DIR`), and the same directory
-# for JAX's flag in case a test sets the cache up without jNO. The size cap keeps a
-# cache that is restored and refilled run after run from growing without bound
-# (least recently used entries go first).
+# for JAX's flag in case a test sets the cache up without jNO.
+#
+# A cache that is restored and refilled run after run must not grow without bound, so
+# it is pruned ONCE here, oldest entries first. JAX's own cap is NOT used
+# (`JAX_COMPILATION_CACHE_MAX_SIZE`): with it, every cache write rescans the whole
+# directory under a file lock, so filling a cold cache costs time quadratic in the
+# number of entries (tests/test_shape_nonconforming.py alone writes 1,560). Every
+# nightly shard that started cold ran into its timeout that way.
 export JNO_COMPILE_CACHE_DIR="${JNO_COMPILE_CACHE_DIR:-$HOME/.cache/jno/xla}"
 export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-$JNO_COMPILE_CACHE_DIR}"
-export JAX_COMPILATION_CACHE_MAX_SIZE="${JAX_COMPILATION_CACHE_MAX_SIZE:-1000000000}"
+unset JAX_COMPILATION_CACHE_MAX_SIZE
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 # MPI (petsc4py, for jno.precond.hypre) runs single-process here, so UCX needs shared memory only.
 # Left to probe the network, MPI_Init fails on runners with an Azure MANA device
 # (`uct_iface_open(ud_verbs/mana_0:1) failed`), and under output capture the test file hangs.
 export UCX_TLS="${UCX_TLS:-self,sm}"
 mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+bash "$(dirname "$0")/ci_prune_cache.sh" "$JAX_COMPILATION_CACHE_DIR" "${CI_COMPILE_CACHE_MAX_MB:-1000}"
 
 rm -f .coverage coverage.xml ci-file-times.tsv
 

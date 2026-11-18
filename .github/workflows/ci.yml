@@ -48,6 +48,7 @@ jobs:
               - 'pytest.ini'
               - '.github/workflows/ci.yml'
               - '.github/ci_test_per_file.sh'
+              - '.github/ci_prune_cache.sh'
               - '.github/ci_plan.py'
             fem:
               - 'jno/_fem.py'
