@@ -103,7 +103,11 @@ jobs:
 
       # One process per test FILE. The all-in-one run accumulates JAX device buffers and coverage
       # state across the suite and gets OOM-killed part-way through on a hosted runner.
+      # Its own limit, below the job's: a JOB that times out is cancelled and skips the cache save and
+      # the file-time upload below, so the next run starts cold again. A STEP that times out fails,
+      # and those steps still run.
       - name: Test ${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }}
+        timeout-minutes: 100
         run: pixi run -- env CI_COVERAGE=1 bash .github/ci_test_per_file.sh $(cat files.txt)
 
       - uses: actions/cache/save@v4

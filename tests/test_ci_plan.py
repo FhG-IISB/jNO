@@ -100,3 +100,25 @@ def test_pruning_a_directory_that_does_not_exist_is_not_an_error(tmp_path):
     import subprocess
 
     subprocess.run(["bash", str(_GITHUB / "ci_prune_cache.sh"), str(tmp_path / "missing"), "1"], check=True)
+
+
+# ------------------------------------------------------------------------------------------------
+# A shard that runs out of time (.github/workflows/ci.yml, nightly.yml)
+# ------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("workflow", "job"), [("ci.yml", "test"), ("nightly.yml", "full")])
+def test_a_shard_that_runs_out_of_time_still_saves_its_cache_and_file_times(workflow, job):
+    """A job that reaches ITS timeout is cancelled, and the cache save and the file-time upload (both
+    ``if: '!cancelled()'``) are skipped: the next run starts cold again and nothing says which files were
+    slow. The test step therefore has its own, shorter limit. A step that times out FAILS, and the steps
+    after it still run."""
+    yaml = pytest.importorskip("yaml")
+    spec = yaml.safe_load((_GITHUB / "workflows" / workflow).read_text())["jobs"][job]
+    steps = spec["steps"]
+    (test,) = [k for k, s in enumerate(steps) if "ci_test_per_file.sh" in s.get("run", "")]
+    assert steps[test].get("timeout-minutes", float("inf")) <= spec["timeout-minutes"] - 10
+    after = [s.get("uses", "").split("@")[0] for s in steps[test + 1 :]]
+    assert "actions/cache/save" in after and "actions/upload-artifact" in after
+    for s in steps[test + 1 :]:
+        assert s.get("if") == "!cancelled()", f"{s.get('uses')} is skipped when the test step fails"
