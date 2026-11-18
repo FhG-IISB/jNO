@@ -13,6 +13,7 @@ Users always remain free to extract ``fem.operator`` and pass their own ``solve_
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from collections import OrderedDict
 from typing import Any
@@ -1033,6 +1034,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)
         _pardiso_check_A(solver, A, _np)
+        threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
         solver.set_phase(11)  # symbolic analysis: the half that survives a value change
         solver._call_pardiso(A, b)
         solver.set_phase(22)
@@ -1046,28 +1048,69 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             "pat": pat,
             "kind": kind,
             "mtype": mtype,
+            "threads": threads,
         }
         while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
             _, old = _PARDISO_CACHE.popitem(last=False)
-            old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
+            with _pardiso_thread_count(old["solver"], old["threads"]):
+                old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
     else:
         _PARDISO_CACHE.move_to_end((skey, entry["kind"]))
-        if entry["dhash"] != dhash:
-            entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
-            entry["solver"].set_phase(22)
-            entry["solver"]._call_pardiso(entry["A"], b)
-            entry["dhash"] = dhash
 
     _PARDISO_LAST_KIND[skey] = entry["kind"]
-    solver, A = entry["solver"], entry["A"]
-    _pardiso_check_factorization(solver, A, b, _np, shape)
-    solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
-    solver.set_phase(33)
-    try:
-        x = solver._call_pardiso(A, b)
-    finally:
-        solver.set_iparm(12, 0)
+    solver = entry["solver"]
+    with _pardiso_thread_count(solver, entry["threads"]):
+        if entry["dhash"] != dhash:
+            entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
+            solver.set_phase(22)
+            solver._call_pardiso(entry["A"], b)
+            entry["dhash"] = dhash
+        A = entry["A"]
+        _pardiso_check_factorization(solver, A, b, _np, shape)
+        solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
+        solver.set_phase(33)
+        try:
+            x = solver._call_pardiso(A, b)
+        finally:
+            solver.set_iparm(12, 0)
     return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+
+
+def _pardiso_mkl(solver):
+    """The MKL runtime behind a ``PyPardisoSolver`` (a ``ctypes`` handle), for the thread-count calls."""
+    mkl = getattr(solver, "libmkl", None)
+    if mkl is None or not hasattr(mkl, "MKL_Set_Num_Threads_Local"):
+        raise RuntimeError(
+            "jno.solve.lu(backend='pardiso') cannot reach MKL's thread-count calls through this pypardiso "
+            "(PyPardisoSolver.libmkl with MKL_Set_Num_Threads_Local / MKL_Get_Max_Threads). Without them a "
+            "factorization can be entered with a thread count it was not analysed for, which corrupts memory "
+            "inside MKL, so jNO refuses the solve. Pin pypardiso>=0.4.4, or use backend='host'."
+        )
+    return mkl
+
+
+@contextlib.contextmanager
+def _pardiso_thread_count(solver, threads):
+    """Run this thread's MKL calls with exactly ``threads`` threads, then restore its own setting.
+
+    MKL PARDISO lays out its parallel schedule in the symbolic analysis (phase 11), for the thread count
+    of the thread that ran it. A later phase entered with another count is not refused: measured with an
+    analysis on 14 threads and a numeric factorization (phase 22) on 1, the solution came back with a
+    relative residual of order 1, or as NaN, or the process died with a glibc heap message. The count is
+    per CALLING thread (the OpenMP setting, ``mkl_set_num_threads_local``), and one cached factorization
+    is called from several: a pool thread under ``jax.jit``, the main thread when the solve is not
+    compiled. The main thread's count is lowered by anything that sets its own (a mesh generator, a
+    ``threadpoolctl`` limit), so compiling a solve and then calling it un-compiled was enough.
+
+    Nothing is lost by keeping the analysed count: a factorization analysed on one thread and refactored
+    from a 14-thread caller was measured slower than on one thread, not faster.
+    """
+    mkl = _pardiso_mkl(solver)
+    previous = mkl.MKL_Set_Num_Threads_Local(int(threads))  # returns this thread's earlier local setting
+    try:
+        yield
+    finally:
+        mkl.MKL_Set_Num_Threads_Local(previous)
 
 
 def _pardiso_check_A(solver, A, np):
