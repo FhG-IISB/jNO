@@ -747,6 +747,61 @@ def test_pardiso_singular_saddle_point_system_still_raises():
         pardiso_lu_solve(_as_bcoo(S), jnp.cos(jnp.arange(n, dtype=jnp.float64))).block_until_ready()
 
 
+@requires_pardiso
+def test_pardiso_factors_a_saddle_point_system_without_perturbing_a_pivot():
+    """A zero diagonal block cannot be pivoted on as it stands. MKL's symmetric indefinite factorization
+    leaves weighted matching and scaling OFF by default and replaces the pivots it cannot use with a
+    perturbation (168 of 864 on this matrix), which costs accuracy. With both on it perturbs none."""
+    from jno.utils.solver.linear import _PARDISO_CACHE
+
+    _PARDISO_CACHE.clear()
+    S = _saddle(6)
+    b = np.cos(np.arange(S.shape[0], dtype=np.float64))
+    x = np.asarray(pardiso_lu_solve(_as_bcoo(S), jnp.asarray(b)))
+    (entry,) = _PARDISO_CACHE.values()
+    assert entry["mtype"] == -2, "the saddle was not factored as symmetric indefinite, so this tests nothing"
+    assert int(entry["solver"].get_iparm(14)) == 0, "PARDISO perturbed pivots of a non-singular saddle system"
+    assert np.linalg.norm(S @ x - b) / np.linalg.norm(b) < 1e-12
+    _PARDISO_CACHE.clear()
+
+
+@requires_pardiso
+def test_pardiso_solves_3d_taylor_hood_stokes_with_a_coefficient_parameter():
+    """The system the pivot perturbation broke: 3-D Taylor-Hood Stokes past a sphere with a per-cell
+    viscosity parameter. With 12 perturbed pivots PARDISO's field agreed with the host backend's to 2e-7
+    only."""
+    inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+    L, H, E = 1.2, 0.4, 1e-9
+    d = (jno.shape.box(0, 0, 0, L, H, H, size=0.3) - jno.shape.sphere(0.35, 0.2, 0.2, 0.1, size=0.1)).domain()
+    d.tag("inlet", lambda x, y, z: x < E)
+    on_sphere = lambda x, y, z: (x - 0.35) ** 2 + (y - 0.2) ** 2 + (z - 0.2) ** 2 < 0.101**2
+    d.tag("noslip", lambda x, y, z: (y < E) | (y > H - E) | (z < E) | (z > H - E) | on_sphere(x, y, z))
+    _, s_nu = d.fem_symbols(space="P0", names=("r_nu", "s_nu"))
+    nu = jno.np.parameter(s_nu, name="nu")
+    cells = max(len(c) for c in d.mesh.cells_dict.values())
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    X = d.variable("interior", split=True)[:3]
+    inlet, noslip = (d.variable(r, split=True)[:3] for r in ("inlet", "noslip"))
+    at = lambda f, Y: f.bind(**dict(zip("xyz", Y)))
+    gu, gv = grad(u, X), grad(v, X)
+    profile = 16.0 * inlet[1] * (H - inlet[1]) * inlet[2] * (H - inlet[2]) / H**4
+    fem = jno.fem(
+        [
+            nu * inner(gu, gv, n_contract=2) - at(p, X) * trace(gv),
+            -at(q, X) * trace(gu),
+            u(*inlet)[0] - profile,
+            u(*inlet)[1] - 0.0,
+            u(*inlet)[2] - 0.0,
+            u(*noslip) - (0.0, 0.0, 0.0),
+        ]
+    )
+    viscosity = jnp.ones(cells)
+    reference = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"), nu=viscosity))
+    solution = np.asarray(fem.solve(linear=jno.solve.lu(backend="pardiso"), nu=viscosity))
+    assert np.linalg.norm(solution - reference) / np.linalg.norm(reference) < 1e-8
+
+
 # ---------------------------------------------------------------------------------------------
 # One threshold used to answer two different questions, and an 8-step budget used to end the loop
 # without saying so. A 165k Taylor-Hood saddle whose refinement reached 1.4e-6 -- four orders clear

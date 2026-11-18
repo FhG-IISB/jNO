@@ -1033,6 +1033,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
         A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)
+        _pardiso_set_pivoting(solver)
         _pardiso_check_A(solver, A, _np)
         threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
         solver.set_phase(11)  # symbolic analysis: the half that survives a value change
@@ -1074,6 +1075,34 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         finally:
             solver.set_iparm(12, 0)
     return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+
+
+def _pardiso_set_pivoting(solver):
+    """Switch on scaling and weighted matching for the symmetric indefinite matrix types.
+
+    MKL enables both by default for the general types (11, 13) and neither for the symmetric indefinite
+    ones (-2, -4, 6), where a diagonal entry that cannot serve as a pivot is then replaced by a
+    perturbation. A saddle-point system has a whole zero diagonal block: measured on a 3-D Taylor-Hood
+    Stokes system, 12 pivots were perturbed and the field agreed with a pivoting LU to 2e-7 only; with
+    matching on, none was perturbed. MKL recommends the pair for exactly this class
+    (``iparm(11) = iparm(13) = 1``, "highly indefinite symmetric matrices, e.g. saddle point problems").
+    On a positive definite matrix it changed nothing that was measured: the same number of factor entries,
+    no pivot perturbed either way.
+
+    The defaults come from ``pardisoinit``, because an ``iparm`` set by hand is only read with
+    ``iparm(1) = 1``, and then every other entry must be given as well.
+    """
+    if solver.mtype not in (-2, -4, 6):
+        return
+    import ctypes
+
+    _pardiso_mkl(solver).pardisoinit(
+        solver.pt.ctypes.data_as(ctypes.c_void_p),
+        ctypes.byref(ctypes.c_int32(solver.mtype)),
+        solver.iparm.ctypes.data_as(ctypes.c_void_p),
+    )
+    solver.set_iparm(11, 1)  # scaling
+    solver.set_iparm(13, 1)  # weighted matching; needs the values in the analysis, which phase 11 gets
 
 
 def _pardiso_mkl(solver):
