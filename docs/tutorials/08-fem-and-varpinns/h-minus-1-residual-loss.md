@@ -47,8 +47,11 @@ the sum over its components.
 - **Structured lattice** (`shape.structured(n=...)`): per-axis sine (Dirichlet) or cosine (Neumann)
   transforms, any real order `s` (`"H^-0.5"`). Dense transforms, O(n^(d+1)) per evaluation.
 - **Simplex mesh** (1-D, 2-D, 3-D): P1 mass $M$ and stiffness $K$ built once;
-  $\|r\|^2_{H^{-1}} = R^\top(M+K)^{-1}R$ with $R = M r$, one CG solve per evaluation (`solver=` takes any
-  `jno.solve` solver). Orders $s=\pm 1$ only.
+  $\|r\|^2_{H^{-1}} = R^\top(M+K)^{-1}R$ with $R = M r$, one solve per evaluation: CG with an AMG
+  preconditioner built once from the constant matrix (Jacobi, with a log line, when `pyamg` is not
+  installed). `solver=` takes any `jno.solve` solver, `precond=` any `jno.precond` preconditioner. With AMG
+  a training step costs 1.1–1.4× a plain `r.mse` step on a GPU (2-D, ~5k nodes); Jacobi up to 10×.
+  Orders $s=\pm 1$ only.
 - `method="grid"` or `"mesh"` forces one; the chosen backend is in `node.backend`.
 
 Not yet: point clouds without a mesh (only `"l2"` and `"Linf"`), the sampled SV-PINN estimator, periodic

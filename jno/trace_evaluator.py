@@ -2998,7 +2998,7 @@ class TraceEvaluator:
         backend = expr.method or ("grid" if mc.get("grid") is not None else "mesh")
         if backend == "grid" and mc.get("grid") is None:
             raise ValueError(f"norm({expr.space!r}, method='grid'): region '{tag}' is not a structured lattice.")
-        op = sobolev_operator(domain, tag, mc, backend, expr.s, expr.bc, expr.scale, expr.solver)
+        op = sobolev_operator(domain, tag, mc, backend, expr.s, expr.bc, expr.scale, expr.solver, expr.precond)
         expr.backend = op.name
         return finish(op(vals))
 

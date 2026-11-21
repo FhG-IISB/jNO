@@ -247,6 +247,34 @@ def test_refusals_name_the_way_out():
 # ---- training ---------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("method", ["grid", "mesh"])
+def test_the_cached_operator_survives_a_second_trace(method):
+    """Breaks if the cached backend holds arrays made inside the first trace: evaluating the norm and then
+    training on it compiles twice, and a leaked tracer raises UnexpectedTracerError."""
+    dom = _lattice(8)
+    x, y, ue = _eigen(dom)
+    net = jno.nn(foundax.mlp(2, 1, hidden_dims=8, num_layers=1, key=jax.random.PRNGKey(0)))
+    node = (net(x, y) * x * (1 - x) * y * (1 - y) - ue).norm("H-1", method=method) ** 2
+    net.optimizer(optax.adam(1e-3))
+    crux = jno.core([node], domain=dom)
+    before = float(np.asarray(crux.eval([node], domain=dom)).reshape(-1)[0])
+    crux.solve(5)
+    after = float(np.asarray(crux.eval([node], domain=dom)).reshape(-1)[0])
+    assert np.isfinite(after) and after != before
+
+
+def test_the_mesh_solve_defaults_to_amg_and_takes_a_given_preconditioner():
+    """Breaks if the default mesh H^-1 solve is not AMG-preconditioned when pyamg is there (measured: Jacobi-CG
+    up to 10x slower per training step on the GPU), or if `precond=` is not passed through."""
+    pytest.importorskip("pyamg")
+    dom = _lattice(8)
+    _, _, r = _eigen(dom)
+    default, given = r.norm("H-1", method="mesh") ** 2, r.norm("H-1", method="mesh", precond=jno.precond.jacobi()) ** 2
+    np.testing.assert_allclose(_value(default, dom), _value(given, dom), rtol=1e-9)  # CG to 1e-10
+    precs = sorted(type(op.precond).__name__ for op in dom._norm_operator_cache.values())
+    assert precs == ["_AMG", "_Jacobi"]
+
+
 def test_a_pinn_trains_on_the_H_minus_1_loss():
     """Breaks if the norm is not differentiable through jno.core (the error would not drop)."""
     dom = _lattice(16)

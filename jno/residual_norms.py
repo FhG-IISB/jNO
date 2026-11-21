@@ -13,8 +13,9 @@ Two backends, both built once per (domain, region, space, options) and cached on
   Dense per-axis matrices cost O(n^(d+1)) per evaluation; an FFT path for large grids is not implemented.
 - :class:`MeshSobolev`, a simplex mesh in 1D/2D/3D: P1 mass ``M`` and stiffness ``K`` assembled on the host
   once. ``H^1``: ``r^T (scale M + K) r`` of the P1 interpolant. ``H^-1``: ``R^T (scale M + K)^-1 R`` with
-  ``R = M r`` the residual tested against the hat functions, one CG solve per evaluation (differentiable
-  through ``lax.custom_linear_solve``). ``bc="dirichlet"`` drops the boundary nodes from the test space
+  ``R = M r`` the residual tested against the hat functions, one linear solve per evaluation (default CG
+  with Jacobi; any ``jno.solve`` solver and ``jno.precond`` preconditioner, the latter built once from the
+  constant matrix; differentiable through ``lax.custom_linear_solve``). ``bc="dirichlet"`` drops the boundary nodes from the test space
   (the dual of ``H^1_0``), ``bc="neumann"`` keeps them (the dual of ``H^1``).
 
 ``M`` and ``K`` come from the fixed mesh, so the norm is differentiable in the field values, not in the mesh
@@ -26,6 +27,7 @@ from __future__ import annotations
 import math
 import re
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -158,7 +160,7 @@ class MeshSobolev:
 
     name = "mesh"
 
-    def __init__(self, mc: dict, s: float, bc: str, scale: float, solver=None):
+    def __init__(self, mc: dict, s: float, bc: str, scale: float, solver=None, precond=None):
         from jax.experimental import sparse
 
         if s not in (-1.0, 1.0):
@@ -186,12 +188,15 @@ class MeshSobolev:
         self.free = jnp.asarray(np.flatnonzero(free))
         self.M = sparse.BCOO.from_scipy_sparse(M)
         self.A = sparse.BCOO.from_scipy_sparse(A[free][:, free].tocsr())
-        if solver is None:
-            import jno
+        import jno
 
-            cg = jno.solve.cg(tol=1e-12)
-            solver = lambda A_, b: cg(A_, b, M=jno.precond.jacobi())  # noqa: E731
-        self.solver = solver
+        self.solver = jno.solve.cg(tol=1e-10) if solver is None else solver
+        if getattr(self.solver, "direct", False):
+            self.precond = None
+        else:
+            self.precond = _default_precond() if precond is None else precond
+            if hasattr(self.precond, "build"):  # host setup (AMG hierarchy, FSAI pattern) once, eagerly
+                self.precond.build(self.A)
 
     def __call__(self, vals):
         c = _components(vals)
@@ -202,19 +207,43 @@ class MeshSobolev:
                 total = total + r @ (self.A @ r)
             else:
                 R = (self.M @ r)[self.free]
-                total = total + R @ self.solver(self.A, R)
+                z = self.solver(self.A, R) if self.precond is None else self.solver(self.A, R, M=self.precond)
+                total = total + R @ z
         return total
 
 
-def sobolev_operator(domain, tag: str, mc: dict, backend: str, s: float, bc: str, scale: float, solver=None):
+def _default_precond():
+    """AMG where pyamg is installed (an optional dependency), else Jacobi, said in the log.
+
+    Measured per training step on a 4x128 MLP, H^-1 on a 2-D mesh of ~5k nodes (RTX 3070, shared): AMG-CG
+    1.1-1.4x the cost of ``r.mse``; Jacobi-CG and FSAI-CG between 1.2x and 10x. On the CPU all three are within
+    20 % of ``r.mse``, the network dominates there."""
+    import importlib.util
+    import logging
+
+    import jno
+
+    if importlib.util.find_spec("pyamg") is not None:
+        return jno.precond.amg()
+    logging.getLogger("jno").info(
+        "norm('H-1') on a mesh: pyamg is not installed, so the solve uses Jacobi-CG; install pyamg for the AMG "
+        "preconditioner (up to 10x faster per step on a GPU), or pass precond=."
+    )
+    return jno.precond.jacobi()
+
+
+def sobolev_operator(domain, tag: str, mc: dict, backend: str, s: float, bc: str, scale: float, solver=None, precond=None):
     """The cached backend for one (region, space, options)."""
     if not hasattr(domain, "_norm_operator_cache"):
         domain._norm_operator_cache = {}
-    key = (tag, backend, s, bc, float(scale), id(solver) if solver is not None else None)
+    key = (tag, backend, s, bc, float(scale), id(solver), id(precond))
     cache = domain._norm_operator_cache
     if key not in cache:
-        if backend == "grid":
-            cache[key] = GridSobolev(mc["grid"], mc["points"], s, bc, scale)
-        else:
-            cache[key] = MeshSobolev(mc, s, bc, scale, solver)
+        # Built while a step is being traced, but kept across traces (eval, then solve, recompiles): the
+        # arrays must be concrete, or the next trace reads a leaked tracer from the first one.
+        with jax.ensure_compile_time_eval():
+            if backend == "grid":
+                cache[key] = GridSobolev(mc["grid"], mc["points"], s, bc, scale)
+            else:
+                cache[key] = MeshSobolev(mc, s, bc, scale, solver, precond)
     return cache[key]

@@ -695,7 +695,16 @@ class Placeholder:
         """
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
 
-    def norm(self, space: "str | None" = None, *, bc: str = "dirichlet", scale: float = 1.0, method=None, solver=None):
+    def norm(
+        self,
+        space: "str | None" = None,
+        *,
+        bc: str = "dirichlet",
+        scale: float = 1.0,
+        method=None,
+        solver=None,
+        precond=None,
+    ):
         """A norm of this field: per point (``space=None``) or over its domain region (a function-space norm).
 
         Without ``space`` this is the pointwise norm, ``|r(x)|`` (the absolute value of a scalar; vector and
@@ -722,15 +731,16 @@ class Placeholder:
                 ``"neumann"`` (the dual of ``H^1``); only negative orders use it.
             scale: the ``scale`` in ``(scale - Laplace)^s``, 1 by default; 0 gives the seminorm.
             method: force a backend, ``"grid"`` or ``"mesh"``; ``None`` picks it from the domain.
-            solver: a ``jno.solve`` linear solver ``(A, b) -> x`` for the mesh ``H^-1`` solve
-                (default: CG to 1e-12 with a Jacobi preconditioner).
+            solver: the ``jno.solve`` linear solver of the mesh ``H^-1`` solve (default ``jno.solve.cg``).
+            precond: its ``jno.precond`` preconditioner, built once from the constant matrix
+                (``jno.precond.amg()``, ``fsai()``, ...; default Jacobi). Ignored by a direct solver.
 
         Returns:
             Placeholder: the pointwise field, or a scalar :class:`Norm` node.
         """
         if space is None:
             return FunctionCall(jnp.abs, [self], "abs")
-        return Norm(self, space, bc=bc, scale=scale, method=method, solver=solver)
+        return Norm(self, space, bc=bc, scale=scale, method=method, solver=solver, precond=precond)
 
     @property
     def mse(self) -> FunctionCall:
@@ -5391,13 +5401,14 @@ class Norm(Placeholder):
     ``backend`` (``"points"``, ``"region"``, ``"grid"`` or ``"mesh"``).
     """
 
-    def __init__(self, target, space, *, bc="dirichlet", scale=1.0, method=None, solver=None, squared=False):
+    def __init__(self, target, space, *, bc="dirichlet", scale=1.0, method=None, solver=None, precond=None, squared=False):
         from ..residual_norms import check_options, parse_space
 
         self.kind, self.s = parse_space(space)
         check_options(self.kind, self.s, bc, scale, method)
         self.target = target
-        self.space, self.bc, self.scale, self.method, self.solver = space, bc, float(scale), method, solver
+        self.space, self.bc, self.scale, self.method = space, bc, float(scale), method
+        self.solver, self.precond = solver, precond
         self.squared = squared
         self.backend = None
         _propagate_weak(self, target)
@@ -5405,7 +5416,14 @@ class Norm(Placeholder):
     def __pow__(self, other):
         if not self.squared and isinstance(other, (int, float)) and other == 2:
             return Norm(
-                self.target, self.space, bc=self.bc, scale=self.scale, method=self.method, solver=self.solver, squared=True
+                self.target,
+                self.space,
+                bc=self.bc,
+                scale=self.scale,
+                method=self.method,
+                solver=self.solver,
+                precond=self.precond,
+                squared=True,
             )
         return super().__pow__(other)
 
