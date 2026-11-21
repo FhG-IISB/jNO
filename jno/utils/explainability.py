@@ -572,35 +572,28 @@ def make_engd_fn(
         damping: Levenberg-Marquardt damping :math:`\\lambda \\ge 0` added to G;
             ``0`` keeps the ``lstsq`` pseudo-inverse.
     """
-    from jno.trace_compiler import TraceCompiler
+    from jno.optimizers._residuals import jacobian, make_residual_fn
 
-    flat_template, _ = jax.flatten_util.ravel_pytree(trainable_template[lid])
-    P = int(flat_template.shape[0])
-
-    compiled_fns = []
-    for expr, w in gram_terms:
-        compiled_fn = TraceCompiler.compile_multi_expression([expr], all_ops)
-        compiled_fns.append((compiled_fn, float(w)))
+    _, unravel = jax.flatten_util.ravel_pytree(trainable_template[lid])
+    # G = sum_k (w_k/N_k) J_k^T J_k is J^T J of the stacked residual with rows sqrt(w_k/N_k) r_k. Its
+    # Jacobian is built a chunk of parameters at a time: the per-term NetworkGradient (one jacfwd over
+    # every parameter at once) holds P copies of the residual's intermediates and ran out of GPU
+    # memory for about a thousand parameters on a Laplacian residual.
+    residual_fn = make_residual_fn(gram_terms, all_ops, frozen, static, lid, unravel, min_consecutive, batchsize)
 
     def _direction(G, g, phi_prev):
         d = engd_direction(G, g, phi_prev, momentum=momentum, damping=damping, rcond=rcond)
         return jnp.where(jnp.any(jnp.isnan(d)), jnp.zeros_like(d), d)
 
     def gram_and_solve_fn(trainable, context, rng, flat_model_grad, phi_prev):
-        full_models = eqx.combine(trainable, frozen, static)
-        G = jnp.zeros((P, P), dtype=flat_model_grad.dtype)
-        for comp_fn, w in compiled_fns:
-            results = comp_fn(
-                full_models,
-                context,
-                batchsize=batchsize,
-                key=rng,
-                min_consecutive=min_consecutive,
-            )
-            J = results[0]  # (B, N, [D,] P): scalar residual ndim=3, vector ndim=4
-            J_flat = J.reshape(-1, J.shape[-1])  # (N_total, P)
-            N = J_flat.shape[0]
-            G = G + (w / N) * (J_flat.T @ J_flat)
+        flat_p, _ = jax.flatten_util.ravel_pytree(trainable[lid])
+
+        def r_of(q):
+            return residual_fn(q, trainable, context, rng)
+
+        m = jax.eval_shape(r_of, flat_p).shape[0]
+        J = jacobian(r_of, flat_p, m)
+        G = (J.T @ J).astype(flat_model_grad.dtype)
         return _direction(G, flat_model_grad, phi_prev), G
 
     def cached_solve_fn(G, flat_model_grad, phi_prev):

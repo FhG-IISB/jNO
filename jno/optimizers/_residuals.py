@@ -55,11 +55,12 @@ def check_gram_terms(gram_terms, who: str) -> int:
     return lids[0]
 
 
-def make_residual_fn(gram_terms, all_ops, frozen, static, lid: int, unravel, min_consecutive: int = 1):
+def make_residual_fn(gram_terms, all_ops, frozen, static, lid: int, unravel, min_consecutive: int = 1, batchsize=None):
     """Build ``residual_fn(flat_p, trainable, context, rng) -> r̂`` (shape ``(m,)``).
 
     ``flat_p`` is the flattened parameter vector of model ``lid`` (the one being optimised); every
-    other model keeps its value in ``trainable``. Full batch: every context point enters ``r̂``.
+    other model keeps its value in ``trainable``. ``batchsize=None`` (the default): every context
+    point enters ``r̂``.
     """
     import equinox as eqx
     import paramax as _paramax
@@ -73,7 +74,7 @@ def make_residual_fn(gram_terms, all_ops, frozen, static, lid: int, unravel, min
         full = _paramax.unwrap(eqx.combine(tr, frozen, static))
         parts = []
         for comp_fn, w in compiled:
-            r = comp_fn(full, context, batchsize=None, key=rng, min_consecutive=min_consecutive)[0]
+            r = comp_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)[0]
             r = jnp.reshape(r, (-1,))
             parts.append(jnp.sqrt(w / r.shape[0]) * r)
         return jnp.concatenate(parts)

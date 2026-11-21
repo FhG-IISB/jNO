@@ -61,7 +61,9 @@ class _Probe(ResidualStepCallback):
 def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     """Ĵᵀ Ĵ is ENGD's Gram matrix, and Ĵᵀ r̂ is the gradient of the mean of the two .mse losses
     (times the number of terms): r̂ and the loss jNO descends are the same objective."""
-    from jno.utils.explainability import make_engd_fn
+    import equinox as eqx
+
+    from jno.trace_compiler import TraceCompiler
 
     net, losses, gram_terms, _ = _build_poisson2d(seed=0)
     net.optimizer(optax.sgd(0.0))
@@ -69,10 +71,17 @@ def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     crux = jno.core(losses)
     crux.solve(1, callbacks=[probe])
 
+    # reference: the per-point Jacobians of the NetworkGradient nodes themselves (an independent path)
     kw = probe.kwargs
-    gram_fn, _ = make_engd_fn(gram_terms, kw["all_ops"], None, kw["frozen"], kw["static"], probe._lid, kw["trainable"])
+    full = eqx.combine(kw["trainable"], kw["frozen"], kw["static"])
     P = probe.P
-    _, G = gram_fn(kw["trainable"], kw["context"], kw["rng"], jnp.zeros(P), jnp.zeros(P))
+    G = jnp.zeros((P, P))
+    for expr, w in gram_terms:
+        Jk = TraceCompiler.compile_multi_expression([expr], kw["all_ops"])(
+            full, kw["context"], batchsize=None, key=kw["rng"], min_consecutive=1
+        )[0]
+        Jk = Jk.reshape(-1, Jk.shape[-1])
+        G = G + (w / Jk.shape[0]) * (Jk.T @ Jk)
     J, r = probe.last_info["J"], probe.last_info["r"]
     assert J.shape == (probe.m, P) and probe.m == 30 * 30 + 4 * 30
     np.testing.assert_allclose(np.asarray(J.T @ J), np.asarray(G), rtol=1e-10, atol=1e-12 * float(jnp.abs(G).max()))
@@ -653,3 +662,16 @@ def test_ss_esoap_trains_poisson2d_far_better_than_adam():
     """3000 steps at lr 1e-3 from the 0.1-scaled start: rel-L2 7.9e-3 measured, Adam 0.29, SOAP 1.4."""
     err, _ = _poisson_error(jno.optimizers.ss_esoap(1e-3), 3000)
     assert np.isfinite(err) and err < 3e-2, f"ss_esoap: rel-L2 {err:.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# engd builds its Gram matrix from the chunked residual Jacobian
+# ---------------------------------------------------------------------------------------------
+
+
+def test_engd_runs_with_thousands_of_parameters():
+    """P = 4417 (two hidden layers of 64) on the 900-point Laplacian residual: the Gram matrix used to
+    come from one jacfwd over every parameter at once, whose intermediates (P copies of the residual's)
+    did not fit the GPU; built 64 columns at a time it does."""
+    err, crux = _poisson_error(jno.optimizers.engd(), 3, hidden_dims=64, num_layers=2)
+    assert np.isfinite(err)
