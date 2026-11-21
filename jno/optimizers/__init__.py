@@ -15,6 +15,8 @@ with ``optax.chain`` and drops straight into ``model.optimizer(...)`` /
   PINN / inverse losses.
 - :func:`soap` — SOAP, Shampoo with Adam in the preconditioner's eigenbasis
   (Vyas et al. 2024, arXiv:2409.11321).
+- :func:`ss_esoap` — SS-ESOAP, SOAP with a secant-energy step scale and adaptive eigenbasis refreshes
+  (Wang et al. 2026, arXiv:2608.29448); :func:`scale_by_ss_esoap` is the bare transform.
 - :func:`score` — SCORE, self-scaled Broyden with a decrement-based step and a shifted secant pair
   (Si, An, Ma & Yan 2026, arXiv:2608.04206).
 - :func:`nncg` — NysNewton-CG, damped Newton by Nyström-preconditioned CG with Armijo steps, a
@@ -78,6 +80,7 @@ from .nncg import nncg
 from .nystrom_ngd import NystromNGDOptimizer, nystrom_ngd
 from .score import score
 from .soap import scale_by_soap, soap
+from .ss_esoap import scale_by_ss_esoap, ss_esoap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
 __all__ = [
@@ -110,6 +113,8 @@ __all__ = [
     "score",
     "soap",
     "scale_by_soap",
+    "ss_esoap",
+    "scale_by_ss_esoap",
     "md",
     "md_decouple",
     "MDOptimizer",

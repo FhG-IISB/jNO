@@ -56,6 +56,8 @@ def test_namespace_is_just_the_optimizers():
         "scale_by_ss_quasi_newton",
         "soap",
         "scale_by_soap",
+        "ss_esoap",
+        "scale_by_ss_esoap",
         "engd",
         "ENGDOptimizer",
         "lm",
@@ -84,7 +86,7 @@ def test_namespace_is_just_the_optimizers():
         "heaviside_continuation",
         "HeavisideContinuation",
     }
-    for factory in (o.ssbroyden, o.ssbfgs, o.soap, o.nncg, o.score):
+    for factory in (o.ssbroyden, o.ssbfgs, o.soap, o.nncg, o.score, o.ss_esoap):
         opt = factory()
         assert hasattr(opt, "init") and hasattr(opt, "update")
     # NOT a re-export of optax — chain/clipping/schedules live in optax, not here

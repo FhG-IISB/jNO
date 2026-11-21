@@ -579,3 +579,77 @@ def test_score_matches_ssbroyden_on_poisson2d():
     err_ssb, _ = _poisson_error(jno.optimizers.ssbroyden(), 500)
     assert np.isfinite(err_score) and err_score < 2e-3, f"score: rel-L2 {err_score:.3e}"
     assert err_score < 3.0 * err_ssb, (err_score, err_ssb)
+
+
+# ---------------------------------------------------------------------------------------------
+# ss_esoap (an optax transform)
+# ---------------------------------------------------------------------------------------------
+
+from jno.optimizers.soap import Preconditioner  # noqa: E402
+from jno.optimizers.ss_esoap import _leaf_step  # noqa: E402
+
+_ESOAP_KW = dict(b1=0.9, b2=0.95, eps=1e-8, tau_min=1e-2, trigger=0.2, check_every=1, warmup=0)
+
+
+def test_ss_esoap_fits_a_matrix_least_squares_problem():
+    A = jax.random.normal(jax.random.PRNGKey(0), (10, 4))
+    B = jax.random.normal(jax.random.PRNGKey(1), (10, 3))
+
+    def loss(p):
+        return 0.5 * jnp.sum((A @ p["W"] + p["b"] - B) ** 2)
+
+    X = jnp.concatenate([A, jnp.ones((10, 1))], 1)
+    best = float(0.5 * jnp.sum((X @ jnp.linalg.lstsq(X, B)[0] - B) ** 2))
+    opt = jno.optimizers.ss_esoap(1e-2)
+    p = {"W": jnp.zeros((4, 3)), "b": jnp.zeros(3)}
+    state = opt.init(p)
+    step = jax.jit(lambda q, st: opt.update(jax.grad(loss)(q), st, q))
+    for _ in range(3000):
+        u, state = step(p, state)
+        p = optax.apply_updates(p, u)
+    assert float(loss(p)) < best * (1 + 1e-3), (float(loss(p)), best)
+
+
+def _leaf_inputs(seed=0):
+    k = jax.random.split(jax.random.PRNGKey(seed), 4)
+    g, w, w_prev, g_prev = (jax.random.normal(kk, (4, 3)) for kk in k)
+    L = jnp.eye(4) + 0.5 * jnp.ones((4, 4))  # far from diagonal in the identity basis
+    R = jnp.eye(3)
+    gg, q = Preconditioner([L, R]), Preconditioner([jnp.eye(4), jnp.eye(3)])
+    return g, w, w_prev, g_prev, gg, q
+
+
+def test_ss_esoap_secant_scale_only_ever_enlarges_the_update_uniformly():
+    g, w, w_prev, _, gg, q = _leaf_inputs()
+    g_prev = g - 3.0 * (w - w_prev)  # c = <y, s> = 3 ||s||^2 > 0
+    m = v = jnp.zeros((4, 3))
+    t = jnp.asarray(5.0)
+    u_scaled = _leaf_step(g, w, w_prev, g_prev, m, v, gg, q, t, **_ESOAP_KW)[0]
+    u_plain = _leaf_step(g, w, w_prev, g_prev, m, v, gg, q, t, **{**_ESOAP_KW, "tau_min": 1.0})[0]
+    ratio = u_scaled / u_plain
+    np.testing.assert_allclose(ratio, ratio[0, 0] * jnp.ones_like(ratio), rtol=1e-10)
+    assert 1.0 <= float(ratio[0, 0]) <= 10.0 + 1e-12  # tau^{-1/2} with tau in [tau_min = 1e-2, 1]
+
+
+def test_ss_esoap_refreshes_a_drifted_basis_and_downscales_the_variance():
+    g, w, w_prev, g_prev, gg, q = _leaf_inputs()
+    m, v = jnp.zeros((4, 3)), jnp.ones((4, 3))
+    _, _, v_new, gg_new, q_new = _leaf_step(g, w, w_prev, g_prev, m, v, gg, q, jnp.asarray(2.0), **_ESOAP_KW)
+    QL = q_new.matrices[0]
+    B = QL.T @ gg_new.matrices[0] @ QL
+    assert float(jnp.linalg.norm(B - jnp.diag(jnp.diag(B)))) < 1e-10 * float(jnp.linalg.norm(B))  # eigenbasis now
+    # v <- gamma v (gamma <= 0.75) before the usual update: v_new <= 0.95 * 0.75 + 0.05 * g~^2
+    gt = q_new.matrices[0].T @ g @ q_new.matrices[1]
+    assert bool(jnp.all(v_new <= 0.95 * 0.75 + 0.05 * gt**2 + 1e-12))
+    # with the trigger out of reach the basis stays
+    _, _, v_keep, _, q_keep = _leaf_step(
+        g, w, w_prev, g_prev, m, v, gg, q, jnp.asarray(2.0), **{**_ESOAP_KW, "trigger": 2.0}
+    )
+    np.testing.assert_array_equal(q_keep.matrices[0], jnp.eye(4))
+    np.testing.assert_allclose(v_keep, 0.95 + 0.05 * g**2)
+
+
+def test_ss_esoap_trains_poisson2d_far_better_than_adam():
+    """3000 steps at lr 1e-3 from the 0.1-scaled start: rel-L2 7.9e-3 measured, Adam 0.29, SOAP 1.4."""
+    err, _ = _poisson_error(jno.optimizers.ss_esoap(1e-3), 3000)
+    assert np.isfinite(err) and err < 3e-2, f"ss_esoap: rel-L2 {err:.3e}"
