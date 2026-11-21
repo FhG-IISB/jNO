@@ -490,3 +490,47 @@ def test_dsgnar_makes_progress_on_poisson2d():
     initialisation of the other tests it accepts no step at all."""
     err, _ = _poisson_error(jno.optimizers.dsgnar(), 200, init_scale=1.0)
     assert np.isfinite(err) and err < 0.1, f"dsgnar: rel-L2 {err:.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# nncg (an optax transform)
+# ---------------------------------------------------------------------------------------------
+
+
+def _optax_minimise(opt, loss, x, steps):
+    @jax.jit
+    def step(x, state):
+        value, grad = jax.value_and_grad(loss)(x)
+        updates, state = opt.update(grad, state, x, value=value, value_fn=loss)
+        x = optax.apply_updates(x, updates)
+        return x, state, loss(x)
+
+    state = opt.init(x)
+    values = []
+    for _ in range(steps):
+        x, state, v = step(x, state)
+        values.append(float(v))
+    return x, values
+
+
+def test_nncg_handles_the_indefinite_hessian_of_rosenbrock():
+    def loss(q):
+        return 100.0 * (q[1] - q[0] ** 2) ** 2 + (1.0 - q[0]) ** 2
+
+    x, values = _optax_minimise(jno.optimizers.nncg(1e-3, rank=2, precond_every=1), loss, jnp.array([-1.2, 1.0]), 200)
+    assert all(b <= a for a, b in zip(values, values[1:]))  # Armijo: never uphill
+    np.testing.assert_allclose(x, [1.0, 1.0], atol=1e-6)
+
+
+def test_nncg_needs_value_fn():
+    opt = jno.optimizers.nncg()
+    x = jnp.zeros(3)
+    with pytest.raises(ValueError, match="value_fn"):
+        opt.update(x, opt.init(x), x)
+
+
+def test_nncg_fine_tunes_poisson2d():
+    """A characterisation, matching the paper's use as a fine-tuner: 200 NNCG steps take the 0.1-scaled
+    start to rel-L2 7.9e-3 (measured; ENGD/LM reach < 1e-6 here), far below Adam's 0.32 after 1000."""
+    err, _ = _poisson_error(jno.optimizers.nncg(cg_maxiter=100), 200)
+    assert np.isfinite(err) and err < 2e-2, f"nncg: rel-L2 {err:.3e}"

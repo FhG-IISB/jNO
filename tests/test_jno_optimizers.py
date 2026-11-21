@@ -45,7 +45,8 @@ def _minimise_grad(opt, steps):
 def test_namespace_is_just_the_optimizers():
     o = jno.optimizers
     # exactly the custom optimizers. Most are optax GradientTransformations; `engd`, `md`, `mma`,
-    # `gcmma` and `bounded` are sentinels that jno.core.solve() expands, because each needs
+    # `gcmma`, `bounded` and the residual optimizers (`lm`, `dngd`, `nystrom_ngd`, `dsgnar`) are
+    # sentinels that jno.core.solve() expands, because each needs
     # information the optax update() contract does not carry. `simp_continuation` is neither -- it is a schedule over a
     # parameter that is not a design variable, and it lives here because it drives the optimisation
     # rather than diagnosing it.
@@ -57,6 +58,15 @@ def test_namespace_is_just_the_optimizers():
         "scale_by_soap",
         "engd",
         "ENGDOptimizer",
+        "lm",
+        "LMOptimizer",
+        "dngd",
+        "DNGDOptimizer",
+        "nystrom_ngd",
+        "NystromNGDOptimizer",
+        "dsgnar",
+        "DSGNAROptimizer",
+        "nncg",
         "md",
         "md_decouple",
         "MDOptimizer",
@@ -73,7 +83,7 @@ def test_namespace_is_just_the_optimizers():
         "heaviside_continuation",
         "HeavisideContinuation",
     }
-    for factory in (o.ssbroyden, o.ssbfgs, o.soap):
+    for factory in (o.ssbroyden, o.ssbfgs, o.soap, o.nncg):
         opt = factory()
         assert hasattr(opt, "init") and hasattr(opt, "update")
     # NOT a re-export of optax — chain/clipping/schedules live in optax, not here
@@ -89,6 +99,17 @@ def test_ssbroyden_converges():
 def test_ssbfgs_converges():
     x = _minimise_linesearch(jno.optimizers.ssbfgs(), steps=30)
     assert np.allclose(x, np.asarray(TARGET), atol=1e-3)
+
+
+def test_nncg_converges():
+    # a damped Newton step on a quadratic: the error shrinks by mu / (2 + mu) per step
+    opt, x = jno.optimizers.nncg(), jnp.zeros(3)
+    state = opt.init(x)
+    for _ in range(10):  # nncg keeps no value in its state, so plain value_and_grad, not optax's helper
+        value, grad = jax.value_and_grad(_loss)(x)
+        updates, state = opt.update(grad, state, x, value=value, value_fn=_loss)
+        x = optax.apply_updates(x, updates)
+    assert np.allclose(np.asarray(x), np.asarray(TARGET), atol=1e-10)
 
 
 def test_soap_converges():
