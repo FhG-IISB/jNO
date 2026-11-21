@@ -25,7 +25,12 @@ class ResidualOptimizer:
         self._gram_terms = gram_terms
 
     def build_callback(self, gram_terms):
-        """Return the ``Callback`` whose ``on_before_update`` replaces the gradient by the step."""
+        """Return the callback that computes this optimizer's step inside ``solve()``.
+
+        Args:
+            gram_terms: ``(NetworkGradient, weight)`` pairs, one per residual class (auto-detected by
+                ``solve()`` unless given to the factory).
+        """
         raise NotImplementedError
 
     @property

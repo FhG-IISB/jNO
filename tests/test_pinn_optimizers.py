@@ -80,7 +80,7 @@ def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     np.testing.assert_allclose(np.asarray(J.T @ r), np.asarray(probe.grads0), rtol=1e-9, atol=1e-13)
 
 
-RESIDUAL_SENTINELS = [jno.optimizers.engd]
+RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm]
 
 
 @pytest.mark.parametrize("make", RESIDUAL_SENTINELS, ids=lambda f: f.__name__)
@@ -116,3 +116,120 @@ def test_step_length_rules():
     t, ft = armijo(lambda t: (1.0 + t) ** 2, jnp.asarray(1.0), jnp.asarray(-2.0), max_steps=5)
     assert float(t) == 0.0 and float(ft) == 1.0
     assert float(half_sq_norm(jnp.array([3.0, 4.0]))) == 12.5
+
+
+# ---------------------------------------------------------------------------------------------
+# Pure-step helpers: drive a method's direction() on a hand-written residual
+# ---------------------------------------------------------------------------------------------
+
+
+def _iterate(direction, state, r_of, theta, steps):
+    """Apply ``theta <- theta - d`` for ``steps`` steps of a pure direction function."""
+    step = jax.jit(lambda th, st: direction(r_of, th, st))
+    info = {}
+    for _ in range(steps):
+        d, state, info = step(theta, state)
+        theta = theta - d
+    return theta, state, info
+
+
+def _linear_problem(m, P, seed=0, cond=1e3):
+    """r(θ) = A θ - b with a prescribed condition number; returns (r_of, A, b)."""
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(seed), 3)
+    U, _ = jnp.linalg.qr(jax.random.normal(k1, (m, min(m, P))))
+    V, _ = jnp.linalg.qr(jax.random.normal(k2, (P, min(m, P))))
+    s = jnp.logspace(0, -np.log10(cond), min(m, P))
+    A = (U * s) @ V.T
+    b = jax.random.normal(k3, (m,))
+    return (lambda q: A @ q - b), A, b
+
+
+def _rosenbrock(q):
+    return jnp.array([10.0 * (q[1] - q[0] ** 2), 1.0 - q[0]])
+
+
+# ---------------------------------------------------------------------------------------------
+# lm
+# ---------------------------------------------------------------------------------------------
+
+from jno.optimizers.lm import _lm_direction, _lm_init  # noqa: E402
+
+
+@pytest.mark.parametrize("m,P", [(30, 8), (8, 30)], ids=["overdetermined", "underdetermined"])
+def test_lm_reaches_the_least_squares_solution_of_a_linear_residual(m, P):
+    r_of, A, b = _linear_problem(m, P)
+    theta, state, info = _iterate(_lm_direction, _lm_init(jnp.float64), r_of, jnp.zeros(P), 40)
+    if m > P:
+        expected = jnp.linalg.lstsq(A, b)[0]
+        np.testing.assert_allclose(theta, expected, rtol=1e-8, atol=1e-10)
+    else:  # consistent system: the residual vanishes (from 0, LM stays in range(Aᵀ): min-norm)
+        np.testing.assert_allclose(A @ theta, b, atol=1e-9)
+        np.testing.assert_allclose(theta, jnp.linalg.pinv(A) @ b, rtol=1e-7, atol=1e-9)
+    assert float(state.damping) < 1e-6  # the damping falls as the linear model keeps predicting well
+
+
+def test_lm_never_increases_the_loss_and_solves_rosenbrock():
+    step = jax.jit(lambda th, st: _lm_direction(_rosenbrock, th, st))
+    theta, state = jnp.array([-1.2, 1.0]), _lm_init(jnp.float64)
+    losses = []
+    for _ in range(60):
+        d, state, info = step(theta, state)
+        theta = theta - d
+        losses.append(float(half_sq_norm(_rosenbrock(theta))))
+    assert all(b <= a * (1 + 1e-14) for a, b in zip(losses, losses[1:]))
+    np.testing.assert_allclose(theta, [1.0, 1.0], atol=1e-10)
+
+
+def test_lm_rejected_step_raises_the_damping_and_keeps_the_parameters():
+    # a tiny initial damping on Rosenbrock from far away: the full GN step overshoots, is rejected,
+    # and the retry at a larger damping is what gets accepted
+    theta = jnp.array([-1.2, 1.0])
+    d, state, info = jax.jit(lambda th, st: _lm_direction(_rosenbrock, th, st, max_tries=1))(
+        theta, _lm_init(jnp.float64, damping=1e-12)
+    )
+    if not bool(info["accepted"]):
+        assert float(jnp.abs(d).max()) == 0.0
+        assert float(state.damping) > 1e-12
+    d2, _, info2 = jax.jit(lambda th, st: _lm_direction(_rosenbrock, th, st, max_tries=20))(
+        theta, _lm_init(jnp.float64, damping=1e-12)
+    )
+    assert bool(info2["accepted"])
+    assert float(half_sq_norm(_rosenbrock(theta - d2))) < float(half_sq_norm(_rosenbrock(theta)))
+
+
+def test_lm_rejects_bad_arguments():
+    with pytest.raises(ValueError, match="damping"):
+        jno.optimizers.lm(damping=0.0)
+    with pytest.raises(ValueError, match="max_tries"):
+        jno.optimizers.lm(max_tries=0)
+
+
+# ---------------------------------------------------------------------------------------------
+# Through jno.core: Poisson2D (the ENGD convergence test, same bar)
+# ---------------------------------------------------------------------------------------------
+
+
+def _poisson_error(opt, epochs, **build):
+    net, losses, _, eval_error = _build_poisson2d(seed=0, **build)
+    net.optimizer(opt)
+    crux = jno.core(losses)
+    crux.solve(epochs)
+    return eval_error(crux), crux
+
+
+def test_lm_converges_on_poisson2d():
+    err, _ = _poisson_error(jno.optimizers.lm(), 200)
+    assert np.isfinite(err) and err < 1e-3, f"lm: rel-L2 {err:.3e}"
+
+
+@pytest.mark.parametrize("make", [jno.optimizers.lm], ids=lambda f: f.__name__)
+def test_residual_sentinel_resolve_is_idempotent(make):
+    """A second solve() on the same model rebuilds the callback and continues from the weights."""
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
+    net.optimizer(make())
+    crux = jno.core(losses)
+    crux.solve(20)
+    e1 = eval_error(crux)
+    crux.solve(20)
+    e2 = eval_error(crux)
+    assert np.isfinite(e2) and e2 <= e1 * 1.01

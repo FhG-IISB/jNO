@@ -102,7 +102,12 @@ class ENGDOptimizer(ResidualOptimizer):
     _who = "jno.optimizers.engd"
 
     def build_callback(self, gram_terms):
-        """The :class:`~jno.utils.adaptive.callbacks.ENGDCallback` that computes the step."""
+        """Return the callback that computes this optimizer's step inside ``solve()``.
+
+        Args:
+            gram_terms: ``(NetworkGradient, weight)`` pairs, one per residual class (auto-detected by
+                ``solve()`` unless given to the factory).
+        """
         from jno.utils.adaptive.callbacks import ENGDCallback
 
         return ENGDCallback(

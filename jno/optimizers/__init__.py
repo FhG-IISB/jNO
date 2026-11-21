@@ -33,6 +33,14 @@ with ``optax.chain`` and drops straight into ``model.optimizer(...)`` /
   on the direction (Hägele et al. 2026, arXiv:2606.25971). Pass it as a sentinel via
   ``net.optimizer(jno.optimizers.md(optax.adam(1e-3)))``; :func:`md_decouple` is the bare transform.
 
+Gauss-Newton family for PINN residuals: sentinels like :func:`engd`, which read the per-point
+residuals of every loss term involving the model (``gram_terms``) instead of only the summed gradient:
+
+- :func:`engd` — energy natural gradient (Müller & Zeinhofer, ICML 2023, arXiv:2302.13163), with
+  SPRING momentum and fixed damping.
+- :func:`lm` — Levenberg-Marquardt, damping adapted from the gain ratio (Levenberg 1944,
+  Marquardt 1963; Madsen, Nielsen & Tingleff 2004).
+
 The ``scale_by_*`` variants are the bare transforms (no line search / learning-rate wrapper) for
 building your own optax chains.
 
@@ -50,6 +58,7 @@ from .continuation import (
     simp_continuation,
 )
 from .engd import ENGDOptimizer, engd
+from .lm import LMOptimizer, lm
 from .md_decouple import MDOptimizer, md, md_decouple
 from .mma import GCMMAOptimizer, MMACallback, MMAOptimizer, gcmma, mma
 from .soap import scale_by_soap, soap
@@ -60,6 +69,8 @@ __all__ = [
     "BoundedOptimizer",
     "engd",
     "ENGDOptimizer",
+    "lm",
+    "LMOptimizer",
     "mma",
     "gcmma",
     "GCMMAOptimizer",

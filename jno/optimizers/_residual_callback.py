@@ -93,7 +93,32 @@ class ResidualStepCallback(Callback):
     # -- Callback hooks -------------------------------------------------------------------------
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
     def on_solve_begin(self, **kwargs) -> None:
-        """Build and compile the step once; reset the optimizer state."""
+        """Called once after ``solve()`` finishes setup, before the training loop.
+
+        Keyword Args:
+            compiled_constraints_fn: Combined compiled JAX function for all constraints.
+            n_constraints (int): Number of constraint terms.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            frozen: Frozen parameter pytree (from ``eqx.partition``).
+            static: Static (non-array) pytree.
+            trainable: Initial trainable parameter pytree (use for pre-compilation only).
+            context: Domain context (use for pre-compilation only).
+            rng: PRNG key.
+            min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            inequality_idx (list[int]): Rows of ``individual_losses`` that are constraints
+                (``jno.le`` / ``jno.ge``, feasible when ``<= 0``, and ``jno.eq``). Empty without
+                constraints.
+            equality_idx (list[int]): The ``jno.eq`` rows among them, feasible when ``== 0``.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
+        """
         if "all_ops" not in kwargs:
             raise RuntimeError(f"{self.who} requires the solver to pass `all_ops` via on_solve_begin.")
         trainable = kwargs["trainable"]
@@ -133,7 +158,32 @@ class ResidualStepCallback(Callback):
 
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kwargs):
-        """Return ``grads`` with model ``lid``'s entry replaced by the step ``d``."""
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+            total_loss: The scalar loss at this step, as descended.
+            individual_losses: Per-entry values, one per ``jno.core`` constraint entry --
+                **including** any ``jno.le``/``jno.ge`` inequality constraints, which are
+                evaluated with everything else but held out of ``total_loss``. A constrained
+                optimiser reads its ``g_j`` here rather than recomputing them.
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
         if self._step_jit is None:
             return None
         flat_p, _ = jax.flatten_util.ravel_pytree(trainable[self._lid])
