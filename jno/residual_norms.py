@@ -20,7 +20,8 @@ Three backends; the first two are built once per (domain, region, space, options
 
 - :func:`point_kernel_norm_sq`, a point cloud: a shape domain without a mesh, its points sampled from the
   geometry. ``H^-1`` as the double integral of ``r`` against the Green's function of ``(scale - Laplace)`` in
-  R^d, by the point rule with weight ``|Omega| / N`` and a cell-averaged self-term: the whole-space norm of
+  R^d mollified over a cell (positive definite on any point set), by the point rule with weight ``|Omega| / N``:
+  the whole-space norm of
   ``r`` extended by zero (no boundary condition), O(N^2) per evaluation in row blocks, memory O(N). ``L2``,
   ``L1`` by the same point rule. ``|Omega|`` comes from the geometry (:func:`shape_volume`); a cloud with no
   geometry at all takes the convex hull of its points, logged.
@@ -256,49 +257,37 @@ def sobolev_operator(domain, tag: str, mc: dict, backend: str, s: float, bc: str
     return cache[key]
 
 
-# ---- point cloud: the Green's function of (scale - Laplace) --------------------------------------------------
+# ---- point cloud: the Green's function of (scale - Laplace), mollified over a cell -----------------------------
 
-_K0_SMALL = (-0.57721566, 0.42278420, 0.23069756, 0.03488590, 0.00262698, 0.00010750, 0.00000740)
-_K0_LARGE = (1.25331414, -0.07832358, 0.02189568, -0.01062446, 0.00587872, -0.00251540, 0.00053208)
-
-
-def bessel_k0(x):
-    """Modified Bessel function K_0 for x > 0 in JAX: Abramowitz & Stegun (1964) 9.8.5 (x <= 2) and 9.8.6 (x > 2),
-    relative error below 2e-7. Not in ``jax.scipy.special``."""
-    from jax.scipy.special import i0
-
-    small = jnp.minimum(x, 2.0)
-    t2 = (small / 2.0) ** 2
-    poly = sum(c * t2**i for i, c in enumerate(_K0_SMALL))
-    k_small = -jnp.log(small / 2.0) * i0(small) + poly
-    large = jnp.maximum(x, 2.0)
-    u = 2.0 / large
-    k_large = jnp.exp(-large) / jnp.sqrt(large) * sum(c * u**i for i, c in enumerate(_K0_LARGE))
-    return jnp.where(x <= 2.0, k_small, k_large)
+_KERNEL_NODES = 64  # trapezoid nodes in s = log(t / tau); each adds one positive Gaussian, so any count stays PD
 
 
-def _green(rho, k: float, d: int):
-    """Green's function of (k^2 - Laplace) in R^d at distance rho > 0."""
-    if d == 1:
-        return jnp.exp(-k * rho) / (2 * k)
-    if d == 2:
-        return bessel_k0(k * rho) / (2 * np.pi)
-    return jnp.exp(-k * rho) / (4 * np.pi * rho)
+def point_kernel(k: float, d: int, cell: float):
+    """The point rule's kernel as a function of the distance: the Green's function of ``(k^2 - Laplace)`` in R^d,
+    mollified over one cell. With the heat-kernel form of the resolvent,
 
+        G_tau(rho) = int_tau^inf exp(-k^2 t) (4 pi t)^(-d/2) exp(-rho^2 / (4 t)) dt,
 
-def _green_cell_average(k: float, d: int, cell: float) -> float:
-    """The Green's function averaged over a ball of volume ``cell`` around its pole: the self-term of the point
-    rule, finite although the kernel is singular there (log in 2-D, 1/rho in 3-D)."""
-    from scipy.special import k1
+    whose Fourier transform is g^(xi) exp(-tau |xi|^2) >= 0: the Green's function smoothed by a Gaussian on each
+    side, of per-axis variance ``tau = a^2 / (d + 2)``, the variance of a ball of the cell's volume (radius
+    ``a``). Finite at rho = 0 and equal to the Green's function to O(tau) beyond a few cells. The integral is a
+    trapezoid rule in ``s = log(t / tau)`` with positive weights, so the discrete kernel is a positive sum of
+    Gaussian kernels: positive definite on any point set, also where points nearly coincide (the unmollified
+    point rule with a cell-averaged diagonal is not, and an optimiser with a line search then diverges)."""
+    radius = {1: cell / 2, 2: np.sqrt(cell / np.pi), 3: (3 * cell / (4 * np.pi)) ** (1 / 3)}[d]
+    tau = radius**2 / (d + 2)
+    s_max = np.log(max(np.e, 60.0 / (k * k * tau)))  # exp(-k^2 t) < e^-60 beyond
+    s = np.linspace(0.0, s_max, _KERNEL_NODES)
+    t = tau * np.exp(s)
+    w = np.full(_KERNEL_NODES, s[1] - s[0]) * t  # dt = t ds
+    w[[0, -1]] /= 2
+    amp = jnp.asarray(w * np.exp(-k * k * t) * (4 * np.pi * t) ** (-d / 2))
+    inv4t = jnp.asarray(1.0 / (4 * t))
 
-    if d == 1:
-        a = cell / 2
-        return (1 - np.exp(-k * a)) / k**2 / (2 * a)
-    if d == 2:
-        a = np.sqrt(cell / np.pi)
-        return (1 - k * a * k1(k * a)) / k**2 / cell
-    a = (3 * cell / (4 * np.pi)) ** (1 / 3)
-    return (1 - np.exp(-k * a) * (1 + k * a)) / k**2 / cell
+    def kernel(rho):
+        return jnp.tensordot(jnp.exp(-(rho[..., None] ** 2) * inv4t), amp, axes=([-1], [0]))
+
+    return kernel
 
 
 def point_cloud_volume(domain, tag: str, points: np.ndarray) -> float:
@@ -331,9 +320,8 @@ def point_kernel_norm_sq(points, vals, scale: float, volume: float, block: int =
             "positive definite in 1-D and 2-D)."
         )
     n, d = points.shape
-    k = float(np.sqrt(scale))
     w = volume / n
-    diag = _green_cell_average(k, d, w)
+    kernel = point_kernel(float(np.sqrt(scale)), d, w)
     c = _components(vals)
     nb = -(-n // block)
     pad = nb * block - n
@@ -344,9 +332,7 @@ def point_kernel_norm_sq(points, vals, scale: float, volume: float, block: int =
         Pi = jax.lax.dynamic_slice_in_dim(P, i * block, block)
         Ci = jax.lax.dynamic_slice_in_dim(C, i * block, block)
         rho = jnp.sqrt(jnp.sum((Pi[:, None, :] - points[None, :, :]) ** 2, axis=-1))
-        safe = jnp.where(rho > 0, rho, 1.0)
-        G = jnp.where(rho > 0, _green(safe, k, d), diag)
-        return jnp.sum(Ci * (G @ c))
+        return jnp.sum(Ci * (kernel(rho) @ c))
 
     return w**2 * jnp.sum(jax.lax.map(rows, jnp.arange(nb)))
 

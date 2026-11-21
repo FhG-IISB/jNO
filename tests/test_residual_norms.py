@@ -256,14 +256,19 @@ def test_point_cloud_H_minus_1_matches_the_whole_space_norm():
     assert abs(errs[1]) < 1e-2 and abs(errs[1]) <= abs(errs[0]) + 1e-3, errs
 
 
-def test_bessel_k0_matches_scipy():
-    """Breaks if the K0 approximation behind the 2-D kernel is off (Abramowitz & Stegun 9.8.5-9.8.6, < 2e-7)."""
-    from scipy.special import k0
+@pytest.mark.parametrize("d", [1, 2, 3])
+def test_the_point_kernel_is_positive_definite_on_random_points(d):
+    """Breaks if the point-rule kernel is indefinite: on random points some pairs sit far closer than a cell, and
+    a kernel that is larger between them than on the diagonal makes the loss unbounded below (an optimiser with
+    a line search then diverges). The cell-mollified kernel has the Fourier transform g^ |chi^|^2 >= 0."""
+    from jno.residual_norms import point_kernel
 
-    from jno.residual_norms import bessel_k0
-
-    x = np.concatenate([np.geomspace(1e-6, 2, 200), np.linspace(2, 60, 200)])
-    np.testing.assert_allclose(np.asarray(bessel_k0(jax.numpy.asarray(x))), k0(x), rtol=3e-7)
+    n = {1: 200, 2: 1089, 3: 1000}[d]
+    pts = np.random.default_rng(0).random((n, d))
+    rho = np.linalg.norm(pts[:, None] - pts[None], axis=-1)
+    G = np.asarray(point_kernel(1.0, d, 1.0 / n)(jax.numpy.asarray(rho)))
+    ev = np.linalg.eigvalsh(G)
+    assert ev[0] > -1e-10 * ev[-1], (ev[:3], ev[-1])
 
 
 def test_a_mesh_free_shape_domain_is_a_point_cloud():
