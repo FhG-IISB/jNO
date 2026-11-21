@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795273089,"nonce":"4GPqsQytZPq2n9kA15Kq0Nb2Hyo=","added":["branch:feat/pinn-optimizers","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1795273089,"nonce":"M3lKuZy58GUXLN3yDXSKqmIOF+k=","message":"Fixed in ac24a05c; test: tests/test_pinn_optimizers.py::test_lm_reaches_the_least_squares_solution_of_a_linear_residual","files":null}]}
