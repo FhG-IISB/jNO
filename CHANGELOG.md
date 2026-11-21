@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and the Green's kernel of (scale - Laplace) on a point cloud (H^-1). `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss`.
+- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh (sampled points) the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss`.
 
 ## [0.4.2] — 2026-10-23
 

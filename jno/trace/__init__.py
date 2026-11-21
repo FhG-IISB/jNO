@@ -721,9 +721,9 @@ class Placeholder:
 
         The backend comes from the domain: a structured lattice uses per-axis sine/cosine transforms (any real
         ``s``), a simplex mesh P1 mass and stiffness matrices (``s`` in {-1, 1}; ``H^-1`` costs one CG solve
-        per evaluation). A mesh-free shape builds its mesh for this. A point cloud (``jno.domain.from_array``) has
-        ``"l2"``, ``"Linf"`` and ``"H-1"``, the last by the Green's kernel of ``(scale - Laplace)`` in R^d (no boundary
-        condition; ``|Omega|`` from the convex hull of the points, logged; O(N^2) per evaluation). The
+        per evaluation). A shape domain without a mesh is a point cloud: ``"L2"``, ``"L1"``, ``"Linf"`` by the point
+        rule on its sampled points, ``"H-1"`` by the Green's kernel of ``(scale - Laplace)`` in R^d (no boundary
+        condition, ``|Omega|`` from the geometry, O(N^2) per evaluation); no mesh is built. The
         field is evaluated at all nodes of its region (as :meth:`integrate` does), not at sampled points.
         ``norm(...)**2`` is fused into the squared norm, so its gradient has no square root.
 
@@ -732,7 +732,8 @@ class Placeholder:
             bc: ``"dirichlet"`` (test functions vanish on the boundary, the dual of ``H^1_0``) or
                 ``"neumann"`` (the dual of ``H^1``); only negative orders use it.
             scale: the ``scale`` in ``(scale - Laplace)^s``, 1 by default; 0 gives the seminorm.
-            method: force a backend, ``"grid"`` or ``"mesh"``; ``None`` picks it from the domain.
+            method: force a backend, ``"grid"``, ``"mesh"`` (builds a mesh-free shape's mesh) or ``"points"``;
+                ``None`` picks it from the domain.
             solver: the ``jno.solve`` linear solver of the mesh ``H^-1`` solve (default ``jno.solve.cg``).
             precond: its ``jno.precond`` preconditioner, built once from the constant matrix
                 (``jno.precond.amg()``, ``fsai()``, ...; default Jacobi). Ignored by a direct solver.

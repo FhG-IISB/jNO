@@ -52,12 +52,12 @@ the sum over its components.
   installed). `solver=` takes any `jno.solve` solver, `precond=` any `jno.precond` preconditioner. With AMG
   a training step costs 1.1–1.4× a plain `r.mse` step on a GPU (2-D, ~5k nodes); Jacobi up to 10×.
   Orders $s=\pm 1$ only.
-- **Point cloud** (`jno.domain.from_array`, no geometry): $H^{-1}$ only, as
+- **Point cloud**, a shape domain without a mesh (`d.variable("interior", sample=(n, None))`): $H^{-1}$ as
   $\iint r(x)\,G(x-y)\,r(y)$ with $G$ the Green's function of $(\text{scale}-\Delta)$ in $\mathbb{R}^d$, by the point
-  rule. No boundary condition (the whole-space norm of $r$ extended by zero); $|\Omega|$ comes from the
-  convex hull of the points (logged); O(N²) per evaluation. A mesh-free *shape* domain builds its mesh and
-  takes the mesh backend.
-- `method="grid"` or `"mesh"` forces one; the chosen backend is in `node.backend`.
+  rule on the sampled points with weight $|\Omega|/N$ ($|\Omega|$ from the geometry); `L2`, `L1`, `Linf` the
+  same way. No boundary condition (the whole-space norm of $r$ extended by zero); O(N²) per evaluation. No
+  mesh is built (`method="mesh"` builds one).
+- `method="grid"`, `"mesh"` or `"points"` forces one; the chosen backend is in `node.backend`.
 
 Not yet: other orders than $H^{-1}$ on point clouds, the sampled SV-PINN estimator, periodic
 `bc`, $H^s$ on boundary tags or sub-regions, time-dependent fields, gradients with respect to the mesh

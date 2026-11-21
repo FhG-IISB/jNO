@@ -266,12 +266,26 @@ def test_bessel_k0_matches_scipy():
     np.testing.assert_allclose(np.asarray(bessel_k0(jax.numpy.asarray(x))), k0(x), rtol=3e-7)
 
 
-def test_a_mesh_free_shape_domain_builds_its_mesh_for_the_norm():
-    """Breaks if a mesh-free shape domain (sampled points, a mesh only on demand) crashes or falls to the point
-    backend: its geometry is known, so the norm builds the mesh, outside the trace, and uses it."""
+def test_a_mesh_free_shape_domain_is_a_point_cloud():
+    """Breaks if a shape domain without a mesh (points sampled from the geometry) builds a mesh behind the user's
+    back, or gets |Omega| or the kernel wrong: the norm is the whole-space H^-1 on the sampled points."""
+    want = _whole_space_norm_of_the_eigenfunction()
+    dom = jno.shape.rect(0, 0, 1, 1).domain()
+    x, y, _ = dom.variable("interior", sample=(4000, None), split=True)
+    r = sin(PI * x) * sin(PI * y)
+    h1, l2 = r.norm("H-1") ** 2, r.norm("L2") ** 2
+    got_h1, got_l2 = _value(h1, dom), _value(l2, dom)
+    assert (h1.backend, l2.backend) == ("points", "points")
+    assert dom.__dict__.get("_mesh") is None  # no mesh was built
+    # Monte-Carlo point rule on 4000 uniform points: a few per cent (measured below 2 %)
+    assert abs(got_h1 / want - 1) < 5e-2 and abs(got_l2 / 0.25 - 1) < 5e-2, (got_h1 / want, got_l2 / 0.25)
+
+
+def test_method_mesh_builds_the_mesh_of_a_mesh_free_shape():
+    """Breaks if method="mesh" on a mesh-free shape crashes (the mesh must be built outside the jitted step)."""
     dom = jno.shape.rect(0, 0, 1, 1).domain()
     x, y, _ = dom.variable("interior", sample=(200, None), split=True)
-    node = (sin(PI * x) * sin(PI * y)).norm("H-1") ** 2
+    node = (sin(PI * x) * sin(PI * y)).norm("H-1", method="mesh") ** 2
     got = _value(node, dom)
     assert node.backend == "mesh"
     # the lazy build uses the shape's default mesh size, which is coarse (measured 5.3 % off)

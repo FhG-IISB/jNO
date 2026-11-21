@@ -2948,7 +2948,10 @@ class TraceEvaluator:
         raw_tag = var.tag
         tag = raw_tag[2:] if raw_tag.startswith("n_") else raw_tag
         domain = var._domain
-        with jax.ensure_compile_time_eval():  # a mesh-free shape builds its mesh here, outside the step's trace
+        mesh_free = domain.__dict__.get("_mesh") is None and domain.__dict__.get("_lazy_plan") is not None
+        if expr.method == "points" or (mesh_free and expr.method is None):
+            return self._eval_norm_point_cloud(expr, ctx, domain, tag, finish)
+        with jax.ensure_compile_time_eval():  # method="mesh" on a mesh-free shape builds it here, outside the trace
             mc = domain.mesh_connectivity
         if mc is None:
             return self._eval_norm_point_cloud(expr, ctx, domain, tag, finish)
@@ -2997,8 +3000,10 @@ class TraceEvaluator:
         return finish(op(vals))
 
     def _eval_norm_point_cloud(self, expr, ctx, domain, tag, finish):
-        """A norm on a point cloud (no mesh, no geometry): ``Linf`` and the Green's-kernel ``H-1``."""
-        from .residual_norms import point_cloud_volume, point_kernel_norm_sq, pointwise_sq
+        """A norm on a point cloud -- a shape domain without a mesh (its points sampled from the geometry), or
+        points with no geometry at all: the point rule with weight ``|Omega| / N`` (``L2``, ``L1``), the
+        maximum (``Linf``) and the Green's kernel (``H-1``), on the points being evaluated."""
+        from .residual_norms import point_cloud_volume, point_kernel_norm_sq, pointwise_sq, shape_volume
 
         vals = self._dispatch(expr.target, ctx)
         while vals.ndim > 2 and vals.shape[0] == 1:  # a point cloud's leading batch / time axes of size 1
@@ -3007,21 +3012,36 @@ class TraceEvaluator:
         if expr.kind == "Linf":
             norm = jnp.sqrt(jnp.max(pointwise_sq(vals)))
             return norm**2 if expr.squared else norm
-        if expr.kind != "H" or expr.s != -1.0:
+        if expr.kind == "H" and expr.s != -1.0:
             raise NotImplementedError(
-                f"norm({expr.space!r}) on the point cloud '{tag}' is not available: a point cloud has no mesh or "
-                "measure, so only 'l2', 'Linf' and 'H-1' (Green's kernel) work there. Mesh the domain "
-                "(jno.shape ... .domain()) or use a lattice (.structured(n=...))."
+                f"norm({expr.space!r}) on the point cloud '{tag}' is not available: without a mesh only 'l2', "
+                "'L2', 'L1', 'Linf' and 'H-1' (Green's kernel) work. Give the shape a mesh size "
+                "(jno.shape.rect(..., size=h)) or use a lattice (.structured(n=...))."
             )
         dim = int(domain.dimension)
-        host_pts = np.asarray(domain.context[tag]).reshape(-1, np.asarray(domain.context[tag]).shape[-1])[:, :dim]
-        volume = point_cloud_volume(domain, tag, host_pts)
-        pts = jnp.asarray(ctx.context[tag]).reshape(-1, jnp.asarray(ctx.context[tag]).shape[-1])[:, :dim]
+        pts = jnp.asarray(ctx.context[tag])
+        pts = pts.reshape(-1, pts.shape[-1])[:, :dim]
         if vals.shape[0] != pts.shape[0]:
             raise NotImplementedError(
                 f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {pts.shape[0]} points of "
                 f"'{tag}'; time-dependent or batched fields are not supported yet."
             )
+        kind_name = getattr(domain, "_geometry_tags", {}).get(tag)
+        if kind_name is not None and (kind_name[0] == "boundary" or kind_name[1] is not None):
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the sampled boundary tag '{tag}' of a mesh-free domain is not supported "
+                "(it needs the boundary's measure). Use 'Linf', or give the shape a mesh size."
+            )
+        if domain.__dict__.get("_lazy_plan") is not None:
+            volume = shape_volume(domain)
+        else:
+            host = np.asarray(domain.context[tag])
+            volume = point_cloud_volume(domain, tag, host.reshape(-1, host.shape[-1])[:, :dim])
+        if expr.kind == "L2":
+            return finish(volume * jnp.mean(pointwise_sq(vals)))
+        if expr.kind == "L1":
+            norm = volume * jnp.mean(jnp.sqrt(pointwise_sq(vals)))
+            return norm**2 if expr.squared else norm
         return finish(point_kernel_norm_sq(pts, vals, expr.scale, volume))
 
     def _eval_integral(self, expr: "Integral", ctx):

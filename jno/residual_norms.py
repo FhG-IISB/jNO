@@ -18,11 +18,12 @@ Three backends; the first two are built once per (domain, region, space, options
   constant matrix; differentiable through ``lax.custom_linear_solve``). ``bc="dirichlet"`` drops the boundary nodes from the test space
   (the dual of ``H^1_0``), ``bc="neumann"`` keeps them (the dual of ``H^1``).
 
-- :func:`point_kernel_norm_sq`, a point cloud without a mesh (``jno.domain.from_array``): ``H^-1`` only, as
-  the double integral of ``r`` against the Green's function of ``(scale - Laplace)`` in R^d, by the point rule
-  with weight ``|Omega| / N`` and a cell-averaged self-term. It is the whole-space norm of ``r`` extended by
-  zero (no boundary condition), ``|Omega|`` is the convex hull of the points (logged), and the cost is O(N^2)
-  per evaluation, in row blocks so memory stays O(N).
+- :func:`point_kernel_norm_sq`, a point cloud: a shape domain without a mesh, its points sampled from the
+  geometry. ``H^-1`` as the double integral of ``r`` against the Green's function of ``(scale - Laplace)`` in
+  R^d, by the point rule with weight ``|Omega| / N`` and a cell-averaged self-term: the whole-space norm of
+  ``r`` extended by zero (no boundary condition), O(N^2) per evaluation in row blocks, memory O(N). ``L2``,
+  ``L1`` by the same point rule. ``|Omega|`` comes from the geometry (:func:`shape_volume`); a cloud with no
+  geometry at all takes the convex hull of its points, logged.
 
 ``M`` and ``K`` come from the fixed mesh, so the norm is differentiable in the field values, not in the mesh
 coordinates.
@@ -39,7 +40,7 @@ import numpy as np
 
 KNOWN_SPACES = "'l2' (root mean square over the points), 'L2', 'L1', 'Linf', 'H1', 'H-1', 'H^s' (s real, e.g. 'H^-0.5')"
 _BCS = ("dirichlet", "neumann")
-_METHODS = (None, "grid", "mesh")
+_METHODS = (None, "grid", "mesh", "points")
 _SIMPLEX_KEY = {1: "lines", 2: "triangles", 3: "tetrahedra"}
 
 
@@ -56,13 +57,13 @@ def parse_space(space: str):
 
 def check_options(kind, s, bc, scale, method):
     """Refuse what this first cut does not do, naming the way out (rule: never fail silently)."""
-    if method in ("points", "sample"):
+    if method == "sample":
         raise NotImplementedError(
-            f"norm(method={method!r}) is planned, not implemented: the point-cloud (Green's kernel) and the "
-            "sampled (SV-PINN Monte-Carlo) estimators. Use a mesh or a structured grid (method=None picks one)."
+            "norm(method='sample') is planned, not implemented: the sampled (SV-PINN Monte-Carlo) estimator. "
+            "Use method=None (the backend picked from the domain), 'grid', 'mesh' or 'points'."
         )
     if method not in _METHODS:
-        raise ValueError(f"norm: method must be one of None, 'grid', 'mesh'; got {method!r}.")
+        raise ValueError(f"norm: method must be one of None, 'grid', 'mesh', 'points'; got {method!r}.")
     if bc == "periodic":
         raise NotImplementedError("norm(bc='periodic') is planned, not implemented. Use 'dirichlet' or 'neumann'.")
     if bc not in _BCS:
@@ -348,3 +349,32 @@ def point_kernel_norm_sq(points, vals, scale: float, volume: float, block: int =
         return jnp.sum(Ci * (G @ c))
 
     return w**2 * jnp.sum(jax.lax.map(rows, jnp.arange(nb)))
+
+
+def shape_volume(domain, n: int = 200_000) -> float:
+    """|Omega| of a mesh-free shape domain from its geometry: a curve's arclength in 1-D, else the bounding box
+    times the fraction of ``n`` uniform points inside it (exact for a box; for a CSG shape a Monte-Carlo
+    estimate with relative standard error sqrt((1 - p) / (p n)), logged). Cached on the domain."""
+    import logging
+
+    cache = domain.__dict__.setdefault("_norm_volume_cache", {})
+    if "__shape__" in cache:
+        return cache["__shape__"]
+    plan, dim = domain._lazy_plan, int(domain.dimension)
+    if dim == 1:
+        leaves = [prim for prim, _size, _key in plan.leaves()]
+        vol = float(sum(prim.measure() for prim in leaves))
+    else:
+        lo, hi = (np.asarray(b, dtype=np.float64)[:dim] for b in plan.bounds())
+        box = float(np.prod(hi - lo))
+        pts = lo + (hi - lo) * np.random.default_rng(0).random((n, dim))
+        frac = float(np.mean(np.asarray(plan.contains(np.pad(pts, ((0, 0), (0, 3 - dim)))), dtype=bool)))
+        vol = box * frac
+        if frac < 1.0:
+            se = np.sqrt((1 - frac) / (frac * n))
+            logging.getLogger("jno").info(
+                f"norm on a mesh-free domain: |Omega| = {vol:.6g} (bounding box x the fraction of {n} points inside, "
+                f"relative standard error {se:.1e})."
+            )
+    cache["__shape__"] = vol
+    return vol
