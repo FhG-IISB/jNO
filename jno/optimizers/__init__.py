@@ -41,7 +41,10 @@ residuals of every loss term involving the model (``gram_terms``) instead of onl
 - :func:`lm` — Levenberg-Marquardt, damping adapted from the gain ratio (Levenberg 1944,
   Marquardt 1963; Madsen, Nielsen & Tingleff 2004).
 - :func:`dngd` — Dual Natural Gradient Descent, the Gauss-Newton step solved over the ``m``
-  residual rows, with geodesic acceleration (Jnini & Vella 2025, arXiv:2505.21404).
+  residual rows, with geodesic acceleration (Jnini & Vella 2025, arXiv:2505.21404); dense or
+  matrix-free with Nyström-preconditioned CG.
+- :func:`nystrom_ngd` — matrix-free natural gradient, Nyström-preconditioned CG and Armijo steps
+  (Bioli, Marcati & Sangalli, CMAME 2026, doi:10.1016/j.cma.2026.119456).
 
 The ``scale_by_*`` variants are the bare transforms (no line search / learning-rate wrapper) for
 building your own optax chains.
@@ -64,6 +67,7 @@ from .engd import ENGDOptimizer, engd
 from .lm import LMOptimizer, lm
 from .md_decouple import MDOptimizer, md, md_decouple
 from .mma import GCMMAOptimizer, MMACallback, MMAOptimizer, gcmma, mma
+from .nystrom_ngd import NystromNGDOptimizer, nystrom_ngd
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
@@ -76,6 +80,8 @@ __all__ = [
     "DNGDOptimizer",
     "lm",
     "LMOptimizer",
+    "nystrom_ngd",
+    "NystromNGDOptimizer",
     "mma",
     "gcmma",
     "GCMMAOptimizer",

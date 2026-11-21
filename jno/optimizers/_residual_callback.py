@@ -86,9 +86,21 @@ class ResidualStepCallback(Callback):
     def check_sizes(self, m: int, P: int) -> None:
         """Raise when the method cannot handle ``m`` residual rows and ``P`` parameters."""
 
-    def direction(self, r_of, flat_p, state):
-        """Return ``(d, new_state, info)``: the new parameters are ``flat_p - d``."""
+    def direction(self, r_of, flat_p, state, **static):
+        """Return ``(d, new_state, info)``: the new parameters are ``flat_p - d``.
+
+        ``static`` holds the settings from :meth:`initial_static` / :meth:`next_static` (shapes such
+        as a sketch rank); the step is compiled once per distinct value.
+        """
         raise NotImplementedError
+
+    def initial_static(self) -> dict:
+        """Static (compile-time) settings of the first step; reset at every ``solve()``."""
+        return {}
+
+    def next_static(self, static: dict, info: dict) -> dict:
+        """Static settings of the next step, from this step's ``info`` (host values)."""
+        return static
 
     # -- Callback hooks -------------------------------------------------------------------------
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_solve_begin
@@ -142,19 +154,31 @@ class ResidualStepCallback(Callback):
         self.m, self.P = m, int(flat0.shape[0])
         self.check_sizes(self.m, self.P)
 
-        def step(flat_p, trainable, context, rng, state):
-            def r_of(q):
-                return residual_fn(q, trainable, context, rng)
+        def make_step(static):
+            def step(flat_p, trainable, context, rng, state):
+                def r_of(q):
+                    return residual_fn(q, trainable, context, rng)
 
-            d, new_state, info = self.direction(r_of, flat_p, state)
-            bad = ~jnp.all(jnp.isfinite(d))
-            info = {**info, "nonfinite": bad}
-            return jnp.where(bad, jnp.zeros_like(d), d), new_state, info
+                d, new_state, info = self.direction(r_of, flat_p, state, **static)
+                bad = ~jnp.all(jnp.isfinite(d))
+                info = {**info, "nonfinite": bad}
+                return jnp.where(bad, jnp.zeros_like(d), d), new_state, info
 
-        self._step_jit = jax.jit(step)
+            return jax.jit(step)
+
+        self._make_step = make_step
+        self._jits = {}
+        self._static = self.initial_static()
         self._state = self.init_state(flat0, m)
-        out = self._step_jit(flat0, trainable, context, rng, self._state)  # compile once, discard
+        out = self._step_for(self._static)(flat0, trainable, context, rng, self._state)  # compile, discard
         jax.block_until_ready(out)
+        self._step_jit = self._step_for(self._static)
+
+    def _step_for(self, static):
+        key = tuple(sorted(static.items()))
+        if key not in self._jits:
+            self._jits[key] = self._make_step(static)
+        return self._jits[key]
 
     # docstring-from: jno.utils.adaptive.callbacks.Callback.on_before_update
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kwargs):
@@ -187,5 +211,7 @@ class ResidualStepCallback(Callback):
         if self._step_jit is None:
             return None
         flat_p, _ = jax.flatten_util.ravel_pytree(trainable[self._lid])
-        d, self._state, self.last_info = self._step_jit(flat_p, trainable, context, rng, self._state)
+        d, self._state, self.last_info = self._step_for(self._static)(flat_p, trainable, context, rng, self._state)
+        if self._static:
+            self._static = self.next_static(self._static, jax.device_get(self.last_info))
         return {**grads, self._lid: self._unravel(d)}

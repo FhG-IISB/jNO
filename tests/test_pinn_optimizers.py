@@ -80,7 +80,7 @@ def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     np.testing.assert_allclose(np.asarray(J.T @ r), np.asarray(probe.grads0), rtol=1e-9, atol=1e-13)
 
 
-RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm, jno.optimizers.dngd]
+RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm, jno.optimizers.dngd, jno.optimizers.nystrom_ngd]
 
 
 @pytest.mark.parametrize("make", RESIDUAL_SENTINELS, ids=lambda f: f.__name__)
@@ -222,7 +222,9 @@ def test_lm_converges_on_poisson2d():
     assert np.isfinite(err) and err < 1e-3, f"lm: rel-L2 {err:.3e}"
 
 
-@pytest.mark.parametrize("make", [jno.optimizers.lm, jno.optimizers.dngd], ids=lambda f: f.__name__)
+@pytest.mark.parametrize(
+    "make", [jno.optimizers.lm, jno.optimizers.dngd, jno.optimizers.nystrom_ngd], ids=lambda f: f.__name__
+)
 def test_residual_sentinel_resolve_is_idempotent(make):
     """A second solve() on the same model rebuilds the callback and continues from the weights."""
     net, losses, _, eval_error = _build_poisson2d(seed=0)
@@ -290,3 +292,117 @@ def test_dngd_converges_on_poisson2d_with_more_parameters_than_rows():
     # hidden 64 x 2 layers: P = 4417 > m = 1020, the regime the residual-space solve is for
     err, _ = _poisson_error(jno.optimizers.dngd(), 200, hidden_dims=64, num_layers=2)
     assert np.isfinite(err) and err < 1e-3, f"dngd: rel-L2 {err:.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# _randnla: Nyström approximation, preconditioner, PCG
+# ---------------------------------------------------------------------------------------------
+
+from jno.optimizers._randnla import nystrom_approx, nystrom_precond, pcg  # noqa: E402
+
+
+def _psd(n, rank, seed=0, decay=1.0):
+    Q, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(seed), (n, rank)))
+    lam = 10.0 ** (-decay * jnp.arange(rank))
+    return (Q * lam) @ Q.T
+
+
+@pytest.mark.parametrize("sketch", ["gaussian", "sampling"])
+def test_nystrom_is_exact_on_a_low_rank_psd_matrix(sketch):
+    A = _psd(40, 6)
+    ny = nystrom_approx(lambda v: A @ v, 40, 10, jax.random.PRNGKey(1), jnp.float64, sketch=sketch)
+    np.testing.assert_allclose((ny.U * ny.lam) @ ny.U.T, A, atol=1e-10)
+    assert bool(jnp.all(ny.lam >= 0)) and bool(jnp.all(jnp.diff(ny.lam) <= 1e-14))
+
+
+def test_nystrom_survives_an_indefinite_operator():
+    A = _psd(30, 5) - 0.3 * jnp.eye(30)
+    ny = nystrom_approx(lambda v: A @ v, 30, 8, jax.random.PRNGKey(2), jnp.float64)
+    assert bool(jnp.all(jnp.isfinite(ny.U))) and bool(jnp.all(ny.lam >= 0))
+
+
+def test_pcg_with_a_nystrom_preconditioner_converges_in_a_few_iterations():
+    """A = (rank-8 PSD, eigenvalues 1..1e-7) + 1e-8 I: cond ~1e8 with 9 distinct eigenvalues, so plain
+    CG needs about 9 iterations; with the rank-12 preconditioner the spectrum collapses to one value."""
+    n, mu = 60, 1e-8
+    A = _psd(n, 8) + mu * jnp.eye(n)
+    b = jax.random.normal(jax.random.PRNGKey(4), (n,))
+    x_true = jnp.linalg.solve(A, b)
+    ny = nystrom_approx(lambda v: A @ v - mu * v, n, 12, jax.random.PRNGKey(5), jnp.float64)
+    sol = pcg(lambda v: A @ v, b, nystrom_precond(ny, mu, 1.0 / (ny.lam[-1] + mu)), tol=1e-12, maxiter=50)
+    assert int(sol.iters) <= 5
+    np.testing.assert_allclose(sol.x, x_true, rtol=1e-6)
+    plain = pcg(lambda v: A @ v, b, lambda v: v, tol=1e-12, maxiter=50)
+    assert int(plain.iters) >= 8 > int(sol.iters)
+
+
+def test_pcg_stops_at_negative_curvature():
+    A = jnp.diag(jnp.array([2.0, 1.0, -1.0]))
+    sol = pcg(lambda v: A @ v, jnp.ones(3), lambda v: v, maxiter=10)
+    assert bool(sol.negative_curvature) and bool(jnp.all(jnp.isfinite(sol.x)))
+
+
+# ---------------------------------------------------------------------------------------------
+# nystrom_ngd, dngd(solver="nystrom_pcg")
+# ---------------------------------------------------------------------------------------------
+
+from jno.optimizers.dngd import _dngd_direction_pcg  # noqa: E402
+from jno.optimizers.nystrom_ngd import _NysState, _nystrom_ngd_direction  # noqa: E402
+
+
+def test_nystrom_ngd_with_full_rank_is_the_damped_gauss_newton_step():
+    r_of, A, b = _linear_problem(30, 12, cond=1e3)
+    theta = jax.random.normal(jax.random.PRNGKey(6), (12,))
+    d, _, info = _nystrom_ngd_direction(r_of, theta, _NysState(jax.random.PRNGKey(0)), rank=12, damping=1e-9)
+    g = A.T @ r_of(theta)
+    d_ref = jnp.linalg.solve(A.T @ A + 1e-9 * jnp.eye(12), g)
+    assert float(info["t"]) == 1.0 and int(info["cg_iters"]) <= 3
+    np.testing.assert_allclose(d, d_ref, rtol=1e-8)
+
+
+def test_nystrom_ngd_solves_a_consistent_linear_residual():
+    """The automatic damping max(10 eps lambda_1, 1e-4 L^2) vanishes with the loss, as for a PINN with
+    an exact solution; on a consistent system the iteration then converges to it."""
+    _, A, _ = _linear_problem(30, 12, cond=1e3)
+    x_true = jnp.linspace(-1.0, 1.0, 12)
+
+    def r_of(q):
+        return A @ (q - x_true)
+
+    theta, _, _ = _iterate(
+        lambda r, q, s: _nystrom_ngd_direction(r, q, s, rank=12), _NysState(jax.random.PRNGKey(0)), r_of, jnp.zeros(12), 15
+    )
+    np.testing.assert_allclose(theta, x_true, atol=1e-8)
+
+
+def test_dngd_matrix_free_step_matches_the_dense_step():
+    r_of, A, b = _linear_problem(15, 60, cond=1e2)
+    theta = jax.random.normal(jax.random.PRNGKey(8), (60,))
+    kw = dict(damping=1e-8, geodesic=False, line_search=False)
+    d_dense, _, _ = _dngd_direction(r_of, theta, (), **kw)
+    d_pcg, _, info = _dngd_direction_pcg(r_of, theta, jax.random.PRNGKey(0), rank=15, **kw)
+    np.testing.assert_allclose(d_pcg, d_dense, rtol=1e-8)
+    assert int(info["cg_iters"]) <= 3
+
+
+def test_nystrom_ngd_rank_rule():
+    from jno.optimizers.nystrom_ngd import _next_rank
+
+    grow = {"lambda_min_sketch": 1.0, "damping": 1e-3, "n_above_10mu": 100}
+    assert _next_rank(100, grow, 20, 500) == 120
+    assert _next_rank(490, grow, 20, 500) == 500
+    shrink = {"lambda_min_sketch": 1e-5, "damping": 1e-3, "n_above_10mu": 41}
+    assert _next_rank(100, shrink, 20, 500) == 60  # 41 eigenvalues above 10 mu -> next multiple of 20 above
+    assert _next_rank(100, {**shrink, "n_above_10mu": 0}, 20, 500) == 20
+
+
+def test_nystrom_ngd_converges_on_poisson2d():
+    err, _ = _poisson_error(jno.optimizers.nystrom_ngd(rank=100), 200)
+    assert np.isfinite(err) and err < 1e-3, f"nystrom_ngd: rel-L2 {err:.3e}"
+
+
+def test_dngd_matrix_free_converges_on_poisson2d():
+    err, _ = _poisson_error(
+        jno.optimizers.dngd(solver="nystrom_pcg", rank=500, cg_maxiter=200), 200, hidden_dims=64, num_layers=2
+    )
+    assert np.isfinite(err) and err < 1e-3, f"dngd(nystrom_pcg): rel-L2 {err:.3e}"
