@@ -77,7 +77,10 @@ schedule (×0.9 every 100 steps) and 2000 steps for both losses, on a 33 × 33 l
 | `r.mse` | 9.7e-1 |
 | `r.norm("H-1") ** 2` | 1.1e-1 |
 
-One seed, one network size; a finer study (seeds, sizes, L-BFGS) is not part of this tutorial.
+That is seed 0, and it is the good case. Over three seeds and 3000 steps the median errors were 0.94 for
+`r.mse` and 0.39 for the $H^{-1}$ loss: the plain loss stayed on its plateau in every run, the $H^{-1}$ loss
+left it in one of three (0.10) and only partly in the others (0.39, 0.85). It helps the conditioning; it does
+not by itself make this network and optimiser reliable at $a = 10$.
 
 ## Full script
 
