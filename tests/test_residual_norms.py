@@ -218,6 +218,66 @@ def test_3d_box_on_grid_and_mesh():
     assert abs(errs[1]) < 5e-2 and 1.7 < _rate(*errs, 1 / 8, 1 / 16) < 2.3, errs
 
 
+# ---- point clouds and mesh-free shapes ------------------------------------------------------------------------
+
+
+def _whole_space_norm_of_the_eigenfunction(scale=1.0, L=80.0, n=8001):
+    """||r||^2 in H^-1(R^2) of r = sin(pi x) sin(pi y) on the unit square, zero outside, by quadrature of its
+    Fourier transform: (2 pi)^-2 int |F(xi1) F(xi2)|^2 / (scale + |xi|^2), |F(w)|^2 = 4 pi^2 cos^2(w/2) / (pi^2 - w^2)^2.
+    Independent of the code under test; the tail beyond |xi| = L is below 1e-7 of the value."""
+    w = np.linspace(0.0, L, n)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        F = np.where(np.abs(w - PI) < 1e-9, 0.25, 4 * PI**2 * np.cos(w / 2) ** 2 / (PI**2 - w**2) ** 2)
+    tw = np.full(n, w[1] - w[0])
+    tw[[0, -1]] /= 2  # trapezoid on [0, L]; the integrand is even in each axis, so x4 for the full plane
+    total = 0.0
+    for i in range(0, n, 500):  # chunk the n x n tensor grid
+        a = slice(i, i + 500)
+        total += np.einsum("i,j,i,j,ij->", F[a], F, tw[a], tw, 1.0 / (scale + w[a, None] ** 2 + w[None, :] ** 2))
+    return 4 * total / (2 * PI) ** 2
+
+
+def test_point_cloud_H_minus_1_matches_the_whole_space_norm():
+    """Breaks if the Green's-kernel backend has the wrong kernel, weights or self-term: on a point cloud there is
+    no boundary, so the norm is the whole-space H^-1 of r extended by zero."""
+    want = _whole_space_norm_of_the_eigenfunction()
+    errs = []
+    for n in (24, 48):
+        c = (np.arange(n) + 0.5) / n  # cell-centred points
+        pts = np.stack(np.meshgrid(c, c, indexing="ij"), -1).reshape(-1, 2)
+        dom = jno.domain.from_array({"interior": pts})
+        xp, yp = dom.variable("interior", split=True)[:2]
+        node = (sin(PI * xp) * sin(PI * yp)).norm("H-1") ** 2
+        # |Omega| is taken as the points' convex hull, (1 - 1/n)^2 here; the point weight |Omega|/N enters squared
+        hull = (1 - 1 / n) ** 2
+        errs.append(_value(node, dom) / (want * hull**2) - 1)
+        assert node.backend == "points"
+    # what is left is the point rule on a log-singular kernel with a cell-averaged self-term
+    assert abs(errs[1]) < 1e-2 and abs(errs[1]) <= abs(errs[0]) + 1e-3, errs
+
+
+def test_bessel_k0_matches_scipy():
+    """Breaks if the K0 approximation behind the 2-D kernel is off (Abramowitz & Stegun 9.8.5-9.8.6, < 2e-7)."""
+    from scipy.special import k0
+
+    from jno.residual_norms import bessel_k0
+
+    x = np.concatenate([np.geomspace(1e-6, 2, 200), np.linspace(2, 60, 200)])
+    np.testing.assert_allclose(np.asarray(bessel_k0(jax.numpy.asarray(x))), k0(x), rtol=3e-7)
+
+
+def test_a_mesh_free_shape_domain_builds_its_mesh_for_the_norm():
+    """Breaks if a mesh-free shape domain (sampled points, a mesh only on demand) crashes or falls to the point
+    backend: its geometry is known, so the norm builds the mesh, outside the trace, and uses it."""
+    dom = jno.shape.rect(0, 0, 1, 1).domain()
+    x, y, _ = dom.variable("interior", sample=(200, None), split=True)
+    node = (sin(PI * x) * sin(PI * y)).norm("H-1") ** 2
+    got = _value(node, dom)
+    assert node.backend == "mesh"
+    # the lazy build uses the shape's default mesh size, which is coarse (measured 5.3 % off)
+    assert abs(got / (0.25 / (1 + 2 * PI**2)) - 1) < 1e-1
+
+
 # ---- boundary, refusals ----------------------------------------------------------------------------------------
 
 
@@ -240,8 +300,10 @@ def test_refusals_name_the_way_out():
         _value((xb * yb).norm("H-1") ** 2, dom)
     pts = jno.domain.from_array({"interior": np.random.default_rng(0).random((50, 2))})
     xp, yp = pts.variable("interior", split=True)[:2]
-    with pytest.raises(NotImplementedError, match="mesh"):
-        _value((xp * yp).norm("H-1") ** 2, pts)
+    with pytest.raises(NotImplementedError, match="point cloud"):
+        _value((xp * yp).norm("H1") ** 2, pts)
+    with pytest.raises(ValueError, match="scale > 0"):
+        _value((xp * yp).norm("H-1", scale=0.0) ** 2, pts)
 
 
 # ---- training ---------------------------------------------------------------------------------------------------

@@ -721,7 +721,9 @@ class Placeholder:
 
         The backend comes from the domain: a structured lattice uses per-axis sine/cosine transforms (any real
         ``s``), a simplex mesh P1 mass and stiffness matrices (``s`` in {-1, 1}; ``H^-1`` costs one CG solve
-        per evaluation). A point cloud without a mesh supports only ``"l2"`` and ``"Linf"`` for now. The
+        per evaluation). A mesh-free shape builds its mesh for this. A point cloud (``jno.domain.from_array``) has
+        ``"l2"``, ``"Linf"`` and ``"H-1"``, the last by the Green's kernel of ``(scale - Laplace)`` in R^d (no boundary
+        condition; ``|Omega|`` from the convex hull of the points, logged; O(N^2) per evaluation). The
         field is evaluated at all nodes of its region (as :meth:`integrate` does), not at sampled points.
         ``norm(...)**2`` is fused into the squared norm, so its gradient has no square root.
 

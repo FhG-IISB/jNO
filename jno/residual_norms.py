@@ -6,7 +6,7 @@ operator the strong L2 residual loss has curvature ~|k|^4 per Fourier mode, the 
 Marcondes 2026, arXiv:2605.03542, Sec. 3-4; the Deep Fourier Residual method, Taylor et al. 2022,
 arXiv:2210.14129; RVPINNs, Rojas et al. 2024). The norm is ``||r||_s^2 = <r, (scale - Laplace)^s r>``.
 
-Two backends, both built once per (domain, region, space, options) and cached on the domain:
+Three backends; the first two are built once per (domain, region, space, options) and cached on the domain:
 
 - :class:`GridSobolev`, a structured lattice (``mesh_connectivity["grid"]``): the per-axis eigenvectors of the
   discrete Laplacian (sine for Dirichlet, cosine for Neumann) as dense transforms, so any real order ``s``.
@@ -17,6 +17,12 @@ Two backends, both built once per (domain, region, space, options) and cached on
   with Jacobi; any ``jno.solve`` solver and ``jno.precond`` preconditioner, the latter built once from the
   constant matrix; differentiable through ``lax.custom_linear_solve``). ``bc="dirichlet"`` drops the boundary nodes from the test space
   (the dual of ``H^1_0``), ``bc="neumann"`` keeps them (the dual of ``H^1``).
+
+- :func:`point_kernel_norm_sq`, a point cloud without a mesh (``jno.domain.from_array``): ``H^-1`` only, as
+  the double integral of ``r`` against the Green's function of ``(scale - Laplace)`` in R^d, by the point rule
+  with weight ``|Omega| / N`` and a cell-averaged self-term. It is the whole-space norm of ``r`` extended by
+  zero (no boundary condition), ``|Omega|`` is the convex hull of the points (logged), and the cost is O(N^2)
+  per evaluation, in row blocks so memory stays O(N).
 
 ``M`` and ``K`` come from the fixed mesh, so the norm is differentiable in the field values, not in the mesh
 coordinates.
@@ -247,3 +253,98 @@ def sobolev_operator(domain, tag: str, mc: dict, backend: str, s: float, bc: str
             else:
                 cache[key] = MeshSobolev(mc, s, bc, scale, solver, precond)
     return cache[key]
+
+
+# ---- point cloud: the Green's function of (scale - Laplace) --------------------------------------------------
+
+_K0_SMALL = (-0.57721566, 0.42278420, 0.23069756, 0.03488590, 0.00262698, 0.00010750, 0.00000740)
+_K0_LARGE = (1.25331414, -0.07832358, 0.02189568, -0.01062446, 0.00587872, -0.00251540, 0.00053208)
+
+
+def bessel_k0(x):
+    """Modified Bessel function K_0 for x > 0 in JAX: Abramowitz & Stegun (1964) 9.8.5 (x <= 2) and 9.8.6 (x > 2),
+    relative error below 2e-7. Not in ``jax.scipy.special``."""
+    from jax.scipy.special import i0
+
+    small = jnp.minimum(x, 2.0)
+    t2 = (small / 2.0) ** 2
+    poly = sum(c * t2**i for i, c in enumerate(_K0_SMALL))
+    k_small = -jnp.log(small / 2.0) * i0(small) + poly
+    large = jnp.maximum(x, 2.0)
+    u = 2.0 / large
+    k_large = jnp.exp(-large) / jnp.sqrt(large) * sum(c * u**i for i, c in enumerate(_K0_LARGE))
+    return jnp.where(x <= 2.0, k_small, k_large)
+
+
+def _green(rho, k: float, d: int):
+    """Green's function of (k^2 - Laplace) in R^d at distance rho > 0."""
+    if d == 1:
+        return jnp.exp(-k * rho) / (2 * k)
+    if d == 2:
+        return bessel_k0(k * rho) / (2 * np.pi)
+    return jnp.exp(-k * rho) / (4 * np.pi * rho)
+
+
+def _green_cell_average(k: float, d: int, cell: float) -> float:
+    """The Green's function averaged over a ball of volume ``cell`` around its pole: the self-term of the point
+    rule, finite although the kernel is singular there (log in 2-D, 1/rho in 3-D)."""
+    from scipy.special import k1
+
+    if d == 1:
+        a = cell / 2
+        return (1 - np.exp(-k * a)) / k**2 / (2 * a)
+    if d == 2:
+        a = np.sqrt(cell / np.pi)
+        return (1 - k * a * k1(k * a)) / k**2 / cell
+    a = (3 * cell / (4 * np.pi)) ** (1 / 3)
+    return (1 - np.exp(-k * a) * (1 + k * a)) / k**2 / cell
+
+
+def point_cloud_volume(domain, tag: str, points: np.ndarray) -> float:
+    """|Omega| for a point cloud: the convex hull of its points (a point cloud carries no geometry), cached on the
+    domain and logged, since a non-convex region makes it too large."""
+    import logging
+
+    cache = domain.__dict__.setdefault("_norm_volume_cache", {})
+    if tag not in cache:
+        d = points.shape[1]
+        if d == 1:
+            vol = float(np.ptp(points[:, 0]))
+        else:
+            from scipy.spatial import ConvexHull
+
+            vol = float(ConvexHull(points).volume)
+        cache[tag] = vol
+        logging.getLogger("jno").info(
+            f"norm on the point cloud '{tag}': |Omega| = {vol:.6g} from the convex hull of its {points.shape[0]} points "
+            "(a non-convex region makes it too large; mesh the domain to use its true measure)."
+        )
+    return cache[tag]
+
+
+def point_kernel_norm_sq(points, vals, scale: float, volume: float, block: int = 1024):
+    """``(|Omega| / N)^2 sum_ij r_i . r_j G(|x_i - x_j|)``, the H^-1(R^d) norm of r by the point rule."""
+    if scale <= 0:
+        raise ValueError(
+            "norm('H-1') on a point cloud needs scale > 0 (the whole-space kernel of -Laplace is not "
+            "positive definite in 1-D and 2-D)."
+        )
+    n, d = points.shape
+    k = float(np.sqrt(scale))
+    w = volume / n
+    diag = _green_cell_average(k, d, w)
+    c = _components(vals)
+    nb = -(-n // block)
+    pad = nb * block - n
+    P = jnp.pad(points, ((0, pad), (0, 0)))
+    C = jnp.pad(c, ((0, pad), (0, 0)))
+
+    def rows(i):
+        Pi = jax.lax.dynamic_slice_in_dim(P, i * block, block)
+        Ci = jax.lax.dynamic_slice_in_dim(C, i * block, block)
+        rho = jnp.sqrt(jnp.sum((Pi[:, None, :] - points[None, :, :]) ** 2, axis=-1))
+        safe = jnp.where(rho > 0, rho, 1.0)
+        G = jnp.where(rho > 0, _green(safe, k, d), diag)
+        return jnp.sum(Ci * (G @ c))
+
+    return w**2 * jnp.sum(jax.lax.map(rows, jnp.arange(nb)))

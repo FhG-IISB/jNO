@@ -2948,16 +2948,10 @@ class TraceEvaluator:
         raw_tag = var.tag
         tag = raw_tag[2:] if raw_tag.startswith("n_") else raw_tag
         domain = var._domain
-        mc = domain.mesh_connectivity
+        with jax.ensure_compile_time_eval():  # a mesh-free shape builds its mesh here, outside the step's trace
+            mc = domain.mesh_connectivity
         if mc is None:
-            if kind != "Linf":
-                raise NotImplementedError(
-                    f"norm({expr.space!r}) needs a mesh or a structured grid; region '{tag}' is a point cloud. "
-                    "On a point cloud only 'l2' and 'Linf' work for now (the Green's-kernel backend is planned): "
-                    "mesh the domain (jno.shape ... .domain()) or use a lattice (.structured(n=...))."
-                )
-            expr.backend = "points"
-            return jnp.sqrt(jnp.max(pointwise_sq(self._dispatch(expr.target, ctx)))) ** (2 if expr.squared else 1)
+            return self._eval_norm_point_cloud(expr, ctx, domain, tag, finish)
 
         cached = self._get_integral_cache(domain, tag, mc, "nodal")
         region_pts = jnp.array(cached["region_pts"])
@@ -3001,6 +2995,34 @@ class TraceEvaluator:
         op = sobolev_operator(domain, tag, mc, backend, expr.s, expr.bc, expr.scale, expr.solver, expr.precond)
         expr.backend = op.name
         return finish(op(vals))
+
+    def _eval_norm_point_cloud(self, expr, ctx, domain, tag, finish):
+        """A norm on a point cloud (no mesh, no geometry): ``Linf`` and the Green's-kernel ``H-1``."""
+        from .residual_norms import point_cloud_volume, point_kernel_norm_sq, pointwise_sq
+
+        vals = self._dispatch(expr.target, ctx)
+        while vals.ndim > 2 and vals.shape[0] == 1:  # a point cloud's leading batch / time axes of size 1
+            vals = vals[0]
+        expr.backend = "points"
+        if expr.kind == "Linf":
+            norm = jnp.sqrt(jnp.max(pointwise_sq(vals)))
+            return norm**2 if expr.squared else norm
+        if expr.kind != "H" or expr.s != -1.0:
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the point cloud '{tag}' is not available: a point cloud has no mesh or "
+                "measure, so only 'l2', 'Linf' and 'H-1' (Green's kernel) work there. Mesh the domain "
+                "(jno.shape ... .domain()) or use a lattice (.structured(n=...))."
+            )
+        dim = int(domain.dimension)
+        host_pts = np.asarray(domain.context[tag]).reshape(-1, np.asarray(domain.context[tag]).shape[-1])[:, :dim]
+        volume = point_cloud_volume(domain, tag, host_pts)
+        pts = jnp.asarray(ctx.context[tag]).reshape(-1, jnp.asarray(ctx.context[tag]).shape[-1])[:, :dim]
+        if vals.shape[0] != pts.shape[0]:
+            raise NotImplementedError(
+                f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {pts.shape[0]} points of "
+                f"'{tag}'; time-dependent or batched fields are not supported yet."
+            )
+        return finish(point_kernel_norm_sq(pts, vals, expr.scale, volume))
 
     def _eval_integral(self, expr: "Integral", ctx):
         """Evaluate a mesh-based integral reduction.
