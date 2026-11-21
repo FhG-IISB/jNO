@@ -10,6 +10,9 @@
   `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a
   secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection
   path in `solve()`.
+- `ssbroyden(pairs=m)` and `ssbfgs(pairs=m)`: the self-scaled metric on at most `m` directions in
+  `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN:
+  160 MB at `m = 100` instead of 315 GB). `pairs=None`, the default, is the dense solver, unchanged.
 
 ## [0.4.2] — 2026-10-23
 

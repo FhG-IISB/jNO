@@ -12,7 +12,8 @@ with ``optax.chain`` and drops straight into ``model.optimizer(...)`` /
 
 - :func:`ssbroyden` / :func:`ssbfgs` — Self-Scaled Broyden / BFGS quasi-Newton with a line search
   (Urbán, Stefanou & Pons, *J. Comput. Phys.* **523** (2025) 113656); excellent on smooth
-  PINN / inverse losses.
+  PINN / inverse losses. ``pairs=m`` keeps the metric on ``m`` directions instead of the dense
+  matrix, for networks too large for it.
 - :func:`soap` — SOAP, Shampoo with Adam in the preconditioner's eigenbasis
   (Vyas et al. 2024, arXiv:2409.11321).
 - :func:`ss_esoap` — SS-ESOAP, SOAP with a secant-energy step scale and adaptive eigenbasis refreshes

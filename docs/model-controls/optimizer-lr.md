@@ -48,7 +48,7 @@ k.optimizer(optax.chain(                                 # compose with optax di
 | Optimizer | What it is | Reference |
 |---|---|---|
 | `engd()` | Energy Natural Gradient Descent — preconditions with the inverse energy Gram matrix G⁻¹; auto-detects `gram_terms`; compatible with `line_search=True`; `momentum=` / `damping=` give SPRING (Gauss-Newton with momentum, Levenberg-Marquardt damping) | Müller & Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent*, ICML 2023, arXiv:2302.13163; SPRING: Goldshlager, Abrahamsen & Lin 2024, arXiv:2401.10190 |
-| `ssbroyden()` / `ssbfgs()` | Self-Scaled Broyden / BFGS quasi-Newton with a zoom line search — strong on smooth PINN / inverse losses | Urbán, Stefanou & Pons, *Unveiling the optimization process of PINNs*, J. Comput. Phys. **523** (2025) 113656 |
+| `ssbroyden()` / `ssbfgs()` | Self-Scaled Broyden / BFGS quasi-Newton with a zoom line search — strong on smooth PINN / inverse losses. The default stores a dense `P × P` matrix (a few thousand parameters at most); `pairs=m` keeps the metric on `m` directions in `m·P` numbers for larger networks (see below) | Urbán, Stefanou & Pons, *Unveiling the optimization process of PINNs*, J. Comput. Phys. **523** (2025) 113656 |
 | `soap()` / `scale_by_soap()` | SOAP — Shampoo with Adam in the preconditioner's eigenbasis | Vyas et al., *SOAP: Improving and Stabilizing Shampoo using Adam* (2024), arXiv:2409.11321 |
 | `lm()` | Levenberg-Marquardt on the PINN residuals; the damping adapts to the gain ratio and rejected steps are retried within the epoch, so the loss never rises; dense (smaller of `P x P`, `m x m`) | Levenberg (1944); Marquardt (1963); Madsen, Nielsen & Tingleff, *Methods for Non-Linear Least Squares Problems* (2004), Sec. 3.2 |
 | `dngd()` | Dual Natural Gradient Descent — the Gauss-Newton step solved over the `m` residual rows, with geodesic acceleration; `solver="nystrom_pcg"` is matrix-free | Jnini & Vella, *Dual Natural Gradient Descent for Scalable Training of PINNs* (2025), arXiv:2505.21404 |
@@ -81,6 +81,34 @@ beyond); `nystrom_ngd` when neither `J` nor a Gram matrix fits in memory. On the
 Poisson problem of the test suite (1020 residual rows) `lm`, `dngd`, `nystrom_ngd` and `engd` reach
 rel-L2 below `1e-3` in 200 steps; the optax transforms `nncg`, `score` and `ss_esoap` need the loss
 only (`nncg` and `score` read it through `value_fn`, which `jno.core` passes).
+
+### Self-scaled Broyden on larger networks (`pairs=`)
+
+`ssbroyden()` and `ssbfgs()` store a dense `P × P` matrix: 11 MB for 1 185 parameters, 315 GB for a
+4 × 256 network (198 401 parameters). `pairs=m` keeps the same metric on at most `m` directions, in
+`m·P` numbers (160 MB for that network at `m = 100`), and never forms the matrix:
+
+```python
+net.optimizer(jno.optimizers.ssbroyden(pairs=100))
+```
+
+Until `m` directions are in use the steps are those of the dense solver (a secant pair adds one
+direction, at most two). Then the quarter of the directions of lowest curvature is dropped. A step
+that raises the loss by more than 10 % is rejected and the metric restarted, which costs one more
+loss evaluation per step. More memory gives a lower error; with only about 30 directions it is
+close to L-BFGS.
+
+Measured relative L2 error (float64, one seed, an uncontrolled workstation GPU; 2026-11-21):
+
+| Network, budget | Problem | `ssbroyden()` | `pairs=300` | `pairs=100` | `pairs=30` | `optax.lbfgs` (memory 100) |
+|---|---|---|---|---|---|---|
+| 2 × 32, 3000 steps | Poisson 2D | 9.1e-8 | 5.5e-7 | 1.2e-6 | 3.2e-4 | 1.3e-3 |
+| 2 × 32, 3000 steps | Helmholtz 2D | 2.6e-5 | 4.4e-5 | 5.5e-4 | 3.3e-2 | 6.2e-3 |
+| 4 × 256, 120 s | Poisson 2D | does not fit | 2.0e-6 | 3.0e-6 | – | 2.0e-4 |
+| 4 × 256, 120 s | Helmholtz 2D | does not fit | 3.2e-2 | 3.9e-2 | – | 6.4e-3 |
+
+On the large Helmholtz problem L-BFGS was ahead after 120 s: both reach the same loss per step in
+that early phase, and an L-BFGS step took 39 ms against 98 ms.
 
 ### Magnitude–Direction Decoupling (`md`)
 
