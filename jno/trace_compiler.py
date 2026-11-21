@@ -43,6 +43,7 @@ from .trace import (
     ModelCall,
     ModelWeights,
     NetworkGradient,
+    Norm,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -476,7 +477,7 @@ class TraceCompiler:
                 visit(node.target)
             elif isinstance(node, NetworkGradient):
                 visit(node.target)  # registers the Model inside target
-            elif isinstance(node, (Integral, IntegralTime)):
+            elif isinstance(node, (Integral, IntegralTime, Norm)):
                 visit(node.target)
             elif isinstance(node, Assembly):
                 visit(node.expr)

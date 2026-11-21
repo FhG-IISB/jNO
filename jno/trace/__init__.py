@@ -56,6 +56,7 @@ __all__ = [
     "Hessian",
     "Integral",
     "IntegralTime",
+    "Norm",
     "Jacobian",
     "Diff",
     "DiffSlot",
@@ -693,6 +694,43 @@ class Placeholder:
             FunctionCall: the scalar node.
         """
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
+
+    def norm(self, space: "str | None" = None, *, bc: str = "dirichlet", scale: float = 1.0, method=None, solver=None):
+        """A norm of this field: per point (``space=None``) or over its domain region (a function-space norm).
+
+        Without ``space`` this is the pointwise norm, ``|r(x)|`` (the absolute value of a scalar; vector and
+        matrix views keep their own pointwise ``.norm()``). With a ``space`` it is a scalar, the norm of the
+        whole field, so ``r.norm("H-1")**2`` is a loss term like ``r.mse``:
+
+        - ``"l2"``: the root mean square over the evaluated points and components; ``r.norm("l2")**2``
+          is ``r.mse`` exactly (for a vector field that is the mean of ``|r|^2`` divided by its size).
+        - ``"L2"``, ``"L1"``, ``"Linf"``: over the region with its measure (mesh nodal weights; boundary
+          tags use the boundary measure).
+        - ``"H1"``, ``"H-1"``, ``"H^s"``: the Sobolev norm ``<r, (scale - Laplace)^s r>^(1/2)``. ``H-1`` is
+          the Riesz-preconditioned residual loss (SV-PINNs, Marcondes 2026, arXiv:2605.03542): for a
+          second-order PDE it turns the |k|^4 curvature of the L2 residual loss into |k|^2.
+
+        The backend comes from the domain: a structured lattice uses per-axis sine/cosine transforms (any real
+        ``s``), a simplex mesh P1 mass and stiffness matrices (``s`` in {-1, 1}; ``H^-1`` costs one CG solve
+        per evaluation). A point cloud without a mesh supports only ``"l2"`` and ``"Linf"`` for now. The
+        field is evaluated at all nodes of its region (as :meth:`integrate` does), not at sampled points.
+        ``norm(...)**2`` is fused into the squared norm, so its gradient has no square root.
+
+        Args:
+            space: ``None`` (pointwise) or a space name, see above.
+            bc: ``"dirichlet"`` (test functions vanish on the boundary, the dual of ``H^1_0``) or
+                ``"neumann"`` (the dual of ``H^1``); only negative orders use it.
+            scale: the ``scale`` in ``(scale - Laplace)^s``, 1 by default; 0 gives the seminorm.
+            method: force a backend, ``"grid"`` or ``"mesh"``; ``None`` picks it from the domain.
+            solver: a ``jno.solve`` linear solver ``(A, b) -> x`` for the mesh ``H^-1`` solve
+                (default: CG to 1e-12 with a Jacobi preconditioner).
+
+        Returns:
+            Placeholder: the pointwise field, or a scalar :class:`Norm` node.
+        """
+        if space is None:
+            return FunctionCall(jnp.abs, [self], "abs")
+        return Norm(self, space, bc=bc, scale=scale, method=method, solver=solver)
 
     @property
     def mse(self) -> FunctionCall:
@@ -5343,6 +5381,36 @@ class Integral(Placeholder):
         if self.integration_var is not None:
             return f"Integral({self.target}, outer={self.integration_var})"
         return f"Integral({self.target})"
+
+
+class Norm(Placeholder):
+    """A function-space norm of ``target`` over its domain region (a scalar). Created by :meth:`Placeholder.norm`.
+
+    ``squared=True`` is the squared norm; ``norm ** 2`` produces it, so the gradient has no square root. The
+    backend is chosen at evaluation from the domain (see :mod:`jno.residual_norms`) and recorded in
+    ``backend`` (``"points"``, ``"region"``, ``"grid"`` or ``"mesh"``).
+    """
+
+    def __init__(self, target, space, *, bc="dirichlet", scale=1.0, method=None, solver=None, squared=False):
+        from ..residual_norms import check_options, parse_space
+
+        self.kind, self.s = parse_space(space)
+        check_options(self.kind, self.s, bc, scale, method)
+        self.target = target
+        self.space, self.bc, self.scale, self.method, self.solver = space, bc, float(scale), method, solver
+        self.squared = squared
+        self.backend = None
+        _propagate_weak(self, target)
+
+    def __pow__(self, other):
+        if not self.squared and isinstance(other, (int, float)) and other == 2:
+            return Norm(
+                self.target, self.space, bc=self.bc, scale=self.scale, method=self.method, solver=self.solver, squared=True
+            )
+        return super().__pow__(other)
+
+    def __repr__(self):
+        return f"Norm({self.target}, {self.space!r}{', squared' if self.squared else ''})"
 
 
 class IntegralTime(Placeholder):

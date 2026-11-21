@@ -99,6 +99,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 |------------|----------|-------|
 | Forward PINNs (residual minimisation) | [stable](tutorials/01-basics/laplace-1d.md) | Hard or soft BC enforcement |
 | Variational PINNs (weak-form losses) | [stable](tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md) | Network trial functions against the FEM weak form |
+| Residual norms (`r.norm("H-1")`, L2, H^s losses) | [beta](tutorials/08-fem-and-varpinns/h-minus-1-residual-loss.md) | Grid (any s) or P1 mesh (s = ±1) backend, picked from the domain |
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](tutorials/11-operator-learning/index.md) | PDE-residual or data-driven |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](adaptive/resampling.md) | |
 | Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |

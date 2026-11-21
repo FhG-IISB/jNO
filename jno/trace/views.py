@@ -1014,8 +1014,11 @@ class VectorView(_DelegatesToPlaceholder):
         raise ValueError("curl requires 2 or 3 spatial variables")
 
     # -- reductions / pairwise --
-    def norm(self) -> "ScalarView":
-        """L2 norm ``sqrt(∑ u_i²)`` → ScalarView."""
+    def norm(self, space: "str | None" = None, **opts):
+        """Euclidean norm ``sqrt(∑ u_i²)`` per point → ScalarView; with a ``space``, the function-space norm of
+        the field (a scalar, built on that pointwise norm), see :meth:`jno.trace.Placeholder.norm`."""
+        if space is not None:
+            return Placeholder.norm(self._expr, space, **opts)
         return ScalarView(FunctionCall(lambda x: jnp.linalg.norm(x, axis=-1), [self._expr], "norm", True))
 
     def dot(self, other) -> "ScalarView":
@@ -2000,16 +2003,34 @@ class MatrixView(_DelegatesToPlaceholder):
         """Eigenvalues via ``jnp.linalg.eigh`` (symmetric input, ascending) → VectorView."""
         return VectorView(FunctionCall(lambda x: jnp.linalg.eigh(x)[0], [self._expr], "eigvals"))
 
-    def norm(self, ord: str = "fro") -> "ScalarView":
-        """Matrix norm (Frobenius by default) → ScalarView.
+    def norm(self, space: "str | None" = None, *, ord="fro", **opts):
+        """Matrix norm per point (Frobenius by default) → ScalarView; with a ``space``, the function-space norm
+        of the field (a scalar), see :meth:`jno.trace.Placeholder.norm`.
 
         Args:
-            ord: the norm, as for ``jnp.linalg.norm`` over the last two axes: ``"fro"`` (default),
-                ``"nuc"``, ``1``, ``2``, ``-1``, ``-2``, ``inf`` or ``-inf``.
+            space: ``None`` for the pointwise norm, or a space name (``"L2"``, ``"H-1"``, ...). The legacy
+                positional ``ord`` (``M.norm("nuc")``, ``M.norm(2)``) is still read as ``ord``.
+            ord: the pointwise norm, as for ``jnp.linalg.norm`` over the last two axes: ``"fro"`` (default),
+                ``"nuc"``, ``1``, ``2``, ``-1``, ``-2``, ``inf`` or ``-inf``. With a Sobolev ``space`` only
+                ``"fro"`` (a Hilbert norm) is allowed.
+            **opts: the options of :meth:`jno.trace.Placeholder.norm` (``bc``, ``scale``, ``method``, ``solver``).
 
         Returns:
-            ScalarView: the norm per point.
+            ScalarView: the norm per point, or a scalar ``Norm`` node.
         """
+        if space is not None and (space in ("fro", "nuc") or not isinstance(space, str)):
+            space, ord = None, space  # legacy positional ord
+        if space is not None:
+            if ord == "fro":
+                return Placeholder.norm(self._expr, space, **opts)
+            from ..residual_norms import parse_space
+
+            if parse_space(space)[0] == "H":
+                raise ValueError(
+                    f"MatrixView.norm({space!r}, ord={ord!r}): a Sobolev norm needs the Frobenius (Hilbert) "
+                    "pointwise norm. Use ord='fro', or an L2/L1/Linf space."
+                )
+            return Placeholder.norm(self.norm(ord=ord)._expr, space, **opts)
         return ScalarView(
             FunctionCall(
                 lambda x, _o=ord: jnp.linalg.norm(x, ord=_o, axis=(-2, -1)),
