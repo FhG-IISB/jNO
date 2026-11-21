@@ -281,6 +281,21 @@ def test_a_mesh_free_shape_domain_is_a_point_cloud():
     assert abs(got_h1 / want - 1) < 5e-2 and abs(got_l2 / 0.25 - 1) < 5e-2, (got_h1 / want, got_l2 / 0.25)
 
 
+def test_a_pinn_trains_on_the_point_cloud_H_minus_1_loss():
+    """Breaks if the point backend only evaluates and fails inside the training step (where the sampled points
+    arrive with other leading axes than in eval)."""
+    dom = jno.shape.rect(0, 0, 1, 1).domain()
+    x, y, _ = dom.variable("interior", sample=(300, None), split=True)
+    ue = sin(PI * x) * sin(PI * y)
+    net = jno.nn(foundax.mlp(2, 1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(0)))
+    node = (-(net(x, y) * x * (1 - x) * y * (1 - y)).laplacian(x, y) - 2 * PI**2 * ue).norm("H-1") ** 2
+    net.optimizer(optax.adam(1e-2))
+    crux = jno.core([node], domain=dom)
+    before = _value(node, dom)
+    crux.solve(50)
+    assert _value(node, dom) < before
+
+
 def test_method_mesh_builds_the_mesh_of_a_mesh_free_shape():
     """Breaks if method="mesh" on a mesh-free shape crashes (the mesh must be built outside the jitted step)."""
     dom = jno.shape.rect(0, 0, 1, 1).domain()

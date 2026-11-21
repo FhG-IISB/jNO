@@ -3005,8 +3005,16 @@ class TraceEvaluator:
         maximum (``Linf``) and the Green's kernel (``H-1``), on the points being evaluated."""
         from .residual_norms import point_cloud_volume, point_kernel_norm_sq, pointwise_sq, shape_volume
 
-        vals = self._dispatch(expr.target, ctx)
-        while vals.ndim > 2 and vals.shape[0] == 1:  # a point cloud's leading batch / time axes of size 1
+        raw = jnp.asarray(ctx.context[tag])
+        if int(np.prod(raw.shape[:-2])) != 1:
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on '{tag}': its points come as {tuple(raw.shape)} (several batches or time "
+                "levels); time-dependent or batched fields are not supported yet. Take the norm per time slice."
+            )
+        flat = raw.reshape(raw.shape[-2], raw.shape[-1])  # (N, D): the layout the derivative nodes expect
+        new_ctx = self._EvalCtx({**ctx.context, tag: flat}, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+        vals = self._dispatch(expr.target, new_ctx)
+        while vals.ndim > 2 and vals.shape[0] == 1:
             vals = vals[0]
         expr.backend = "points"
         if expr.kind == "Linf":
@@ -3019,8 +3027,7 @@ class TraceEvaluator:
                 "(jno.shape.rect(..., size=h)) or use a lattice (.structured(n=...))."
             )
         dim = int(domain.dimension)
-        pts = jnp.asarray(ctx.context[tag])
-        pts = pts.reshape(-1, pts.shape[-1])[:, :dim]
+        pts = flat[:, :dim]
         if vals.shape[0] != pts.shape[0]:
             raise NotImplementedError(
                 f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {pts.shape[0]} points of "
