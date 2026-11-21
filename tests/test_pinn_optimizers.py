@@ -80,7 +80,13 @@ def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     np.testing.assert_allclose(np.asarray(J.T @ r), np.asarray(probe.grads0), rtol=1e-9, atol=1e-13)
 
 
-RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm, jno.optimizers.dngd, jno.optimizers.nystrom_ngd]
+RESIDUAL_SENTINELS = [
+    jno.optimizers.engd,
+    jno.optimizers.lm,
+    jno.optimizers.dngd,
+    jno.optimizers.nystrom_ngd,
+    jno.optimizers.dsgnar,
+]
 
 
 @pytest.mark.parametrize("make", RESIDUAL_SENTINELS, ids=lambda f: f.__name__)
@@ -223,7 +229,9 @@ def test_lm_converges_on_poisson2d():
 
 
 @pytest.mark.parametrize(
-    "make", [jno.optimizers.lm, jno.optimizers.dngd, jno.optimizers.nystrom_ngd], ids=lambda f: f.__name__
+    "make",
+    [jno.optimizers.lm, jno.optimizers.dngd, jno.optimizers.nystrom_ngd],
+    ids=lambda f: f.__name__,
 )
 def test_residual_sentinel_resolve_is_idempotent(make):
     """A second solve() on the same model rebuilds the callback and continues from the weights."""
@@ -406,3 +414,79 @@ def test_dngd_matrix_free_converges_on_poisson2d():
         jno.optimizers.dngd(solver="nystrom_pcg", rank=500, cg_maxiter=200), 200, hidden_dims=64, num_layers=2
     )
     assert np.isfinite(err) and err < 1e-3, f"dngd(nystrom_pcg): rel-L2 {err:.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# dsgnar
+# ---------------------------------------------------------------------------------------------
+
+import importlib  # noqa: E402
+
+_ds = importlib.import_module("jno.optimizers.dsgnar")  # the module; jno.optimizers.dsgnar is the factory
+
+
+def _sketch(m, P, s, seed=0):
+    return _ds._draw_sketch(jax.random.PRNGKey(seed), m, P, s, 2, jnp.float64)
+
+
+def test_dsgnar_parameter_sketch_is_an_isometry_and_the_row_sketch_is_linear():
+    m, P, s = 50, 37, 12
+    sk = _sketch(m, P, s)
+    pt = jax.random.normal(jax.random.PRNGKey(1), (s,))
+    np.testing.assert_allclose(jnp.linalg.norm(_ds._lift(sk, pt, P)), jnp.linalg.norm(pt), rtol=1e-12)
+    a, b = jax.random.normal(jax.random.PRNGKey(2), (2, m))
+    np.testing.assert_allclose(
+        _ds._count_sketch(sk, a + 2 * b, s), _ds._count_sketch(sk, a, s) + 2 * _ds._count_sketch(sk, b, s), atol=1e-12
+    )
+    # each row lands in K=2 buckets with weight 1/sqrt(2): ||C e_j||^2 = 1 unless both hashes collide
+    col = _ds._count_sketch(sk, jax.nn.one_hot(3, m), s)
+    assert float(jnp.sum(col**2)) in (pytest.approx(1.0), pytest.approx(2.0), pytest.approx(0.0))
+
+
+def test_dsgnar_damping_for_a_radius_meets_the_radius():
+    sig = jnp.array([3.0, 1.0, 1e-3])
+    b = jnp.array([1.0, -2.0, 0.5])
+    for delta in (1e-2, 0.3, 1.0):
+        lam = _ds._lm_lambda_for_radius(sig, b, delta)
+        np.testing.assert_allclose(jnp.linalg.norm(sig / (sig**2 + lam) * b), delta, rtol=1e-8)
+    # the undamped step is shorter than a huge radius: no damping
+    assert float(_ds._lm_lambda_for_radius(sig, b, 1e6)) == 0.0
+
+
+def test_dsgnar_stage_switch_follows_the_trend_of_log_damping():
+    W = _ds._WINDOW
+    rising = jnp.linspace(-10.0, -5.0, W)
+    falling = rising[::-1]
+    assert bool(_ds._stage_switch(rising, jnp.asarray(W)))
+    assert not bool(_ds._stage_switch(falling, jnp.asarray(W)))
+    assert not bool(_ds._stage_switch(rising, jnp.asarray(W - 1)))  # window not yet full
+
+
+def test_dsgnar_never_increases_the_loss_and_solves_a_consistent_linear_residual():
+    m, P = 40, 12
+    _, A, _ = _linear_problem(m, P, cond=1e2)
+    x_true = jnp.linspace(-1.0, 1.0, P)
+
+    def r_of(q):
+        return A @ (q - x_true)
+
+    sk = _sketch(m, P, P)
+    state = _ds._DSGNARState(sk, jnp.asarray(1.0), jnp.asarray(False), jnp.zeros(_ds._WINDOW), jnp.asarray(0))
+    step = jax.jit(lambda th, st: _ds._dsgnar_direction(r_of, th, st, s=P))
+    theta, losses = jnp.zeros(P), []
+    for _ in range(40):
+        d, state, info = step(theta, state)
+        theta = theta - d
+        losses.append(float(half_sq_norm(r_of(theta))))
+    assert all(b <= a for a, b in zip(losses, losses[1:]))
+    np.testing.assert_allclose(theta, x_true, atol=1e-7)
+
+
+def test_dsgnar_makes_progress_on_poisson2d():
+    """A characterisation, not the paper's accuracy: at this size (129 parameters, a 43 x 43 sketch
+    of 1020 residual rows) the sketched gradient's sign is close to random, so many steps are
+    rejected; from a standard initialisation the error still falls by more than 10x in 200 epochs
+    (rel-L2 3.4e-2 measured, against 4.9e-5 for lm on the same problem). From the 0.1-scaled
+    initialisation of the other tests it accepts no step at all."""
+    err, _ = _poisson_error(jno.optimizers.dsgnar(), 200, init_scale=1.0)
+    assert np.isfinite(err) and err < 0.1, f"dsgnar: rel-L2 {err:.3e}"

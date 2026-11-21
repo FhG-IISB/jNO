@@ -55,7 +55,7 @@ def _bdy_pts():
     ).astype(_np.float64)
 
 
-def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1):
+def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1, init_scale: float = 0.1):
     """Return (net, losses, gram_terms, eval_error) for Poisson2D on [0,1]²."""
     import foundax
 
@@ -72,7 +72,7 @@ def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1):
         activation=jax.nn.tanh,
         key=jax.random.PRNGKey(seed),
     )
-    scaled = jax.tree_util.tree_map(lambda w: w * 0.1 if eqx.is_array(w) else w, base)
+    scaled = jax.tree_util.tree_map(lambda w: w * init_scale if eqx.is_array(w) else w, base)
     net = jno.nn.wrap(scaled)
 
     pi = jno.np.pi

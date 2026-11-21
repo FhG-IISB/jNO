@@ -45,6 +45,8 @@ residuals of every loss term involving the model (``gram_terms``) instead of onl
   matrix-free with Nyström-preconditioned CG.
 - :func:`nystrom_ngd` — matrix-free natural gradient, Nyström-preconditioned CG and Armijo steps
   (Bioli, Marcati & Sangalli, CMAME 2026, doi:10.1016/j.cma.2026.119456).
+- :func:`dsgnar` — doubly-sketched Gauss-Newton, step length from a target gain ratio
+  (Webb, Jerad & Cartis 2026, arXiv:2607.02194).
 
 The ``scale_by_*`` variants are the bare transforms (no line search / learning-rate wrapper) for
 building your own optax chains.
@@ -63,6 +65,7 @@ from .continuation import (
     simp_continuation,
 )
 from .dngd import DNGDOptimizer, dngd
+from .dsgnar import DSGNAROptimizer, dsgnar
 from .engd import ENGDOptimizer, engd
 from .lm import LMOptimizer, lm
 from .md_decouple import MDOptimizer, md, md_decouple
@@ -78,6 +81,8 @@ __all__ = [
     "ENGDOptimizer",
     "dngd",
     "DNGDOptimizer",
+    "dsgnar",
+    "DSGNAROptimizer",
     "lm",
     "LMOptimizer",
     "nystrom_ngd",
