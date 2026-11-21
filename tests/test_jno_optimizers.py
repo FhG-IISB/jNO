@@ -67,6 +67,7 @@ def test_namespace_is_just_the_optimizers():
         "dsgnar",
         "DSGNAROptimizer",
         "nncg",
+        "score",
         "md",
         "md_decouple",
         "MDOptimizer",
@@ -83,7 +84,7 @@ def test_namespace_is_just_the_optimizers():
         "heaviside_continuation",
         "HeavisideContinuation",
     }
-    for factory in (o.ssbroyden, o.ssbfgs, o.soap, o.nncg):
+    for factory in (o.ssbroyden, o.ssbfgs, o.soap, o.nncg, o.score):
         opt = factory()
         assert hasattr(opt, "init") and hasattr(opt, "update")
     # NOT a re-export of optax — chain/clipping/schedules live in optax, not here

@@ -534,3 +534,48 @@ def test_nncg_fine_tunes_poisson2d():
     start to rel-L2 7.9e-3 (measured; ENGD/LM reach < 1e-6 here), far below Adam's 0.32 after 1000."""
     err, _ = _poisson_error(jno.optimizers.nncg(cg_maxiter=100), 200)
     assert np.isfinite(err) and err < 2e-2, f"nncg: rel-L2 {err:.3e}"
+
+
+# ---------------------------------------------------------------------------------------------
+# score (an optax transform)
+# ---------------------------------------------------------------------------------------------
+
+
+def _quadratic(seed=0, n=6, cond=1e3):
+    Q, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(seed), (n, n)))
+    A = (Q * jnp.logspace(0, np.log10(cond), n)) @ Q.T
+    x_star = jnp.arange(1.0, n + 1)
+    return (lambda q: 0.5 * (q - x_star) @ A @ (q - x_star)), x_star
+
+
+def test_score_minimises_an_ill_conditioned_quadratic():
+    loss, x_star = _quadratic()
+    x, values = _optax_minimise(jno.optimizers.score(), loss, jnp.zeros(6), 60)
+    assert all(b <= a * (1 + 1e-12) + 1e-300 for a, b in zip(values, values[1:]))
+    np.testing.assert_allclose(x, x_star, rtol=1e-8)
+
+
+def test_score_minimises_rosenbrock():
+    def loss(q):
+        return 100.0 * (q[1] - q[0] ** 2) ** 2 + (1.0 - q[0]) ** 2
+
+    x, values = _optax_minimise(jno.optimizers.score(), loss, jnp.array([-1.2, 1.0]), 200)
+    assert all(b <= a * (1 + 1e-12) for a, b in zip(values, values[1:]))
+    np.testing.assert_allclose(x, [1.0, 1.0], atol=1e-6)
+
+
+def test_score_rejects_bad_constants():
+    with pytest.raises(ValueError, match="c1 < c2"):
+        jno.optimizers.score(c1=0.9, c2=0.5)
+    with pytest.raises(ValueError, match="mu_min"):
+        jno.optimizers.score(mu_min=2.0, mu_max=1.0)
+
+
+def test_score_matches_ssbroyden_on_poisson2d():
+    """A quasi-Newton method needs more steps than the Gauss-Newton ones: 500 from the 0.1-scaled
+    start (measured rel-L2 8.8e-4 for score, 4.5e-4 for ssbroyden). The paper's advantage over
+    SSBroyden was shown after Adam pre-training and 150 000 refinement steps, not at this size."""
+    err_score, _ = _poisson_error(jno.optimizers.score(), 500)
+    err_ssb, _ = _poisson_error(jno.optimizers.ssbroyden(), 500)
+    assert np.isfinite(err_score) and err_score < 2e-3, f"score: rel-L2 {err_score:.3e}"
+    assert err_score < 3.0 * err_ssb, (err_score, err_ssb)
