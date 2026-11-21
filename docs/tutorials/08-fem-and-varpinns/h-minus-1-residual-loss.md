@@ -60,8 +60,11 @@ the sum over its components.
 - `method="grid"`, `"mesh"` or `"points"` forces one; the chosen backend is in `node.backend`.
 
 Not yet: other orders than $H^{-1}$ on point clouds, the sampled SV-PINN estimator, periodic
-`bc`, $H^s$ on boundary tags or sub-regions, time-dependent fields, gradients with respect to the mesh
-coordinates. Each raises an error that says so.
+`bc`, $H^s$ on boundary tags or sub-regions, gradients with respect to the mesh coordinates. Each raises an
+error that says so.
+
+Batched fields (`n * domain`, operator learning) and time-dependent fields are normed per batch sample and
+per time level, like every constraint; the training loss averages them, as it does for `r.mse`.
 
 ## The result
 

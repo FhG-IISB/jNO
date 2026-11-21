@@ -307,6 +307,52 @@ def test_method_mesh_builds_the_mesh_of_a_mesh_free_shape():
     assert abs(got / (0.25 / (1 + 2 * PI**2)) - 1) < 1e-1
 
 
+# ---- batched and time-dependent fields (operator learning, transient PINNs) ------------------------------------
+
+
+def _evals(node, dom):
+    crux = jno.core([node], domain=dom)
+    return np.asarray(crux.eval([node], domain=dom)).reshape(-1)
+
+
+@pytest.mark.parametrize("method", ["grid", "mesh"])
+def test_a_stacked_batch_takes_the_norm_per_sample(method):
+    """Breaks if the norm of a batch (n * domain, the operator-learning layout) is taken over the stacked arrays
+    instead of per sample: three identical samples must each give the single-sample value."""
+    one = _lattice(16)
+    _, _, r1 = _eigen(one)
+    single = _value(r1.norm("H-1", method=method) ** 2, one)
+    three = 3 * _lattice(16)
+    x, y, _ = three.variable("interior", split=True)
+    got = _evals((sin(PI * x) * sin(PI * y)).norm("H-1", method=method) ** 2, three)
+    assert got.size == 3
+    np.testing.assert_allclose(got, single, rtol=1e-12)
+
+
+def test_a_time_dependent_field_takes_the_norm_per_time_level():
+    """Breaks if a transient field's norm mixes its time levels or the spatial points with the time axis: the
+    compiler hands each time level to the norm separately (as for every constraint; the training loss then
+    averages them), so r = (1 + t) sin sin must give (1 + t)^2 times the steady value at the level evaluated."""
+    dom = jno.shape.rect(0, 0, 1, 1).structured(n=(16, 16)).domain(time=(0, 1, 4))
+    x, y, t = dom.variable("interior", split=True)[:3]
+    node = ((1 + t) * sin(PI * x) * sin(PI * y)).norm("H-1") ** 2
+    crux = jno.core([node], domain=dom)
+    got, mse, tv = (np.asarray(v).reshape(-1) for v in crux.eval([node, sin(PI * x).mse + 0 * t, t], domain=dom))
+    # eval reduces a time-dependent constraint at the first time level (as it does r.mse), t[0] = 0
+    assert got.size == mse.size == 1 and tv[0] == 0.0
+    np.testing.assert_allclose(got, (1 + tv[0]) ** 2 * 0.25 / (1 + _lam_h(16)), rtol=1e-12)
+
+
+def test_a_stacked_mesh_free_batch_takes_the_point_norm_per_sample():
+    """Breaks if the point backend refuses or mixes a batch of sampled point clouds (each sample its own draw)."""
+    dom = 2 * jno.shape.rect(0, 0, 1, 1).domain()
+    x, y, _ = dom.variable("interior", sample=(2000, None), split=True)
+    got = _evals((sin(PI * x) * sin(PI * y)).norm("L2") ** 2, dom)
+    assert got.size == 2
+    # Monte-Carlo point rule on 2000 uniform points per sample: a few per cent each
+    assert np.all(np.abs(got / 0.25 - 1) < 5e-2), got
+
+
 # ---- boundary, refusals ----------------------------------------------------------------------------------------
 
 

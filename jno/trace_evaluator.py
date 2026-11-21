@@ -2968,9 +2968,10 @@ class TraceEvaluator:
         vals = self._dispatch(expr.target, new_ctx)
         n_pts = region_pts.shape[0]
         if vals.shape[0] != n_pts:
-            raise NotImplementedError(
-                f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {n_pts} nodes of '{tag}'; "
-                "time-dependent or batched fields are not supported yet. Take the norm per time slice."
+            raise ValueError(
+                f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {n_pts} nodes of '{tag}'. The "
+                "compiler hands a norm one batch sample and one time level at a time, so this layout is unexpected "
+                "(a jNO bug); please report it with the expression."
             )
         sq = pointwise_sq(vals)
         weights = jnp.array(cached["weights"])
@@ -3007,9 +3008,10 @@ class TraceEvaluator:
 
         raw = jnp.asarray(ctx.context[tag])
         if int(np.prod(raw.shape[:-2])) != 1:
-            raise NotImplementedError(
-                f"norm({expr.space!r}) on '{tag}': its points come as {tuple(raw.shape)} (several batches or time "
-                "levels); time-dependent or batched fields are not supported yet. Take the norm per time slice."
+            raise ValueError(
+                f"norm({expr.space!r}) on '{tag}': its points come as {tuple(raw.shape)}. The compiler hands a norm "
+                "one batch sample and one time level at a time, so this layout is unexpected (a jNO bug); please "
+                "report it with the expression."
             )
         flat = raw.reshape(raw.shape[-2], raw.shape[-1])  # (N, D): the layout the derivative nodes expect
         new_ctx = self._EvalCtx({**ctx.context, tag: flat}, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
@@ -3029,9 +3031,9 @@ class TraceEvaluator:
         dim = int(domain.dimension)
         pts = flat[:, :dim]
         if vals.shape[0] != pts.shape[0]:
-            raise NotImplementedError(
+            raise ValueError(
                 f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {pts.shape[0]} points of "
-                f"'{tag}'; time-dependent or batched fields are not supported yet."
+                f"'{tag}', an unexpected layout (a jNO bug); please report it with the expression."
             )
         kind_name = getattr(domain, "_geometry_tags", {}).get(tag)
         if kind_name is not None and (kind_name[0] == "boundary" or kind_name[1] is not None):

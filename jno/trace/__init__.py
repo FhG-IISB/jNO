@@ -727,6 +727,9 @@ class Placeholder:
         field is evaluated at all nodes of its region (as :meth:`integrate` does), not at sampled points.
         ``norm(...)**2`` is fused into the squared norm, so its gradient has no square root.
 
+        Batched fields (``n * domain``, operator learning) and time-dependent ones are normed per batch sample
+        and per time level, like every constraint; the training loss averages them, as it does ``mse``.
+
         Args:
             space: ``None`` (pointwise) or a space name, see above.
             bc: ``"dirichlet"`` (test functions vanish on the boundary, the dual of ``H^1_0``) or
@@ -5347,14 +5350,15 @@ def contains_cellwise(expr) -> bool:
 
 
 def contains_integral(expr) -> bool:
-    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` reduction anywhere."""
+    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` / :class:`Norm` reduction anywhere
+    (a value over the whole region, not per point)."""
     seen: set = set()
 
     def walk(node) -> bool:
         if not isinstance(node, Placeholder) or id(node) in seen:
             return False
         seen.add(id(node))
-        if isinstance(node, (Integral, IntegralTime)):
+        if isinstance(node, (Integral, IntegralTime, Norm)):
             return True
         for _kind, _attr, val in _iter_placeholder_children(node):
             if isinstance(val, Placeholder):
@@ -7834,7 +7838,7 @@ def _child_placeholders(node):
         return [node.expr]
     if isinstance(node, (Hessian, Jacobian)):
         return [node.target]
-    if isinstance(node, (Integral, IntegralTime, NetworkGradient, TemporalDerivative)):
+    if isinstance(node, (Integral, IntegralTime, Norm, NetworkGradient, TemporalDerivative)):
         return [node.target]
     if isinstance(node, Tracker):
         return [node.expr]
@@ -8067,7 +8071,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, NetworkGradient):
             visit(node.target)
-        elif isinstance(node, (Integral, IntegralTime)):
+        elif isinstance(node, (Integral, IntegralTime, Norm)):
             visit(node.target)
         elif isinstance(node, TemporalDerivative):
             visit(node.target)
@@ -8137,7 +8141,7 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, NetworkGradient):
             visit(node.target)
-        elif isinstance(node, (Integral, IntegralTime)):
+        elif isinstance(node, (Integral, IntegralTime, Norm)):
             visit(node.target)
         elif isinstance(node, TemporalDerivative):
             visit(node.target)
