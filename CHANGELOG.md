@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- PINN optimizers from the literature in `jno.optimizers`, each module citing its paper at the top:
+  `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent,
+  dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()`
+  (doubly-sketched Gauss-Newton; not yet validated at the published scale), `nncg()` (NysNewton-CG),
+  `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a
+  secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection
+  path in `solve()`.
+
 ## [0.4.2] — 2026-10-23
 
 jNO 0.4.2 adds `jno.peec`, a differentiable partial-element equivalent-circuit solver, and makes a shape's coordinates design variables shared by PEEC and FEM. PINN derivatives are cheaper: every AD derivative on one point set now comes from one shared forward-mode pass. `jno.info` writes the equations in math notation. A comparison against other FEM libraries on the same problems found the FEM fixes below.
