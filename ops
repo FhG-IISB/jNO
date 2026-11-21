@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795273370,"nonce":"wDEtFvCU4bFNmPpvUF0TbePxI68=","added":["branch:feat/pinn-optimizers","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1795273370,"nonce":"uoS3XFnrHCyhqssFycdP4+W+bdw=","message":"Fixed in 3681f21f (chunked forward/reverse mode); test: tests/test_pinn_optimizers.py::test_dngd_converges_on_poisson2d_with_more_parameters_than_rows","files":null}]}
