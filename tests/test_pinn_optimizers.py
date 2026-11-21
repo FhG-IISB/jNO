@@ -80,7 +80,7 @@ def test_residual_jacobian_reproduces_engd_gram_and_loss_gradient():
     np.testing.assert_allclose(np.asarray(J.T @ r), np.asarray(probe.grads0), rtol=1e-9, atol=1e-13)
 
 
-RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm]
+RESIDUAL_SENTINELS = [jno.optimizers.engd, jno.optimizers.lm, jno.optimizers.dngd]
 
 
 @pytest.mark.parametrize("make", RESIDUAL_SENTINELS, ids=lambda f: f.__name__)
@@ -222,7 +222,7 @@ def test_lm_converges_on_poisson2d():
     assert np.isfinite(err) and err < 1e-3, f"lm: rel-L2 {err:.3e}"
 
 
-@pytest.mark.parametrize("make", [jno.optimizers.lm], ids=lambda f: f.__name__)
+@pytest.mark.parametrize("make", [jno.optimizers.lm, jno.optimizers.dngd], ids=lambda f: f.__name__)
 def test_residual_sentinel_resolve_is_idempotent(make):
     """A second solve() on the same model rebuilds the callback and continues from the weights."""
     net, losses, _, eval_error = _build_poisson2d(seed=0)
@@ -233,3 +233,60 @@ def test_residual_sentinel_resolve_is_idempotent(make):
     crux.solve(20)
     e2 = eval_error(crux)
     assert np.isfinite(e2) and e2 <= e1 * 1.01
+
+
+# ---------------------------------------------------------------------------------------------
+# dngd
+# ---------------------------------------------------------------------------------------------
+
+from jno.optimizers.dngd import _dngd_direction  # noqa: E402
+from jno.utils.explainability import engd_direction  # noqa: E402
+
+
+def test_dngd_step_is_the_engd_step_written_in_residual_space():
+    """-Jᵀ(JJᵀ+λI)⁻¹r = (JᵀJ+λI)⁻¹Jᵀr: the m x m solve and ENGD's P x P damped solve agree."""
+    r_of, A, b = _linear_problem(12, 40, cond=1e2)
+    theta = jax.random.normal(jax.random.PRNGKey(3), (40,))
+    lam = 1e-6
+    d, _, _ = _dngd_direction(r_of, theta, (), damping=lam, geodesic=False, line_search=False)
+    G, g = A.T @ A, A.T @ r_of(theta)
+    d_engd = engd_direction(G, g, jnp.zeros(40), damping=lam)
+    np.testing.assert_allclose(d, d_engd, rtol=1e-8, atol=1e-12)
+
+
+def test_dngd_solves_a_consistent_linear_residual_in_one_step():
+    r_of, A, b = _linear_problem(10, 50, cond=1e2)
+    theta0 = jnp.zeros(50)
+    d, _, info = _dngd_direction(r_of, theta0, (), damping=1e-14)
+    theta = theta0 - d
+    np.testing.assert_allclose(A @ theta, b, atol=1e-9)
+    np.testing.assert_allclose(theta, jnp.linalg.pinv(A) @ b, rtol=1e-7, atol=1e-9)
+    assert float(info["eta"]) == 1.0
+    assert bool(info["geodesic"])  # f_vv = 0 for a linear residual: a = 0 always passes the ratio test
+
+
+def test_dngd_geodesic_acceleration_cancels_the_second_order_term():
+    """For r(θ) = Aθ + q(θ) with q quadratic, the accelerated step leaves an O(|v|³) residual where
+    the plain Gauss-Newton step leaves O(|v|²)."""
+    k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+    m, P = 6, 20
+    A = jax.random.normal(k1, (m, P))
+    B = 0.05 * jax.random.normal(k2, (m, P, P))
+    c = 1e-2 * jnp.arange(1.0, m + 1)
+
+    def r_of(q):
+        return A @ q + 0.5 * jnp.einsum("ipq,p,q->i", B, q, q) - c
+
+    theta = jnp.zeros(P)
+    d_plain, _, _ = _dngd_direction(r_of, theta, (), damping=1e-14, geodesic=False, line_search=False)
+    d_acc, _, info = _dngd_direction(r_of, theta, (), damping=1e-14, geodesic=True, line_search=False)
+    assert bool(info["geodesic"])
+    r_plain = float(jnp.linalg.norm(r_of(theta - d_plain)))
+    r_acc = float(jnp.linalg.norm(r_of(theta - d_acc)))
+    assert r_acc < 0.05 * r_plain, (r_plain, r_acc)
+
+
+def test_dngd_converges_on_poisson2d_with_more_parameters_than_rows():
+    # hidden 64 x 2 layers: P = 4417 > m = 1020, the regime the residual-space solve is for
+    err, _ = _poisson_error(jno.optimizers.dngd(), 200, hidden_dims=64, num_layers=2)
+    assert np.isfinite(err) and err < 1e-3, f"dngd: rel-L2 {err:.3e}"

@@ -40,6 +40,8 @@ residuals of every loss term involving the model (``gram_terms``) instead of onl
   SPRING momentum and fixed damping.
 - :func:`lm` — Levenberg-Marquardt, damping adapted from the gain ratio (Levenberg 1944,
   Marquardt 1963; Madsen, Nielsen & Tingleff 2004).
+- :func:`dngd` — Dual Natural Gradient Descent, the Gauss-Newton step solved over the ``m``
+  residual rows, with geodesic acceleration (Jnini & Vella 2025, arXiv:2505.21404).
 
 The ``scale_by_*`` variants are the bare transforms (no line search / learning-rate wrapper) for
 building your own optax chains.
@@ -57,6 +59,7 @@ from .continuation import (
     heaviside_continuation,
     simp_continuation,
 )
+from .dngd import DNGDOptimizer, dngd
 from .engd import ENGDOptimizer, engd
 from .lm import LMOptimizer, lm
 from .md_decouple import MDOptimizer, md, md_decouple
@@ -69,6 +72,8 @@ __all__ = [
     "BoundedOptimizer",
     "engd",
     "ENGDOptimizer",
+    "dngd",
+    "DNGDOptimizer",
     "lm",
     "LMOptimizer",
     "mma",

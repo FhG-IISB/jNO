@@ -96,10 +96,33 @@ def linearize(r_of: Callable, flat_p: jax.Array) -> Linearized:
     return Linearized(r=r, jvp=jvp, vjp=lambda u: vjp_t(u)[0])
 
 
-def jacobian(r_of: Callable, flat_p: jax.Array, m: int) -> jax.Array:
-    """Dense ``J = ∂r̂/∂θ`` (``m x P``), forward mode when there are fewer parameters than rows."""
+JACOBIAN_CHUNK = 64  # basis vectors pushed through the residual at once (bounds the memory of J)
+
+
+def jacobian(r_of: Callable, flat_p: jax.Array, m: int, chunk: int = JACOBIAN_CHUNK) -> jax.Array:
+    """Dense ``J = ∂r̂/∂θ`` (``m x P``), built ``chunk`` columns (forward mode) or rows (reverse mode) at a time.
+
+    ``jax.jacfwd`` / ``jax.jacrev`` push all ``P`` (or ``m``) basis vectors through the residual at
+    once, which holds ``P`` copies of every intermediate of the whole collocation set: a PINN with a
+    few thousand parameters and a Laplacian in the residual runs out of GPU memory that way. Chunking
+    does the same work in ``ceil(P / chunk)`` passes. Forward mode costs ``P`` JVPs, reverse mode one
+    forward pass plus ``m`` VJPs (each about three times a JVP); the cheaper one is used.
+    """
     P = flat_p.shape[0]
-    return jax.jacfwd(r_of)(flat_p) if P <= m else jax.jacrev(r_of)(flat_p)
+    dtype = flat_p.dtype
+    if P <= 3 * m:
+
+        def col(i):
+            return jax.jvp(r_of, (flat_p,), (jax.nn.one_hot(i, P, dtype=dtype),))[1]
+
+        return jax.lax.map(col, jnp.arange(P), batch_size=min(chunk, P)).T
+
+    r, vjp_fn = jax.vjp(r_of, flat_p)
+
+    def row(j):
+        return vjp_fn(jax.nn.one_hot(j, m, dtype=r.dtype))[0]
+
+    return jax.lax.map(row, jnp.arange(m), batch_size=min(chunk, m))
 
 
 def second_directional(r_of: Callable, flat_p: jax.Array, v: jax.Array) -> jax.Array:
