@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1795274259,"nonce":"4B0BbOalQLSOHIfXVtiZfVLpoHs=","message":"Fixed in bbc33a88 (adaptive rank, Algorithm 4 of the paper); test: tests/test_pinn_optimizers.py::test_nystrom_ngd_converges_on_poisson2d","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1795274259,"nonce":"vvMJJ9A1qEGZKto62KZUl8ZR0rY=","status":2}]}
