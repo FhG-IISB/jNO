@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `jno.fdm` by integrating every term over a control volume, so it conserves to round-off and handles convection-dominated flow, shocks, systems of conservation laws and incompressible flow. Nothing in it is specific to a PDE: the fluxes, limiters, well-balancing, boundary conditions and pressure-velocity coupling all read the expressions you write.
+
+### Added
+- `jno.fvm(constraints, centering="cell" | "vertex")`: cell-centred control volumes on line, triangle, quad, tet and hex meshes, or the median dual around the nodes. An outer derivative becomes a face flux, and other terms are evaluated at the centroid. Every boundary condition is one equation per face: Dirichlet, Neumann, Robin, any nonlinear flux law, or a slip wall `U·n = 0` on a vector unknown. Second order on every cell type; the problem has `.centroids`, `.volumes` and `.to_nodes(sol)`.
+- `jno.fv(flux=, limiter=, recon=, average=, speed=, equilibrium=)`: the scheme of a flux, passed as `scheme=` on its outer derivative.
+  - Fluxes: Rusanov, HLL and a generic Roe flux (`|A| = sqrt(A^2 + d^2 I)`, no eigendecomposition) for any system, or a callable.
+  - Limiters for the MUSCL reconstruction: van Albada, minmod, van Leer, superbee, Barth-Jespersen, Venkatakrishnan, or a callable.
+  - `equilibrium=` preserves a given steady state to round-off (Berberich, Chandrashekar & Klingenberg 2021).
+- Saddle pairs found by structure: an equation without its own unknown is a constraint, and its flux gets the Rhie-Chow correction, with a weight probed from the momentum equation. Incompressible Navier-Stokes, Stokes and Darcy run on the same code. On 32 x 32 cells, the Re = 100 lid-driven cavity is within 3.2e-3 of Ghia et al.
+- `jno.solve.erk(method, tableau=, cfl=)`: explicit Runge-Kutta for fvm, fdm and fem blocks: SSPRK2, SSPRK3, SSPRK(5,4), RK4, or any Butcher tableau. Zero-mass rows are solved at every stage, and `cfl=` takes the step from the spectral radius of the first-order operator.
+- `jno.solve.simple()` and `jno.solve.piso()`: pressure-correction solvers on the assembled tangent of any saddle system. `jno.precond.saddle(schur="simple")`: the SIMPLE Schur approximation, built from the assembled operator alone.
+- `jno.fvm(...).solve()` composes into `jno.core` for inverse problems and differentiates under `jax.grad`. `jno.precond.gmg()` runs on the cell lattice of a structured quad or hex mesh, and `jno.info` reports how each equation was read.
+- Docs: `docs/fvm.md`, and five tutorials in `tutorials/14-fvm` (Poisson, advection-diffusion, Burgers shock, Sod shock tube, lid-driven cavity).
+
+### Changed
+- `jno.fdm` and `jno.fvm` share their constraint classification, DOF layout and parameter machinery in `jno._strong_form.StrongFormProblem`. `jno.fdm` behaves as before.
+
 ## [0.4.3] — 2026-11-22
 
 jNO 0.4.3 adds second-order optimizers for PINNs from the recent literature (Levenberg-Marquardt, dual and Nyström natural gradient, NNCG, SCORE, SS-ESOAP and SPRING momentum for ENGD) and a limited-memory self-scaled Broyden for large networks. Coarse spaces and GenEO make two-level Schwarz a one-line preconditioner, and transient FEM gains variable-order BDF, adaptive steps with rejection and every time scheme on every element family. FEM builds and first solves are several times faster, with cuDSS as the direct default on a GPU. Function-space norms give an H^-1 residual loss for PINNs.

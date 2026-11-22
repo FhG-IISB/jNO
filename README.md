@@ -359,10 +359,11 @@ fine-tuning plug into the same `jno.core`.
 | [Coupling & constraints](https://fhg-iisb.github.io/jNO/fem/geometry/) | periodic and Bloch ties, mortar ties between non-matching meshes, contact, moving meshes (ALE) | beta |
 | [Adaptivity](https://fhg-iisb.github.io/jNO/fem/geometry/) | h (anisotropic remeshing), r and p adaptivity | beta |
 | [FDM](https://fhg-iisb.github.io/jNO/fdm/) | strong form on structured and unstructured grids, 2-D and 3-D, geometric multigrid | stable |
+| [FVM](https://fhg-iisb.github.io/jNO/fvm/) | the fdm constraint list by finite volumes, cell- or vertex-centred, 1-D to 3-D; Rusanov, HLL and Roe fluxes with limiters; systems of conservation laws; incompressible flow (Rhie-Chow, SIMPLE, PISO) | beta |
 | [RCWA](https://fhg-iisb.github.io/jNO/rcwa/) | vector Maxwell, anisotropic media, diffraction orders, Jones readout | stable |
 | [PEEC](https://fhg-iisb.github.io/jNO/peec/) | partial-element equivalent circuits: inductance and resistance of conductor layouts, DC to MHz | beta |
 | [Solvers](https://fhg-iisb.github.io/jNO/solvers/) | sparse LU (SuperLU, PARDISO, cuDSS), Krylov, AMG, AMS, Schwarz with coarse spaces (GenEO); Newton; eigenproblems (LOBPCG, shift-invert, Arnoldi) | stable |
-| [Time integration](https://fhg-iisb.github.io/jNO/solvers/) | θ-method, BDF2, SDIRK, Rosenbrock, exponential, adaptive steps | stable |
+| [Time integration](https://fhg-iisb.github.io/jNO/solvers/) | θ-method, BDF2, SDIRK, Rosenbrock, exponential, explicit SSP Runge-Kutta, adaptive steps | stable |
 | [Inverse & design](https://fhg-iisb.github.io/jNO/inverse-problems/) | gradients through any solve: coefficients, fields, geometry, topology optimisation (MMA) | stable |
 | [Geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) | CSG via gmsh-OCC, multi-material regions, signed distance, mesh import | stable |
 | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) | FEM, FDM and PINN subdomains in one problem | beta |
