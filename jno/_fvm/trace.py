@@ -1047,6 +1047,16 @@ class _PrecondHost:
         self._problem = problem
         self.domain = types.SimpleNamespace(mesh_connectivity={"grid": grid} if grid is not None else {})
 
+    @property
+    def blocks(self):
+        """Per-unknown DOF slices of the blocked state (what the saddle preconditioners slice by)."""
+        p = self._problem
+        return [slice(b * p._N, (b + c) * p._N) for b, c in zip(p._block0, p._ncomp)]
+
+    @property
+    def _saddle_block_indices(self):
+        return tuple(sorted(self._problem._saddle))
+
     def __getattr__(self, name):
         return getattr(self._problem, name)
 

@@ -129,3 +129,21 @@ def test_a_constraint_must_carry_one_unknown():
     ai, bi, ci = a.bind(x=x, y=y), b.bind(x=x, y=y), c.bind(x=x, y=y)
     with pytest.raises(ValueError, match="constraint"):
         jno.fvm([ai.xx + bi.x, ai.x + ci.y, ci.xx + ai])  # equation 1 has no b, and carries a and c
+
+
+def test_a_krylov_solve_with_the_simple_schur_saddle_preconditioner():
+    """``jno.precond.saddle(schur="simple")`` builds ``D − C diag(A)⁻¹ B`` from the assembled operator: gmres
+    with it reaches the direct solution of a Darcy saddle system."""
+    d = jno.shape.rect(0, 0, 1, 1, size=1 / 16).domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    U, P = d.unknown.vector(2), d.unknown()
+    Ui, pi = U.bind(x=x, y=y), P.bind(x=x, y=y)
+    cons = [
+        Ui + jnn.stack([pi.x, pi.y], axis=-1),
+        Ui[0].x + Ui[1].y - 2 * PI**2 * jnn.sin(PI * x) * jnn.sin(PI * y),
+        P(xb, yb) - 0.0,
+    ]
+    a = np.asarray(jno.fvm(cons).solve())
+    b = np.asarray(jno.fvm(cons).solve(linear=jno.solve.gmres(tol=1e-12), precond=jno.precond.saddle(schur="simple")))
+    np.testing.assert_allclose(a, b, atol=1e-10)
