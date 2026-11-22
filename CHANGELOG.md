@@ -4,6 +4,22 @@
 
 ### Added
 - `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh (sampled points) the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss`.
+- PINN optimizers from the literature in `jno.optimizers`, each module citing its paper at the top:
+  `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent,
+  dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()`
+  (doubly-sketched Gauss-Newton; not yet validated at the published scale), `nncg()` (NysNewton-CG),
+  `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a
+  secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection
+  path in `solve()`.
+- `ssbroyden(pairs=m)` and `ssbfgs(pairs=m)`: the self-scaled metric on at most `m` directions in
+  `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN:
+  160 MB at `m = 100` instead of 315 GB). `pairs=None`, the default, is the dense solver, unchanged.
+
+### Fixed
+- `engd` builds its Gram matrix from the residual Jacobian a chunk of parameters at a time (it ran out
+  of GPU memory at about a thousand parameters on a Laplacian residual) and solves from the SVD of that
+  Jacobian instead of from G = JᵀJ, which squared its condition number: on a near-singular G the old
+  solve made the training path depend on rounding.
 
 ## [0.4.2] — 2026-10-23
 

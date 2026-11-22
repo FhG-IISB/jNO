@@ -2646,36 +2646,28 @@ class core:
                             f"but there are only {self.n_constraints} constraints (indices 0–{self.n_constraints - 1})."
                         )
 
-        # ── ENGD optimizer auto-expansion ────────────────────────────────────
-        # Detect ENGDOptimizer sentinels before the _has_before_update_hooks
-        # check below so the injected ENGDCallback is visible to that guard.
+        # ── Residual-optimizer auto-expansion (engd, lm, dngd, nystrom_ngd, dsgnar) ──
+        # Detect ResidualOptimizer sentinels before the _has_before_update_hooks
+        # check below so the injected callback is visible to that guard.
         # We do NOT mutate fm._opt_fn — _engd_opt_overrides is threaded to the
         # optimizer-build loop so re-calls to solve() stay idempotent.
-        from .optimizers import ENGDOptimizer as _ENGDOptimizer
-        from .utils.adaptive.callbacks import ENGDCallback as _ENGDCallback
+        from .optimizers._sentinel import ResidualOptimizer as _ResidualOptimizer
 
         _engd_opt_overrides: Dict[int, Any] = {}
         for _lid, _fm in self._collect_flax_modules().items():
-            if isinstance(_fm._opt_fn, _ENGDOptimizer):
+            if isinstance(_fm._opt_fn, _ResidualOptimizer):
                 _sentinel = _fm._opt_fn
                 _gts = _sentinel._gram_terms
                 if _gts is None:
                     _gts = _auto_gram_terms(self.constraints, _fm)
                 if not _gts:
                     raise ValueError(
-                        f"jno.optimizers.engd: could not auto-detect gram_terms for "
+                        f"{_sentinel._who}: could not auto-detect gram_terms for "
                         f"model (layer_id={_lid}). Pass gram_terms= explicitly to "
-                        "engd(), or ensure the model appears in at least one loss "
+                        f"{_sentinel._factory_name}(), or ensure the model appears in at least one loss "
                         "expression passed to jno.core(...)."
                     )
-                _cb = _ENGDCallback(
-                    gram_terms=_gts,
-                    gram_interval=_sentinel._gram_interval,
-                    rcond=_sentinel._rcond,
-                    line_search=_sentinel._line_search,
-                    momentum=_sentinel._momentum,
-                    damping=_sentinel._damping,
-                )
+                _cb = _sentinel.build_callback(_gts)
                 if callbacks is None:
                     callbacks = [_cb]
                 else:

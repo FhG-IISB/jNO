@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from ._sentinel import ResidualOptimizer
+
 
 # docstring-from: jno.optimizers.engd.engd
-class ENGDOptimizer:
+class ENGDOptimizer(ResidualOptimizer):
     r"""Return an ENGD optimizer sentinel to pass to ``net.optimizer()``.
 
     Energy Natural Gradient Descent (E-NGD, Müller & Zeinhofer, ICML 2023,
@@ -90,12 +92,32 @@ class ENGDOptimizer:
         from jno.utils.adaptive.callbacks import _check_spring_args
 
         _check_spring_args(momentum, damping, "jno.optimizers.engd")
-        self._gram_terms = gram_terms
+        super().__init__(gram_terms)
         self._gram_interval = gram_interval
         self._rcond = rcond
         self._line_search = line_search
         self._momentum = float(momentum)
         self._damping = float(damping)
+
+    _who = "jno.optimizers.engd"
+
+    def build_callback(self, gram_terms):
+        """Return the callback that computes this optimizer's step inside ``solve()``.
+
+        Args:
+            gram_terms: ``(NetworkGradient, weight)`` pairs, one per residual class (auto-detected by
+                ``solve()`` unless given to the factory).
+        """
+        from jno.utils.adaptive.callbacks import ENGDCallback
+
+        return ENGDCallback(
+            gram_terms=gram_terms,
+            gram_interval=self._gram_interval,
+            rcond=self._rcond,
+            line_search=self._line_search,
+            momentum=self._momentum,
+            damping=self._damping,
+        )
 
     def __repr__(self):
         parts = [f"gram_interval={self._gram_interval}"]
