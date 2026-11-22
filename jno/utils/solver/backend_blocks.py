@@ -896,6 +896,53 @@ def _block_time_grid(block):
     return jnp.linspace(t0, t1, n_steps + 1)
 
 
+def window_block(block, span=None, state0=None, who="solve"):
+    """``block`` marched over ``span = (t0, t1)`` from ``state0`` instead of its own window and initial state.
+
+    The step stays the block's own ``dt``, and the window must hold a whole number of them: the step solvers
+    composed for the block bake ``dt`` in, and two windows that tile the block's window then take exactly the
+    steps one march takes. ``state0`` replaces the initial
+    condition; a window that starts after the block's own start needs it, as nothing else says what the state
+    is there. The copy keeps the compiled time-scheme pieces the block holds (keyed on what they bake in) but
+    not its traced marches, which are keyed on the identity of the block's fields.
+
+    Returns ``block`` itself when neither is given."""
+    import copy
+
+    import jax.numpy as jnp
+
+    if span is None and state0 is None:
+        return block
+    b0, b1, dt = float(block.t0), float(block.t1), float(block.dt)
+    t0, t1 = (b0, b1) if span is None else (float(span[0]), float(span[1]))
+    if not t1 > t0:
+        raise ValueError(f"{who}(span=({t0}, {t1})): a window ends after it starts.")
+    if state0 is None and abs(t0 - b0) > 1e-12 * max(1.0, abs(b0), abs(b1)):
+        raise ValueError(
+            f"{who}(span=({t0}, {t1})): the window starts after the initial time {b0}, so the state there is "
+            "unknown; pass it as x0= (the last frame of the window before, say)."
+        )
+    n = round((t1 - t0) / dt)
+    if n < 1 or abs(n * dt - (t1 - t0)) > 1e-9 * max(dt, abs(t1 - t0)):
+        raise ValueError(
+            f"{who}(span=({t0}, {t1})): the window is {(t1 - t0) / dt:.6g} steps of the problem's dt = {dt:g}; "
+            "it must be a whole number of them (set the step with domain.time)."
+        )
+    out = copy.copy(block)
+    for private in ("_march_cache", "_device_consts"):  # keyed on field identities: built afresh per window
+        out.__dict__.pop(private, None)
+    out.t0, out.t1 = t0, t1
+    if state0 is not None:
+        s0 = jnp.asarray(state0).reshape(-1)
+        n0 = int(jnp.asarray(block.state0).size)
+        if int(s0.size) != n0:
+            raise ValueError(f"{who}(x0=...): the state has {int(s0.size)} entries; this march needs {n0}.")
+        out.state0 = s0.astype(jnp.asarray(block.state0).dtype)
+        if getattr(out, "state0_fn", None) is not None:
+            out.state0_fn = None  # a parametric initial state is replaced too
+    return out
+
+
 def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, theta=None):
     """March in chunks of ``cadence`` steps, re-composing the per-step solvers between them.
 

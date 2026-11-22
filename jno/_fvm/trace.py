@@ -750,26 +750,39 @@ class _TraceFVM(StrongFormProblem):
             return _solve.cg(tol=1e-12), (precond if precond is not None else jno_precond.amg())
         return _solve.gmres(tol=1e-12), (precond if precond is not None else jno_precond.ilu())
 
-    def solve(self, nonlinear=None, x0=None, *, linear=None, precond=None, time=None, save_ts=None):
+    def solve(self, nonlinear=None, x0=None, *, linear=None, precond=None, time=None, save_ts=None, span=None):
         """Solve the problem: the cell values, ``(N,)`` for one scalar unknown, ``(n_fields, N)`` otherwise.
 
         Args:
             nonlinear: a ``jno.solve`` nonlinear driver; default Newton on the assembled tangent.
-            x0: initial guess (blocked DOF vector).
+            x0: steady: the initial guess (blocked DOF vector). Transient: the state the march starts from, in
+                place of the initial condition (a frame of an earlier march, flattened).
             linear: a ``jno.solve`` linear solver; default ``cg`` (symmetric) or ``gmres``.
             precond: a ``jno.precond`` spec; default ``amg`` (symmetric) or ``ilu``.
+            time: the time scheme of a transient problem.
+            save_ts: the times a transient solve returns (default: the step grid).
+            span: ``(t0, t1)``, march only this window of ``domain.time``, a whole number of its steps; a window
+                after the start needs ``x0=``. Returns the frames of the window's grid, both ends included.
         """
+        if span is not None and not self._transient:
+            raise ValueError("jno.fvm([...]).solve(span=...) marches a window of a transient problem; this one is steady.")
         trainable = self._trainable_params()
         if trainable:
             return self._parametric_node(
-                trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts
+                trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts, span=span
             )
         self._record_fixed_networks()
-        return self._solve_now(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts)
+        return self._solve_now(
+            nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts, span=span
+        )
 
-    def _solve_now(self, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None, extra_params=None):
+    def _solve_now(
+        self, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None, span=None, extra_params=None
+    ):
         if self._transient:
-            traj = self._march(nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts)
+            traj = self._march(
+                nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts, x0=x0, span=span
+            )
             return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
         u = self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, extra_params=extra_params)
         return self._shape(u)
@@ -906,7 +919,7 @@ class _TraceFVM(StrongFormProblem):
 
         return stable
 
-    def _march(self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None):
+    def _march(self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None, x0=None, span=None):
         """Method of lines: ``M u̇ + R(u, t) = 0`` with ``M = diag(c·V)`` (zero on pinned cells), marched by
         ``time=`` (backward Euler by default, any ``jno.solve`` scheme, ``jno.solve.erk`` explicitly).
         A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``."""
@@ -925,7 +938,9 @@ class _TraceFVM(StrongFormProblem):
                 self._lru_put(key, kept)
         block, steppers, second, n = kept
         from ..fdm import _integrate_transient
+        from ..utils.solver.backend_blocks import window_block
 
+        block = window_block(block, span, x0, who="jno.fvm([...]).solve")
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         traj = _integrate_transient(block, ts, time, *steppers)
         return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)

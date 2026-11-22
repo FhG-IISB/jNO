@@ -1871,7 +1871,9 @@ class _ERKScheme(_TimeScheme):
         # The compiled pieces are kept on the block, keyed by the tableau, so a repeated solve of a problem that
         # keeps its block (jno.fvm does) neither traces nor compiles again; a traced march is built afresh.
         cache = {} if traced else block.__dict__.setdefault("_erk_compiled", {})
-        ident = (self.name, self.A.tobytes(), self.b.tobytes(), self.c.tobytes(), int(grid.shape[0]))
+        # keyed on everything a compiled piece bakes in: the tableau, the step and the number of steps (the grid
+        # itself is an argument), so the windows of a coupled march (`window_block`) share them
+        ident = (self.name, self.A.tobytes(), self.b.tobytes(), self.c.tobytes(), int(grid.shape[0]), dt)
         step = cache.get(("step", ident))
         if step is None:
             step = cache[("step", ident)] = self.stepper(block, args)
@@ -1903,13 +1905,13 @@ class _ERKScheme(_TimeScheme):
                 u = run(u, t_next - dt, sub)
                 return u, u
 
-            def march(s0):
+            def march(s0, grid):
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
                 return jnp.concatenate([s0[None, :], ys], axis=0)
 
             if not traced:
                 march = cache[("march", ident, sub)] = jax.jit(march)
-        traj = march(s0)
+        traj = march(s0, grid)
         return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
 
     def __repr__(self):

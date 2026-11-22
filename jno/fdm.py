@@ -1683,13 +1683,16 @@ class _TraceFDM(StrongFormProblem):
                 v0 = v0.at[jnp.asarray(b * self._N + idx)].set(vb)
         return v0
 
-    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None):
+    def solve(
+        self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None, span=None
+    ):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
         **Transient** problems (an ``u(initial) - u0`` condition is present) march by method-of-lines —
         ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
-        return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state).
+        return the trajectory (``(n_save, N)``). There ``x0=`` is the state the march starts from, in place of the
+        initial condition (a frame of an earlier march, flattened; a ``u.tt`` problem takes ``[u; v]``).
 
         ``linear=`` and ``precond=`` are the same solver slots as ``fem.solve``'s: any ``jno.solve``
         linear solver (``cg``, ``bicgstab``, ``gmres``, ``lu``, …) and any ``jno.precond`` spec (``jacobi``,
@@ -1707,21 +1710,34 @@ class _TraceFDM(StrongFormProblem):
 
         ``save_ts=`` are the times a transient solve returns, exactly as ``fem.solve(save_ts=…)``: the march
         keeps its own step ``Δt`` from ``domain.time`` and the trajectory is sampled at ``save_ts`` (linear
-        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step."""
+        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step.
+
+        ``span=(t0, t1)`` marches only that window of ``domain.time`` (a whole number of its steps); a window
+        that starts after the initial time needs ``x0=``. It returns the frames of the window's grid, both
+        ends included, so marching two windows, the second from the first's last frame, is one march."""
         if save_ts is not None and not self._transient:
             raise ValueError("jno.fdm([...]): save_ts= samples a transient march; this problem is steady.")
+        if span is not None and not self._transient:
+            raise ValueError("jno.fdm([...]): span= marches a window of a transient problem; this one is steady.")
 
         def _run():
             trainable = self._trainable_params()
             self._record_fixed_networks()
             if self._transient:
-                if x0 is not None:
-                    raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
                 if trainable:
                     return self._parametric_node(
-                        trainable, nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts
+                        trainable,
+                        nonlinear=nonlinear,
+                        x0=x0,
+                        linear=linear,
+                        precond=precond,
+                        time=time,
+                        save_ts=save_ts,
+                        span=span,
                     )
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
+                return self._march(
+                    nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts, x0=x0, span=span
+                )
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
             return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
@@ -2407,7 +2423,9 @@ class _TraceFDM(StrongFormProblem):
         Schwarz driver builds once and reuses)."""
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
-    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None):
+    def _parametric_node(
+        self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None, span=None
+    ):
         """When the constraints carry a trainable ``jno.np.parameter`` or ``jno.nn`` network (an inverse
         parameter), return the solve as a **trace node** instead of an array — exactly as ``fem.solve()``
         does — so it composes into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with
@@ -2435,7 +2453,9 @@ class _TraceFDM(StrongFormProblem):
             # consults (the PDE, boundary and flux values, time coefficients, initial values).
             self._override = extra
             try:
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
+                return self._march(
+                    nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts, x0=x0, span=span
+                )
             finally:
                 self._override = None
 
@@ -2443,7 +2463,7 @@ class _TraceFDM(StrongFormProblem):
         node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
         return node
 
-    def _march(self, *, nonlinear=None, save_ts=None, time=None, linear=None, precond=None):
+    def _march(self, *, nonlinear=None, save_ts=None, time=None, linear=None, precond=None, x0=None, span=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
         :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
         nodes; **Dirichlet and Neumann/Robin flux nodes carry a zero mass row** — Dirichlet pins to ``g``,
@@ -2474,7 +2494,9 @@ class _TraceFDM(StrongFormProblem):
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
-            traj = self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
+            traj = self._march_second_order(
+                spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots, start=(span, x0)
+            )
             # (steps, field, node) for a vector or coupled field, as the first-order march returns
             return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
 
@@ -2488,10 +2510,10 @@ class _TraceFDM(StrongFormProblem):
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             return boundary_rows(wn, spatial_res(wn, t), t)
 
-        traj = self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
+        traj = self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots, start=(span, x0))
         return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)  # (steps, field, node)
 
-    def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots):
+    def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots, start=(None, None)):
         """Build the semidiscrete block ``M ẏ + R(y) = 0`` and march it.
 
         With no solver slots it is a residual block, stepped by the matrix-free Newton–Krylov (the
@@ -2552,6 +2574,9 @@ class _TraceFDM(StrongFormProblem):
         steppers = (None, None)
         if linear is not None or precond is not None or nonlinear is not None:
             steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+        from .utils.solver.backend_blocks import window_block
+
+        block = window_block(block, *start, who="jno.fdm([...]).solve")  # x0= / span=: march from that state
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         return _integrate_transient(block, ts, time, *steppers)
 
@@ -2641,7 +2666,9 @@ class _TraceFDM(StrongFormProblem):
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         return block, nonlinear, linear
 
-    def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots):
+    def _march_second_order(
+        self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots, start=(None, None)
+    ):
         """March ``m·u_tt + c·u_t + R_spatial(u) = 0`` as the first-order augmented system in
         ``y = [u; v]`` with ``v = u_t`` — the same reduction :func:`jno.fem` makes for ``u_tt``:
 
@@ -2676,7 +2703,7 @@ class _TraceFDM(StrongFormProblem):
         # operator comes out rank-deficient (measured: rank 152 of 162 on a two-component wave) and CG
         # returns NaN, so such a system marches the augmented [u; v] block instead -- the same answer, twice
         # the unknowns per step. Making Newmark work for systems is open.
-        if time is None and self._nf == 1:
+        if time is None and self._nf == 1 and start[0] is None and start[1] is None:  # a window: the [u; v] block
             traj = self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
             if save_ts is None:
                 return traj
@@ -2686,7 +2713,7 @@ class _TraceFDM(StrongFormProblem):
             return _resample_trajectory(traj, grid_ts, save_ts, traj.dtype)
         state0 = jnp.concatenate([self._initial_state(), v0])
         metadata = {"theta": 0.5, "second_order": True}
-        return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots)[:, :N]
+        return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots, start=start)[:, :N]
 
     def _newmark(self, spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, window, slots):
         """The default ``u.tt`` march: Newmark average acceleration (Newmark 1959, J. Eng. Mech. Div. 85),

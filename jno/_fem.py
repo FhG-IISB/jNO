@@ -2910,9 +2910,16 @@ class FEM:
         basis=None,
         shard=None,
         profile=False,
+        span=None,
         **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
 
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
@@ -3098,6 +3105,7 @@ class FEM:
             tau=tau,
             basis=basis,
             shard=shard,
+            span=span,
         )
         given = {k: v for k, v in slots.items() if v is not None}
         if profile:
@@ -3212,6 +3220,7 @@ class FEM:
         basis=None,
         shard=None,
         profile=False,
+        span=None,
         **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
@@ -3443,6 +3452,7 @@ class FEM:
                         time=time,
                         tau=tau,
                         shard=shard,
+                        span=span,
                         **kwargs,
                     )
             finally:
@@ -3697,6 +3707,7 @@ class FEM:
         tau=None,
         shard=None,
         continuation=None,
+        span=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
@@ -3787,6 +3798,7 @@ class FEM:
             linear = _solve_ns.lu()
         has_slots = (
             (x0 is not None)
+            or (span is not None)
             or (nonlinear is not None)
             or (linear is not None)
             or (precond is not None)
@@ -3995,6 +4007,7 @@ class FEM:
                 time=time,
                 shard=shard,
                 kwargs=kwargs,
+                span=span,
             )
             from_slots = True
         else:
@@ -4454,7 +4467,7 @@ class FEM:
         except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
             return False
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs, span=None):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
@@ -4467,6 +4480,8 @@ class FEM:
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
             )
+        if span is not None and self._mode != "transient":
+            raise ValueError(f"fem.solve(span=...) marches a window of a transient problem; this one is {self._mode}.")
         if time is not None and getattr(time, "limit", None) is not None:
             # Checked here rather than in the scheme, because not every transient route reaches a
             # scheme's own `integrate` — and applying the wrong step-size criterion silently would be a
@@ -4482,12 +4497,12 @@ class FEM:
             # slot/precond see the step operator (M + theta dt A) -- materialized ONCE before the
             # scan when the operator is time-independent -- and the nonlinear slot drives each
             # implicit step. The bring-your-own (block, args, save_ts) contract is unchanged.
-            if x0 is not None:
-                raise ValueError(
-                    "fem.solve: x0= on a transient problem -- the initial state comes from the initial "
-                    "conditions, and each step already warm-starts from the previous state."
-                )
-            from .utils.solver.backend_blocks import _default_transient_integrate
+            from .utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate, window_block
+
+            if x0 is not None or span is not None:  # march a window from a given state (checked here, once)
+                _window_grid = _block_time_grid(window_block(self._op, span, x0, who="fem.solve"))
+                if kwargs.get("save_ts") is None:
+                    kwargs = {**kwargs, "save_ts": _window_grid}
             from .utils.solver.solver_api import (
                 _refresh_cadence,
                 _uncached,
@@ -4520,6 +4535,7 @@ class FEM:
                 _preflight(self._op)
 
             def _stepper(block, args, save_ts):
+                block = window_block(block, span, x0, who="fem.solve")  # the block itself without x0= / span=
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
                     return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
                 if _cadence is not None and not isinstance(save_ts, jax.core.Tracer):
