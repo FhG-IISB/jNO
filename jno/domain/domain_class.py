@@ -213,7 +213,7 @@ def _named_point_groups(mesh):
             local = idx - (int(idx.min()) if idx.max() >= len(data) else 0)
             ids.append(data[local[(local >= 0) & (local < len(data))]].reshape(-1))
         if ids:
-            out[name] = pts[np.unique(np.concatenate(ids))]
+            out[name] = pts[unique_values(np.concatenate(ids))]
     return out
 
 
