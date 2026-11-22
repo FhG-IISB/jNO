@@ -39,6 +39,7 @@ from .._strong_form import (
     _contains_unknown,
     _context_leaf,
     _find_unknowns,
+    _has_temporal,
     _iter,
     _rtol,
     _set_temporal,
@@ -826,6 +827,22 @@ class _TraceFVM(StrongFormProblem):
         """Per-cell coefficients of ``u.t`` and ``u.tt`` in every equation, as functions of time
         ``(c(t), m(t))``, each ``(n, nf)``; probed as ``F(u.t=1) − F(0)``, and refused when they depend on u."""
         exprs = [e["volume"] for e in self._equations]
+
+        def temporal_part(e):
+            """Only the terms of ``e`` that hold a time derivative: the others (a source ``p`` of an axisymmetric gas,
+            ``m/ρ`` inside it) are NaN at the probe's constant state 0 and would make the coefficient NaN."""
+            if e is None:
+                return None
+            keep = [(sg, tm) for sg, tm in _signed_terms(e, distribute=False) if _has_temporal(tm)]
+            if not keep:
+                return None
+            out = None
+            for sg, tm in keep:
+                tm = tm if sg > 0 else -1.0 * tm
+                out = tm if out is None else out + tm
+            return out
+
+        exprs = [temporal_part(e) for e in exprs]
 
         def coef(t_val, tt_val, t, state, with_scale=False):
             q = [jnp.full((self._N, c), state) for c in self._ncomp]

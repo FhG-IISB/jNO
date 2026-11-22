@@ -577,12 +577,21 @@ class FEMParticipant(Participant):
         return jnp.asarray(evaluate_at(expr, iface.points, leaf, domain=self.domain)).reshape(-1)
 
     def _flux_field(self, expr):
+        """The field whose flux ``expr`` is: the one it differentiates (a thermal stress also reads T, undifferentiated)."""
         found = []
 
-        def walk(n):
+        def collect(n):
             n = _unwrap(n)
             if self.owns(n):
                 found.append(n)
+            for c in _iter(n):
+                collect(c)
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, _derivative_nodes()):
+                collect(n.target)
+                return
             for c in _iter(n):
                 walk(c)
 

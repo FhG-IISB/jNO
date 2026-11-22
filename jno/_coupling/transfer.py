@@ -22,7 +22,8 @@ nodal fields:
   but turns a uniform flux into a non-uniform one across non-matching nodes, measured at 3 % in a slab.)
 
 ``measure`` sets ``dμ``: plain length/area, ``"axisymmetric"`` (``2π r ds`` with ``r`` the second coordinate,
-for an ``(x, r)`` meridian plane), or any callable of the points.
+for an ``(x, r)`` meridian plane; ``"axisymmetric:0"`` with ``r`` the first, an ``(r, z)`` one), or any callable of the
+points.
 """
 
 from __future__ import annotations
@@ -53,13 +54,27 @@ _D4_L = np.array(
 _D4_W = np.array([0.223381589678011] * 3 + [0.109951743655322] * 3)
 
 
+def radial_axis(measure):
+    """The coordinate that is ``r`` in an axisymmetric measure: ``"axisymmetric"`` the second (an ``(x, r)``
+    meridian), ``"axisymmetric:0"`` the first (an ``(r, z)`` one); ``None`` for any other measure."""
+    if isinstance(measure, str) and measure.startswith("axisymmetric"):
+        tail = measure[len("axisymmetric") :]
+        if tail in ("", ":1"):
+            return 1
+        if tail == ":0":
+            return 0
+        raise ValueError(f"measure={measure!r}: use 'axisymmetric' (r the second coordinate) or 'axisymmetric:0'.")
+    return None
+
+
 def _measure_fn(measure):
     if measure is None:
         return lambda p: np.ones(p.shape[0])
     if isinstance(measure, str):
-        if measure != "axisymmetric":
+        k = radial_axis(measure)
+        if k is None:
             raise ValueError(f"measure={measure!r}: use None, 'axisymmetric' or a callable of the points (n, dim).")
-        return lambda p: 2.0 * np.pi * p[:, 1]
+        return lambda p: 2.0 * np.pi * p[:, k]
     if callable(measure):
         return lambda p: np.asarray(measure(p), dtype=float).reshape(p.shape[0])
     raise TypeError(f"measure={measure!r}: use None, 'axisymmetric' or a callable of the points (n, dim).")
@@ -96,6 +111,16 @@ class Interface:
     def of(cls, domain, tag, measure=None):
         """The interface a boundary ``tag`` of ``domain`` carries."""
         facets = domain.tag_facets(tag)
+        if facets is None:
+            # a tag made by a predicate (`domain.tag(...)`) knows its mesh NODES (`tag_node_mask`; its
+            # `tag_indices` index a sampling pool, not the mesh): its facets are the boundary facets whose
+            # nodes all carry it
+            boundary = domain.tag_facets("boundary")
+            if boundary is not None:
+                pts_all = np.asarray(domain.mesh_connectivity["points"], dtype=float)
+                nodes = np.flatnonzero(np.asarray(domain.tag_node_mask(tag, pts_all)))
+                mine = np.isin(np.asarray(boundary), nodes).all(axis=1)
+                facets = np.asarray(boundary)[mine] if mine.any() else None
         if facets is None:
             raise ValueError(f"interface: the domain has no boundary facets tagged {tag!r}.")
         dim = int(getattr(domain, "dimension", np.asarray(domain.mesh_connectivity["points"]).shape[1]))

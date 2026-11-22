@@ -2139,8 +2139,9 @@ def coupling(
             (Quarteroni & Valli 1999); ``"auto"`` sets ``alpha = sqrt(S_a S_b)`` from the two interface
             stiffnesses. Robust when neither side is much stiffer than the other.
         measure: the interface measure: ``None`` (length or area), ``"axisymmetric"`` (``2π r ds``, ``r`` the
-            second coordinate) or a callable of the points. It must match the measure the problems' own
-            forms integrate with.
+            second coordinate, an ``(x, r)`` meridian), ``"axisymmetric:0"`` (``r`` the first, ``(r, z)``) or a callable
+            of the points. It must match the measure the problems' own forms integrate with: a finite-element
+            side's interface load is written with it (``2π r``).
         implicit: iterate every window to ``tol`` (``True``), or one sweep per window (``False``, loose coupling:
             cheaper, first order in the window, not energy-conserving).
         window: the coupling window of a transient coupling, a whole number of every problem's step; default the

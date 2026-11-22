@@ -183,6 +183,16 @@ def _directional(view, components, scheme):
     return out
 
 
+def _bindings_on_two_meshes(cv, other_cv) -> bool:
+    """Do two coordinate bindings name Variables of two different domains (an interface condition between
+    problems on their own meshes)?"""
+    doms = {id(getattr(v, "_domain", None)) for v in cv.values()}
+    other = {id(getattr(v, "_domain", None)) for v in other_cv.values()}
+    return None not in {getattr(v, "_domain", None) for v in list(cv.values()) + list(other_cv.values())} and not (
+        doms & other
+    )
+
+
 def _coord_sets_of(*operands) -> tuple:
     """Every distinct coordinate binding among ``operands``, kept whole.
 
@@ -191,7 +201,10 @@ def _coord_sets_of(*operands) -> tuple:
     (or a tie stamp). The full list survives here for a reader that needs each side's region, such as a
     partitioned coupling that hands each problem its own part."""
     out = []
-    for o in operands:
+    flat = []
+    for o in operands:  # `jnn.stack([a, b])` hands its operands over as one list
+        flat.extend(o if isinstance(o, (list, tuple)) else [o])
+    for o in flat:
         if o is None:
             continue
         sets = getattr(o, "_coord_sets", None)
@@ -2915,7 +2928,10 @@ class FieldViewWithPartials(ScalarView):
         tie_tags = extra = None
         if other_cv:
             conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
-            if conflict and _is_periodic_tie_combination(
+            if conflict and _bindings_on_two_meshes(cv, other_cv):
+                pass  # an interface condition between problems on two meshes: each side keeps its own binding
+                # (`_coord_sets`); nothing can differentiate across the two, so there is nothing ambiguous
+            elif conflict and _is_periodic_tie_combination(
                 object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
             ):
                 # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
@@ -3182,7 +3198,9 @@ def _make_named_with_partials_cls(view_cls):
             tie_tags = extra = None
             if other_cv:
                 conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
-                if conflict and _is_periodic_tie_combination(
+                if conflict and _bindings_on_two_meshes(cv, other_cv):
+                    pass  # see FieldViewWithPartials._rewrap: each mesh keeps its own binding (`_coord_sets`)
+                elif conflict and _is_periodic_tie_combination(
                     object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
                 ):
                     # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the

@@ -135,10 +135,19 @@ class Coupled:
 
     # -- structure ------------------------------------------------------------------------------------
     def _who(self, node):
-        return [i for i, p in enumerate(self.parts) if mentions(node, p.owns)]
+        """The participants ``node`` belongs to: whose unknowns it reads, and whose coordinates or normals (a
+        Variable knows its domain), so ``p_g * n_s`` -- the gas pressure on the wall normal -- reads the gas for
+        ``p_g`` and the wall for ``n_s``."""
+        return [i for i, p in enumerate(self.parts) if mentions(node, p.owns) or self._reads_domain(node, p.domain)]
+
+    @staticmethod
+    def _reads_domain(node, domain):
+        from .._strong_form import _iter_variables
+
+        return any(getattr(v, "_domain", None) is domain for v in _iter_variables(node))
 
     def _analyse(self, expr):
-        owners = self._who(expr)
+        owners = [i for i, p in enumerate(self.parts) if mentions(expr, p.owns)]
         if len(owners) < 2:
             raise ValueError(
                 "jno.core([...]): an interface condition must mix the unknowns of two problems; this one reads "
@@ -160,6 +169,12 @@ class Coupled:
                 )
             ]
             tags = {v.tag for cv in mine for v in cv.values() if getattr(v, "axis", "spatial") == "spatial"}
+            if not tags:  # no binding survived (git-bug 3c78460): its own Variables in the tree say where it is
+                tags = self._tags_from_variables(expr, dom)
+                if len(tags) == 1:
+                    (tag,) = tags
+                    xs = dom.variable(tag, split=True)
+                    mine = [{n: v for n, v in zip(("x", "y", "z"), xs) if getattr(v, "axis", "spatial") == "spatial"}]
             if len(tags) != 1:
                 raise ValueError(
                     f"jno.core([...]): in an interface condition, the {self.parts[i].kind} problem's part must "
@@ -172,6 +187,20 @@ class Coupled:
                 cv.update(c)
             cond.coords[i] = cv
         return cond
+
+    @staticmethod
+    def _tags_from_variables(expr, dom):
+        """Boundary tags of ``dom``'s own Variables in ``expr``: coordinates by their tag, normals ``n_<tag>``."""
+        from .._fvm.trace import _is_normal
+        from .._strong_form import _iter_variables
+
+        tags = set()
+        for v in _iter_variables(expr):
+            if getattr(v, "_domain", None) is not dom or getattr(v, "axis", "spatial") == "temporal":
+                continue
+            tag = str(v.tag)
+            tags.add(tag[2:] if _is_normal(v) and tag.startswith("n_") else tag)
+        return tags
 
     def _owned_subtrees(self, expr, i):
         """The maximal subtrees of ``expr`` that read participant ``i``'s unknowns and no other's."""
@@ -457,7 +486,27 @@ class Coupled:
             rest = term if rest is None else rest + term
         if rest is None:
             raise ValueError("jno.core([...]): the flux condition leaves nothing for the finite-element side to impose.")
-        return rest * self._test_function(i, original)
+        test = self._test_function(i, original)
+        field = part._flux_field(self._own_part(original.expr, i))
+        shape = tuple(getattr(field, "value_shape", ()) or ())
+        if shape:  # a traction: the load against the vector test function, component by component
+            term = _componentwise(rest, test, shape[0])
+        else:
+            term = rest * test
+        from .transfer import radial_axis
+
+        axis = radial_axis(self.spec.measure)
+        if axis is not None:  # the forms carry 2 pi r ds
+            r = [v for k, v in original.coords[i].items() if int(getattr(v, "dim", [0])[0]) == axis]
+            if len(r) != 1:
+                raise ValueError("jno.solve.coupling(measure='axisymmetric'): the interface binding has no r coordinate.")
+            term = term * (2.0 * np.pi * r[0])
+        elif self.spec.measure is not None:
+            raise NotImplementedError(
+                "jno.solve.coupling(measure=<callable>): a finite-element side writes its interface load with the "
+                "measure as an expression; use None or 'axisymmetric'."
+            )
+        return term
 
     def _test_function(self, i, original):
         """The test function of the field this condition is about, bound to the interface variables."""
@@ -639,6 +688,30 @@ class Coupled:
             return np.asarray(state)
         nf, N = getattr(p, "_nf", 1), getattr(p, "_N", None)
         return np.asarray(state).reshape(N) if nf == 1 else np.asarray(state).reshape(nf, N)
+
+
+def _componentwise(rest, test, dim):
+    """``rest · test`` for a vector load ``rest`` (sums of scalar coefficients times a boundary normal), written
+    ``Σ_k coef · n[..., k] · test[k]``. Written as ``inner(coef * n, test)`` it is wrong in jno.fem when the
+    coefficient varies along the facet (git-bug 8388acd)."""
+    from .._fvm.trace import _factors, _is_normal, _product, _signed_terms
+    from ..trace import Variable
+
+    total = None
+    for sign, term in _signed_terms(rest, distribute=True):
+        fs = _factors(term)
+        normals = [f for f in fs if isinstance(_unwrap(f), Variable) and _is_normal(_unwrap(f))]
+        if len(normals) != 1:
+            raise NotImplementedError(
+                "jno.core([...]): a vector load on a finite-element side is read as a coefficient times the boundary "
+                "normal (p * n); this one is another vector expression."
+            )
+        coef = _product([f for f in fs if f is not normals[0]])
+        for k in range(dim):
+            piece = coef * normals[0][..., k] * test[k]
+            piece = piece if sign > 0 else -1.0 * piece
+            total = piece if total is None else total + piece
+    return total
 
 
 class _Aitken:
