@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794600259,"nonce":"078PZF8FVPP4DQcPLrD2I5AAmmQ=","added":["branch:main","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795348449,"nonce":"Qt1lH1ajb14MgAaNY0mDuOx+kmI=","target":"7ef20298b10a12c9388b1fa62d1fbb28b658849221b005c55fbd81f5c25711b7","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABhe_aEQ","github-url":"https://github.com/FhG-IISB/jNO/issues/309"}}]}
