@@ -86,7 +86,10 @@ only (`nncg` and `score` read it through `value_fn`, which `jno.core` passes).
 
 `ssbroyden()` and `ssbfgs()` store a dense `P × P` matrix: 11 MB for 1 185 parameters, 315 GB for a
 4 × 256 network (198 401 parameters). `pairs=m` keeps the same metric on at most `m` directions, in
-`m·P` numbers (160 MB for that network at `m = 100`), and never forms the matrix:
+`m·P` numbers (160 MB for that network at `m = 100`), and never forms the matrix. The layout, an
+orthonormal basis with a small matrix on it and a multiple of the identity on the rest, is the
+limited-memory reduced-Hessian method of Gill & Leonard (SIAM J. Optim. 14, 2003), here with the
+self-scaled update:
 
 ```python
 net.optimizer(jno.optimizers.ssbroyden(pairs=100))

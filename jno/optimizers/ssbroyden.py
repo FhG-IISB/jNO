@@ -28,7 +28,14 @@ The limited-memory form (``pairs=m``) is an addition of jNO. It shares its aim w
   On the limited memory BFGS method for large scale optimization.
   Mathematical Programming, 45, 503-528,
 but not the construction: L-BFGS rebuilds the metric from the last ``m`` pairs at every step, while
-here the metric of the dense solver is kept on a subspace of at most ``m`` dimensions.
+here the metric of the dense solver is kept on a subspace of at most ``m`` dimensions. That
+construction, an orthonormal basis with a reduced matrix on its span and a multiple of the identity
+on the rest, is the limited-memory reduced-Hessian method of
+  Gill, P. E., & Leonard, M. W. (2003).
+  Limited-memory reduced-Hessian methods for large-scale unconstrained optimization.
+  SIAM Journal on Optimization, 14(2), 380-401. doi:10.1137/S1052623497319973,
+there with the BFGS update. New here are the self-scaled Broyden update on the reduced matrix, the
+projection rule for a full basis below, and the step check.
 
 With ``Q`` an ``m x P`` matrix of orthonormal rows, the inverse metric is
 
