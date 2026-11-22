@@ -711,6 +711,27 @@ class _TraceFVM(StrongFormProblem):
 
         return extra_params is None and getattr(self, "_override", None) is None and _core.trace_state_clean()
 
+    def _nodal_stencil(self, kind):
+        """``(idx, weights)`` of the mesh's P1/Q1 interpolant at every site of ``kind`` ("cells", "faces",
+        "bfaces"): the nodes of the mesh cell that holds the site's centroid and their shape values there.
+
+        A field given at the mesh nodes (a neighbour's interface data, say) is read at the sites through it.
+        The mean over a site's own nodes equals this only where the site sits at that mean: true for
+        cell-centred volumes and faces on simplices, not for the median dual, whose volumes sit at the
+        vertices and whose boundary half-faces sit a quarter of the way along a facet (linear data were
+        0.4 % wrong there)."""
+        from ..utils.solver.fem_adapt import _locate_barycentric
+
+        cache = self.__dict__.setdefault("_nodal_stencils", {})
+        if kind not in cache:
+            g = self.graph
+            sites = {"cells": g.centroid, "faces": g.fcentroid, "bfaces": g.b_centroid}[kind]
+            idx, w, _inside = _locate_barycentric(
+                np.asarray(g.points, float), np.asarray(g.cells), np.asarray(sites, float), tol=1e-9, k=8
+            )
+            cache[kind] = (np.asarray(idx), np.asarray(w))
+        return cache[kind]
+
     def _residual_kept(self, first_order=False):
         """The jitted residual at the stored values, built once per fingerprint."""
         key = ("residual", first_order, self._fingerprint())
@@ -1312,10 +1333,10 @@ class _Evaluator:
         g, o = self.p.graph, self.ops
         if value is None or np.ndim(value) == 0:
             return None
-        if np.shape(value)[0] == g.points.shape[0]:  # one value per mesh node: the mean over the site's nodes
+        if np.shape(value)[0] == g.points.shape[0]:  # one value per mesh node: its P1/Q1 interpolant at the site
             v = jnp.asarray(value).reshape(g.points.shape[0], -1)
-            nodes = {"cells": g.cells, "faces": g.f_nodes, "bfaces": g.b_nodes}[kind]
-            out = v[jnp.asarray(nodes)].mean(axis=1)
+            idx_w = self.p._nodal_stencil(kind)
+            out = jnp.einsum("sk,skc->sc", jnp.asarray(idx_w[1]), v[jnp.asarray(idx_w[0])])
         elif np.shape(value)[0] == g.n:  # one value per volume: interpolated to faces, the owner's at the boundary
             v = jnp.asarray(value).reshape(g.n, -1)
             out = {"cells": v, "faces": o.face_value(v), "bfaces": v[o.b_owner]}[kind]

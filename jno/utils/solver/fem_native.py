@@ -2040,6 +2040,14 @@ def assemble_fem_native(
     )
     # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w);
     # shapes: (n_faces, n_q, n_dof_i), (..., dim), (n_faces, n_q, dim), (n_faces, dim-1, dim), (n_q,)
+    # A field parameter in a SURFACE term interpolates on the P1 basis at the facet's quadrature points --
+    # `_p1_shape_vals` is tabulated at the volume rule, whose point count does not match a facet's, and
+    # using it there failed with a broadcast error (a neighbour's interface data in a Neumann condition).
+    _p1_face_phi = (
+        _build_face_tables(1, quad_degree, dim, _cell_type)[0]
+        if _field_param_names and face_tables_per_field[0] is not None
+        else None
+    )
 
     conn = build_facet_connectivity(cells_p1, cell_key)
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
@@ -3483,7 +3491,7 @@ def assemble_fem_native(
         if test_vals is not None:
             loc["test_shape_vals"] = {btfi: test_vals}
         if _field_param_names:
-            loc["shape_vals"] = _p1_shape_vals
+            loc["shape_vals"] = _p1_face_phi[k]  # P1 at this facet's quadrature points
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
@@ -3551,7 +3559,7 @@ def assemble_fem_native(
         }
         _pack_gaps(loc, per_f, n_vec, gaps)  # so an AL multiplier update can read the same gap
         if _field_param_names:
-            loc["shape_vals"] = _p1_shape_vals
+            loc["shape_vals"] = _p1_face_phi[k]  # P1 at this facet's quadrature points
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
