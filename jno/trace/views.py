@@ -1016,7 +1016,18 @@ class VectorView(_DelegatesToPlaceholder):
     # -- reductions / pairwise --
     def norm(self, space: "str | None" = None, **opts):
         """Euclidean norm ``sqrt(∑ u_i²)`` per point → ScalarView; with a ``space``, the function-space norm of
-        the field (a scalar, built on that pointwise norm), see :meth:`jno.trace.Placeholder.norm`."""
+        the field, a scalar built on that pointwise norm: ``(∫ |u|² dx)^(1/2)`` for ``"L2"``, the sum of the
+        components' squared norms for a Sobolev space such as ``"H-1"``.
+
+        Args:
+            space: ``None`` for the pointwise norm, or a space name (``"l2"``, ``"L2"``, ``"L1"``, ``"Linf"``,
+                ``"H1"``, ``"H-1"``, ``"H^s"``).
+            **opts: the options of the function-space norm, as for a scalar field: ``bc``, ``scale``,
+                ``method``, ``solver``, ``precond``.
+
+        Returns:
+            ScalarView: the norm per point, or a scalar ``Norm`` node.
+        """
         if space is not None:
             return Placeholder.norm(self._expr, space, **opts)
         return ScalarView(FunctionCall(lambda x: jnp.linalg.norm(x, axis=-1), [self._expr], "norm", True))

@@ -5406,6 +5406,16 @@ class Norm(Placeholder):
     ``squared=True`` is the squared norm; ``norm ** 2`` produces it, so the gradient has no square root. The
     backend is chosen at evaluation from the domain (see :mod:`jno.residual_norms`) and recorded in
     ``backend`` (``"points"``, ``"region"``, ``"grid"`` or ``"mesh"``).
+
+    Args:
+        target: the field whose norm is taken.
+        space: the space name (``"l2"``, ``"L2"``, ``"L1"``, ``"Linf"``, ``"H1"``, ``"H-1"``, ``"H^s"``).
+        bc: ``"dirichlet"`` or ``"neumann"``, the test space of a negative order.
+        scale: the ``scale`` in ``(scale - Laplace)^s``; 0 gives the seminorm.
+        method: force a backend (``"grid"``, ``"mesh"``, ``"points"``), or ``None`` to pick it from the domain.
+        solver: the ``jno.solve`` linear solver of the mesh ``H^-1`` solve.
+        precond: its ``jno.precond`` preconditioner.
+        squared: the squared norm (what ``norm ** 2`` gives).
     """
 
     def __init__(self, target, space, *, bc="dirichlet", scale=1.0, method=None, solver=None, precond=None, squared=False):

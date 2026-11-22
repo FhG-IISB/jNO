@@ -93,7 +93,15 @@ def pointwise_sq(vals):
 
 class GridSobolev:
     """``sum_k (scale + lambda_k)^s c_k^2 ||v_k||^2`` with ``v_k`` the tensor-product eigenvectors of the
-    discrete Laplacian on the lattice, ``c_k`` the coefficients of the field in the trapezoid inner product."""
+    discrete Laplacian on the lattice, ``c_k`` the coefficients of the field in the trapezoid inner product.
+
+    Args:
+        grid: the lattice descriptor ``{"shape", "spacing", "origin"}`` (``mesh_connectivity["grid"]``).
+        points: the mesh nodes, checked to be in grid order (``idx = ((i Ny + j) Nz + k)``).
+        s: the Sobolev order, any real number.
+        bc: ``"dirichlet"`` (sine eigenvectors) or ``"neumann"`` (cosine eigenvectors).
+        scale: the ``scale`` in ``(scale - Laplace)^s``.
+    """
 
     name = "grid"
 
@@ -164,7 +172,20 @@ def p1_mass_stiffness(points: np.ndarray, cells: np.ndarray):
 
 
 class MeshSobolev:
-    """``H^1`` and ``H^-1`` on a simplex mesh with P1 hat functions (see the module docstring)."""
+    """``H^1`` and ``H^-1`` on a simplex mesh with P1 hat functions: ``r^T (scale M + K) r`` for ``H^1``, and
+    ``R^T (scale M + K)^-1 R`` with ``R = M r`` for ``H^-1``, one linear solve per evaluation. ``M`` and ``K`` are
+    the consistent P1 mass and stiffness matrices, assembled once on the host.
+
+    Args:
+        mc: the domain's ``mesh_connectivity`` (points, simplices, boundary indices).
+        s: the Sobolev order, ``1`` or ``-1``.
+        bc: ``"dirichlet"`` drops the boundary nodes from the test space (the dual of ``H^1_0``),
+            ``"neumann"`` keeps them (the dual of ``H^1``); only ``s = -1`` uses it.
+        scale: the ``scale`` in ``(scale - Laplace)^s``.
+        solver: the ``jno.solve`` linear solver (default CG to 1e-10).
+        precond: the ``jno.precond`` preconditioner, built once from the constant matrix (default AMG with
+            pyamg, else Jacobi); ignored by a direct solver.
+    """
 
     name = "mesh"
 
