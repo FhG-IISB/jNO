@@ -1825,8 +1825,12 @@ class _ERKScheme(_TimeScheme):
         mass, residual = _block_mass_and_residual(block, args)
         A, b, c = self.A, self.b, self.c
         n = int(jnp.asarray(block.state0).size)
-        with jax.ensure_compile_time_eval():
-            structure, alg_np = _mass_structure(mass(float(block.t0)), n)
+        known = (block.metadata or {}).get("mass_structure")  # decided by the problem on concrete values
+        if known is not None:
+            structure, alg_np = known
+        else:
+            with jax.ensure_compile_time_eval():
+                structure, alg_np = _mass_structure(mass(float(block.t0)), n)
         algebraic = jnp.asarray(alg_np)
         has_alg = bool(alg_np.any())
 

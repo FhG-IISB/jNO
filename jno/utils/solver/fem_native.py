@@ -5018,7 +5018,7 @@ def assemble_fem_native(
                 for _pn, _pnode in _dir_param_exprs.items():
                     _pb = _bare_node(_pnode)
                     if getattr(getattr(_pb, "model", None), "_runtime_field", False) and _pn in a:
-                        if vecs[fidx] != 1 or len(np.asarray(pts_f_all[fidx])) != np.asarray(a[_pn]).reshape(-1).size:
+                        if vecs[fidx] != 1 or len(np.asarray(pts_f_all[fidx])) != int(np.prod(jnp.shape(a[_pn]))):
                             raise NotImplementedError(
                                 "jno.fem: an interface value read as a nodal field needs a scalar P1 field "
                                 "on the side that takes it as its essential condition."

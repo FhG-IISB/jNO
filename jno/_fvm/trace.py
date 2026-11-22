@@ -545,7 +545,7 @@ class _TraceFVM(StrongFormProblem):
         eqs = self._equations
         scope = self._params_scope(extra_params)
         nB = self.graph.b_owner.shape[0]
-        self._decide_condition_affinity(self._params_scope(self._current_params()))  # decided on concrete values
+        self._decide_condition_affinity(self._concrete_scope())  # decided on concrete values
 
         def residual(dofs, t=None):
             q = self._split_dofs(dofs)
@@ -600,6 +600,16 @@ class _TraceFVM(StrongFormProblem):
             return residual(dofs, t) - jnp.where(keep, residual(q_eq, t), 0.0)
 
         return well_balanced
+
+    def _concrete_scope(self):
+        """The evaluation scope at the stored values, without the traced ones a march injects (``_override``):
+        what a structural decision is made on."""
+        saved = self.__dict__.get("_override")
+        self._override = None
+        try:
+            return self._params_scope(self._current_params())
+        finally:
+            self._override = saved
 
     def _equilibrium(self):
         """The ``equilibrium=`` state of the convective scheme, if one was given."""
@@ -919,7 +929,9 @@ class _TraceFVM(StrongFormProblem):
 
         return stable
 
-    def _march(self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None, x0=None, span=None):
+    def _march(
+        self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None, x0=None, span=None, substeps=None
+    ):
         """Method of lines: ``M u̇ + R(u, t) = 0`` with ``M = diag(c·V)`` (zero on pinned cells), marched by
         ``time=`` (backward Euler by default, any ``jno.solve`` scheme, ``jno.solve.erk`` explicitly).
         A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``."""
@@ -940,7 +952,7 @@ class _TraceFVM(StrongFormProblem):
         from ..fdm import _integrate_transient
         from ..utils.solver.backend_blocks import window_block
 
-        block = window_block(block, span, x0, who="jno.fvm([...]).solve")
+        block = window_block(block, span, x0, who="jno.fvm([...]).solve", substeps=substeps)
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         traj = _integrate_transient(block, ts, time, *steppers)
         return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)
@@ -965,6 +977,7 @@ class _TraceFVM(StrongFormProblem):
         for k, cells, _ in self._pins:
             for b in range(self._block0[k], self._block0[k] + self._ncomp[k]):
                 pinned[b * self._N + np.asarray(cells)] = True
+        pinned_np, V_np = pinned, np.tile(np.asarray(self.ops.volume), self._nf)
         pinned = jnp.asarray(pinned)
 
         def blocked(c):
@@ -995,12 +1008,38 @@ class _TraceFVM(StrongFormProblem):
                 return spatial(y, t)
 
         N2 = int(state0.size)
-        diag = jnp.stack([jnp.arange(N2), jnp.arange(N2)], axis=1)
+        with jax.ensure_compile_time_eval():
+            diag = jnp.stack([jnp.arange(N2), jnp.arange(N2)], axis=1)
         common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata={})
+        # The mass's structure (diagonal; which rows are algebraic), decided on the stored values: inside a traced
+        # march (a coupling's window, data injected through `_override`) the mass is a tracer, and an explicit
+        # scheme decides how to invert it on concrete values.
+        if getattr(self, "_override", None) is not None:
+            saved, self._override = self._override, None
+            try:
+                with jax.ensure_compile_time_eval():
+                    c_s, m_s = self._time_coefficients(self._params_scope())
+                    if second:
+                        md = np.concatenate([np.ones(n), np.where(pinned_np, 0.0, np.asarray(blocked(m_s(t0))) * V_np)])
+                    else:
+                        md = np.where(pinned_np, 0.0, np.asarray(blocked(c_s(t0))) * V_np)
+            finally:
+                self._override = saved
+            common["metadata"]["mass_structure"] = (("diag", np.arange(N2)), md == 0)
         jac = lambda w, t, args: self._operator("march", lambda y: residual(y, t, args), w)  # noqa: E731
         if not isinstance(time, _ERKScheme):  # only an implicit step reads the tangent; erk never assembles it
             with jax.ensure_compile_time_eval():
-                self._pattern("march", lambda y: residual(y, float(t0), {}), state0)  # where the flux is defined
+                if getattr(self, "_override", None) is not None and not second:
+                    # where the flux is defined is structural: decided on the stored values, as the residual of a
+                    # traced march (a coupling's window data) cannot be probed concretely
+                    saved, self._override = self._override, None
+                    try:
+                        spatial_c = self._residual_fn()
+                        self._pattern("march", lambda y: spatial_c(y, float(t0)), state0)
+                    finally:
+                        self._override = saved
+                else:
+                    self._pattern("march", lambda y: residual(y, float(t0), {}), state0)  # where the flux is defined
         if second:
             first = lambda y, t, args: jnp.concatenate([-y[n:], spatial_first(y[:n], t)])  # noqa: E731
         else:

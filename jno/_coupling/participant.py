@@ -148,6 +148,33 @@ class Participant:
     def transient(self, problem=None) -> bool:
         raise NotImplementedError
 
+    def autonomous(self) -> bool:
+        """Do the problem's own conditions and coefficients leave time alone (no explicit ``t`` outside a time
+        derivative)? Then, with its interface data held over a window, a window gives the same result at any
+        start time, and one compiled window march serves them all."""
+        from ..trace import Hessian, Jacobian, TemporalDerivative, Variable
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, (TemporalDerivative, Jacobian, Hessian)):
+                return walk(n.target)
+            if isinstance(n, Variable):
+                return getattr(n, "axis", None) == "temporal"
+            return any(walk(c) for c in _iter(n))
+
+        return not any(walk(c) for c in self.constraints())
+
+    def march(self, problem, state, t0, window, data, time=None):
+        """The state after the window ``[t0, t0 + window]`` from ``state``, the data held over it."""
+        raise NotImplementedError
+
+    def initial(self, problem):
+        """The state its initial condition gives."""
+        raise NotImplementedError
+
+    def _span(self, t0, window):
+        return (0.0, float(window)) if self.autonomous() else (float(t0), float(t0) + float(window))
+
     # -- solving and reading back -----------------------------------------------------------------------
     def solve(self, problem, data, x0=None):
         raise NotImplementedError
@@ -248,6 +275,19 @@ class FDMParticipant(_StrongForm):
         x0 = None if x0 is None else jnp.asarray(x0).reshape(-1)
         return jnp.asarray(problem._steady_solve(x0=x0, linear=_solve.lu())).reshape(-1)
 
+    def march(self, problem, state, t0, window, data, time=None):
+        import jax.numpy as jnp
+
+        traj = problem._march(time=time, x0=jnp.asarray(state).reshape(-1), span=self._span(t0, window))
+        return jnp.asarray(traj)[-1].reshape(-1)
+
+    def initial(self, problem):
+        import jax.numpy as jnp
+
+        if getattr(problem, "_time_order", 1) == 2:
+            raise NotImplementedError("coupling: a u.tt problem marches [u; v]; its windows are not coupled yet.")
+        return jnp.asarray(problem._initial_state()).reshape(-1)
+
     def rebuild(self, extra):
         import jno
 
@@ -306,6 +346,61 @@ class FVMParticipant(_StrongForm):
 
             fn = cache[(id(expr), tag, keys)] = jax.jit(run)
         return fn(jnp.asarray(state), [data[k] for k in keys])
+
+    def march(self, problem, state, t0, window, data, time=None):
+        """One window, compiled once per window length for an autonomous problem: the data are traced inputs
+        (the march reads them through ``_override``). An explicit scheme with ``cfl=`` gets its substeps here,
+        from the state at the window's start, as a static number."""
+        import copy
+
+        import jax
+        import jax.numpy as jnp
+
+        from ..utils.solver.timeschemes import _ERKScheme
+
+        keys = tuple(sorted(data))
+        span = self._span(t0, window)
+        state = jnp.asarray(state).reshape(-1)
+        scheme, sub = time, None
+        if isinstance(time, _ERKScheme) and time.cfl is not None:
+            sub = self._cfl_substeps(problem, state, time)
+            scheme = copy.copy(time)
+            scheme.cfl = None
+
+        def run(values, x0):
+            problem._override = self._scope(problem, dict(zip(keys, values)))
+            try:
+                traj = problem._march(time=scheme, x0=x0, span=span, substeps=sub)
+            finally:
+                problem._override = None
+            return jnp.asarray(traj)[-1].reshape(-1)
+
+        if not self.autonomous():  # its own times: compiled per window
+            return jax.jit(run)([data[k] for k in keys], state)
+        cache = problem.__dict__.setdefault("_cpl_march", {})
+        key = (keys, span, sub, repr(scheme))
+        if key not in cache:
+            cache[key] = jax.jit(run)
+        return cache[key]([data[k] for k in keys], state)
+
+    def initial(self, problem):
+        import jax.numpy as jnp
+
+        if getattr(problem, "_time_order", 1) == 2:
+            raise NotImplementedError("coupling: a u.tt problem marches [u; v]; its windows are not coupled yet.")
+        return jnp.asarray(problem._initial_values(problem._params_scope())).reshape(-1)
+
+    def _cfl_substeps(self, problem, state, time):
+        """Substeps per step for the stable explicit step at ``state`` (the problem's CFL estimate)."""
+        from ..utils.solver.time_route import _infer_time_window
+
+        block = self.__dict__.get("_cfl_block")
+        if block is None:
+            t0, t1, dt = _infer_time_window(problem.domain)
+            block = problem._march_parts(None, None, None, time, t0, t1, dt)[0]
+            self._cfl_block = block
+        limit = float(block.metadata["cfl_dt"](state, time.cfl))
+        return max(1, int(np.ceil(float(block.dt) / limit - 1e-12)))
 
     def _face_values(self, problem, state, expr, faces, data):
         import jax.numpy as jnp
@@ -404,6 +499,37 @@ class FEMParticipant(Participant):
         out = problem.solve(**data)
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
+
+    def march(self, problem, state, t0, window, data, time=None):
+        """One window of the FEM's own time block: its step solvers (a direct step, composed once per scheme), a
+        window copy of the block from ``state``, and the data as the runtime arguments. Going through
+        ``fem.solve`` composed new step solvers on every call, a new compiled-march key each time (0.5 s a window,
+        90 % of a contact coupling)."""
+        import jax.numpy as jnp
+
+        from .. import solve as _solve
+        from ..utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate, window_block
+        from ..utils.solver.solver_api import compose_transient_step_solvers
+
+        block = problem._op
+        cache = problem.__dict__.setdefault("_cpl_steppers", {})
+        key = repr(time)
+        if key not in cache:
+            cache[key] = compose_transient_step_solvers(None, _solve.lu(), None, problem, block, time)
+        lin_s, nonlin_s = cache[key]
+        win = window_block(block, self._span(t0, window), jnp.asarray(state).reshape(-1), who="coupling")
+        args = {k: jnp.asarray(v) for k, v in data.items()}
+        grid = _block_time_grid(win)
+        if time is not None:
+            ys = time.integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
+        else:
+            ys = _default_transient_integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
+        return jnp.asarray(ys)[-1].reshape(-1)
+
+    def initial(self, problem):
+        import jax.numpy as jnp
+
+        return jnp.asarray(problem._op.state0).reshape(-1)
 
     def _field_nodal(self, problem, state, field):
         """A scalar P1 field's nodal values from the DOF vector."""

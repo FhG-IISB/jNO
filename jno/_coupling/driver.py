@@ -55,15 +55,20 @@ class CouplingSpec:
     alpha: object = None
     measure: object = None
     omega0: float = 0.5
+    implicit: bool = True
+    window: object = None
+    time: object = None
+    reuse: int = 0
 
     def __post_init__(self):
         if self.scheme not in ("gauss-seidel", "jacobi"):
             raise ValueError(f"jno.solve.coupling(scheme={self.scheme!r}): use 'gauss-seidel' or 'jacobi'.")
         if not (self.alpha is None or self.alpha == "auto" or (isinstance(self.alpha, (int, float)) and self.alpha > 0)):
             raise ValueError(f"jno.solve.coupling(alpha={self.alpha!r}): use a positive number or 'auto'.")
-        if not (self.accel is None or self.accel == "aitken" or isinstance(self.accel, (int, float))):
+        if not (self.accel is None or self.accel in ("aitken", "iqn-ils") or isinstance(self.accel, (int, float))):
             raise ValueError(
-                f"jno.solve.coupling(accel={self.accel!r}): use 'aitken', None, or a number (a fixed relaxation)."
+                f"jno.solve.coupling(accel={self.accel!r}): use 'aitken', 'iqn-ils', None, or a number (a fixed "
+                "relaxation)."
             )
 
 
@@ -117,6 +122,8 @@ class Coupled:
         if not self.conditions:
             raise ValueError("jno.core([...]): problems on their own meshes need interface conditions between them.")
         self.stiffness = {}
+        transient = [i for i, part in enumerate(self.parts) if part.transient()]
+        self._window = self._windows(transient) if transient else None  # (window, t0, t1)
         if self.spec.alpha is not None:
             self._robin()
         self.assign = self._assign()  # condition index -> receiving participant
@@ -304,7 +311,12 @@ class Coupled:
                     face = part.interface(self.conditions[k].tags[i], self.spec.measure)
                     lv = level if k == kv else 0.0
                     extra.update(d.setter(part.nodal(face, np.full(face.points.shape[0], lv)), prob))
-            state = part.solve(prob, extra)
+            if part.transient(prob) and self._window is not None:  # a window's stiffness: from rest, one window
+                window, t0, _ = self._window
+                rest = np.zeros(np.asarray(part.initial(prob)).size)
+                state = part.march(prob, rest, t0, window, extra, time=self._time_of(i))
+            else:
+                state = part.solve(prob, extra)
             out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra)))
         self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / iface.total
         return self.stiffness[key]
@@ -487,7 +499,9 @@ class Coupled:
             cache[key] = (conservative if d.flux else consistent)(dst, src)
         return cache[key]
 
-    def _solve_part(self, i, states):
+    def _advance(self, i, start, states, t, window):
+        """Participant ``i`` with its current data: a window's march from ``start`` for a transient problem, a
+        (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady."""
         part, prob = self.parts[i], self.problems[i]
         extra = {}
         for d in self.data:
@@ -495,56 +509,117 @@ class Coupled:
                 iface = part.interface(d.receiver_tag, self.spec.measure)
                 extra.update(d.setter(part.nodal(iface, d.values), prob))
         self._last[i] = extra  # what its boundary conditions read: its own samples need them too
+        if window is not None and part.transient(prob):
+            return part.march(prob, start[i], t, window, extra, time=self._time_of(i))
         return part.solve(prob, extra, x0=states[i])
 
-    def solve(self):
-        """Iterate to the coupled solution: a list with each problem's solution, in the order given."""
+    def _time_of(self, i):
+        tm = self.spec.time
+        if isinstance(tm, dict):
+            return next((s for p, s in tm.items() if p is self.parts[i].problem), None)
+        return tm
+
+    def _iterate(self, start, states, t=None, window=None):
+        """One coupled solve -- the steady problem, or one window -- iterated until the interface data stop
+        changing (or a single sweep, ``implicit=False``). Returns the participants' states."""
         n = len(self.parts)
-        states = [None] * n
+        states = list(states)
         pos = {i: k for k, i in enumerate(self.order)}
         back = [d for d in self.data if pos[d.sender] >= pos[d.receiver]]  # read before their sender runs
         if self.spec.scheme == "jacobi":
             back = list(self.data)
         x = np.concatenate([d.values for d in back]) if back else np.zeros(0)
-        omega, r_prev = None, None
-        self.history = []
+        self._accel.start()
+        history = []
         for it in range(1, self.spec.max_iter + 1):
             self._set(back, x)
             if self.spec.scheme == "jacobi":
-                states = [self._solve_part(i, states) for i in range(n)]
+                states = [self._advance(i, start, states, t, window) for i in range(n)]
             else:
                 for i in self.order:
                     for d in self.data:  # forward data: fresh from senders already run in this sweep
                         if d.receiver == i and d not in back:
                             d.values = self._produce(d, states)
-                    states[i] = self._solve_part(i, states)
+                    states[i] = self._advance(i, start, states, t, window)
             x_new = np.concatenate([self._produce(d, states) for d in back]) if back else np.zeros(0)
-            r = x_new - x
-            scale = max(float(np.linalg.norm(x_new)), 1e-300)
-            err = float(np.linalg.norm(r)) / scale
-            self.history.append(err)
-            if err <= self.spec.tol or not back:
+            err = float(np.linalg.norm(x_new - x)) / max(float(np.linalg.norm(x_new)), 1e-300)
+            history.append(err)
+            self.history = history
+            if err <= self.spec.tol or not back or not self.spec.implicit:
                 self._set(back, x_new)
                 break
-            h = self.history
-            if len(h) >= 4 and max(h[-3:]) <= 1.5 * min(h[-3:]) and h[-1] < 1e-4:
+            if len(history) >= 4 and max(history[-3:]) <= 1.5 * min(history[-3:]) and history[-1] < 1e-4:
                 raise RuntimeError(
                     f"jno.core([...]): the coupling stalled at an interface change of {err:.1e} (history "
                     f"{self._brief()}), above tol = {self.spec.tol:.1e}: the participants' own solves are not that "
                     "accurate. Set tol above it, or solve the participants more accurately (a direct solver)."
                 )
-            omega = self._relaxation(omega, r, r_prev)
-            x = x + omega * r
-            r_prev = r
+            x = self._accel.next(x, x_new)
         else:
             raise RuntimeError(
-                f"jno.core([...]): the coupling did not converge in {self.spec.max_iter} iterations (interface "
-                f"change {self.history[-1]:.2e} > tol {self.spec.tol:.1e}; history {self._brief()}). Raise max_iter, "
-                "relax (accel='aitken' or a number below 1), or swap the Dirichlet side (dirichlet=...)."
+                f"jno.core([...]): the coupling did not converge in {self.spec.max_iter} iterations"
+                f"{'' if t is None else f' in the window at t = {t:g}'} (interface change {history[-1]:.2e} > tol "
+                f"{self.spec.tol:.1e}; history {self._brief()}). Raise max_iter, accelerate (accel='iqn-ils' or "
+                "'aitken'), or swap the Dirichlet side (dirichlet=...)."
             )
-        self.iterations = len(self.history)
+        return states
+
+    def _windows(self, transient):
+        """``(window, t0, t1)`` of a transient coupling: the transient problems' common time span, the window the
+        given one or the largest of their steps, a whole number of every one of them."""
+        from ..utils.solver.time_route import _infer_time_window
+
+        spans = [_infer_time_window(self.parts[i].domain) for i in transient]
+        t0, t1 = spans[0][0], spans[0][1]
+        if any(abs(a - t0) > 1e-12 or abs(b - t1) > 1e-12 for a, b, _ in spans):
+            raise ValueError(
+                "jno.core([...]): the coupled transient problems march different time spans "
+                f"({[(a, b) for a, b, _ in spans]}); give their domains the same time=(t0, t1, ...)."
+            )
+        window = self.spec.window if self.spec.window is not None else max(dt for _, _, dt in spans)
+        for _, _, dt in spans:
+            k = window / dt
+            if abs(k - round(k)) > 1e-9 * max(1.0, k):
+                raise ValueError(
+                    f"jno.core([...]): the coupling window {window:g} is not a whole number of a problem's step "
+                    f"{dt:g}; set jno.solve.coupling(window=...) to a common multiple."
+                )
+        n = (t1 - t0) / window
+        if abs(n - round(n)) > 1e-9 * max(1.0, n):
+            raise ValueError(f"jno.core([...]): the time span {t1 - t0:g} is not a whole number of windows {window:g}.")
+        return float(window), float(t0), float(t1)
+
+    def solve(self):
+        """Iterate to the coupled solution: a list with each problem's solution, in the order given -- for a
+        transient coupling, each problem's states at the window ends (the initial state first)."""
+        n = len(self.parts)
+        self._accel = _accelerator(self.spec)
+        transient = [i for i in range(n) if self.parts[i].transient(self.problems[i])]
+        if not transient:
+            states = self._iterate([None] * n, [None] * n)
+            self.iterations = len(self.history)
+            self.states = states
+            return [self._shape(i, st) for i, st in enumerate(states)]
+        window, t0, t1 = self._window
+        start = [self.parts[i].initial(self.problems[i]) if i in transient else None for i in range(n)]
+        states = list(start)
+        frames = [[] for _ in range(n)]
+        self.window_iterations, self.times = [], [t0]
+        t = t0
+        for w in range(int(round((t1 - t0) / window))):
+            states = self._iterate(start, states, t, window)
+            if w == 0:  # a quasi-steady problem's first frame is its state in the first window
+                for i in range(n):
+                    frames[i].append(start[i] if i in transient else states[i])
+            for i in range(n):
+                frames[i].append(states[i])
+            self.window_iterations.append(len(self.history))
+            start = [states[i] if i in transient else None for i in range(n)]
+            t += window
+            self.times.append(t)
+        self.iterations = int(sum(self.window_iterations))
         self.states = states
-        return [self._shape(i, st) for i, st in enumerate(states)]
+        return [np.stack([self._shape(i, f) for f in frames[i]]) for i in range(n)]
 
     def _brief(self):
         h = self.history
@@ -557,20 +632,6 @@ class Coupled:
             d.values = np.asarray(x[k : k + m])
             k += m
 
-    def _relaxation(self, omega, r, r_prev):
-        a = self.spec.accel
-        if a is None:
-            return 1.0
-        if isinstance(a, (int, float)):
-            return float(a)
-        if r_prev is None or omega is None:  # Aitken (Küttler & Wall 2008)
-            return self.spec.omega0
-        dr = r - r_prev
-        denom = float(dr @ dr)
-        if denom <= 0.0:
-            return omega
-        return float(-omega * (r_prev @ dr) / denom)
-
     def _shape(self, i, state):
         p = self.problems[i]
         part = self.parts[i]
@@ -578,6 +639,82 @@ class Coupled:
             return np.asarray(state)
         nf, N = getattr(p, "_nf", 1), getattr(p, "_N", None)
         return np.asarray(state).reshape(N) if nf == 1 else np.asarray(state).reshape(nf, N)
+
+
+class _Aitken:
+    """Dynamic relaxation ``x + ω r``, ``ω`` from the last two residuals (Küttler & Wall 2008); a fixed ``ω`` when
+    one is given."""
+
+    def __init__(self, omega0, fixed=None):
+        self.omega0, self.fixed, self.omega, self.r_prev = omega0, fixed, None, None
+
+    def start(self):
+        self.r_prev = None
+
+    def next(self, x, x_new):
+        r = x_new - x
+        if self.fixed is not None:
+            return x + self.fixed * r
+        if self.r_prev is None or self.omega is None:
+            self.omega = self.omega0
+        else:
+            dr = r - self.r_prev
+            denom = float(dr @ dr)
+            if denom > 0.0:
+                self.omega = float(-self.omega * (self.r_prev @ dr) / denom)
+        self.r_prev = r
+        return x + self.omega * r
+
+
+class _IQNILS:
+    """Interface quasi-Newton with an inverse Jacobian from a least-squares model (IQN-ILS, Degroote, Bathe &
+    Vierendeels 2009): ``x = x̃ + W c``, ``c = argmin ‖V c + r‖``, ``V`` and ``W`` the differences of the residuals
+    and of the outputs this window (and of the last ``reuse`` windows'). Columns that would make the
+    least-squares problem singular are dropped (QR filter)."""
+
+    def __init__(self, omega0, reuse=0, eps=1e-10):
+        self.omega0, self.reuse, self.eps = omega0, int(reuse), eps
+        self.V, self.W, self.old, self.prev = [], [], [], None
+
+    def start(self):
+        if self.V:
+            self.old.append((self.V, self.W))
+            self.old = self.old[-self.reuse :] if self.reuse else []
+        self.V, self.W, self.prev = [], [], None
+
+    def next(self, x, x_new):
+        r = x_new - x
+        if self.prev is not None:
+            self.V.insert(0, r - self.prev[1])
+            self.W.insert(0, x_new - self.prev[0])
+        self.prev = (x_new, r)
+        V = self.V + [v for vs, _ in self.old for v in vs]
+        W = self.W + [w for _, ws in self.old for w in ws]
+        if not V:
+            return x + self.omega0 * r
+        Vm, Wm = np.stack(V, axis=1), np.stack(W, axis=1)
+        while Vm.shape[1]:
+            Q, R = np.linalg.qr(Vm)
+            d = np.abs(np.diag(R))
+            bad = np.flatnonzero(d < self.eps * max(float(np.linalg.norm(R)), 1e-300))
+            if bad.size == 0:
+                break
+            Vm, Wm = np.delete(Vm, bad[0], axis=1), np.delete(Wm, bad[0], axis=1)
+        if not Vm.shape[1]:
+            return x + self.omega0 * r
+        c = np.linalg.solve(R, -(Q.T @ r))
+        return x_new + Wm @ c
+
+
+def _accelerator(spec):
+    a = spec.accel
+    if a is None:
+        return _Aitken(1.0, fixed=1.0)
+    if isinstance(a, (int, float)):
+        return _Aitken(float(a), fixed=float(a))
+    if a == "iqn-ils":
+        return _IQNILS(spec.omega0, reuse=spec.reuse)
+    return _Aitken(spec.omega0)
 
 
 def detect(constraints):

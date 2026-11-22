@@ -90,3 +90,23 @@ def test_a_window_after_the_start_needs_its_state(case):
     make, _ = CASES[case]
     with pytest.raises(ValueError, match="x0="):
         _arr(make().solve(span=(0.05, T)))
+
+
+@pytest.mark.parametrize(
+    "case, window", [("fdm-euler", 0.05), ("fvm-euler", 0.05), ("fvm-ssprk3", 0.01), ("fem-euler", 0.05), ("fem-cn", 0.05)]
+)
+def test_a_participant_marches_window_by_window_like_one_march(case, window):
+    from jno._coupling.participant import participant
+
+    make, scheme = CASES[case]
+    prob = make()
+    time = None if scheme is None else scheme()
+    full = _arr(prob.solve(time=time))
+    p = participant(prob)
+    state, t = full[0], 0.0
+    steps = int(round(window / 0.01))
+    for k in range(int(round(T / window))):
+        state = np.asarray(p.march(prob, state, t, window, {}, time=time))
+        t += window
+        # an autonomous problem marches every window as [0, window]: one compiled march for all of them
+        np.testing.assert_allclose(state, full[(k + 1) * steps], atol=1e-10 * np.abs(full).max())

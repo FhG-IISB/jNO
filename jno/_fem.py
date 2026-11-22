@@ -3225,6 +3225,12 @@ class FEM:
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
+
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
         equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution

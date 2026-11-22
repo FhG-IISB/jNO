@@ -2092,6 +2092,10 @@ def coupling(
     dirichlet=None,
     alpha=None,
     measure=None,
+    implicit=True,
+    window=None,
+    time=None,
+    reuse=0,
 ):
     """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
     meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
@@ -2107,8 +2111,8 @@ def coupling(
             ``"jacobi"`` (all read the last sweep's data).
         tol: the relative change of the interface data at which the iteration stops.
         max_iter: the most sweeps.
-        accel: ``"aitken"`` (dynamic relaxation, Küttler & Wall 2008), ``None`` (none), or a fixed relaxation
-            factor.
+        accel: ``"aitken"`` (dynamic relaxation, Küttler & Wall 2008), ``"iqn-ils"`` (interface quasi-Newton,
+            Degroote, Bathe & Vierendeels 2009), ``None`` (none), or a fixed relaxation factor.
         dirichlet: the problem that takes the value condition of a pair, in place of the stiffness probe.
         alpha: Robin-Robin in place of Dirichlet-Neumann: each side of a pair takes ``flux + alpha * value``
             (Quarteroni & Valli 1999); ``"auto"`` sets ``alpha = sqrt(S_a S_b)`` from the two interface
@@ -2116,13 +2120,30 @@ def coupling(
         measure: the interface measure: ``None`` (length or area), ``"axisymmetric"`` (``2π r ds``, ``r`` the
             second coordinate) or a callable of the points. It must match the measure the problems' own
             forms integrate with.
+        implicit: iterate every window to ``tol`` (``True``), or one sweep per window (``False``, loose coupling:
+            cheaper, first order in the window, not energy-conserving).
+        window: the coupling window of a transient coupling, a whole number of every problem's step; default the
+            largest step. Each problem marches its own steps inside it, the interface data held over it.
+        time: the time scheme of the transient problems: one for all, or ``{problem: scheme}``; default each
+            problem's own default (backward Euler).
+        reuse: IQN-ILS keeps the columns of this many earlier windows.
 
     The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
     """
     from ._coupling.driver import CouplingSpec
 
     return CouplingSpec(
-        scheme=scheme, tol=tol, max_iter=max_iter, accel=accel, dirichlet=dirichlet, alpha=alpha, measure=measure
+        scheme=scheme,
+        tol=tol,
+        max_iter=max_iter,
+        accel=accel,
+        dirichlet=dirichlet,
+        alpha=alpha,
+        measure=measure,
+        implicit=implicit,
+        window=window,
+        time=time,
+        reuse=reuse,
     )
 
 
