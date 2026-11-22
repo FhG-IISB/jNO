@@ -41,6 +41,7 @@ from .._strong_form import (
     _find_unknowns,
     _iter,
     _rtol,
+    _set_temporal,
     _spatial_tags,
     _unwrap,
     _zero_temporal,
@@ -67,16 +68,28 @@ def _is_normal(v):
     return str(getattr(v, "tag", "")).startswith("n_")
 
 
-def _signed_terms(node, sign=1.0):
+def _signed_terms(node, sign=1.0, distribute=True):
     """``node`` as a signed sum ``[(±1, term), ...]`` over ``+``, ``-`` and a literal factor ``-1``."""
     from ..trace import BinaryOp, Literal
 
     n = _unwrap(node)
     if isinstance(n, BinaryOp) and n.op in ("+", "-"):
-        return _signed_terms(n.left, sign) + _signed_terms(n.right, sign if n.op == "+" else -sign)
+        right = sign if n.op == "+" else -sign
+        return _signed_terms(n.left, sign, distribute) + _signed_terms(n.right, right, distribute)
     if isinstance(n, BinaryOp) and n.op == "*" and isinstance(n.left, Literal) and np.ndim(n.left.value) == 0:
         if float(n.left.value) == -1.0:
-            return _signed_terms(n.right, -sign)
+            return _signed_terms(n.right, -sign, distribute)
+    if not distribute:
+        return [(sign, n)]
+    # a product or quotient distributes over a sum, so `nu*(ui.xx + ui.yy)` is two divergence terms
+    if isinstance(n, BinaryOp) and n.op == "*":
+        left, right = _signed_terms(n.left), _signed_terms(n.right)
+        if len(left) > 1 or len(right) > 1:
+            return [(sign * sl * sr, BinaryOp("*", tl, tr)) for sl, tl in left for sr, tr in right]
+    if isinstance(n, BinaryOp) and n.op == "/":
+        top = _signed_terms(n.left)
+        if len(top) > 1:
+            return [(sign * st, BinaryOp("/", tt, n.right)) for st, tt in top]
     return [(sign, n)]
 
 
@@ -321,21 +334,24 @@ class _TraceFVM(StrongFormProblem):
                 grp = groups.setdefault(key, {"coef": _product(coef) if coef else None, "central": {}, "convective": {}})
                 scheme = getattr(_unwrap(divs[0]), "scheme", None)
                 for axis, F in _divergence_parts(divs[0]):
-                    for s2, sub in _signed_terms(F):
-                        kind = "convective" if self._has_unknown(sub) and not _has_derivative(sub) else "central"
-                        sub = _expand_hessians(sub)
+                    pieces = []
+                    for s1, whole in _signed_terms(F, distribute=False):
+                        whole = _expand_hessians(whole)
                         if (
-                            kind == "central"
-                            and isinstance(scheme, FVScheme)
+                            isinstance(scheme, FVScheme)
                             and scheme.average in ("arithmetic", "harmonic")
+                            and self._has_unknown_derivative(whole)
                         ):
-                            sub = _face_mean(sub, scheme.average)
+                            whole = _face_mean(whole, scheme.average)  # the whole coefficient, before distributing
+                        pieces += [(s1 * s2, sub) for s2, sub in _signed_terms(whole)]
+                    for s2, sub in pieces:
+                        kind = "convective" if self._has_unknown(sub) and not _has_derivative(sub) else "central"
+                        if kind == "convective":
+                            schemes.add(scheme if isinstance(scheme, FVScheme) else None)
                         mag = abs(scale)
                         if mag != 1.0:
                             sub = BinaryOp("*", Literal(mag), sub)
                         grp[kind].setdefault(axis, []).append((np.sign(scale) * s2, sub))
-                        if kind == "convective":
-                            schemes.add(scheme if isinstance(scheme, FVScheme) else None)
                 continue
             if self._has_unknown_derivative(term):
                 noncons = True
@@ -453,8 +469,6 @@ class _TraceFVM(StrongFormProblem):
         """The finite-volume residual ``R(dofs)`` (blocked DOF layout), volume terms integrated (``V·term``)
         and fluxes summed over faces. ``spatial=True`` drops the ``u.t`` terms."""
         eqs = self._equations
-        if not spatial:
-            raise NotImplementedError
         scope = self._params_scope(extra_params)
         nB = self.graph.b_owner.shape[0]
         self._decide_condition_affinity(scope)
@@ -557,9 +571,164 @@ class _TraceFVM(StrongFormProblem):
             precond: a ``jno.precond`` spec; default ``amg`` (symmetric) or ``ilu``.
         """
         if self._transient:
-            raise NotImplementedError("jno.fvm([...]): transient problems are not supported yet.")
+            traj = self._march(nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts)
+            return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
         u = self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
         return self._shape(u)
+
+    # -- transient ------------------------------------------------------------------------------------
+    def _time_coefficients(self, scope):
+        """Per-cell coefficients of ``u.t`` and ``u.tt`` in every equation, as functions of time
+        ``(c(t), m(t))``, each ``(n, nf)``; probed as ``F(u.t=1) − F(0)``, and refused when they depend on u."""
+        exprs = [e["volume"] for e in self._equations]
+
+        def coef(t_val, tt_val, t, state):
+            q = [jnp.full((self._N, c), state) for c in self._ncomp]
+            qb = [jnp.full((self.graph.b_owner.shape[0], c), state) for c in self._ncomp]
+            ev = self._evaluator(q, qb, t, scope)
+            cols = []
+            for k, e in enumerate(exprs):
+                c = self._ncomp[k] if len(exprs) > 1 else self._nf
+                if e is None:
+                    cols.append(jnp.zeros((self._N, c)))
+                    continue
+                on = ev.rows(ev.values(_set_temporal(e, t_val, tt_val), "cells"), c, "cells")
+                off = ev.rows(ev.values(_set_temporal(e, 0.0, 0.0), "cells"), c, "cells")
+                cols.append(on - off)
+            return jnp.concatenate(cols, axis=1)
+
+        out = []
+        for t_val, tt_val, what in ((1.0, 0.0, "u.t"), (0.0, 1.0, "u.tt")):
+            with jax.ensure_compile_time_eval():
+                if not self._same(coef(t_val, tt_val, None, 0.0), coef(t_val, tt_val, None, 0.83)):
+                    raise ValueError(
+                        f"jno.fvm([...]): the coefficient of {what} depends on u; only coordinates and time are supported."
+                    )
+            out.append(lambda t=None, a=t_val, b=tt_val: coef(a, b, t, 0.0))
+        return out
+
+    def _initial_values(self, scope, velocity=False):
+        """Initial cell values ``(n, nf)`` from the ``u(xi, yi) - u0`` conditions (or the velocity from
+        ``ui0.t - v0``), each solved per cell for its unknown (one Newton step when affine). A field without
+        one starts at 0."""
+        q0 = [jnp.zeros((self._N, c)) for c in self._ncomp]
+        conds = self._vel_ic if velocity else self._ic
+        for c in conds:
+            k = self._field_of(c)
+            expr = _unwrap(c)
+            qb = [jnp.zeros((self.graph.b_owner.shape[0], cc)) for cc in self._ncomp]
+
+            def res(z, k=k, expr=expr):
+                q = [z if j == k else q0[j] for j in range(len(q0))]
+                ev = self._evaluator(q, qb, None, scope)
+                if velocity:  # the condition is affine in u.t: c·v + rest
+                    e1, e0 = _set_temporal(expr, 1.0), _set_temporal(expr, 0.0)
+                    on = ev.rows(ev.values(e1, "cells"), self._ncomp[k], "cells")
+                    off = ev.rows(ev.values(e0, "cells"), self._ncomp[k], "cells")
+                    return off, on - off
+                return ev.rows(ev.values(expr, "cells", {k: z}), self._ncomp[k], "cells"), None
+
+            if velocity:
+                off, slope = res(q0[k])
+                q0[k] = -off / jnp.where(slope != 0, slope, 1.0)
+                continue
+            z = q0[k]
+            for _ in range(_NEWTON_STEPS):
+                r = res(z)[0]
+                d = jax.jvp(lambda w: res(w)[0], (z,), (jnp.ones_like(z),))[1]
+                z = z - r / jnp.where(d != 0, d, 1.0)
+            q0[k] = z
+        return jnp.concatenate(q0, axis=1).T.reshape(-1)
+
+    def _cfl_dt(self, residual, mass_diag):
+        """``(state, cfl) -> Δt``: the largest stable explicit step from the Gershgorin bound of the scaled
+        tangent ``M⁻¹ ∂R/∂u`` (covers convection, diffusion and reaction alike): ``Δt = 2·cfl / max_i Σ_j
+        |J_ij| / m_i``."""
+
+        def stable(w, cfl):
+            J = self._operator("march", lambda y: residual(y, self._start_time(), {}), jnp.asarray(w))
+            rows = jax.ops.segment_sum(jnp.abs(J.data), J.indices[:, 0], num_segments=J.shape[0])
+            m = mass_diag(None)
+            rate = jnp.where(m > 0, rows / jnp.where(m > 0, m, 1.0), 0.0)
+            return 2.0 * float(cfl) / max(float(rate.max()), np.finfo(float).tiny)
+
+        return stable
+
+    def _march(self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None):
+        """Method of lines: ``M u̇ + R(u, t) = 0`` with ``M = diag(c·V)`` (zero on pinned cells), marched by
+        ``time=`` (backward Euler by default, any ``jno.solve`` scheme, ``jno.solve.erk`` explicitly).
+        A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``."""
+        import jax.experimental.sparse as jsparse
+
+        from ..utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
+        from ..utils.solver.solver_api import compose_transient_step_solvers
+        from ..utils.solver.time_route import _infer_time_window
+        from ..utils.solver.timeschemes import _ERKScheme
+
+        t0, t1, dt = _infer_time_window(self.domain)
+        if dt is None:
+            raise ValueError("jno.fvm([...]): domain.time must give n_steps >= 2 for a transient march.")
+        scope = self._params_scope()
+        spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
+        c_of, m_of = self._time_coefficients(scope)
+        V = jnp.tile(self.ops.volume, self._nf)
+        pinned = np.zeros(self._Ntot, dtype=bool)
+        for k, cells, _ in self._pins:
+            for b in range(self._block0[k], self._block0[k] + self._ncomp[k]):
+                pinned[b * self._N + np.asarray(cells)] = True
+        pinned = jnp.asarray(pinned)
+
+        def blocked(c):
+            return c.T.reshape(-1)
+
+        u0 = self._initial_values(scope)
+        second = self._time_order == 2
+        n = self._Ntot
+        if second:
+            v0 = self._initial_values(scope, velocity=True) if self._vel_ic else jnp.zeros(n)
+            state0 = jnp.concatenate([u0, v0])
+
+            def mass_diag(t=None):
+                return jnp.concatenate([jnp.ones(n), jnp.where(pinned, 0.0, blocked(m_of(t)) * V)])
+
+            def residual(y, t, args):
+                u, v = y[:n], y[n:]
+                r = spatial(u, t) + jnp.where(pinned, 0.0, blocked(c_of(t)) * V * v)
+                return jnp.concatenate([-v, r])
+
+        else:
+            state0 = u0
+
+            def mass_diag(t=None):
+                return jnp.where(pinned, 0.0, blocked(c_of(t)) * V)
+
+            def residual(y, t, args):
+                return spatial(y, t)
+
+        N2 = int(state0.size)
+        diag = jnp.stack([jnp.arange(N2), jnp.arange(N2)], axis=1)
+        common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata={})
+        jac = lambda w, t, args: self._operator("march", lambda y: residual(y, t, args), w)  # noqa: E731
+        with jax.ensure_compile_time_eval():
+            self._pattern("march", lambda y: residual(y, float(t0), {}), jnp.zeros(N2))
+        common["metadata"]["cfl_dt"] = self._cfl_dt(residual, mass_diag)
+        block = SemidiscreteTimeBlock(
+            mass=lambda t, args: jsparse.BCOO((mass_diag(t), diag), shape=(N2, N2)),
+            residual=residual,
+            jacobian=jac,
+            **common,
+        )
+        if isinstance(time, _ERKScheme):
+            steppers = (None, None)
+        else:
+            nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True)
+            linear = linear if linear is not None else _solve.lu()
+            steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+        from ..fdm import _integrate_transient
+
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        traj = _integrate_transient(block, ts, time, *steppers)
+        return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)
 
     def _shape(self, u):
         u = jnp.asarray(u)

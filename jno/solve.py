@@ -73,6 +73,7 @@ __all__ = [
     "sdirk",
     "rosenbrock",
     "theta",
+    "erk",
     "exponential",
     "adaptive",
     "arclength",
@@ -2077,6 +2078,35 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):
+    """**Explicit Runge-Kutta** time scheme for ``fem.solve(time=...)``, ``fdm(...).solve(time=...)`` and
+    ``fvm(...).solve(time=...)``: no linear solve per step, so it is the scheme for hyperbolic problems at a
+    CFL-limited step.
+
+    ``method`` is ``"ssprk3"`` (default; the third-order strong-stability-preserving scheme of Shu and Osher,
+    which keeps a total-variation-diminishing spatial scheme TVD), ``"ssprk2"`` (Heun), ``"ssprk54"`` (the
+    five-stage fourth-order SSP scheme of Spiteri and Ruuth), ``"rk4"`` or ``"euler"``; or give any explicit
+    Butcher tableau as ``tableau=(A, b, c, order)`` with ``A`` strictly lower triangular. The march takes
+    the domain's step (``domain.time``); with ``cfl=`` a finite-volume problem picks the number of substeps
+    per step from its CFL limit at the initial state (``Δt = cfl · min V/Σ_f a_f|S_f|``) and warns if the
+    limit falls below it later.
+
+    Rows with zero mass (Dirichlet and flux rows of ``jno.fdm``, a pinned cell) are constraints, solved at
+    every stage. The march is a fixed-length ``lax.scan``, so it is reverse-mode differentiable.
+
+    References: Gottlieb, Shu & Tadmor, *SIAM Review* **43** (2001) 89-112; Spiteri & Ruuth, *SIAM J. Numer.
+    Anal.* **40** (2002) 469-491."""
+    from .utils.solver.timeschemes import _ERK_TABLEAUS, _ERKScheme
+
+    if tableau is not None:
+        A, b, c, order = tableau
+        return _ERKScheme(A, b, c, order, "tableau", cfl)
+    if method not in _ERK_TABLEAUS:
+        raise ValueError(f"jno.solve.erk: method={method!r} is not one of {sorted(_ERK_TABLEAUS)}; or pass tableau=.")
+    A, b, c, order = _ERK_TABLEAUS[method]
+    return _ERKScheme(A, b, c, order, method, cfl)
 
 
 def bdf(order: int | None = None, *, ndf: bool = True):

@@ -1703,3 +1703,192 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, chec
     from .backend_blocks import _resample_trajectory
 
     return _resample_trajectory(traj_u, grid, save_ts, dtype, 2)  # ETD2: second order in time
+
+
+# -- explicit Runge-Kutta ------------------------------------------------------------------------------
+
+_ERK_TABLEAUS = {
+    # (A, b, c, order). SSP schemes: Gottlieb, Shu & Tadmor, SIAM Review 43 (2001), Sec. 4; SSPRK(5,4):
+    # Spiteri & Ruuth, SIAM J. Numer. Anal. 40 (2002), Table 3.1, in Butcher form.
+    "euler": ([[0.0]], [1.0], [0.0], 1),
+    "ssprk2": ([[0.0, 0.0], [1.0, 0.0]], [0.5, 0.5], [0.0, 1.0], 2),
+    "ssprk3": ([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.25, 0.25, 0.0]], [1 / 6, 1 / 6, 2 / 3], [0.0, 1.0, 0.5], 3),
+    "ssprk54": (
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.39175222700392, 0.0, 0.0, 0.0, 0.0],
+            [0.21766909633821, 0.36841059262959, 0.0, 0.0, 0.0],
+            [0.08269208670950, 0.13995850206999, 0.25189177424738, 0.0, 0.0],
+            [0.06796628370320, 0.11503469844438, 0.20703489864929, 0.54497475021237, 0.0],
+        ],
+        [0.14681187618661, 0.24848290924556, 0.10425883036650, 0.27443890091960, 0.22600748319395],
+        [0.0, 0.39175222700392, 0.58607968896780, 0.47454236302687, 0.93501063100924],
+        4,
+    ),
+    "rk4": (
+        [[0.0, 0.0, 0.0, 0.0], [0.5, 0.0, 0.0, 0.0], [0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+        [1 / 6, 1 / 3, 1 / 3, 1 / 6],
+        [0.0, 0.5, 0.5, 1.0],
+        4,
+    ),
+}
+
+
+def _block_mass_and_residual(block, args):
+    """``(mass(t), residual(u, t))`` of a semidiscrete block, linear (``M u̇ + A u = c + f(t)``) or not
+    (``M(t) u̇ + R(u, t) = 0``), both as the residual form ``M u̇ + R = 0``."""
+    if block.is_nonlinear():
+        if block.mass_residual is not None:
+            raise NotImplementedError("jno.solve.erk: a state-dependent mass c(u)·u_t is not supported.")
+        return (lambda t: block.mass(t, args)), (lambda u, t: block.residual(u, t, args))
+
+    def mass(t):
+        return block.mass_fn(t, args) if block.mass_fn is not None else block.M
+
+    def residual(u, t):
+        A = block.operator_fn(t, args) if block.operator_fn is not None else block.A
+        r = A @ u
+        if block.affine_bias is not None:
+            r = r - jnp.asarray(block.affine_bias).reshape(-1)
+        if block.forcing_vector_fn is not None:
+            r = r - jnp.asarray(block.forcing_vector_fn(t, args)).reshape(-1)
+        return r
+
+    return mass, residual
+
+
+def _mass_structure(M, n):
+    """How a mass matrix is applied, decided once on concrete values: ``("diag", rows)`` when it is
+    diagonal (a BCOO's diagonal entries at ``rows``, or a vector), else ``("general", None)``, with the mask of
+    its zero (algebraic) rows."""
+    import jax.experimental.sparse as jsparse
+
+    if isinstance(M, jsparse.BCOO):
+        idx = np.asarray(M.indices)
+        if np.all(idx[:, 0] == idx[:, 1]):
+            diag = np.zeros(n)
+            np.add.at(diag, idx[:, 0], np.asarray(M.data))
+            return ("diag", idx[:, 0]), diag == 0
+        return ("general", None), np.zeros(n, dtype=bool)
+    Md = np.asarray(M)
+    if Md.ndim == 1:
+        return ("vector", None), Md == 0
+    if np.count_nonzero(Md - np.diag(np.diag(Md))) == 0:
+        return ("dense_diag", None), np.diag(Md) == 0
+    return ("general", None), np.zeros(n, dtype=bool)
+
+
+def _apply_mass_inverse(M, structure, algebraic, r):
+    """``M⁻¹ r`` on the differential rows (0 on the algebraic ones), for the structure of :func:`_mass_structure`."""
+    kind, rows = structure
+    if kind == "general":
+        return jax.scipy.sparse.linalg.cg(lambda v: M @ v, r, tol=1e-12, maxiter=10 * r.shape[0])[0]
+    if kind == "diag":
+        diag = jnp.zeros(r.shape[0], r.dtype).at[jnp.asarray(rows)].add(M.data)
+    elif kind == "vector":
+        diag = jnp.asarray(M)
+    else:
+        diag = jnp.diagonal(jnp.asarray(M))
+    return jnp.where(algebraic, 0.0, r / jnp.where(algebraic, 1.0, diag))
+
+
+class _ERKScheme(_TimeScheme):
+    """Explicit Runge-Kutta (see :func:`jno.solve.erk`)."""
+
+    def __init__(self, A, b, c, order, name, cfl=None):
+        self.A = np.asarray(A, dtype=float)
+        self.b = np.asarray(b, dtype=float)
+        self.c = np.asarray(c, dtype=float)
+        s = self.b.size
+        if self.A.shape != (s, s) or self.c.size != s or np.any(np.triu(self.A) != 0):
+            raise ValueError(
+                "jno.solve.erk: an explicit tableau has a strictly lower-triangular A of size s x s, b and c of size s."
+            )
+        self._order, self.name, self.cfl = int(order), name, None if cfl is None else float(cfl)
+
+    @property
+    def step_order(self):
+        return self._order
+
+    def _project(self, residual, U, t, algebraic):
+        """Zero-mass rows (a Dirichlet value, a pin, a flux row) are constraints: solved at every stage by
+        Newton-Jacobi on those rows (one iteration for a value row ``u - g``)."""
+        mask = algebraic.astype(U.dtype)
+
+        def body(_, U):
+            r, d = jax.jvp(lambda z: residual(z, t), (U,), (mask,))
+            return jnp.where(algebraic, U - r / jnp.where(d != 0, d, 1.0), U)
+
+        return jax.lax.fori_loop(0, 8, body, U)
+
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+        mass, residual = _block_mass_and_residual(block, args)
+        A, b, c = self.A, self.b, self.c
+        n = int(jnp.asarray(block.state0).size)
+        with jax.ensure_compile_time_eval():
+            structure, alg_np = _mass_structure(mass(float(block.t0)), n)
+        algebraic = jnp.asarray(alg_np)
+        has_alg = bool(alg_np.any())
+
+        def rate(U, t):
+            return -_apply_mass_inverse(mass(t), structure, algebraic, residual(U, t))
+
+        def step_fn(u, t, dt, guess=None):
+            ks = []
+            for i in range(b.size):
+                U = u
+                for j in range(i):
+                    if A[i, j] != 0:
+                        U = U + (dt * A[i, j]) * ks[j]
+                if has_alg:
+                    U = self._project(residual, U, t + c[i] * dt, algebraic)
+                ks.append(rate(U, t + c[i] * dt))
+            out = u
+            for i in range(b.size):
+                if b[i] != 0:
+                    out = out + (dt * b[i]) * ks[i]
+            return self._project(residual, out, t + dt, algebraic) if has_alg else out
+
+        return step_fn
+
+    def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        from .backend_blocks import _block_time_grid, _resample_trajectory
+
+        s0 = jnp.asarray(block.state0).reshape(-1)
+        grid = jnp.asarray(_block_time_grid(block), s0.dtype)
+        dt = float(block.dt)
+        sub = 1
+        cfl_dt = (block.metadata or {}).get("cfl_dt")
+        if self.cfl is not None:
+            if cfl_dt is None:
+                raise ValueError(
+                    f"{self!r}: cfl= needs the problem's stable step (a finite-volume problem supplies it); this "
+                    "block has none. Drop cfl= and set the step with domain.time."
+                )
+            stable = float(cfl_dt(s0, self.cfl))
+            sub = max(1, int(np.ceil(dt / stable - 1e-12)))
+        step = self.stepper(block, args)
+
+        def advance(u, t_next):
+            h = dt / sub
+            u = jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_next - dt + i * h, h), u)
+            return u, u
+
+        ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
+        traj = jnp.concatenate([s0[None, :], ys], axis=0)
+        if self.cfl is not None and not isinstance(traj, jax.core.Tracer):
+            worst = min(float(cfl_dt(traj[k], self.cfl)) for k in range(0, traj.shape[0], max(1, traj.shape[0] // 8)))
+            if dt / sub > worst * (1 + 1e-9):
+                import warnings
+
+                warnings.warn(
+                    f"{self!r}: the CFL limit fell to a step of {worst:.3g} during the march, below the {dt / sub:.3g} "
+                    "chosen from the initial state. The result may be unstable: lower cfl= or the domain.time step.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+        return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+
+    def __repr__(self):
+        cfl = "" if self.cfl is None else f", cfl={self.cfl}"
+        return f"jno.solve.erk({self.name!r}{cfl})"
