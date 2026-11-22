@@ -15,6 +15,12 @@
   `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN:
   160 MB at `m = 100` instead of 315 GB). `pairs=None`, the default, is the dense solver, unchanged.
 
+### Fixed
+- `engd` builds its Gram matrix from the residual Jacobian a chunk of parameters at a time (it ran out
+  of GPU memory at about a thousand parameters on a Laplacian residual) and solves from the SVD of that
+  Jacobian instead of from G = JᵀJ, which squared its condition number: on a near-singular G the old
+  solve made the training path depend on rounding.
+
 ## [0.4.2] — 2026-10-23
 
 jNO 0.4.2 adds `jno.peec`, a differentiable partial-element equivalent-circuit solver, and makes a shape's coordinates design variables shared by PEEC and FEM. PINN derivatives are cheaper: every AD derivative on one point set now comes from one shared forward-mode pass. `jno.info` writes the equations in math notation. A comparison against other FEM libraries on the same problems found the FEM fixes below.

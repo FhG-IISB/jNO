@@ -348,6 +348,49 @@ def test_engd_direction_plain_is_unchanged():
     assert jnp.array_equal(got, jnp.linalg.lstsq(G, g)[0])
 
 
+@pytest.mark.parametrize("mu,lam", [(0.0, 0.0), (0.8, 0.0), (0.0, 1e-3), (0.9, 1e-3), (0.5, 10.0)])
+@pytest.mark.parametrize("shape", [(12, 40), (50, 20)])
+def test_factored_direction_matches_the_gram_form(mu, lam, shape):
+    """On a well-conditioned J the step from the SVD factor equals the step from G = J^T J."""
+    import jax.numpy as jnp
+
+    from jno.utils.explainability import engd_direction, engd_direction_factored, gram_factor
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(4), 3)
+    N, P = shape
+    J = jax.random.normal(k1, (N, P))
+    g = J.T @ jax.random.normal(k2, (N,))
+    phi_prev = jax.random.normal(k3, (P,))
+    want = engd_direction(J.T @ J, g, phi_prev, momentum=mu, damping=lam, rcond=None)
+    got = engd_direction_factored(gram_factor(J), g, phi_prev, momentum=mu, damping=lam, rcond=None)
+    assert float(jnp.max(jnp.abs(got - want)) / jnp.max(jnp.abs(want))) < 1e-8
+
+
+def test_factored_direction_keeps_the_small_singular_directions_accurate():
+    """J with singular values from 1 down to 1e-6: the factor gives the exact pseudo-inverse step to
+    near machine precision, the G form only to about eps / sigma_min^2, which is what made ENGD's
+    path depend on rounding."""
+    import jax.numpy as jnp
+
+    from jno.utils.explainability import engd_direction, engd_direction_factored, gram_factor
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(5), 3)
+    N, P = 20, 40
+    U, _ = jnp.linalg.qr(jax.random.normal(k1, (N, N)))
+    V, _ = jnp.linalg.qr(jax.random.normal(k2, (P, N)))
+    s = jnp.logspace(0, -6, N)
+    J = (U * s) @ V.T
+    g = J.T @ jax.random.normal(k3, (N,))
+    want = V @ ((V.T @ g) / s**2)
+
+    def rel(d):
+        return float(jnp.linalg.norm(d - want) / jnp.linalg.norm(want))
+
+    got = engd_direction_factored(gram_factor(J), g, jnp.zeros(P))
+    assert rel(got) < 1e-8
+    assert rel(engd_direction(J.T @ J, g, jnp.zeros(P))) > 100 * rel(got)
+
+
 @pytest.mark.parametrize(
     "kw,match",
     [({"momentum": -0.1}, "momentum"), ({"momentum": 1.0}, "momentum"), ({"damping": -1e-3}, "damping")],

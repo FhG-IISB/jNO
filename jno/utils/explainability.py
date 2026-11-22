@@ -526,9 +526,10 @@ def make_engd_fn(
     :math:`G = \\sum_k (w_k / N_k) \\, J_k^\\top J_k`
     where :math:`J_k \\in \\mathbb{R}^{N_k \\times P}` is the per-point
     parameter Jacobian of the :math:`k`-th constraint residual, and solves
-    :math:`G \\mathbf{d} = \\nabla L` via ``jnp.linalg.lstsq`` for the
-    natural gradient direction :math:`\\mathbf{d}`
-    (Sec. 3, arXiv:2302.13163).
+    :math:`G \\mathbf{d} = \\nabla L` for the natural gradient direction
+    :math:`\\mathbf{d}` (Sec. 3, arXiv:2302.13163). G is kept as the thin SVD of
+    the stacked residual Jacobian (:func:`gram_factor`), not as the P x P matrix:
+    see :func:`engd_direction_factored` for why.
 
     The :math:`1/N_k` normalisation makes each Gram term weight-consistent
     with the corresponding :math:`\\operatorname{mean}`-reduced loss term, so
@@ -538,16 +539,18 @@ def make_engd_fn(
     Returns a pair of JIT-friendly callables::
 
         gram_and_solve_fn(trainable, context, rng, flat_model_grad, phi_prev)
-            -> (nat_flat, G)
+            -> (nat_flat, factor)
 
-        cached_solve_fn(G, flat_model_grad, phi_prev)
+        cached_solve_fn(factor, flat_model_grad, phi_prev)
             -> nat_flat
+
+    ``factor`` is ``(s, Vt)`` from :func:`gram_factor`, with :math:`G = V_t^\\top \\operatorname{diag}(s^2) V_t`.
 
     ``phi_prev`` is the previous direction (zeros on the first step); it only
     enters when ``momentum > 0`` (SPRING, see :func:`engd_direction`).
 
-    Use ``gram_and_solve_fn`` every ``gram_interval`` steps to recompute G
-    and ``cached_solve_fn`` in between for cheap updates with the cached G.
+    Use ``gram_and_solve_fn`` every ``gram_interval`` steps to recompute the factor
+    and ``cached_solve_fn`` in between for cheap updates with the cached one.
 
     Args:
         gram_terms: Sequence of ``(NetworkGradient_expr, weight)`` pairs.
@@ -564,9 +567,10 @@ def make_engd_fn(
         lid: Layer ID (integer) of the model to precondition.
         trainable_template: The initial ``trainable`` pytree — used to infer
             *P* and build the unravel closure for the natural gradient.
-        rcond: Relative condition-number cutoff for ``jnp.linalg.lstsq``.
-            ``None`` (default) uses machine epsilon — correct for float64.
-            Increase to regularise a near-singular G; but this floors accuracy.
+        rcond: Relative cutoff on the eigenvalues of G for the pseudo-inverse
+            (as ``jnp.linalg.lstsq(G, ...)`` would apply it). ``None`` (default)
+            uses ``eps * P``. Increase to regularise a near-singular G; but this
+            floors accuracy.
         min_consecutive: Forwarded to each compiled expression.
         momentum: SPRING momentum :math:`\\mu \\in [0, 1)`; ``0`` is plain ENGD.
         damping: Levenberg-Marquardt damping :math:`\\lambda \\ge 0` added to G;
@@ -581,8 +585,8 @@ def make_engd_fn(
     # memory for about a thousand parameters on a Laplacian residual.
     residual_fn = make_residual_fn(gram_terms, all_ops, frozen, static, lid, unravel, min_consecutive, batchsize)
 
-    def _direction(G, g, phi_prev):
-        d = engd_direction(G, g, phi_prev, momentum=momentum, damping=damping, rcond=rcond)
+    def _direction(factor, g, phi_prev):
+        d = engd_direction_factored(factor, g, phi_prev, momentum=momentum, damping=damping, rcond=rcond)
         return jnp.where(jnp.any(jnp.isnan(d)), jnp.zeros_like(d), d)
 
     def gram_and_solve_fn(trainable, context, rng, flat_model_grad, phi_prev):
@@ -592,12 +596,12 @@ def make_engd_fn(
             return residual_fn(q, trainable, context, rng)
 
         m = jax.eval_shape(r_of, flat_p).shape[0]
-        J = jacobian(r_of, flat_p, m)
-        G = (J.T @ J).astype(flat_model_grad.dtype)
-        return _direction(G, flat_model_grad, phi_prev), G
+        J = jacobian(r_of, flat_p, m).astype(flat_model_grad.dtype)
+        factor = gram_factor(J)
+        return _direction(factor, flat_model_grad, phi_prev), factor
 
-    def cached_solve_fn(G, flat_model_grad, phi_prev):
-        return _direction(G, flat_model_grad, phi_prev)
+    def cached_solve_fn(factor, flat_model_grad, phi_prev):
+        return _direction(factor, flat_model_grad, phi_prev)
 
     return gram_and_solve_fn, cached_solve_fn
 
@@ -630,4 +634,45 @@ def engd_direction(G, g, phi_prev, *, momentum: float = 0.0, damping: float = 0.
         step = cho_solve(c, rhs)
     else:
         step = jnp.linalg.lstsq(G, rhs, rcond=rcond)[0]
+    return step if momentum == 0.0 else momentum * phi_prev + step
+
+
+def gram_factor(J):
+    """The Gram matrix :math:`G = J^\\top J` as the thin SVD of ``J``: ``(s, Vt)`` with :math:`G = V_t^\\top \\operatorname{diag}(s^2) V_t`.
+
+    ``J`` is the stacked, weighted residual Jacobian (``m x P``). The factor has ``min(m, P)`` rows,
+    so it is also smaller than G when there are fewer residual rows than parameters.
+    """
+    _, s, Vt = jnp.linalg.svd(J, full_matrices=False)
+    return s, Vt
+
+
+def engd_direction_factored(
+    factor, g, phi_prev, *, momentum: float = 0.0, damping: float = 0.0, rcond: float | None = None
+):
+    """:func:`engd_direction` with G given by its factor ``(s, Vt)`` from :func:`gram_factor`.
+
+    The same step, :math:`\\phi_k = \\mu\\,\\phi_{k-1} + (G + \\lambda I)^{-1}\\,(g - \\mu\\,G\\,\\phi_{k-1})`,
+    with the pseudo-inverse for ``damping=0`` cut at eigenvalues of G below ``rcond`` (default
+    ``eps * P``, what ``jnp.linalg.lstsq(G, ...)`` uses) times the largest.
+
+    Why the factor: forming :math:`G = J^\\top J` squares the condition number of ``J``. An eigenvalue
+    :math:`\\sigma^2` of G is then known only to about :math:`\\epsilon\\,\\sigma_{\\max}^2`, so the
+    directions with small :math:`\\sigma` carry relative error :math:`\\epsilon\\,\\sigma_{\\max}^2/\\sigma^2`
+    in the solve, while the SVD of ``J`` has them to :math:`\\epsilon\\,\\sigma_{\\max}/\\sigma`. A PINN's
+    G is close to singular, and with the G form 20 ENGD steps on a 1-D Poisson problem ended anywhere
+    between a loss of 1e-14 and 5e-5 depending only on the order in which G was summed (the chunk size
+    of the Jacobian); from the factor they end near 6e-14 either way.
+    """
+    s, Vt = factor
+    lam = s * s
+    rhs = g if momentum == 0.0 else g - momentum * (Vt.T @ (lam * (Vt @ phi_prev)))
+    proj = Vt @ rhs
+    if damping > 0.0:
+        # (G + damping I)^-1: 1/(s^2 + damping) on the range of Vt^T, 1/damping on its complement.
+        step = Vt.T @ (proj / (lam + damping)) + (rhs - Vt.T @ proj) / damping
+    else:
+        cut = (jnp.finfo(lam.dtype).eps * Vt.shape[1] if rcond is None else rcond) * jnp.max(lam)
+        keep = lam > cut
+        step = Vt.T @ jnp.where(keep, proj / jnp.where(keep, lam, 1.0), 0.0)
     return step if momentum == 0.0 else momentum * phi_prev + step
