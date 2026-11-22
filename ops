@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1794304601,"nonce":"e83q5FczfEAvAdRS2cS76ETPf+Y=","added":["branch:feat/rcwa-jax-field","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795348241,"nonce":"zNnx16vEyIBtZLbwLkLPoqliiMg=","target":"89980399223c9190b53c1fb2679363685076d9c5d12d4b9e9232dbe17c1e475b","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABhe9nNA","github-url":"https://github.com/FhG-IISB/jNO/issues/235"}}]}
