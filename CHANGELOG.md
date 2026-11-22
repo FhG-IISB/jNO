@@ -1,25 +1,56 @@
 # Changelog
 
-## Unreleased
+## [0.4.3] — 2026-11-22
+
+jNO 0.4.3 adds second-order optimizers for PINNs from the recent literature (Levenberg-Marquardt, dual and Nyström natural gradient, NNCG, SCORE, SS-ESOAP and SPRING momentum for ENGD) and a limited-memory self-scaled Broyden for large networks. Coarse spaces and GenEO make two-level Schwarz a one-line preconditioner, and transient FEM gains variable-order BDF, adaptive steps with rejection and every time scheme on every element family. FEM builds and first solves are several times faster, with cuDSS as the direct default on a GPU. Function-space norms give an H^-1 residual loss for PINNs.
+
+### Breaking changes and migration
+- `schwarz(nullspace="rigid")` and `amg(nullspace="rigid")` raise and say what to write instead: `schwarz(coarse=<space>)`, or the rigid modes as formulas (#191).
+- `jno.solve.lu()` without a backend is cuDSS where the solve runs on a GPU in float64 with the extension installed, otherwise JAX's `spsolve`; the log line names what ran (#192).
+- `adaptive_march` rejects a step whose error is over the tolerance and retries it smaller; it used to commit it and only shrink the next one (#195).
+- A linear transient whose step operator has a zero-diagonal saddle row defaults to `jno.solve.lu()` (#195).
+- Parameters that nothing read are removed: `Rcwa.solve(inc=)`, `FEM.pinned_solver`'s extras, `TraceEvaluator.evaluate(active_region=)`, `build_single_layer_params(arg_shapes=)` and `Callback.on_training_end`'s arguments (#188).
+- `engd` solves from the SVD of the residual Jacobian. Results agree with 0.4.2 up to rounding, but on a near-singular Gram matrix the training path can differ (#214).
 
 ### Added
-- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh (sampled points) the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss`.
-- PINN optimizers from the literature in `jno.optimizers`, each module citing its paper at the top:
-  `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent,
-  dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()`
-  (doubly-sketched Gauss-Newton; not yet validated at the published scale), `nncg()` (NysNewton-CG),
-  `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a
-  secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection
-  path in `solve()`.
-- `ssbroyden(pairs=m)` and `ssbfgs(pairs=m)`: the self-scaled metric on at most `m` directions in
-  `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN:
-  160 MB at `m = 100` instead of 315 GB). `pairs=None`, the default, is the dense solver, unchanged.
+- PINN optimizers in `jno.optimizers`, each module citing its paper: `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent, dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()` (doubly-sketched Gauss-Newton; not yet validated at the published scale), `nncg()` (NysNewton-CG), `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection path in `solve()` (#214).
+- `ssbroyden(pairs=m)` and `ssbfgs(pairs=m)`: the self-scaled metric on at most `m` directions, in `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN: 160 MB at `m = 100` instead of 315 GB). The layout is the limited-memory reduced-Hessian method of Gill & Leonard (2003). `pairs=None`, the default, is the dense solver, unchanged (#214).
+- `engd(momentum=, damping=)`: SPRING, Gauss-Newton with momentum (Goldshlager, Abrahamsen & Lin 2024), and a Levenberg-Marquardt shift solved by Cholesky (#193).
+- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss` (#213).
+- Coarse spaces as values: `jno.precond.coarse(space, parts=)` turns formulas, arrays, sparse matrices, callables or computed spaces into a preconditioner, and `M1 >> M2` composes corrections, so two-level Schwarz is `Q >> S >> Q`. `jno.space.eigvecs(k)` and `jno.space.geneo(tau=, nev=)` (GenEO, Spillane et al. 2014) solve batched local eigenproblems on the device. Also `fem.eigs(deflate=)`, `jno.solve.trace(deflate=)` and a sparse block-Cholesky factor of large coarse matrices (#191).
+- `jno.solve.bdf()`: variable-step, variable-order BDF/NDF (orders 1-5, Shampine & Reichelt 1997), with dense output at the scheme's order. Every time scheme (theta, bdf2, bdf, sdirk, rosenbrock, exponential) marches Lagrange, Hermite, Morley, Argyris, N1E and 1-D line elements (#198).
+- Trainables through transient marches: `exponential()` integrates and differentiates a trainable operator, and a parameter, network or data field in the initial condition trains; where the initial state is fixed at build, a trainable there is refused by name (#198).
+- Embedded error estimates for `sdirk(2/3)` and `rosenbrock("ros34pw2")` (Alexander 1977; Rang & Angermann 2005): one step per attempt instead of three. Index-2 rows (incompressibility) leave the error norm (#195).
+- `jno.fdm`: a repeated `solve()` reuses its traced and compiled march, and `time=rosenbrock()` marches a nonlinear problem (#196).
+- RCWA: `field3d` returns a differentiable JAX |E|^2, and `.attach(eps=...)` reaches RCWA per region (#197).
+- N1E on periodic cells: an incident face load, a sparse periodic prolongation, an exact periodic DtN boundary through `jno.np.sqrtm(L)`, and tangential-trace face terms in nonlinear coupled forms (#197).
+- `.structured()` on a plan of axis-aligned boxes meshes a rectilinear lattice with exact interfaces, as voxels or Kuhn tets (#197).
+- `lu(backend="pardiso")` factors a complex form with MKL's complex types, and `jno.solve.gmres` reports its iterations in `fem.stats["linear_iterations"]` (#197).
+- Soft cover enrichment: where to raise the order as a differentiable design variable (private module, with a tutorial on the L-shape) (#194).
+- Full docstrings on every public object, so editor hovers show the options; `jno.np`/`jno.fn` functions are explicit definitions (#188).
+- A loaded `.msh` keeps a named physical point as a node region (#212).
+
+### Fixed: silent wrong answers
+- MKL PARDISO returned wrong values or NaN, or corrupted the heap, when a cached factorization was used with a thread count other than its analysis's (compiled and un-compiled solves mixed); every call now runs with the analysis's count (#211).
+- A face term coupling two N1E fields was added to the first field's diagonal block instead of its off-diagonal block (#197).
+- A test-free summand in a weak form gave a wrong answer on a 1-D line; it is now dropped when it is a literal `0 +` and refused otherwise, on every assembler (#198).
+- A transient march on a zero-diagonal saddle at small `dt` returned a NaN trajectory from a broken-down BiCGStab; the step solve now goes through the residual gate and raises by name (#195).
 
 ### Fixed
-- `engd` builds its Gram matrix from the residual Jacobian a chunk of parameters at a time (it ran out
-  of GPU memory at about a thousand parameters on a Laplacian residual) and solves from the SVD of that
-  Jacobian instead of from G = JᵀJ, which squared its condition number: on a near-singular G the old
-  solve made the training path depend on rounding.
+- A solvable saddle-point system was refused as singular by `lu(backend="pardiso")`: the check used only the upper triangle of a symmetric matrix. Symmetric indefinite systems are also factored with scaling and weighted matching (#211).
+- An enclosed material in a loaded `.msh` was treated as a boundary; it is a region (#212).
+- An unknown inside `expr.integrate(fem)` is the trial, not a parameter.
+- `engd` ran out of GPU memory at about a thousand parameters on a Laplacian residual: its Gram matrix comes from the residual Jacobian a chunk of parameters at a time. It solves from the SVD of that Jacobian, since forming G = JᵀJ squared its condition number (#214).
+- PARDISO ignores the padding entries of a fixed-length BCOO, as JAX's CSR conversion does (#194).
+- Adaptive steps keep the gradient through a rejected attempt, and a zero right-hand side gives a zero step instead of NaN (#195).
+- A periodic multi-field reduction inside a traced Newton, a periodic face split by gmsh, and `fem.eval` of a test-free integrand reading an `.attach`-ed coefficient (#197).
+- `.auglag()` raised `ImportError` (#191).
+
+### Performance
+- FEM builds 6.6-7.7x faster and first solves 8.7-16x faster on P2 problems of 0.7-1M dofs, at about half the XLA peak and host memory: sorted `unique`, hashed mesh promotion, byte-bounded element chunks, staged host-to-device transfers, hoisted program constants, and a CSR matvec that shares the operator's values. A parametric elastic solve with the default solver is 65x faster (#192).
+
+### Tooling
+- Tests run as balanced parallel shards with a kept compile cache; the nightly fits its timeout (#199, #211).
 
 ## [0.4.2] — 2026-10-23
 
