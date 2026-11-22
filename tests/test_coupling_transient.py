@@ -89,3 +89,43 @@ def test_loose_coupling_takes_one_sweep_per_window_and_stays_close():
     # dt = 1e-3 but not round-off
     gap = np.abs(tb[-1] - rb[-1]).max()
     assert 1e-6 < gap < 0.05
+
+
+def test_a_steady_problem_couples_quasi_steadily_to_a_transient_one():
+    # a capacity-free slab [-1, 0] (k_a, held at 0 on its far side) on a heating slab [0, 1] (k_b, rho c 1, held at 1):
+    # the steady slab answers every window at once, exactly a Robin condition k_b dT/dn = (k_a/L_a)(0 - T) on the
+    # transient one -- which one jno.fem problem on the same mesh solves directly
+    ka, kb = 2.0, 1.0
+    da = jno.shape.rect(-1.0, 0.0, 0.0, 0.1, size=0.05).domain()
+    x, y, _ = da.variable("interior", split=True)
+    xl, yl, _ = da.variable("left", split=True)
+    ua = da.unknown()
+    pa = jno.fvm([-ka * (ua.bind(x=x, y=y).xx + ua.bind(x=x, y=y).yy), ua(xl, yl) - 0.0])
+    xa, ya, _ = da.variable("right", split=True)
+    uar = ua.bind(x=xa, y=ya)
+
+    def wall(robin):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 0.1, size=0.04).domain(time=(0.0, 0.1, 21))
+        T, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        ci = d.variable("initial", split=True)
+        tb, vb = T.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        xs, ys, _ = d.variable("left", split=True)
+        cons = [tb.t * vb + kb * (tb.x * vb.x + tb.y * vb.y), T(xr, yr) - 1.0, T(*ci) - (1.0 + 0.0 * ci[0])]
+        if robin:
+            cons.append((ka / 1.0) * T.bind(x=xs, y=ys) * v.bind(x=xs, y=ys))
+        Tl = T.bind(x=xs, y=ys)
+        return jno.fem(cons), Tl, Tl.d(d.variable("left", normals=True)), d
+
+    pb, ub, fb, db = wall(False)
+    c = couple(
+        [pa, pb], [uar - ub, ka * uar.d(da.variable("right", normals=True)) + kb * fb], CouplingSpec(tol=1e-10, max_iter=40)
+    )
+    _, tb = c.solve()
+    ref, *_ = wall(True)
+    tref = np.asarray(ref.solve().fn())
+    # the fvm flux is piecewise constant over its faces; projected onto the FEM's P1 space it differs from the P1
+    # Robin term by O(h²) (h 0.04-0.05 here: a few 1e-5), the transfer's own discretisation, not the coupling's
+    np.testing.assert_allclose(tb, tref, atol=2e-4)
+    assert np.abs(tb[-1] - tb[0]).max() > 0.1  # the wall did cool

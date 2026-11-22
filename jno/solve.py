@@ -75,6 +75,7 @@ __all__ = [
     "theta",
     "coupling",
     "erk",
+    "ptc",
     "piso",
     "simple",
     "exponential",
@@ -2081,6 +2082,26 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12):
+    """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
+    ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
+
+    Each step solves ``(J + |diag J| / Δτ) δ = -F(u)`` (a backward-Euler step in pseudo-time) and ``Δτ`` grows as the
+    residual falls (switched evolution relaxation, Mulder & van Leer 1985), so it follows the transient path
+    where it must -- a shock or a front that has not formed in the start state -- and ends as Newton. A row with
+    no diagonal (a saddle point's constraint) stays algebraic.
+
+    Args:
+        dtau0: the first pseudo-time step, in units of the diagonal (``1`` doubles it; smaller is more cautious).
+        dtau_max: the largest pseudo-time step.
+        max_steps: the most steps.
+        rtol, atol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
+    """
+    from .utils.solver.ptc import PseudoTransient
+
+    return PseudoTransient(dtau0=dtau0, dtau_max=dtau_max, max_steps=max_steps, rtol=rtol, atol=atol)
 
 
 def coupling(
