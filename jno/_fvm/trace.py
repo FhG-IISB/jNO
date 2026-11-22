@@ -59,6 +59,17 @@ _BOUNDARY_PASSES = 6  # boundary values and volume gradients, alternated to thei
 # -- the trace ------------------------------------------------------------------------------------------
 
 
+def _mentions(node, model):
+    """Does ``node`` contain the unknown ``model``, inside a time derivative ``u.t`` too (the generic walk does
+    not enter a ``TemporalDerivative``'s target)?"""
+    from ..trace import TemporalDerivative
+
+    n = _unwrap(node)
+    if isinstance(n, TemporalDerivative):
+        return _mentions(n.target, model)
+    return _contains_unknown(n, model) or any(_mentions(c, model) for c in _iter(n))
+
+
 def _is_spatial(v):
     tag = str(getattr(v, "tag", ""))
     return getattr(v, "axis", "spatial") == "spatial" and not tag.startswith("n_") and tag not in ("cell_size",)
@@ -254,7 +265,16 @@ class _TraceFVM(StrongFormProblem):
         self.region, self.region_geometry = self._pde_region()
         if self.region is not None:
             raise NotImplementedError("jno.fvm([...]): a PDE on a sub-region is not supported yet.")
+        self._saddle = self._saddle_pairs()  # {constraint equation k: the unknown j its fluxes carry}
         self._equations = [self._split_equation(e) for e in self._pde_exprs()]
+        for k, j in self._saddle.items():
+            eq = self._equations[k]
+            eq["mass"] = {a: F for g in eq["groups"] for a, F in g["convective"].items()}
+            eq["partner"] = j
+            for g in eq["groups"]:
+                g["convective"] = {}
+            if eq["scheme"] is not None:
+                eq["scheme"] = None
         self._conditions = self._boundary_conditions()
         self._pins = self._pin_rows()
 
@@ -295,6 +315,43 @@ class _TraceFVM(StrongFormProblem):
         return self.graph.boundary_faces_on(self._region_mesh_nodes(tag))
 
     # -- the PDE as volume terms and fluxes ----------------------------------------------------------
+    def _saddle_pairs(self):
+        """``{k: j}`` for every constraint equation: equation ``k`` holds no term in its own unknown ``k`` but
+        carries a flux of unknown ``j`` (``div U = 0`` for the pressure ``p``). Unknown ``k`` is then a Lagrange
+        multiplier of that constraint. Its equation gets a central flux with a momentum-weighted (Rhie-Chow)
+        correction instead of a Riemann flux, and the gradient of ``k`` elsewhere is read in Green-Gauss form."""
+        if len(self.unknowns) < 2:
+            return {}
+        out = {}
+        for k, e in enumerate(self._pde_exprs()):
+            if _mentions(e, self.unknowns[k]):
+                continue
+            others = [j for j, w in enumerate(self.unknowns) if j != k and _mentions(e, w)]
+            if len(others) != 1:
+                raise ValueError(
+                    f"jno.fvm([...]): equation {k} has no term in its own unknown, so it is a constraint, but it "
+                    f"involves {len(others)} other unknowns; a constraint equation must carry the flux of one."
+                )
+            out[k] = others[0]
+        return out
+
+    def _is_multiplier(self, node):
+        """Is ``node`` a bare constraint unknown (a pressure)?"""
+        from ..trace import ModelCall
+
+        n = _unwrap(node)
+        return isinstance(n, ModelCall) and any(n.model is self.unknowns[k] for k in getattr(self, "_saddle", {}))
+
+    def _has_noncons_derivative(self, node):
+        """A derivative of an unknown inside a volume term, other than the gradient of a multiplier (that one is
+        read in Green-Gauss form, which is the divergence of ``p I`` and so conservative)."""
+        from ..trace import Hessian, Jacobian
+
+        n = _unwrap(node)
+        if isinstance(n, (Jacobian, Hessian)) and self._has_unknown(n.target):
+            return not (isinstance(n, Jacobian) and self._is_multiplier(n.target))
+        return any(self._has_noncons_derivative(c) for c in _iter(n))
+
     def _pde_exprs(self):
         if len(self.unknowns) == 1:
             expr = self._pde[0]
@@ -304,7 +361,7 @@ class _TraceFVM(StrongFormProblem):
         return [_unwrap(self._pde[k]) for k in range(len(self.unknowns))]
 
     def _has_unknown(self, node):
-        return any(_contains_unknown(node, u) for u in self.unknowns)
+        return any(_mentions(node, u) for u in self.unknowns)
 
     def _has_unknown_derivative(self, node):
         from ..trace import Hessian, Jacobian
@@ -353,7 +410,7 @@ class _TraceFVM(StrongFormProblem):
                             sub = BinaryOp("*", Literal(mag), sub)
                         grp[kind].setdefault(axis, []).append((np.sign(scale) * s2, sub))
                 continue
-            if self._has_unknown_derivative(term):
+            if self._has_noncons_derivative(term):
                 noncons = True
             volume.append((sign, _expand_hessians(term)))
         if noncons:
@@ -399,7 +456,7 @@ class _TraceFVM(StrongFormProblem):
 
     def _field_of(self, constraint):
         """The unknown a condition constrains: the one it mentions."""
-        ks = [k for k, u in enumerate(self.unknowns) if _contains_unknown(constraint, u)]
+        ks = [k for k, u in enumerate(self.unknowns) if _mentions(constraint, u)]
         if len(ks) != 1:
             raise ValueError(
                 f"jno.fvm([...]): a boundary condition or pin must mention exactly one unknown; this one mentions "
@@ -497,6 +554,8 @@ class _TraceFVM(StrongFormProblem):
                         r = r + div
                 if conv is not None:
                     r = r + conv[:, cols]
+                if eq.get("mass"):
+                    r = r + self.ops.divergence(*ev.mass_flux(eq["mass"], eq["partner"], k, c))
                 out.append(r)
             R = jnp.concatenate(out, axis=1)  # (n, nf)
             for k, cells, expr in self._pins:
@@ -1019,7 +1078,7 @@ class _Evaluator:
             self._grad_cache[key] = (Tc, Tb, self.ops.cell_gradient(Tc, Tb))
         Tc, Tb, G = self._grad_cache[key]
         if kind == "cells":
-            out = G
+            out = self.ops.green_gauss(Tc, Tb) if self.p._is_multiplier(target) else G
         elif kind == "faces":
             out = self.ops.face_gradient(Tc, G)
         else:
@@ -1093,6 +1152,107 @@ class _Evaluator:
         return qf - (jnp.swapaxes(J, 1, 2) @ lam)[..., 0]
 
     # -- fluxes ---------------------------------------------------------------------------------------
+    def mass_flux(self, by_axis, j, k, c):
+        """Interior and boundary fluxes of a constraint equation (``div U = 0``): the central flux of the
+        interpolated state, with the momentum-weighted (Rhie-Chow) correction ``-D_f [∂p/∂d − ∇p̄·d̂](S·d̂)`` at
+        interior faces, which couples the multiplier ``p`` (unknown ``k``) to its neighbours; boundary faces carry
+        the boundary state alone.
+
+        Based on: Rhie, C. M., & Chow, W. L. (1983). Numerical study of the turbulent flow past an airfoil with
+        trailing edge separation. AIAA Journal 21(11), 1525-1532."""
+        o = self.ops
+        fi = sum(self.rows(self.values(F, "faces"), c, "faces") * o.S[:, a : a + 1] for a, F in by_axis.items())
+        fb = None
+        if o.b_owner.shape[0]:
+            fb = sum(self.rows(self.values(F, "bfaces"), c, "bfaces") * o.bS[:, a : a + 1] for a, F in by_axis.items())
+        P = self.q[k]
+        G = o.green_gauss(P, self.qb[k])
+        Gf = G[o.owner] + o.gw[:, None, None] * (G[o.neigh] - G[o.owner])
+        jump = (P[o.neigh] - P[o.owner]) / o.dmag[:, None] - jnp.einsum("fcd,fd->fc", Gf, o.dhat)
+        D = self.momentum_weight(j, k)
+        sd = jnp.einsum("fd,fd->f", o.S, o.dhat)
+        return fi - (D * sd)[:, None] * jump, fb
+
+    def momentum_weight(self, j, k):
+        """``D_f = β V/a_P`` at the faces for the momentum of unknown ``j`` and the multiplier ``k``, all probed
+        from the momentum equation itself (nothing names a viscosity, a velocity or a permeability):
+        ``a_P = Σ_f |S_f| (λ_f + κ_f/|d_f|) + V |∂(volume term)/∂U|`` -- ``λ`` the spectral radius of its
+        convective normal flux, ``κ`` its diffusivity (the sensitivity of the central normal flux to the
+        gradient), the last a drag or reaction (Darcy's ``U/K``) -- and ``β`` the coefficient of ``∇p`` in it.
+        Differentiable."""
+        o, p = self.ops, self.p
+        eq = p._equations[j]
+        c = p._ncomp[j]
+        lam = jnp.zeros(o.owner.shape[0], o.S.dtype)
+        conv = {a: F for g in eq["groups"] for a, F in g["convective"].items()}
+        if conv:
+
+            def Fn(U):
+                states = {
+                    jj: (U if jj == j else self._unknown_at(jj, "faces", None, None)) for jj in range(len(p.unknowns))
+                }
+                return sum(
+                    self.rows(self.values(F, "faces", states), c, "faces") * o.nhat[:, a : a + 1] for a, F in conv.items()
+                )
+
+            lam = _spectral_radius(_flux_jacobian(Fn, o.face_value(self.q[j])))
+        kappa = jnp.zeros_like(lam)
+        central = [g["central"] for g in eq["groups"] if g["central"] and g["coef"] is None]
+        if central:
+            q0 = self.q[j]
+
+            def flux_of(qj):
+                saved, self.q[j] = self.q[j], qj
+                self._grad_cache = {}
+                try:
+                    return sum(self.central_flux(by, c)[0] for by in central)  # (n_if, c)
+                finally:
+                    self.q[j] = saved
+                    self._grad_cache = {}
+
+            acc = jnp.zeros_like(lam)
+            for comp in range(c):
+                for a in range(o.dim):
+                    t = jnp.zeros_like(q0).at[:, comp].set(o.centroid[:, a])  # a unit gradient along axis a
+                    dF = jax.jvp(flux_of, (q0,), (t,))[1][:, comp]
+                    acc = acc + o.nhat[:, a] * dF
+            kappa = jnp.abs(acc) / (c * o.Smag)
+        aface = o.Smag * (lam + kappa / o.dmag)
+        aP = jax.ops.segment_sum(aface, o.owner, num_segments=o.n) + jax.ops.segment_sum(aface, o.neigh, num_segments=o.n)
+        if o.b_owner.shape[0]:
+            aP = aP + jax.ops.segment_sum(o.bSmag * kappa.mean() / o.bdperp, o.b_owner, num_segments=o.n)
+        beta = jnp.ones(o.n, o.S.dtype)
+        if eq["volume"] is not None:
+            vol = _zero_temporal(eq["volume"])
+
+            def vol_of(i, qi, qbi=None):
+                saved, self.q[i] = self.q[i], qi
+                saved_b = self.qb[i]
+                if qbi is not None:
+                    self.qb[i] = qbi
+                self._grad_cache = {}
+                try:
+                    return self.rows(self.values(vol, "cells"), c, "cells")
+                finally:
+                    self.q[i], self.qb[i] = saved, saved_b
+                    self._grad_cache = {}
+
+            drag = jnp.zeros(o.n, o.S.dtype)
+            for comp in range(c):  # the volume term's own diagonal in U
+                t = jnp.zeros_like(self.q[j]).at[:, comp].set(1.0)
+                drag = drag + jnp.abs(jax.jvp(lambda z: vol_of(j, z), (self.q[j],), (t,))[1][:, comp]) / c
+            aP = aP + o.volume * drag
+            grads = []
+            for a in range(min(c, o.dim)):  # the coefficient of ∂p/∂x_a in component a
+                t = jnp.zeros_like(self.q[k]).at[:, 0].set(o.centroid[:, a])
+                tb = jnp.zeros_like(self.qb[k]).at[:, 0].set(o.bcentroid[:, a])  # the boundary values move too
+                f = lambda z, zb: vol_of(k, z, zb)  # noqa: E731
+                grads.append(jax.jvp(f, (self.q[k], self.qb[k]), (t, tb))[1][:, a])
+            if grads:
+                beta = jnp.abs(sum(grads) / len(grads))
+        DP = beta * o.volume / jnp.maximum(aP, jnp.finfo(aP.dtype).tiny)
+        return 0.5 * (DP[o.owner] + DP[o.neigh])
+
     def central_flux(self, by_axis, c):
         """Interior and boundary normal fluxes ``Σ_axis F_axis S_axis`` of the central part of a group."""
         o = self.ops
@@ -1125,10 +1285,17 @@ class _Evaluator:
         def split(Q):
             return {k: Q[:, b : b + c] for k, (b, c) in enumerate(zip(p._block0, p._ncomp))}
 
+        rows = []  # the components whose equations carry a convective flux: only they are damped
+        for k, eq in enumerate(eqs):
+            c = p._ncomp[k] if len(eqs) > 1 else p._nf
+            rows += [any(g["convective"] for g in eq["groups"])] * c
+        live = jnp.asarray(rows, dtype=jnp.concatenate(self.q, axis=1).dtype)
+
         def numerical(QL, QR, site, normals):
             Fn = lambda Q: normal_flux(split(Q), site, normals)  # noqa: E731
             if callable(scheme.flux):
                 return scheme.flux(QL, QR, normals, Fn)
+            QR = QL + live * (QR - QL)  # a row without a convective flux sees no jump to damp
             fL, fR = Fn(QL), Fn(QR)
             if scheme.flux == "rusanov":
                 sL = self._speed(QL, site, normals, Fn, split, scheme)
@@ -1253,9 +1420,12 @@ def _eig_extremes(A):
     on every device (no eigendecomposition)."""
     if A.shape[1] == 1:
         return A[:, 0, 0], A[:, 0, 0]
-    coef = _charpoly(A)
-    bound = jnp.abs(A).sum(axis=2).max(axis=1) * (1.0 + 1e-8) + jnp.finfo(A.dtype).tiny
-    return _extreme_root(coef, -bound), _extreme_root(coef, bound)
+    # on A/β, β = ‖A‖_∞ held constant: eigenvalues scale with A, so this is exact, and it stays finite at A = 0
+    beta = jax.lax.stop_gradient(jnp.abs(A).sum(axis=2).max(axis=1))
+    beta = jnp.where(beta > 0, beta, 1.0)
+    coef = _charpoly(A / beta[:, None, None])
+    edge = jnp.full_like(beta, 1.0 + 1e-8)
+    return beta * _extreme_root(coef, -edge), beta * _extreme_root(coef, edge)
 
 
 def _smooth_abs(a, delta=1e-8):
