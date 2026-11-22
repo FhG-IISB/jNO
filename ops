@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1793877850,"nonce":"lxXqGI3AVbdBtu/WSefTV7L7RyY=","added":["branch:feat/engd-spring","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795348530,"nonce":"j/XyA4MSpLmymVz0iAR1N/Hy7uQ=","target":"db78325e8ff405b349de077ef1b9189f30a4b8676cdabecca2a9aa79cff51e2e","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABhfAGcA","github-url":"https://github.com/FhG-IISB/jNO/issues/339"}}]}
