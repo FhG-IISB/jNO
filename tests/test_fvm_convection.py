@@ -87,15 +87,18 @@ def test_a_custom_flux_callable_equals_the_built_in_rusanov():
     np.testing.assert_allclose(a, b, atol=1e-12)
 
 
-def test_burgers_shock_sits_where_conservation_puts_it():
-    """Steady viscous Burgers ``(u²/2)' = ν u''`` with u(0) = 1, u(1) = -1: by symmetry the shock is at 0.5,
-    and only the conservative form keeps it there with the right jump."""
-    _, x, xl, xr, u, ui = _line(0.01)
-    p = jno.fvm([(ui * ui / 2).d(x, scheme=jno.fv()) - 0.005 * ui.xx, u(xl) - 1.0, u(xr) + 1.0])
-    s, c = np.asarray(p.solve(x0=np.asarray(1.0 - 2.0 * (np.arange(p._N) > p._N // 2)))), p.centroids[:, 0]
-    crossing = c[np.argmin(np.abs(s))]
-    assert abs(crossing - 0.5) < 0.011
-    assert s[c < 0.4].min() > 0.99 and s[c > 0.6].max() < -0.99
+def test_steady_viscous_burgers_converges_to_the_tanh_profile():
+    """``(u²/2)' = ν u''`` with the boundary values of ``u = -tanh((x - 0.5)/(2ν))``, ν = 0.05: Newton on the
+    assembled tangent, and the error falls at second order. (A thin shock, ν → 0, is not a steady test: its
+    position is fixed only through terms of size exp(-1/2ν), so the steady Jacobian is singular to round-off.)"""
+    nu, errs = 0.05, []
+    for h in (0.02, 0.01):
+        _, x, xl, xr, u, ui = _line(h)
+        edge = float(np.tanh(0.5 / (2 * nu)))
+        p = jno.fvm([(ui * ui / 2).d(x, scheme=jno.fv()) - nu * ui.xx, u(xl) - edge, u(xr) + edge])
+        s, c = np.asarray(p.solve(x0=np.zeros(p._N))), p.centroids[:, 0]
+        errs.append(np.abs(s + np.tanh((c - 0.5) / (2 * nu))).max())
+    assert errs[0] < 2e-2 and errs[0] / errs[1] > 3.0
 
 
 def test_a_step_advected_across_triangles_stays_bounded():

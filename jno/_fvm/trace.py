@@ -465,7 +465,7 @@ class _TraceFVM(StrongFormProblem):
     def _evaluator(self, q, qb, t, scope):
         return _Evaluator(self, q, qb, t, scope)
 
-    def _residual_fn(self, *, spatial=True, extra_params=None):
+    def _residual_fn(self, *, spatial=True, extra_params=None, first_order=False):
         """The finite-volume residual ``R(dofs)`` (blocked DOF layout), volume terms integrated (``V·term``)
         and fluxes summed over faces. ``spatial=True`` drops the ``u.t`` terms."""
         eqs = self._equations
@@ -477,6 +477,7 @@ class _TraceFVM(StrongFormProblem):
             q = self._split_dofs(dofs)
             qb = [qk[self.ops.b_owner] if nB else jnp.zeros((0, qk.shape[1]), qk.dtype) for qk in q]
             ev = self._evaluator(q, qb, t, scope)
+            ev.first_order = first_order
             for i in range(self.ops.boundary_passes):
                 ev.solve_boundary(first=i == 0)
             out = []
@@ -504,12 +505,39 @@ class _TraceFVM(StrongFormProblem):
             R = self._require_real(R, "the finite-volume residual (a complex coefficient or source)")
             return R.T.reshape(-1)
 
-        return residual
+        eq_expr = self._equilibrium()
+        if eq_expr is None:
+            return residual
+        keep = np.ones(self._Ntot, dtype=bool)
+        for k, cells, _ in self._pins:
+            for b in range(self._block0[k], self._block0[k] + self._ncomp[k]):
+                keep[b * self._N + np.asarray(cells)] = False
+        keep = jnp.asarray(keep)
+
+        def well_balanced(dofs, t=None):
+            """``R(q) − R(q_eq)``: the discrete residual of the equilibrium is removed, so it is a steady state of
+            the scheme to round-off (Berberich, Chandrashekar & Klingenberg 2021); pinned rows are left alone."""
+            q = [jnp.zeros((self._N, c), jnp.asarray(dofs).dtype) for c in self._ncomp]
+            qb = [jnp.zeros((nB, c), jnp.asarray(dofs).dtype) for c in self._ncomp]
+            ev = self._evaluator(q, qb, t, scope)
+            q_eq = ev.rows(ev.values(eq_expr, "cells"), self._nf, "cells").T.reshape(-1)
+            return residual(dofs, t) - jnp.where(keep, residual(q_eq, t), 0.0)
+
+        return well_balanced
+
+    def _equilibrium(self):
+        """The ``equilibrium=`` state of the convective scheme, if one was given."""
+        if not any(g["convective"] for eq in self._equations for g in eq["groups"]):
+            return None
+        return self._convective_scheme().equilibrium
 
     def _decide_condition_affinity(self, scope):
         """Which boundary conditions are affine in their face value (one Newton step solves them exactly),
         decided once on concrete values: the jvp of the condition at two face states must agree."""
         cache = self.__dict__.setdefault("_condition_affine", {})
+        self.__dict__.setdefault("_condition_partial", {})
+        if "_mirror" not in self.__dict__:
+            self._mirror = jnp.zeros((self.graph.b_owner.shape[0], self._nf), dtype=bool)
         todo = [(k, f, e) for k, f, e in self._conditions if id(e) not in cache]
         if not todo:
             return
@@ -523,6 +551,11 @@ class _TraceFVM(StrongFormProblem):
                 j0 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0,), (tangent,))[1]
                 j1 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0 + 0.71,), (tangent,))[1]
                 cache[id(expr)] = bool(jnp.all(jnp.abs(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.abs(j0).max()) + 1.0)))
+                partial = int(j0.shape[1]) < self._ncomp[k]
+                self._condition_partial[id(expr)] = partial
+                if partial:  # the outer Riemann state of these faces is the mirror image of the inner one
+                    cols = slice(self._block0[k], self._block0[k] + self._ncomp[k])
+                    self._mirror = self._mirror.at[faces, cols].set(True)
 
     # -- solving --------------------------------------------------------------------------------------
     def _pattern(self, key, fun, u):
@@ -534,8 +567,13 @@ class _TraceFVM(StrongFormProblem):
 
         pairs = np.stack([self.graph.owner, self.graph.neigh], axis=1)
         n = int(np.asarray(u).size)
-        v = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype=jnp.asarray(u).dtype)
-        ref = jax.jvp(fun, (jnp.asarray(u),), (v,))[1]
+        rng = np.random.default_rng(0)
+        v = jnp.asarray(rng.standard_normal(n), dtype=jnp.asarray(u).dtype)
+        # verified at a GENERIC state near `u`: at a piecewise-constant one a limiter's dependence on the second
+        # ring vanishes, a too-narrow pattern passes, and the tangents assembled later are wrong
+        u = jnp.asarray(u)
+        u = u + 0.01 * (jnp.abs(u) + 1.0) * jnp.asarray(rng.standard_normal(n), dtype=u.dtype)
+        ref = jax.jvp(fun, (u,), (v,))[1]
         for radius in (1, 2, 3, 4):
             pattern = _stencil_pattern(pairs, self._N, radius, n_fields=n // self._N)
             color, n_colors = _color_columns(pattern)
@@ -640,17 +678,35 @@ class _TraceFVM(StrongFormProblem):
             q0[k] = z
         return jnp.concatenate(q0, axis=1).T.reshape(-1)
 
-    def _cfl_dt(self, residual, mass_diag):
-        """``(state, cfl) -> Δt``: the largest stable explicit step from the Gershgorin bound of the scaled
-        tangent ``M⁻¹ ∂R/∂u`` (covers convection, diffusion and reaction alike): ``Δt = 2·cfl / max_i Σ_j
-        |J_ij| / m_i``."""
+    def _cfl_dt(self, residual_first_order, mass_diag):
+        """``(state, cfl) -> Δt``: ``2·cfl / ρ`` with ``ρ`` the spectral radius of the scaled first-order
+        tangent ``M⁻¹ ∂R/∂u``, by Gelfand's formula on 40 matrix-free products (it converges for complex
+        eigenvalue pairs too). For upwinded convection ``ρ = 2a/Δx``, so ``cfl`` is the classical Courant
+        number; diffusion and reaction enter the same way. The first-order operator is read because a
+        limiter's derivatives would inflate the bound."""
+
+        m = mass_diag(None)
+        dyn = m > 0
+        f = lambda y: residual_first_order(y, self._start_time(), {})  # noqa: E731
+        v0 = jnp.where(dyn, jnp.asarray(np.random.default_rng(3).standard_normal(m.shape[0])), 0.0)
+
+        @jax.jit
+        def rho_of(w):
+            _, lin = jax.linearize(f, w)
+
+            def body(i, carry):
+                v, acc = carry
+                v = jnp.where(dyn, lin(v) / jnp.where(dyn, m, 1.0), 0.0)
+                nrm = jnp.linalg.norm(v)
+                acc = acc + jnp.where(i >= 20, jnp.log(jnp.maximum(nrm, jnp.finfo(v.dtype).tiny)), 0.0)
+                return v / jnp.maximum(nrm, jnp.finfo(v.dtype).tiny), acc
+
+            _, acc = jax.lax.fori_loop(0, 40, body, (v0 / jnp.linalg.norm(v0), 0.0))
+            return jnp.exp(acc / 20.0)
 
         def stable(w, cfl):
-            J = self._operator("march", lambda y: residual(y, self._start_time(), {}), jnp.asarray(w))
-            rows = jax.ops.segment_sum(jnp.abs(J.data), J.indices[:, 0], num_segments=J.shape[0])
-            m = mass_diag(None)
-            rate = jnp.where(m > 0, rows / jnp.where(m > 0, m, 1.0), 0.0)
-            return 2.0 * float(cfl) / max(float(rate.max()), np.finfo(float).tiny)
+            rho = float(rho_of(jnp.asarray(w)))
+            return 2.0 * float(cfl) / max(rho, np.finfo(float).tiny)
 
         return stable
 
@@ -670,6 +726,7 @@ class _TraceFVM(StrongFormProblem):
             raise ValueError("jno.fvm([...]): domain.time must give n_steps >= 2 for a transient march.")
         scope = self._params_scope()
         spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
+        spatial_first = self._residual_fn(extra_params=getattr(self, "_override", None), first_order=True)
         c_of, m_of = self._time_coefficients(scope)
         V = jnp.tile(self.ops.volume, self._nf)
         pinned = np.zeros(self._Ntot, dtype=bool)
@@ -710,8 +767,12 @@ class _TraceFVM(StrongFormProblem):
         common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata={})
         jac = lambda w, t, args: self._operator("march", lambda y: residual(y, t, args), w)  # noqa: E731
         with jax.ensure_compile_time_eval():
-            self._pattern("march", lambda y: residual(y, float(t0), {}), jnp.zeros(N2))
-        common["metadata"]["cfl_dt"] = self._cfl_dt(residual, mass_diag)
+            self._pattern("march", lambda y: residual(y, float(t0), {}), state0)  # where the flux is defined
+        if second:
+            first = lambda y, t, args: jnp.concatenate([-y[n:], spatial_first(y[:n], t)])  # noqa: E731
+        else:
+            first = lambda y, t, args: spatial_first(y, t)  # noqa: E731
+        common["metadata"]["cfl_dt"] = self._cfl_dt(first, mass_diag)
         block = SemidiscreteTimeBlock(
             mass=lambda t, args: jsparse.BCOO((mass_diag(t), diag), shape=(N2, N2)),
             residual=residual,
@@ -741,10 +802,11 @@ class _TraceFVM(StrongFormProblem):
 
         residual = jax.jit(self._residual_fn(extra_params=extra_params))
         zeros = jnp.zeros(self._Ntot)
+        probe_at = zeros if x0 is None else jnp.asarray(x0)  # a flux like m/rho is undefined at 0
         make_probe = lambda: jax.jit(self._residual_fn(extra_params=self._current_params()))  # noqa: E731
         with jax.ensure_compile_time_eval():
             linear_problem = self._is_affine("steady", make_probe, self._Ntot)
-            self._pattern("steady", make_probe(), zeros)
+            self._pattern("steady", make_probe(), probe_at)
         if linear_problem:
             if nonlinear is not None:
                 raise ValueError("jno.fvm: nonlinear= given, but this problem is linear.")
@@ -754,8 +816,7 @@ class _TraceFVM(StrongFormProblem):
         u0 = zeros if x0 is None else jnp.asarray(x0)
         tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
         nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True, line_search=True)
-        if linear is None:
-            linear, precond = self._defaults(tangent(u0), None, precond)
+        # no linear= given: Newton's direct variant factorises the assembled tangent (sparse LU), as jno.fdm does
         precond = self._frozen(precond, lambda: tangent(u0))
         return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)(residual, u0, jacobian=tangent)
 
@@ -821,6 +882,7 @@ class _Evaluator:
     def __init__(self, prob, q, qb, t, scope):
         self.p, self.ops, self.q, self.qb, self.t = prob, prob.ops, list(q), list(qb), t
         self.scope = scope
+        self.first_order = False  # first-order face states (the CFL bound reads that operator)
         self._grad_cache = {}
 
     # sites: "cells", "faces", ("cells", idx), ("bfaces", idx), "bfaces"
@@ -994,7 +1056,8 @@ class _Evaluator:
         new = [o.owner_at_face(self.q[k], G[k]) for k in range(len(self.q))]
         self._grad_cache = {}
         for k, faces, expr in self.p._conditions:
-            qf = new[k][faces] if first else self.qb[k][faces]  # later passes start from the last values
+            partial = self.p._condition_partial.get(id(expr), False)  # projected from the interior state each pass
+            qf = new[k][faces] if first or partial else self.qb[k][faces]  # later passes start from the last values
             affine = self.p._condition_affine.get(id(expr), False)
             for _ in range(1 if affine else (_NEWTON_STEPS if first else 4)):
                 qf = self._newton_step(k, faces, expr, qf)
@@ -1004,25 +1067,30 @@ class _Evaluator:
 
     def _condition(self, k, faces, expr, qf):
         r = self.rows_of(self.values(expr, ("bfaces", faces), {k: qf}), ("bfaces", faces))
-        if r.shape[1] != qf.shape[1]:
-            if r.shape[1] == 1:
-                r = jnp.broadcast_to(r, qf.shape)
-            else:
-                raise NotImplementedError(
-                    f"jno.fvm([...]): a boundary condition gives {r.shape[1]} equations per face for an unknown "
-                    f"with {qf.shape[1]} components."
-                )
+        if r.shape[1] > qf.shape[1]:
+            raise ValueError(
+                f"jno.fvm([...]): a boundary condition gives {r.shape[1]} equations per face for an unknown with "
+                f"{qf.shape[1]} components."
+            )
         return r
 
     def _newton_step(self, k, faces, expr, qf):
+        """One Newton step on a face condition ``r(q_f) = 0``. With as many equations as components it is
+        the plain step; with fewer (``U·n = 0`` on a vector unknown) the face state moves only along the
+        condition's gradients, ``q_f ← q_f − Jᵀ(JJᵀ)⁻¹ r``: the projection of the interior state onto the
+        condition set, with the unconstrained directions extrapolated (for an affine condition, the face
+        value of the mirror state)."""
         c = qf.shape[1]
         r = self._condition(k, faces, expr, qf)
         cols = [
             jax.jvp(lambda z: self._condition(k, faces, expr, z), (qf,), (jnp.zeros_like(qf).at[:, j].set(1.0),))[1]
             for j in range(c)
         ]
-        J = jnp.stack(cols, axis=-1)  # (m, c, c): d r_i / d q_j, face by face
-        return qf - jnp.linalg.solve(J, r[..., None])[..., 0]
+        J = jnp.stack(cols, axis=-1)  # (m, p, c): d r_i / d q_j, face by face
+        if J.shape[1] == c:
+            return qf - jnp.linalg.solve(J, r[..., None])[..., 0]
+        lam = jnp.linalg.solve(J @ jnp.swapaxes(J, 1, 2), r[..., None])
+        return qf - (jnp.swapaxes(J, 1, 2) @ lam)[..., 0]
 
     # -- fluxes ---------------------------------------------------------------------------------------
     def central_flux(self, by_axis, c):
@@ -1063,9 +1131,13 @@ class _Evaluator:
                 return scheme.flux(QL, QR, normals, Fn)
             fL, fR = Fn(QL), Fn(QR)
             if scheme.flux == "rusanov":
-                a = jnp.maximum(
-                    self._speed(QL, site, normals, Fn, split, scheme), self._speed(QR, site, normals, Fn, split, scheme)
-                )
+                sL = self._speed(QL, site, normals, Fn, split, scheme)
+                sR = self._speed(QR, site, normals, Fn, split, scheme)
+                # a smooth max: where the two speeds tie (a stationary shock) max() has a kink that stalls Newton.
+                # Exact at a tie (so a linear flux stays exact upwinding), within δ/2 of the max elsewhere.
+                gap, delta = sL - sR, 1e-3 * (sL + sR)
+                a = 0.5 * (sL + sR + jnp.sqrt(gap * gap + delta * delta + jnp.finfo(sL.dtype).tiny) - delta)
+
                 return 0.5 * (fL + fR) - 0.5 * a[:, None] * (QR - QL)
             if scheme.flux == "hll":
                 lo_L, hi_L = _eig_extremes(_flux_jacobian(Fn, QL))
@@ -1085,7 +1157,19 @@ class _Evaluator:
         fi = o.Smag[:, None] * numerical(QL, QR, "faces", o.nhat)
         fb = None
         if o.b_owner.shape[0]:
-            fb = o.bSmag[:, None] * numerical(Qin, Qb, "bfaces", o.bn)
+            # where a condition fixes only part of the state (a slip wall), the outer state is the mirror image
+            # 2 q_f - q_P, so the normal flux of what the condition removes vanishes (no mass through a wall)
+            Qout = Qb
+            for k, faces, expr in p._conditions:
+                if not p._condition_partial.get(id(expr), False):
+                    continue
+                cols = slice(p._block0[k], p._block0[k] + p._ncomp[k])
+                inner = Qin[faces][:, cols]
+                z = inner  # the inner state projected onto the condition set, then reflected through it
+                for _ in range(1 if p._condition_affine.get(id(expr), False) else 4):
+                    z = self._newton_step(k, faces, expr, z)
+                Qout = Qout.at[faces, cols].set(2.0 * z - inner)
+            fb = o.bSmag[:, None] * numerical(Qin, Qout, "bfaces", o.bn)
         return o.divergence(fi, fb)
 
     def _face_states(self, scheme):
@@ -1094,7 +1178,7 @@ class _Evaluator:
         o = self.ops
         Q = jnp.concatenate(self.q, axis=1)
         Qb = jnp.concatenate(self.qb, axis=1) if o.b_owner.shape[0] else jnp.zeros((0, Q.shape[1]), Q.dtype)
-        if scheme.recon == "none":
+        if scheme.recon == "none" or self.first_order:
             return Q[o.owner], Q[o.neigh], Q[o.b_owner], Qb
         G = o.cell_gradient(Q, Qb) if scheme.recon == "lsq" else o.green_gauss(Q, Qb)
         if scheme.multidimensional:
@@ -1132,31 +1216,61 @@ def _flux_jacobian(Fn, Q):
     return jnp.stack(cols, axis=-1)
 
 
-def _power(M, iters=40):
-    """Largest eigenvalue of matrices whose eigenvalues are real and non-negative, by power iteration."""
-    v = jnp.ones(M.shape[:2] + (1,), dtype=M.dtype) / jnp.sqrt(M.shape[1])
-    for _ in range(iters):
-        v = M @ v
-        v = v / (jnp.linalg.norm(v, axis=1, keepdims=True) + jnp.finfo(M.dtype).tiny)
-    return jnp.linalg.norm(M @ v, axis=1)[:, 0]
+def _charpoly(A):
+    """Coefficients ``c_0..c_n`` of ``det(xI − A) = Σ c_k x^k`` for each ``A`` (Faddeev-LeVerrier)."""
+    n = A.shape[1]
+    eye = jnp.eye(n, dtype=A.dtype)
+    coef = [jnp.ones(A.shape[0], A.dtype)]  # c_n
+    Mk = jnp.zeros_like(A)
+    for k in range(1, n + 1):
+        Mk = A @ Mk + coef[-1][:, None, None] * eye
+        coef.append(-jnp.trace(A @ Mk, axis1=1, axis2=2) / k)
+    return jnp.stack(coef[::-1], axis=1)  # (m, n+1): c_0 .. c_n
 
 
-def _spectral_radius(A):
-    """``max |λ|`` of each ``A`` (real eigenvalues, as for a hyperbolic system): ``√λ_max(A²)``."""
-    if A.shape[1] == 1:
-        return jnp.abs(A[:, 0, 0])
-    return jnp.sqrt(_power(A @ A))
+def _extreme_root(coef, x0, iters=60):
+    """The real root of a real-rooted polynomial nearest beyond ``x0`` (Newton from outside the roots moves
+    monotonically onto the extreme one)."""
+    n = coef.shape[1] - 1
+    dcoef = coef[:, 1:] * jnp.arange(1, n + 1, dtype=coef.dtype)
+
+    def poly(c, x):
+        out = jnp.zeros_like(x)
+        for k in range(c.shape[1] - 1, -1, -1):
+            out = out * x + c[:, k]
+        return out
+
+    def body(_, x):
+        d = poly(dcoef, x)
+        return x - poly(coef, x) / jnp.where(d != 0, d, 1.0)
+
+    return jax.lax.fori_loop(0, iters, body, x0)
 
 
 def _eig_extremes(A):
-    """``(λ_min, λ_max)`` of each ``A`` (real eigenvalues), by power iteration on ``ρI ± A``."""
+    """``(λ_min, λ_max)`` of each ``A``, whose eigenvalues are real (a hyperbolic system): the extreme roots of
+    the characteristic polynomial, by Newton from the bounds ``∓‖A‖_∞``. Exact, differentiable, and the same
+    on every device (no eigendecomposition)."""
     if A.shape[1] == 1:
         return A[:, 0, 0], A[:, 0, 0]
-    rho = _spectral_radius(A)[:, None, None]
-    eye = jnp.eye(A.shape[1], dtype=A.dtype)
-    hi = _power(rho * eye + A) - rho[:, 0, 0]
-    lo = rho[:, 0, 0] - _power(rho * eye - A)
-    return lo, hi
+    coef = _charpoly(A)
+    bound = jnp.abs(A).sum(axis=2).max(axis=1) * (1.0 + 1e-8) + jnp.finfo(A.dtype).tiny
+    return _extreme_root(coef, -bound), _extreme_root(coef, bound)
+
+
+def _smooth_abs(a, delta=1e-8):
+    """``|a|``, rounded to a parabola within ``δ`` of zero (C¹, so Newton does not stall at a sonic point) and
+    exact elsewhere. ``δ`` is a fixed constant: one that followed the state but was held out of the tangent
+    made the tangent wrong exactly at the sonic face, and Newton stalled there."""
+    return jnp.where(jnp.abs(a) >= delta, jnp.abs(a), 0.5 * (a * a / delta + delta))
+
+
+def _spectral_radius(A):
+    """``max |λ|`` of each ``A`` (real eigenvalues, as for a hyperbolic system)."""
+    if A.shape[1] == 1:
+        return _smooth_abs(A[:, 0, 0])
+    lo, hi = _eig_extremes(A)
+    return jnp.maximum(jnp.abs(lo), jnp.abs(hi))
 
 
 def _abs_matrix(A, delta, iters=20):

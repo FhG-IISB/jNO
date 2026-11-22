@@ -1857,36 +1857,47 @@ class _ERKScheme(_TimeScheme):
         s0 = jnp.asarray(block.state0).reshape(-1)
         grid = jnp.asarray(_block_time_grid(block), s0.dtype)
         dt = float(block.dt)
-        sub = 1
-        cfl_dt = (block.metadata or {}).get("cfl_dt")
-        if self.cfl is not None:
-            if cfl_dt is None:
-                raise ValueError(
-                    f"{self!r}: cfl= needs the problem's stable step (a finite-volume problem supplies it); this "
-                    "block has none. Drop cfl= and set the step with domain.time."
-                )
-            stable = float(cfl_dt(s0, self.cfl))
-            sub = max(1, int(np.ceil(dt / stable - 1e-12)))
         step = self.stepper(block, args)
 
-        def advance(u, t_next):
+        def run(u, t_start, sub):
             h = dt / sub
-            u = jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_next - dt + i * h, h), u)
+            return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+
+        cfl_dt = (block.metadata or {}).get("cfl_dt")
+        if self.cfl is not None and cfl_dt is None:
+            raise ValueError(
+                f"{self!r}: cfl= needs the problem's stable step (a finite-volume problem supplies it); this "
+                "block has none. Drop cfl= and set the step with domain.time."
+            )
+        traced = isinstance(s0, jax.core.Tracer) or any(
+            isinstance(a, jax.core.Tracer) for a in jax.tree_util.tree_leaves(args)
+        )
+        if self.cfl is not None and not traced:
+            # Evaluated eagerly: the substeps of every interval come from the CFL limit of the state at its start,
+            # so a wave that speeds up during the march is followed.
+            from functools import partial
+
+            jitted = {}
+            states, u = [s0], s0
+            for k in range(1, grid.shape[0]):
+                sub = max(1, int(np.ceil(dt / float(cfl_dt(u, self.cfl)) - 1e-12)))
+                if sub not in jitted:
+                    jitted[sub] = jax.jit(partial(run, sub=sub))
+                u = jitted[sub](u, grid[k - 1])
+                states.append(u)
+            traj = jnp.stack(states)
+            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        # Traced (a gradient through the march): a fixed number of substeps, from the initial state.
+        sub = (
+            1 if self.cfl is None else max(1, int(np.ceil(dt / float(cfl_dt(jax.lax.stop_gradient(s0), self.cfl)) - 1e-12)))
+        )
+
+        def advance(u, t_next):
+            u = run(u, t_next - dt, sub)
             return u, u
 
         ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
         traj = jnp.concatenate([s0[None, :], ys], axis=0)
-        if self.cfl is not None and not isinstance(traj, jax.core.Tracer):
-            worst = min(float(cfl_dt(traj[k], self.cfl)) for k in range(0, traj.shape[0], max(1, traj.shape[0] // 8)))
-            if dt / sub > worst * (1 + 1e-9):
-                import warnings
-
-                warnings.warn(
-                    f"{self!r}: the CFL limit fell to a step of {worst:.3g} during the march, below the {dt / sub:.3g} "
-                    "chosen from the initial state. The result may be unstable: lower cfl= or the domain.time step.",
-                    UserWarning,
-                    stacklevel=3,
-                )
         return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
 
     def __repr__(self):

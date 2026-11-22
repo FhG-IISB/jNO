@@ -2090,8 +2090,9 @@ def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):
     five-stage fourth-order SSP scheme of Spiteri and Ruuth), ``"rk4"`` or ``"euler"``; or give any explicit
     Butcher tableau as ``tableau=(A, b, c, order)`` with ``A`` strictly lower triangular. The march takes
     the domain's step (``domain.time``); with ``cfl=`` a finite-volume problem picks the number of substeps
-    per step from its CFL limit at the initial state (``Δt = cfl · min V/Σ_f a_f|S_f|``) and warns if the
-    limit falls below it later.
+    of every step from its CFL limit, ``Δt = 2·cfl/ρ(M⁻¹ ∂R/∂u)`` of its first-order operator (for upwinded
+    convection the classical Courant number ``a Δt/Δx``), at the state where the step starts. Under a
+    gradient trace the count is fixed, from the initial state.
 
     Rows with zero mass (Dirichlet and flux rows of ``jno.fdm``, a pinned cell) are constraints, solved at
     every stage. The march is a fixed-length ``lax.scan``, so it is reverse-mode differentiable.
