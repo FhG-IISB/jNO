@@ -1,0 +1,870 @@
+"""``jno.fvm``: a finite-volume discretisation of the strong-form constraint list ``jno.fdm`` reads.
+
+Based on:
+  Moukalled, F., Mangani, L., & Darwish, M. (2016). The Finite Volume Method in Computational Fluid
+  Dynamics. Springer -- the cell-centred discretisation of diffusion (ch. 8-9) and convection (ch. 11).
+  LeVeque, R. J. (2002). Finite Volume Methods for Hyperbolic Problems. Cambridge University Press --
+  conservation form and numerical fluxes (ch. 4, 12).
+
+How a PDE term is read. Every term is integrated over a control volume. An outermost spatial derivative
+``(F).x`` is a divergence: by the divergence theorem it becomes the face sum ``Σ_f F_f S_f,x``, so
+``ui.xx + ui.yy`` is ``Σ_f ∇u_f·S_f`` and ``(κ*ui.x).x + (κ*ui.y).y`` is ``Σ_f κ_f ∇u_f·S_f``. A
+coefficient that multiplies a whole divergence and does not contain an unknown stays at the volume.
+Inside a flux ``F``, a sub-term that holds a derivative of an unknown is evaluated centrally at the face
+(face gradient, interpolated values); a sub-term in the unknowns' values alone is convective, and all
+such sub-terms of all equations are gathered into one normal flux ``F·n`` that a numerical flux (Rusanov
+by default) evaluates on the left and right states. Terms without an outer derivative (``u.t``, a
+source, a reaction) are evaluated at the volume centroid (the midpoint rule). A derivative of an
+unknown that is not the outermost operator of its term (``b*ui.x``) is evaluated with the least-squares
+volume gradient: consistent, but not conservative, which a warning says.
+
+Boundary conditions. A boundary face carries a value ``q_f``. With the owner value carried to the foot of
+the face normal, ``q_P'``, the face's normal derivative is ``(q_f - q_P')/d⊥``. Every condition is one
+equation in ``q_f`` per face (Dirichlet ``u - g``, Neumann ``u.d(n) - h``, Robin, any nonlinear flux
+law), solved by a per-face Newton step; a face without a condition has zero normal derivative.
+"""
+
+from __future__ import annotations
+
+import warnings
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from .. import precond as jno_precond
+from .. import solve as _solve
+from .._strong_form import (
+    StrongFormProblem,
+    _contains_unknown,
+    _context_leaf,
+    _find_unknowns,
+    _iter,
+    _rtol,
+    _spatial_tags,
+    _unwrap,
+    _zero_temporal,
+)
+from .geometry import cell_graph
+from .ops import FVOps
+
+__all__ = ["fvm"]
+
+_NEWTON_STEPS = 12  # per-face Newton for a nonlinear boundary condition (one step when it is affine)
+_BOUNDARY_PASSES = 6  # boundary values and volume gradients, alternated to their fixed point on skewed cells
+
+
+# -- the trace ------------------------------------------------------------------------------------------
+
+
+def _is_spatial(v):
+    tag = str(getattr(v, "tag", ""))
+    return getattr(v, "axis", "spatial") == "spatial" and not tag.startswith("n_") and tag not in ("cell_size",)
+
+
+def _is_normal(v):
+    return str(getattr(v, "tag", "")).startswith("n_")
+
+
+def _signed_terms(node, sign=1.0):
+    """``node`` as a signed sum ``[(±1, term), ...]`` over ``+``, ``-`` and a literal factor ``-1``."""
+    from ..trace import BinaryOp, Literal
+
+    n = _unwrap(node)
+    if isinstance(n, BinaryOp) and n.op in ("+", "-"):
+        return _signed_terms(n.left, sign) + _signed_terms(n.right, sign if n.op == "+" else -sign)
+    if isinstance(n, BinaryOp) and n.op == "*" and isinstance(n.left, Literal) and np.ndim(n.left.value) == 0:
+        if float(n.left.value) == -1.0:
+            return _signed_terms(n.right, -sign)
+    return [(sign, n)]
+
+
+def _factors(node):
+    """The factors of a product, ``a*b/c`` -> ``[a, b, 1/c]``."""
+    from ..trace import BinaryOp, Literal
+
+    n = _unwrap(node)
+    if isinstance(n, BinaryOp) and n.op == "*":
+        return _factors(n.left) + _factors(n.right)
+    if isinstance(n, BinaryOp) and n.op == "/":
+        return _factors(n.left) + [BinaryOp("/", Literal(1.0), n.right)]
+    return [n]
+
+
+def _product(factors):
+    from ..trace import BinaryOp, Literal
+
+    if not factors:
+        return Literal(1.0)
+    out = factors[0]
+    for f in factors[1:]:
+        out = BinaryOp("*", out, f)
+    return out
+
+
+def _signed_sum(terms):
+    from ..trace import BinaryOp, Literal
+
+    if not terms:
+        return None
+    sign0, out = terms[0]
+    out = out if sign0 > 0 else BinaryOp("*", Literal(-1.0), out)
+    for sign, t in terms[1:]:
+        out = BinaryOp("+" if sign > 0 else "-", out, t)
+    return out
+
+
+def _is_divergence(node):
+    """An outer spatial derivative: ``Jacobian(T, [x_k])`` or a ``Hessian`` over spatial variables."""
+    from ..trace import Hessian, Jacobian
+
+    n = _unwrap(node)
+    if isinstance(n, Jacobian):
+        return len(n.variables) == 1 and _is_spatial(n.variables[0])
+    if isinstance(n, Hessian):
+        return all(_is_spatial(v) for v in n.variables) and (n.trace or len(n.variables) == 2)
+    return False
+
+
+def _divergence_parts(node):
+    """``[(axis, F)]`` with ``node = Σ ∂F/∂x_axis``: a first derivative is one part, a Laplacian
+    ``Hessian(T, vars, trace)`` one part ``(v, ∂T/∂v)`` per variable, a mixed ``∂²T/∂a∂b`` the part
+    ``(a, ∂T/∂b)``."""
+    from ..trace import Jacobian
+
+    n = _unwrap(node)
+    if isinstance(n, Jacobian):
+        return [(int(n.variables[0].dim[0]), n.target)]
+    if n.trace:
+        return [(int(v.dim[0]), Jacobian(n.target, [v], n.scheme)) for v in n.variables]
+    a, b = n.variables
+    return [(int(a.dim[0]), Jacobian(n.target, [b], n.scheme))]
+
+
+def _expand_hessians(node):
+    """Every ``Hessian`` as nested first derivatives, so a second derivative inside a term is a gradient of
+    a gradient (the volume and face gradients are first-order operators)."""
+    from .._strong_form import _map_children
+    from ..trace import Hessian, Jacobian
+
+    n = _unwrap(node)
+    if isinstance(n, Hessian):
+        target = _expand_hessians(n.target)
+        if n.trace:
+            parts = [Jacobian(Jacobian(target, [v], n.scheme), [v], n.scheme) for v in n.variables]
+            return _signed_sum([(1.0, p) for p in parts])
+        if len(n.variables) == 2:
+            a, b = n.variables
+            return Jacobian(Jacobian(target, [b], n.scheme), [a], n.scheme)
+        raise NotImplementedError("jno.fvm([...]): a full Hessian matrix is not supported; write its entries.")
+    return _map_children(n, _expand_hessians)
+
+
+def _has_derivative(node):
+    from ..trace import Hessian, Jacobian
+
+    n = _unwrap(node)
+    if isinstance(n, (Jacobian, Hessian)):
+        return True
+    return any(_has_derivative(c) for c in _iter(n))
+
+
+# -- the problem ----------------------------------------------------------------------------------------
+
+
+class _TraceFVM(StrongFormProblem):
+    """A finite-volume problem authored as a strong-form constraint list (see :func:`fvm`)."""
+
+    _who = "jno.fvm"
+
+    def __init__(self, constraints, centering="cell"):
+        if centering != "cell":
+            raise NotImplementedError(f"jno.fvm([...], centering={centering!r}): only 'cell' is available yet.")
+        self.centering = centering
+        self._constraints = list(constraints)
+        self.unknowns = _find_unknowns(constraints, "jno.fvm")
+        self.unknown = self.unknowns[0]
+        self.domain = self.unknown._fem_field_domain
+        from ..geometry.parametric import refuse_if_parametric
+
+        refuse_if_parametric(self.domain, "jno.fvm", "its control volumes are built from the mesh as constants")
+        dim = int(self.domain.dimension)
+        cells, kind = self.domain._cells_topo()
+        self._mesh_points = np.asarray(self.domain.mesh_connectivity["points"])[:, :dim]
+        self.graph = cell_graph(self._mesh_points, cells, kind)
+        self._N = self.graph.n
+        self._ncomp = [int(np.prod(np.shape(w.module.value)[1:], dtype=int)) for w in self.unknowns]
+        self._block0 = [int(b) for b in np.cumsum([0] + self._ncomp)[:-1]]
+        self._nf = int(sum(self._ncomp))
+        self._Ntot = self._nf * self._N
+        self._classify(constraints)
+        for tie in self._periodic_ties:
+            fa, fb = (self.graph.boundary_faces_on(self._region_mesh_nodes(t)) for t in tie)
+            shift = self.graph.b_centroid[fa].mean(axis=0) - self.graph.b_centroid[fb].mean(axis=0)
+            self.graph = self.graph.with_periodic(fa, fb, shift)
+        self.ops = FVOps(self.graph)
+        self._pts = self.ops.centroid
+        self.region, self.region_geometry = self._pde_region()
+        if self.region is not None:
+            raise NotImplementedError("jno.fvm([...]): a PDE on a sub-region is not supported yet.")
+        self._equations = [self._split_equation(e) for e in self._pde_exprs()]
+        self._conditions = self._boundary_conditions()
+        self._pins = self._pin_rows()
+
+    # -- regions --------------------------------------------------------------------------------------
+    def _region_mesh_nodes(self, tag):
+        """Mesh node ids of a region tag (the nodes its boundary faces or pinned cells are found from)."""
+        if tag in (None, "boundary"):
+            return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
+        reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
+        if reg is not None and len(reg.get("point_indices", [])) > 0:
+            return np.asarray(reg["point_indices"], dtype=int)
+        facets = self.domain.tag_facets(tag)
+        if facets is not None:
+            return np.unique(np.asarray(facets).ravel())
+        pool = getattr(self.domain, "_mesh_pool", {}).get(tag)
+        if pool is not None:
+            from scipy.spatial import cKDTree
+
+            pts = np.unique(np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, : self.graph.dim], axis=0)
+            dist, nodes = cKDTree(self._mesh_points).query(pts)
+            if len(pts) and np.all(dist <= _rtol() * float(np.ptp(self._mesh_points, axis=0).max())):
+                return np.unique(nodes).astype(int)
+        raise ValueError(
+            f"jno.fvm([...]): no mesh nodes found for region {tag!r}. Use a boundary tag of the domain, "
+            "'boundary', or a `domain.point_region(name, xy)` node."
+        )
+
+    def _region_faces(self, tag):
+        """Boundary face indices of a region: exact facet matches where the tag stores facets, else the faces
+        whose nodes all lie on the region."""
+        if tag in (None, "boundary"):
+            return np.arange(self.graph.b_owner.shape[0])
+        facets = self.domain.tag_facets(tag)
+        if facets is not None and np.shape(facets)[1] == self.graph.b_nodes.shape[1]:
+            keys = {tuple(r) for r in np.sort(np.asarray(facets), axis=1)}
+            mine = np.sort(self.graph.b_nodes, axis=1)
+            return np.flatnonzero([tuple(r) in keys for r in mine])
+        return self.graph.boundary_faces_on(self._region_mesh_nodes(tag))
+
+    # -- the PDE as volume terms and fluxes ----------------------------------------------------------
+    def _pde_exprs(self):
+        if len(self.unknowns) == 1:
+            expr = self._pde[0]
+            for c in self._pde[1:]:
+                expr = expr + c
+            return [_unwrap(expr)]
+        return [_unwrap(self._pde[k]) for k in range(len(self.unknowns))]
+
+    def _has_unknown(self, node):
+        return any(_contains_unknown(node, u) for u in self.unknowns)
+
+    def _has_unknown_derivative(self, node):
+        from ..trace import Hessian, Jacobian
+
+        n = _unwrap(node)
+        if isinstance(n, (Jacobian, Hessian)) and self._has_unknown(n.target):
+            return True
+        return any(self._has_unknown_derivative(c) for c in _iter(n))
+
+    def _split_equation(self, expr):
+        """``{"volume": expr | None, "groups": [...], "nonconservative": bool}`` of one equation.
+
+        A group is the fluxes under one volume coefficient: ``{"coef": node | None, "central": {axis:
+        expr}, "convective": {axis: expr}}``."""
+        from ..trace import Literal
+
+        volume, groups, noncons = [], {}, False
+        for sign, term in _signed_terms(expr):
+            factors = _factors(term)
+            divs = [f for f in factors if _is_divergence(f)]
+            rest = [f for f in factors if not _is_divergence(f)]
+            if len(divs) == 1 and not any(self._has_unknown(f) for f in rest):
+                literal = [f for f in rest if isinstance(f, Literal)]
+                coef = [f for f in rest if not isinstance(f, Literal)]
+                scale = sign * float(np.prod([float(np.asarray(f.value)) for f in literal])) if literal else sign
+                key = id(coef[0]) if len(coef) == 1 else (None if not coef else tuple(id(c) for c in coef))
+                grp = groups.setdefault(key, {"coef": _product(coef) if coef else None, "central": {}, "convective": {}})
+                for axis, F in _divergence_parts(divs[0]):
+                    for s2, sub in _signed_terms(F):
+                        kind = "convective" if self._has_unknown(sub) and not _has_derivative(sub) else "central"
+                        grp[kind].setdefault(axis, []).append((scale * s2, _expand_hessians(sub)))
+                continue
+            if self._has_unknown_derivative(term):
+                noncons = True
+            volume.append((sign, _expand_hessians(term)))
+        if noncons:
+            warnings.warn(
+                "jno.fvm([...]): a derivative of an unknown is not the outer operator of its term (e.g. `b*ui.x`), so "
+                "it is evaluated with the volume gradient: consistent, but not conservative -- a shock or a "
+                "discontinuity moves at the wrong speed. Write it in divergence form, e.g. `(b*ui).x` or "
+                "`(ui**2/2).x`.",
+                UserWarning,
+                stacklevel=4,
+            )
+        out = []
+        for grp in groups.values():
+            out.append(
+                {
+                    "coef": grp["coef"],
+                    "central": {a: _signed_sum(t) for a, t in grp["central"].items()},
+                    "convective": {a: _signed_sum(t) for a, t in grp["convective"].items()},
+                }
+            )
+        if any(g["convective"] and g["coef"] is not None for g in out):
+            raise NotImplementedError(
+                "jno.fvm([...]): a convective flux under a variable coefficient (`c(x)*(b*u).x`) is not "
+                "supported; move the coefficient inside the derivative."
+            )
+        return {"volume": _signed_sum(volume), "groups": out}
+
+    def _field_of(self, constraint):
+        """The unknown a condition constrains: the one it mentions."""
+        ks = [k for k, u in enumerate(self.unknowns) if _contains_unknown(constraint, u)]
+        if len(ks) != 1:
+            raise ValueError(
+                f"jno.fvm([...]): a boundary condition or pin must mention exactly one unknown; this one mentions "
+                f"{len(ks)}."
+            )
+        return ks[0]
+
+    def _condition_region(self, c):
+        normals = {str(v.tag)[2:] for v in _iter_vars(c) if _is_normal(v)}
+        tags = normals or {t for t in _spatial_tags(c)}
+        tags.discard(None)
+        if len(tags) != 1:
+            raise ValueError(
+                f"jno.fvm([...]): a condition must live on one region; this one uses {sorted(map(str, tags))}."
+            )
+        return next(iter(tags))
+
+    def _boundary_conditions(self):
+        """``[(field, face_ids, expr)]``: every condition that lives on boundary faces."""
+        out, claimed = [], {}
+        for c in self._dirichlet + self._neumann:
+            tag = self._condition_region(c)
+            faces = self._region_faces(tag) if self._has_boundary_faces(tag) else None
+            if faces is None:
+                continue  # a pin on cells (see _pin_rows)
+            k = self._field_of(c)
+            seen = claimed.setdefault(k, np.zeros(self.graph.b_owner.shape[0], dtype=bool))
+            if seen[faces].any():
+                raise ValueError(
+                    f"jno.fvm([...]): two conditions on the same boundary faces of unknown {k} (region {tag!r}). "
+                    "Give each face one condition per unknown."
+                )
+            seen[faces] = True
+            out.append((k, jnp.asarray(faces, dtype=jnp.int32), _expand_hessians(_unwrap(c))))
+        return out
+
+    def _has_boundary_faces(self, tag):
+        try:
+            return self._region_faces(tag).size > 0
+        except ValueError:
+            return False
+
+    def _pin_rows(self):
+        """``[(field, cells, expr)]``: value conditions on regions without boundary faces (a point region,
+        a gauge): they replace the equations of the cells nearest to the region's nodes."""
+        from scipy.spatial import cKDTree
+
+        out = []
+        for c in self._dirichlet:
+            tag = self._condition_region(c)
+            if self._has_boundary_faces(tag):
+                continue
+            nodes = self._region_mesh_nodes(tag)
+            _, cells = cKDTree(self.graph.centroid).query(self._mesh_points[nodes])
+            out.append((self._field_of(c), jnp.asarray(np.unique(cells), dtype=jnp.int32), _unwrap(c)))
+        return out
+
+    # -- evaluation -----------------------------------------------------------------------------------
+    def _split_dofs(self, dofs):
+        q = jnp.asarray(dofs).reshape(self._nf, self._N).T  # (n, nf)
+        return [q[:, b : b + c] for b, c in zip(self._block0, self._ncomp)]
+
+    def _evaluator(self, q, qb, t, scope):
+        return _Evaluator(self, q, qb, t, scope)
+
+    def _residual_fn(self, *, spatial=True, extra_params=None):
+        """The finite-volume residual ``R(dofs)`` (blocked DOF layout), volume terms integrated (``V·term``)
+        and fluxes summed over faces. ``spatial=True`` drops the ``u.t`` terms."""
+        eqs = self._equations
+        if not spatial:
+            raise NotImplementedError
+        scope = self._params_scope(extra_params)
+        nB = self.graph.b_owner.shape[0]
+        self._decide_condition_affinity(scope)
+
+        def residual(dofs, t=None):
+            q = self._split_dofs(dofs)
+            qb = [qk[self.ops.b_owner] if nB else jnp.zeros((0, qk.shape[1]), qk.dtype) for qk in q]
+            ev = self._evaluator(q, qb, t, scope)
+            for i in range(self.ops.boundary_passes):
+                ev.solve_boundary(first=i == 0)
+            out = []
+            conv = ev.convective_divergence(eqs)  # (n, nf) or None, all equations' convective fluxes
+            for k, eq in enumerate(eqs):
+                c = self._ncomp[k] if len(eqs) > 1 else self._nf
+                cols = slice(self._block0[k], self._block0[k] + c) if len(eqs) > 1 else slice(0, self._nf)
+                r = jnp.zeros((self._N, c), dtype=jnp.asarray(dofs).dtype)
+                if eq["volume"] is not None:
+                    r = r + self.ops.volume[:, None] * ev.rows(ev.values(_zero_temporal(eq["volume"]), "cells"), c, "cells")
+                for grp in eq["groups"]:
+                    if grp["central"]:
+                        fi, fb = ev.central_flux(grp["central"], c)
+                        div = self.ops.divergence(fi, fb)
+                        if grp["coef"] is not None:
+                            div = div * ev.rows(ev.values(grp["coef"], "cells"), 1, "cells")
+                        r = r + div
+                if conv is not None:
+                    r = r + conv[:, cols]
+                out.append(r)
+            R = jnp.concatenate(out, axis=1)  # (n, nf)
+            for k, cells, expr in self._pins:
+                cols = slice(self._block0[k], self._block0[k] + self._ncomp[k])
+                R = R.at[cells, cols].set(ev.rows(ev.values(expr, ("cells", cells)), self._ncomp[k], ("cells", cells)))
+            R = self._require_real(R, "the finite-volume residual (a complex coefficient or source)")
+            return R.T.reshape(-1)
+
+        return residual
+
+    def _decide_condition_affinity(self, scope):
+        """Which boundary conditions are affine in their face value (one Newton step solves them exactly),
+        decided once on concrete values: the jvp of the condition at two face states must agree."""
+        cache = self.__dict__.setdefault("_condition_affine", {})
+        todo = [(k, f, e) for k, f, e in self._conditions if id(e) not in cache]
+        if not todo:
+            return
+        with jax.ensure_compile_time_eval():
+            q = [jnp.full((self._N, c), 0.3) for c in self._ncomp]
+            qb = [jnp.full((self.graph.b_owner.shape[0], c), 0.3) for c in self._ncomp]
+            ev = self._evaluator(q, qb, None, scope)
+            for k, faces, expr in todo:
+                q0 = jnp.zeros((int(faces.shape[0]), self._ncomp[k]))
+                tangent = jnp.ones_like(q0)
+                j0 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0,), (tangent,))[1]
+                j1 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0 + 0.71,), (tangent,))[1]
+                cache[id(expr)] = bool(jnp.all(jnp.abs(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.abs(j0).max()) + 1.0)))
+
+    # -- solving --------------------------------------------------------------------------------------
+    def _pattern(self, key, fun, u):
+        """``(pattern, colour, n_colours)`` of ``fun``'s Jacobian on the face graph, verified like fdm's."""
+        cache = self.__dict__.setdefault("_sparsity_cache", {})
+        if key in cache:
+            return cache[key]
+        from ..fdm import _assemble_sparse, _color_columns, _stencil_pattern
+
+        pairs = np.stack([self.graph.owner, self.graph.neigh], axis=1)
+        n = int(np.asarray(u).size)
+        v = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype=jnp.asarray(u).dtype)
+        ref = jax.jvp(fun, (jnp.asarray(u),), (v,))[1]
+        for radius in (1, 2, 3, 4):
+            pattern = _stencil_pattern(pairs, self._N, radius, n_fields=n // self._N)
+            color, n_colors = _color_columns(pattern)
+            A = _assemble_sparse(fun, u, pattern, color, n_colors)
+            if float(jnp.linalg.norm(A @ v - ref)) <= _rtol(ref.dtype) * (float(jnp.linalg.norm(ref)) or 1.0):
+                cache[key] = (pattern, color, n_colors)
+                return cache[key]
+        raise ValueError("jno.fvm: could not assemble the residual's Jacobian on the face graph.")
+
+    def _operator(self, key, fun, u):
+        from ..fdm import _assemble_sparse
+
+        pattern, color, n_colors = self._pattern(key, fun, u)
+        return _assemble_sparse(fun, u, pattern, color, n_colors)
+
+    def _defaults(self, A, linear, precond):
+        """``cg`` + ``amg`` for a symmetric operator, ``gmres`` + ``ilu`` otherwise."""
+        if linear is not None:
+            return linear, precond
+        a, b = self._symmetry_probe(A)
+        symmetric = abs(a - b) <= _rtol() * max(abs(a), abs(b), np.finfo(float).tiny)
+        if symmetric:
+            return _solve.cg(tol=1e-12), (precond if precond is not None else jno_precond.amg())
+        return _solve.gmres(tol=1e-12), (precond if precond is not None else jno_precond.ilu())
+
+    def solve(self, nonlinear=None, x0=None, *, linear=None, precond=None, time=None, save_ts=None):
+        """Solve the problem: the cell values, ``(N,)`` for one scalar unknown, ``(n_fields, N)`` otherwise.
+
+        Args:
+            nonlinear: a ``jno.solve`` nonlinear driver; default Newton on the assembled tangent.
+            x0: initial guess (blocked DOF vector).
+            linear: a ``jno.solve`` linear solver; default ``cg`` (symmetric) or ``gmres``.
+            precond: a ``jno.precond`` spec; default ``amg`` (symmetric) or ``ilu``.
+        """
+        if self._transient:
+            raise NotImplementedError("jno.fvm([...]): transient problems are not supported yet.")
+        u = self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
+        return self._shape(u)
+
+    def _shape(self, u):
+        u = jnp.asarray(u)
+        if self._nf == 1:
+            return u.reshape(self._N)
+        return u.reshape(self._nf, self._N)
+
+    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, linear=None, precond=None):
+        from ..utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
+
+        residual = jax.jit(self._residual_fn(extra_params=extra_params))
+        zeros = jnp.zeros(self._Ntot)
+        make_probe = lambda: jax.jit(self._residual_fn(extra_params=self._current_params()))  # noqa: E731
+        with jax.ensure_compile_time_eval():
+            linear_problem = self._is_affine("steady", make_probe, self._Ntot)
+            self._pattern("steady", make_probe(), zeros)
+        if linear_problem:
+            if nonlinear is not None:
+                raise ValueError("jno.fvm: nonlinear= given, but this problem is linear.")
+            A = self._operator("steady", residual, zeros)
+            linear, precond = self._defaults(A, linear, precond)
+            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
+        u0 = zeros if x0 is None else jnp.asarray(x0)
+        tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
+        nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True)
+        if linear is None:
+            linear, precond = self._defaults(tangent(u0), None, precond)
+        precond = self._frozen(precond, lambda: tangent(u0))
+        return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)(residual, u0, jacobian=tangent)
+
+    def _frozen(self, precond, representative):
+        """A preconditioner that needs a concrete matrix (amg, ilu) is set up once on the tangent at the
+        initial guess, as fdm does for its Newton."""
+        if precond is None:
+            return None
+        from ..utils.solver.solver_api import (
+            LinearOperator,
+            PrecondContext,
+            _FrozenMarchPrecond,
+            _untraceable_leaves,
+            materialize_precond,
+            prepare_precond,
+        )
+
+        if not _untraceable_leaves(precond)[1]:
+            return precond
+        prepare_precond(precond, self)
+        return _FrozenMarchPrecond(
+            materialize_precond(precond, PrecondContext(LinearOperator(representative()), self)), precond
+        )
+
+    # -- what the user reads --------------------------------------------------------------------------
+    @property
+    def centroids(self):
+        """``(N, dim)`` control-volume centroids (where the returned values live)."""
+        return np.asarray(self.graph.centroid)
+
+    @property
+    def volumes(self):
+        """``(N,)`` control-volume measures."""
+        return np.asarray(self.graph.volume)
+
+    def to_nodes(self, sol):
+        """Volume-weighted average of cell values at the mesh nodes, ``(..., n_nodes)``."""
+        sol = np.asarray(sol)
+        cells, V = self.graph.cells, self.graph.volume
+        n_nodes = self._mesh_points.shape[0]
+        w = np.zeros(n_nodes)
+        np.add.at(w, cells.ravel(), np.repeat(V, cells.shape[1]))
+        flat = sol.reshape(-1, self._N)
+        out = np.zeros((flat.shape[0], n_nodes))
+        for i, row in enumerate(flat):
+            np.add.at(out[i], cells.ravel(), np.repeat(V * row, cells.shape[1]))
+        return (out / w).reshape(sol.shape[:-1] + (n_nodes,))
+
+
+def _iter_vars(node):
+    from ..trace import Variable
+
+    n = _unwrap(node)
+    if isinstance(n, Variable):
+        return [n]
+    return [v for c in _iter(n) for v in _iter_vars(c)]
+
+
+class _Evaluator:
+    """One evaluation of the residual: the unknowns' volume and boundary values, and the trace evaluated at
+    volumes, interior faces or boundary faces with derivatives replaced by finite-volume gradients."""
+
+    def __init__(self, prob, q, qb, t, scope):
+        self.p, self.ops, self.q, self.qb, self.t = prob, prob.ops, list(q), list(qb), t
+        self.scope = scope
+        self._grad_cache = {}
+
+    # sites: "cells", "faces", ("cells", idx), ("bfaces", idx), "bfaces"
+    def _site(self, site):
+        kind, idx = (site, None) if isinstance(site, str) else site
+        return kind, idx
+
+    def _coords(self, kind, idx):
+        o = self.ops
+        x = {"cells": o.centroid, "faces": o.fcentroid, "bfaces": o.bcentroid}[kind]
+        return x if idx is None else x[idx]
+
+    def _unknown_at(self, k, kind, idx, override):
+        if override is not None and k in override:
+            return override[k]
+        if kind == "cells":
+            v = self.q[k]
+        elif kind == "faces":
+            v = self.ops.face_value(self.q[k])
+        else:
+            v = self.qb[k]
+        return v if idx is None else v[idx]
+
+    def count(self, site):
+        """Number of points of a site."""
+        kind, idx = self._site(site)
+        if idx is not None:
+            return int(idx.shape[0])
+        return {"cells": self.ops.n, "faces": int(self.ops.owner.shape[0]), "bfaces": int(self.ops.b_owner.shape[0])}[kind]
+
+    def rows(self, value, c, site):
+        """An evaluated term as ``(m, c)`` at a site of ``m`` points (a constant is broadcast)."""
+        m = self.count(site)
+        v = jnp.asarray(value)
+        if v.ndim == 0 or v.size == 1:
+            return jnp.broadcast_to(v.reshape(1, 1), (m, c))
+        v = v.reshape(m, -1)
+        return jnp.broadcast_to(v, (m, c)) if v.shape[1] == 1 and c > 1 else v
+
+    def values(self, expr, site, override=None):
+        """``expr`` evaluated at a site, ``(m, ...)``; ``override`` maps an unknown's index to its values there."""
+        from .._strong_form import _map_children
+        from ..trace import Jacobian, ModelCall
+        from ..trace_evaluator import TraceEvaluator
+
+        kind, idx = self._site(site)
+        x = self._coords(kind, idx)
+        m = x.shape[0]
+        context = {"__time__": jnp.full((m, 1), self.p._start_time() if self.t is None else self.t, dtype=x.dtype)}
+        leaves = {}
+
+        def leaf(name, value):
+            tag = f"fvm_{name}_{len(leaves)}"
+            leaves[tag] = jnp.asarray(value).reshape(m, -1)
+            return _context_leaf(tag, None, self.p.domain)
+
+        def rewrite(node):
+            n = _unwrap(node)
+            if isinstance(n, ModelCall):
+                for k, w in enumerate(self.p.unknowns):
+                    if n.model is w:
+                        return leaf(f"q{k}", self._unknown_at(k, kind, idx, override))
+                data = self._nodal_data(n.model, kind, idx)
+                if data is not None:
+                    return leaf("data", data)
+                return n
+            if isinstance(n, Jacobian):
+                if all(_is_normal(v) for v in n.variables):
+                    if kind != "bfaces":
+                        raise ValueError("jno.fvm([...]): a normal derivative `u.d(n)` belongs on a boundary.")
+                    g = self._gradient(n.target, kind, idx, override)  # (m, c, dim)
+                    nrm = self.ops.bn if idx is None else self.ops.bn[idx]
+                    return leaf("dn", jnp.einsum("mcd,md->mc", g, nrm))
+                if not all(_is_spatial(v) for v in n.variables):
+                    raise NotImplementedError("jno.fvm([...]): only spatial and normal derivatives are supported.")
+                g = self._gradient(n.target, kind, idx, override)
+                return leaf("grad", jnp.concatenate([g[:, :, int(v.dim[0])] for v in n.variables], axis=1))
+            return _map_children(n, rewrite)
+
+        expr = rewrite(expr)
+        for v in _iter_vars(expr):
+            tag = v.tag
+            if tag in leaves or tag in context:
+                continue
+            if _is_normal(v):
+                if kind != "bfaces":
+                    raise ValueError("jno.fvm([...]): a boundary normal is used away from the boundary.")
+                context[tag] = self.ops.bn if idx is None else self.ops.bn[idx]
+            elif tag == "cell_size":
+                h = self.ops.volume ** (1.0 / self.ops.dim)
+                h = {"cells": h, "faces": 0.5 * (h[self.ops.owner] + h[self.ops.neigh]), "bfaces": h[self.ops.b_owner]}[
+                    kind
+                ]
+                context[tag] = (h if idx is None else h[idx])[:, None]
+            elif getattr(v, "axis", "spatial") == "spatial":
+                context[tag] = x
+        context.update(leaves)
+        ev = TraceEvaluator(params={**self.scope, **self.p._live_params()})
+        return ev.evaluate(expr, context=context, var_bindings={})
+
+    def _nodal_data(self, model, kind, idx):
+        """A data field given at the mesh nodes, averaged to the site (a volume's or a face's nodes)."""
+        value = getattr(getattr(model, "module", None), "value", None)
+        g, o = self.p.graph, self.ops
+        if value is None or np.ndim(value) == 0:
+            return None
+        if np.shape(value)[0] == g.points.shape[0]:  # one value per mesh node: the mean over the site's nodes
+            v = jnp.asarray(value).reshape(g.points.shape[0], -1)
+            nodes = {"cells": g.cells, "faces": g.f_nodes, "bfaces": g.b_nodes}[kind]
+            out = v[jnp.asarray(nodes)].mean(axis=1)
+        elif np.shape(value)[0] == g.n:  # one value per volume: interpolated to faces, the owner's at the boundary
+            v = jnp.asarray(value).reshape(g.n, -1)
+            out = {"cells": v, "faces": o.face_value(v), "bfaces": v[o.b_owner]}[kind]
+        else:
+            return None
+        return out if idx is None else out[idx]
+
+    def _gradient(self, target, kind, idx, override):
+        """Gradient ``(m, c, dim)`` of an expression at a site: least squares at volumes, the corrected face
+        gradient at interior faces, and at boundary faces the owner's gradient with its normal component
+        from the face value."""
+        key = id(target)
+        if key not in self._grad_cache:
+            Tc = self.rows_of(self.values(target, "cells"), "cells")
+            Tb = self.rows_of(self.values(target, "bfaces"), "bfaces") if self.ops.b_owner.shape[0] else None
+            self._grad_cache[key] = (Tc, Tb, self.ops.cell_gradient(Tc, Tb))
+        Tc, Tb, G = self._grad_cache[key]
+        if kind == "cells":
+            out = G
+        elif kind == "faces":
+            out = self.ops.face_gradient(Tc, G)
+        else:
+            Tsite = (
+                Tb if override is None else self.rows_of(self.values(target, ("bfaces", idx), override), ("bfaces", idx))
+            )
+            if override is None:
+                out = self.ops.boundary_gradient(Tc, G, Tb)
+                return out if idx is None else out[idx]
+            Gp = G[self.ops.b_owner[idx]]
+            foot = Tc[self.ops.b_owner[idx]] + jnp.einsum("fcd,fd->fc", Gp, self.ops.br_t[idx])
+            dn = (Tsite - foot) / self.ops.bdperp[idx][:, None]
+            nrm = self.ops.bn[idx]
+            return Gp + (dn - jnp.einsum("fcd,fd->fc", Gp, nrm))[:, :, None] * nrm[:, None, :]
+        return out if idx is None else out[idx]
+
+    def rows_of(self, value, site):
+        """An evaluated expression as ``(m, c)``, its own number of components."""
+        m = self.count(site)
+        v = jnp.asarray(value)
+        if v.size == 1:
+            return jnp.broadcast_to(v.reshape(1, 1), (m, 1))
+        return v.reshape(m, -1)
+
+    # -- boundary values ------------------------------------------------------------------------------
+    def solve_boundary(self, first=True):
+        """Boundary face values for this pass: each condition solved on its faces by Newton (one step when
+        affine), every other face at zero normal derivative. Uses the volume gradients of the previous
+        pass for the owner value at the foot of the normal."""
+        o = self.ops
+        if not o.b_owner.shape[0]:
+            return
+        G = [o.cell_gradient(self.q[k], self.qb[k]) for k in range(len(self.q))]
+        new = [o.owner_at_face(self.q[k], G[k]) for k in range(len(self.q))]
+        self._grad_cache = {}
+        for k, faces, expr in self.p._conditions:
+            qf = new[k][faces] if first else self.qb[k][faces]  # later passes start from the last values
+            affine = self.p._condition_affine.get(id(expr), False)
+            for _ in range(1 if affine else (_NEWTON_STEPS if first else 4)):
+                qf = self._newton_step(k, faces, expr, qf)
+            new[k] = new[k].at[faces].set(qf)
+        self.qb = new
+        self._grad_cache = {}
+
+    def _condition(self, k, faces, expr, qf):
+        r = self.rows_of(self.values(expr, ("bfaces", faces), {k: qf}), ("bfaces", faces))
+        if r.shape[1] != qf.shape[1]:
+            if r.shape[1] == 1:
+                r = jnp.broadcast_to(r, qf.shape)
+            else:
+                raise NotImplementedError(
+                    f"jno.fvm([...]): a boundary condition gives {r.shape[1]} equations per face for an unknown "
+                    f"with {qf.shape[1]} components."
+                )
+        return r
+
+    def _newton_step(self, k, faces, expr, qf):
+        c = qf.shape[1]
+        r = self._condition(k, faces, expr, qf)
+        cols = [
+            jax.jvp(lambda z: self._condition(k, faces, expr, z), (qf,), (jnp.zeros_like(qf).at[:, j].set(1.0),))[1]
+            for j in range(c)
+        ]
+        J = jnp.stack(cols, axis=-1)  # (m, c, c): d r_i / d q_j, face by face
+        return qf - jnp.linalg.solve(J, r[..., None])[..., 0]
+
+    # -- fluxes ---------------------------------------------------------------------------------------
+    def central_flux(self, by_axis, c):
+        """Interior and boundary normal fluxes ``Σ_axis F_axis S_axis`` of the central part of a group."""
+        o = self.ops
+        fi = sum(self.rows(self.values(F, "faces"), c, "faces") * o.S[:, a : a + 1] for a, F in by_axis.items())
+        fb = None
+        if o.b_owner.shape[0]:
+            fb = sum(self.rows(self.values(F, "bfaces"), c, "bfaces") * o.bS[:, a : a + 1] for a, F in by_axis.items())
+        return fi, fb
+
+    def convective_divergence(self, eqs):
+        """``Σ_faces F*·S`` of every equation's convective fluxes, ``(n, nf)``, with the Rusanov numerical
+        flux on the gathered normal flux ``F·n`` of the whole system; ``None`` when there are none."""
+        if not any(g["convective"] for eq in eqs for g in eq["groups"]):
+            return None
+        o, p = self.ops, self.p
+
+        def normal_flux(states, site, normals):
+            cols = []
+            for k, eq in enumerate(eqs):
+                c = p._ncomp[k] if len(eqs) > 1 else p._nf
+                acc = jnp.zeros((normals.shape[0], c), dtype=normals.dtype)
+                for g in eq["groups"]:
+                    for a, F in g["convective"].items():
+                        acc = acc + self.rows(self.values(F, site, states), c, site) * normals[:, a : a + 1]
+                cols.append(acc)
+            return jnp.concatenate(cols, axis=1)
+
+        def split(Q):
+            return {k: Q[:, b : b + c] for k, (b, c) in enumerate(zip(p._block0, p._ncomp))}
+
+        def rusanov(QL, QR, site, normals):
+            fL = normal_flux(split(QL), site, normals)
+            fR = normal_flux(split(QR), site, normals)
+            a = jnp.maximum(
+                self._speed(QL, site, normals, normal_flux, split), self._speed(QR, site, normals, normal_flux, split)
+            )
+            return 0.5 * (fL + fR) - 0.5 * a[:, None] * (QR - QL)
+
+        Q = jnp.concatenate(self.q, axis=1)
+        Qb = jnp.concatenate(self.qb, axis=1)
+        fi = o.Smag[:, None] * rusanov(Q[o.owner], Q[o.neigh], "faces", o.nhat)
+        fb = None
+        if o.b_owner.shape[0]:
+            fb = o.bSmag[:, None] * rusanov(Q[o.b_owner], Qb, "bfaces", o.bn)
+        return o.divergence(fi, fb)
+
+    def _speed(self, Q, site, normals, normal_flux, split):
+        """Spectral radius of ``∂(F·n)/∂Q`` face by face: ``|dF/dq|`` for one component, else from power
+        iteration on the square of the Jacobian (real eigenvalues, as for a hyperbolic system)."""
+        nf = Q.shape[1]
+        f = lambda z: normal_flux(split(z), site, normals)  # noqa: E731
+        cols = [jax.jvp(f, (Q,), (jnp.zeros_like(Q).at[:, j].set(1.0),))[1] for j in range(nf)]
+        J = jnp.stack(cols, axis=-1)  # (m, nf, nf)
+        if nf == 1:
+            return jnp.abs(J[:, 0, 0])
+        J2 = J @ J
+        v = jnp.ones((J.shape[0], nf, 1), dtype=J.dtype)
+        for _ in range(30):
+            v = J2 @ v
+            v = v / (jnp.linalg.norm(v, axis=1, keepdims=True) + jnp.finfo(J.dtype).tiny)
+        lam2 = jnp.linalg.norm(J2 @ v, axis=1)[:, 0]
+        return jnp.sqrt(lam2)
+
+
+def fvm(constraints, centering: str = "cell"):
+    """A finite-volume problem from a strong-form constraint list, written as for :func:`jno.fdm`::
+
+        u = d.unknown(); ui = u.bind(x=x, y=y)
+        sol = jno.fvm([-(ui.xx + ui.yy) - f, u(xb, yb) - g]).solve()   # (n_cells,)
+
+    Each PDE term is integrated over a control volume: an outer derivative ``(F).x`` becomes a flux
+    through the faces, other terms are evaluated at the centroid. Boundary conditions are written as in
+    ``jno.fdm`` (``u(xb, yb) - g``, ``ur.d(nr) - h``, ``ur.d(nr) + a*(ur - u_inf)``) and hold on the
+    boundary faces of their region.
+
+    Args:
+        constraints: the PDE residual(s), boundary conditions and pins.
+        centering: ``"cell"`` -- one control volume per mesh cell.
+
+    Returns:
+        The problem; ``.solve()`` returns the volume values, ``.centroids`` says where they live.
+    """
+    return _TraceFVM(constraints, centering=centering)

@@ -39,6 +39,7 @@ class FVGraph:
         area: ``(n_if, dim)`` interior area vectors, pointing from ``owner`` to ``neigh``; their norm is
             the face measure (1 for a point face in 1-D).
         fcentroid: ``(n_if, dim)`` interior face centroids, on the owner's side of a periodic pair.
+        f_nodes: ``(n_if, k)`` mesh node ids of each interior face (owner's side of a periodic pair).
         delta: ``(n_if, dim)`` ``centroid[neigh] - centroid[owner]``; across a periodic pair the
             difference with the neighbour translated by one period.
         b_owner: ``(n_bf,)`` the volume of each boundary face.
@@ -56,6 +57,7 @@ class FVGraph:
     neigh: np.ndarray
     area: np.ndarray
     fcentroid: np.ndarray
+    f_nodes: np.ndarray
     delta: np.ndarray
     b_owner: np.ndarray
     b_area: np.ndarray
@@ -110,6 +112,7 @@ class FVGraph:
             neigh=np.concatenate([self.neigh, nb]),
             area=np.concatenate([self.area, self.b_area[fa]]),
             fcentroid=np.concatenate([self.fcentroid, self.b_centroid[fa]]),
+            f_nodes=np.concatenate([self.f_nodes, self.b_nodes[fa]]),
             delta=np.concatenate([self.delta, delta]),
             b_owner=self.b_owner[keep],
             b_area=self.b_area[keep],
@@ -197,6 +200,7 @@ def cell_graph(points, cells, cell_type: str) -> FVGraph:
         neigh=neigh,
         area=flat_s[a],
         fcentroid=flat_c[a],
+        f_nodes=flat_n[a],
         delta=centroid[neigh] - centroid[owner],
         b_owner=bd // n_local,
         b_area=flat_s[bd],

@@ -1,1 +1,5 @@
-"""Finite-volume method: :func:`jno.fvm` and its scheme object :func:`jno.fv`."""
+"""Finite-volume method: :func:`jno.fvm`."""
+
+from .trace import fvm
+
+__all__ = ["fvm"]
