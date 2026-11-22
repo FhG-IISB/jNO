@@ -1514,13 +1514,20 @@ class _Evaluator:
                     self.q[j] = saved
                     self._grad_cache = {}
 
-            acc = jnp.zeros_like(lam)
-            for comp in range(c):
-                for a in range(o.dim):
-                    t = jnp.zeros_like(q0).at[:, comp].set(o.centroid[:, a])  # a unit gradient along axis a
-                    dF = jax.jvp(flux_of, (q0,), (t,))[1][:, comp]
-                    acc = acc + o.nhat[:, a] * dF
-            kappa = jnp.abs(acc) / (c * o.Smag)
+            # Few probes: in each, component `comp` gets a unit gradient along its own axis, so one jvp covers c axes
+            # (a velocity in 2-D or 3-D: one). The response of a diffusive flux is then κ S_axis per component, and
+            # κ = Σ|dF| / Σ|S_axis|, a magnitude, which is all the weight needs.
+            num, den = jnp.zeros_like(lam), jnp.zeros_like(lam)
+            for start in range(0, o.dim, c):
+                axes = [(comp, start + comp) for comp in range(c) if start + comp < o.dim]
+                t = jnp.zeros_like(q0)
+                for comp, a in axes:
+                    t = t.at[:, comp].set(o.centroid[:, a])
+                dF = jax.jvp(flux_of, (q0,), (t,))[1]
+                for comp, a in axes:
+                    num = num + jnp.abs(dF[:, comp])
+                    den = den + jnp.abs(o.S[:, a])
+            kappa = num / jnp.maximum(den, jnp.finfo(den.dtype).tiny)
         aface = o.Smag * (lam + kappa / o.dmag)
         aP = jax.ops.segment_sum(aface, o.owner, num_segments=o.n) + jax.ops.segment_sum(aface, o.neigh, num_segments=o.n)
         if o.b_owner.shape[0]:
@@ -1541,19 +1548,16 @@ class _Evaluator:
                     self.q[i], self.qb[i] = saved, saved_b
                     self._grad_cache = {}
 
-            drag = jnp.zeros(o.n, o.S.dtype)
-            for comp in range(c):  # the volume term's own diagonal in U
-                t = jnp.zeros_like(self.q[j]).at[:, comp].set(1.0)
-                drag = drag + jnp.abs(jax.jvp(lambda z: vol_of(j, z), (self.q[j],), (t,))[1][:, comp]) / c
-            aP = aP + o.volume * drag
-            grads = []
-            for a in range(min(c, o.dim)):  # the coefficient of ∂p/∂x_a in component a
-                t = jnp.zeros_like(self.q[k]).at[:, 0].set(o.centroid[:, a])
-                tb = jnp.zeros_like(self.qb[k]).at[:, 0].set(o.bcentroid[:, a])  # the boundary values move too
-                f = lambda z, zb: vol_of(k, z, zb)  # noqa: E731
-                grads.append(jax.jvp(f, (self.q[k], self.qb[k]), (t, tb))[1][:, a])
-            if grads:
-                beta = jnp.abs(sum(grads) / len(grads))
+            # the volume term's diagonal in U (a drag), every component at once: one jvp
+            dvol = jax.jvp(lambda z: vol_of(j, z), (self.q[j],), (jnp.ones_like(self.q[j]),))[1]
+            aP = aP + o.volume * jnp.abs(dvol).mean(axis=1)
+            # the coefficient of ∂p/∂x_a in component a: one jvp of p = Σ_a x_a (its boundary values move too)
+            na = min(c, o.dim)
+            if na:
+                t = jnp.zeros_like(self.q[k]).at[:, 0].set(o.centroid[:, :na].sum(axis=1))
+                tb = jnp.zeros_like(self.qb[k]).at[:, 0].set(o.bcentroid[:, :na].sum(axis=1))
+                dp = jax.jvp(lambda z, zb: vol_of(k, z, zb), (self.q[k], self.qb[k]), (t, tb))[1]
+                beta = jnp.abs(dp[:, :na]).mean(axis=1)
         DP = beta * o.volume / jnp.maximum(aP, jnp.finfo(aP.dtype).tiny)
         return 0.5 * (DP[o.owner] + DP[o.neigh])
 
