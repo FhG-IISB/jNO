@@ -47,6 +47,7 @@ from .._strong_form import (
 )
 from .geometry import cell_graph
 from .ops import FVOps
+from .scheme import FVScheme
 
 __all__ = ["fvm"]
 
@@ -158,6 +159,39 @@ def _expand_hessians(node):
             return Jacobian(Jacobian(target, [b], n.scheme), [a], n.scheme)
         raise NotImplementedError("jno.fvm([...]): a full Hessian matrix is not supported; write its entries.")
     return _map_children(n, _expand_hessians)
+
+
+class _FaceMean:
+    """Marker: ``expr`` taken at an interior face as the arithmetic or harmonic mean of its two cell values."""
+
+    def __init__(self, expr, mode):
+        self.expr, self.mode = expr, mode
+
+    def __mul__(self, other):
+        from ..trace import BinaryOp
+
+        return BinaryOp("*", _AsPlaceholder(self), other)
+
+
+def _AsPlaceholder(marker):
+    """A ``FunctionCall`` node that carries the marker (never evaluated: the evaluator replaces it)."""
+    from ..trace import FunctionCall
+
+    node = FunctionCall(lambda: None, [], "fvm_face_mean")
+    node._fvm_face_mean = marker
+    return node
+
+
+def _face_mean(sub, mode):
+    """``coef * grad`` with the coefficient factors (those without a derivative) under a face mean."""
+    from ..trace import BinaryOp
+
+    factors = _factors(sub)
+    coef = [f for f in factors if not _has_derivative(f)]
+    rest = [f for f in factors if _has_derivative(f)]
+    if not coef or not rest:
+        return sub
+    return BinaryOp("*", _AsPlaceholder(_FaceMean(_product(coef), mode)), _product(rest))
 
 
 def _has_derivative(node):
@@ -272,9 +306,9 @@ class _TraceFVM(StrongFormProblem):
 
         A group is the fluxes under one volume coefficient: ``{"coef": node | None, "central": {axis:
         expr}, "convective": {axis: expr}}``."""
-        from ..trace import Literal
+        from ..trace import BinaryOp, Literal
 
-        volume, groups, noncons = [], {}, False
+        volume, groups, noncons, schemes = [], {}, False, set()
         for sign, term in _signed_terms(expr):
             factors = _factors(term)
             divs = [f for f in factors if _is_divergence(f)]
@@ -285,10 +319,23 @@ class _TraceFVM(StrongFormProblem):
                 scale = sign * float(np.prod([float(np.asarray(f.value)) for f in literal])) if literal else sign
                 key = id(coef[0]) if len(coef) == 1 else (None if not coef else tuple(id(c) for c in coef))
                 grp = groups.setdefault(key, {"coef": _product(coef) if coef else None, "central": {}, "convective": {}})
+                scheme = getattr(_unwrap(divs[0]), "scheme", None)
                 for axis, F in _divergence_parts(divs[0]):
                     for s2, sub in _signed_terms(F):
                         kind = "convective" if self._has_unknown(sub) and not _has_derivative(sub) else "central"
-                        grp[kind].setdefault(axis, []).append((scale * s2, _expand_hessians(sub)))
+                        sub = _expand_hessians(sub)
+                        if (
+                            kind == "central"
+                            and isinstance(scheme, FVScheme)
+                            and scheme.average in ("arithmetic", "harmonic")
+                        ):
+                            sub = _face_mean(sub, scheme.average)
+                        mag = abs(scale)
+                        if mag != 1.0:
+                            sub = BinaryOp("*", Literal(mag), sub)
+                        grp[kind].setdefault(axis, []).append((np.sign(scale) * s2, sub))
+                        if kind == "convective":
+                            schemes.add(scheme if isinstance(scheme, FVScheme) else None)
                 continue
             if self._has_unknown_derivative(term):
                 noncons = True
@@ -316,7 +363,23 @@ class _TraceFVM(StrongFormProblem):
                 "jno.fvm([...]): a convective flux under a variable coefficient (`c(x)*(b*u).x`) is not "
                 "supported; move the coefficient inside the derivative."
             )
-        return {"volume": _signed_sum(volume), "groups": out}
+        if len(schemes) > 1:
+            raise ValueError(
+                "jno.fvm([...]): the convective terms of one equation carry different schemes. They form one normal "
+                "flux F·n, so give every axis the same `scheme=jno.fv(...)` (or none)."
+            )
+        return {"volume": _signed_sum(volume), "groups": out, "scheme": next(iter(schemes)) if schemes else None}
+
+    def _convective_scheme(self):
+        """The one scheme of the system's convective fluxes (they are solved together): an equation's
+        ``jno.fv(...)``, the default where none is given."""
+        given = {e["scheme"] for e in self._equations if e["scheme"] is not None}
+        if len(given) > 1:
+            raise ValueError(
+                "jno.fvm([...]): the equations of a system carry different `jno.fv(...)` schemes; their convective "
+                "fluxes go through one numerical flux, so give them the same one."
+            )
+        return next(iter(given)) if given else FVScheme()
 
     def _field_of(self, constraint):
         """The unknown a condition constrains: the one it mentions."""
@@ -521,7 +584,7 @@ class _TraceFVM(StrongFormProblem):
             return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
         u0 = zeros if x0 is None else jnp.asarray(x0)
         tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
-        nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True)
+        nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True, line_search=True)
         if linear is None:
             linear, precond = self._defaults(tangent(u0), None, precond)
         precond = self._frozen(precond, lambda: tangent(u0))
@@ -647,6 +710,14 @@ class _Evaluator:
 
         def rewrite(node):
             n = _unwrap(node)
+            marker = getattr(n, "_fvm_face_mean", None)
+            if marker is not None:
+                if kind == "faces":
+                    Tc = self.rows_of(self.values(marker.expr, "cells"), "cells")
+                    a, b = Tc[self.ops.owner], Tc[self.ops.neigh]
+                    mean = 0.5 * (a + b) if marker.mode == "arithmetic" else 2.0 * a * b / (a + b)
+                    return leaf("mean", mean if idx is None else mean[idx])
+                return leaf("mean", self.values(marker.expr, site, override))
             if isinstance(n, ModelCall):
                 for k, w in enumerate(self.p.unknowns):
                     if n.model is w:
@@ -795,11 +866,13 @@ class _Evaluator:
         return fi, fb
 
     def convective_divergence(self, eqs):
-        """``Σ_faces F*·S`` of every equation's convective fluxes, ``(n, nf)``, with the Rusanov numerical
-        flux on the gathered normal flux ``F·n`` of the whole system; ``None`` when there are none."""
+        """``Σ_faces F*·S`` of every equation's convective fluxes, ``(n, nf)``: the gathered normal flux
+        ``F·n`` of the whole system on reconstructed face states, through the scheme's numerical flux;
+        ``None`` when there are none."""
         if not any(g["convective"] for eq in eqs for g in eq["groups"]):
             return None
         o, p = self.ops, self.p
+        scheme = p._convective_scheme()
 
         def normal_flux(states, site, normals):
             cols = []
@@ -815,38 +888,120 @@ class _Evaluator:
         def split(Q):
             return {k: Q[:, b : b + c] for k, (b, c) in enumerate(zip(p._block0, p._ncomp))}
 
-        def rusanov(QL, QR, site, normals):
-            fL = normal_flux(split(QL), site, normals)
-            fR = normal_flux(split(QR), site, normals)
-            a = jnp.maximum(
-                self._speed(QL, site, normals, normal_flux, split), self._speed(QR, site, normals, normal_flux, split)
-            )
-            return 0.5 * (fL + fR) - 0.5 * a[:, None] * (QR - QL)
+        def numerical(QL, QR, site, normals):
+            Fn = lambda Q: normal_flux(split(Q), site, normals)  # noqa: E731
+            if callable(scheme.flux):
+                return scheme.flux(QL, QR, normals, Fn)
+            fL, fR = Fn(QL), Fn(QR)
+            if scheme.flux == "rusanov":
+                a = jnp.maximum(
+                    self._speed(QL, site, normals, Fn, split, scheme), self._speed(QR, site, normals, Fn, split, scheme)
+                )
+                return 0.5 * (fL + fR) - 0.5 * a[:, None] * (QR - QL)
+            if scheme.flux == "hll":
+                lo_L, hi_L = _eig_extremes(_flux_jacobian(Fn, QL))
+                lo_R, hi_R = _eig_extremes(_flux_jacobian(Fn, QR))
+                sl = jnp.minimum(jnp.minimum(lo_L, lo_R), 0.0)[:, None]
+                sr = jnp.maximum(jnp.maximum(hi_L, hi_R), 0.0)[:, None]
+                width = jnp.where(sr - sl > 0, sr - sl, 1.0)
+                hll = (sr * fL - sl * fR + sl * sr * (QR - QL)) / width
+                return jnp.where(sr - sl > 0, hll, 0.5 * (fL + fR))
+            # "roe": the jump damped by |A| at the mean state, |A| = sqrt(A^2 + d^2 I) (entropy fix built in)
+            A = _flux_jacobian(Fn, 0.5 * (QL + QR))
+            rho = _spectral_radius(A)
+            absA = _abs_matrix(A, scheme.entropy_fix * rho)
+            return 0.5 * (fL + fR) - 0.5 * jnp.einsum("mij,mj->mi", absA, QR - QL)
 
-        Q = jnp.concatenate(self.q, axis=1)
-        Qb = jnp.concatenate(self.qb, axis=1)
-        fi = o.Smag[:, None] * rusanov(Q[o.owner], Q[o.neigh], "faces", o.nhat)
+        QL, QR, Qin, Qb = self._face_states(scheme)
+        fi = o.Smag[:, None] * numerical(QL, QR, "faces", o.nhat)
         fb = None
         if o.b_owner.shape[0]:
-            fb = o.bSmag[:, None] * rusanov(Q[o.b_owner], Qb, "bfaces", o.bn)
+            fb = o.bSmag[:, None] * numerical(Qin, Qb, "bfaces", o.bn)
         return o.divergence(fi, fb)
 
-    def _speed(self, Q, site, normals, normal_flux, split):
-        """Spectral radius of ``∂(F·n)/∂Q`` face by face: ``|dF/dq|`` for one component, else from power
-        iteration on the square of the Jacobian (real eigenvalues, as for a hyperbolic system)."""
-        nf = Q.shape[1]
-        f = lambda z: normal_flux(split(z), site, normals)  # noqa: E731
-        cols = [jax.jvp(f, (Q,), (jnp.zeros_like(Q).at[:, j].set(1.0),))[1] for j in range(nf)]
-        J = jnp.stack(cols, axis=-1)  # (m, nf, nf)
-        if nf == 1:
-            return jnp.abs(J[:, 0, 0])
-        J2 = J @ J
-        v = jnp.ones((J.shape[0], nf, 1), dtype=J.dtype)
-        for _ in range(30):
-            v = J2 @ v
-            v = v / (jnp.linalg.norm(v, axis=1, keepdims=True) + jnp.finfo(J.dtype).tiny)
-        lam2 = jnp.linalg.norm(J2 @ v, axis=1)[:, 0]
-        return jnp.sqrt(lam2)
+    def _face_states(self, scheme):
+        """``(Q_L, Q_R, Q_inner, Q_boundary)``: the reconstructed states on both sides of every interior face
+        and on the inner side of every boundary face (the outer one is the boundary value)."""
+        o = self.ops
+        Q = jnp.concatenate(self.q, axis=1)
+        Qb = jnp.concatenate(self.qb, axis=1) if o.b_owner.shape[0] else jnp.zeros((0, Q.shape[1]), Q.dtype)
+        if scheme.recon == "none":
+            return Q[o.owner], Q[o.neigh], Q[o.b_owner], Qb
+        G = o.cell_gradient(Q, Qb) if scheme.recon == "lsq" else o.green_gauss(Q, Qb)
+        if scheme.multidimensional:
+            phi = o.multidimensional_limiter(Q, Qb, G, scheme.limiter, scheme.venkat_k)
+            QL, QR, Qin = o.reconstruct(Q, phi[:, :, None] * G)
+            return QL, QR, Qin, Qb
+        if scheme.limiter is None:
+            QL, QR, Qin = o.reconstruct(Q, G)
+            return QL, QR, Qin, Qb
+        # a ψ(r) limiter per face, on the upwind difference of Darwish & Moukalled (2003), written as a·ψ(b/a)
+        eps = (scheme.venkat_k * o.dmag) ** 3
+        dQ = Q[o.neigh] - Q[o.owner]
+        upL = 2.0 * jnp.einsum("fcd,fd->fc", G[o.owner], o.delta) - dQ
+        upR = 2.0 * jnp.einsum("fcd,fd->fc", G[o.neigh], o.delta) - dQ
+        QL = Q[o.owner] + 0.5 * scheme.increment(dQ, upL, eps[:, None])
+        QR = Q[o.neigh] - 0.5 * scheme.increment(dQ, upR, eps[:, None])
+        dB = 2.0 * (Qb - Q[o.b_owner])  # against a mirror cell beyond the face
+        upB = 2.0 * jnp.einsum("fcd,fd->fc", G[o.b_owner], 2.0 * o.br) - dB
+        epsB = (scheme.venkat_k * 2.0 * o.bdperp) ** 3
+        Qin = Q[o.b_owner] + 0.5 * scheme.increment(dB, upB, epsB[:, None])
+        return QL, QR, Qin, Qb
+
+    def _speed(self, Q, site, normals, Fn, split, scheme):
+        """Wave speed per face: the scheme's ``speed=`` expression, else the spectral radius of
+        ``∂(F·n)/∂Q``."""
+        if scheme.speed is not None:
+            return self.rows(self.values(scheme.speed, site, split(Q)), 1, site)[:, 0]
+        return _spectral_radius(_flux_jacobian(Fn, Q))
+
+
+def _flux_jacobian(Fn, Q):
+    """``∂Fn/∂Q`` face by face, ``(m, nf, nf)``: faces are independent, so one jvp per component."""
+    nf = Q.shape[1]
+    cols = [jax.jvp(Fn, (Q,), (jnp.zeros_like(Q).at[:, j].set(1.0),))[1] for j in range(nf)]
+    return jnp.stack(cols, axis=-1)
+
+
+def _power(M, iters=40):
+    """Largest eigenvalue of matrices whose eigenvalues are real and non-negative, by power iteration."""
+    v = jnp.ones(M.shape[:2] + (1,), dtype=M.dtype) / jnp.sqrt(M.shape[1])
+    for _ in range(iters):
+        v = M @ v
+        v = v / (jnp.linalg.norm(v, axis=1, keepdims=True) + jnp.finfo(M.dtype).tiny)
+    return jnp.linalg.norm(M @ v, axis=1)[:, 0]
+
+
+def _spectral_radius(A):
+    """``max |λ|`` of each ``A`` (real eigenvalues, as for a hyperbolic system): ``√λ_max(A²)``."""
+    if A.shape[1] == 1:
+        return jnp.abs(A[:, 0, 0])
+    return jnp.sqrt(_power(A @ A))
+
+
+def _eig_extremes(A):
+    """``(λ_min, λ_max)`` of each ``A`` (real eigenvalues), by power iteration on ``ρI ± A``."""
+    if A.shape[1] == 1:
+        return A[:, 0, 0], A[:, 0, 0]
+    rho = _spectral_radius(A)[:, None, None]
+    eye = jnp.eye(A.shape[1], dtype=A.dtype)
+    hi = _power(rho * eye + A) - rho[:, 0, 0]
+    lo = rho[:, 0, 0] - _power(rho * eye - A)
+    return lo, hi
+
+
+def _abs_matrix(A, delta, iters=20):
+    """``|A|`` as ``sqrt(A² + δ²I)`` by the Denman-Beavers iteration (``δ`` per matrix); ``|a|`` smoothed to
+    ``sqrt(a² + δ²)`` for a scalar."""
+    if A.shape[1] == 1:
+        return jnp.sqrt(A * A + (delta * delta)[:, None, None])
+    eye = jnp.eye(A.shape[1], dtype=A.dtype)
+    Y = A @ A + (delta * delta)[:, None, None] * eye + jnp.finfo(A.dtype).tiny * eye
+    Z = jnp.broadcast_to(eye, Y.shape)
+    for _ in range(iters):
+        Yi, Zi = jnp.linalg.inv(Y), jnp.linalg.inv(Z)
+        Y, Z = 0.5 * (Y + Zi), 0.5 * (Z + Yi)
+    return Y
 
 
 def fvm(constraints, centering: str = "cell"):

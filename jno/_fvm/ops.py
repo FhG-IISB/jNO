@@ -102,6 +102,42 @@ class FVOps:
             b = b + self._sum((self.lsq_wb[:, None, None] * dTb[:, :, None]) * self.br[:, None, :], self.b_owner)
         return jnp.einsum("nij,ncj->nci", self.lsq_inv, b)
 
+    def green_gauss(self, T, Tb):
+        """Green-Gauss gradient ``(n, c, dim)``: ``(1/V) Σ_f T_f S_f`` with linearly interpolated face values."""
+        Tf = self.face_value(T)
+        contrib = Tf[:, :, None] * self.S[:, None, :]
+        b = self._sum(contrib, self.owner) - self._sum(contrib, self.neigh)
+        if self.b_owner.shape[0]:
+            b = b + self._sum(Tb[:, :, None] * self.bS[:, None, :], self.b_owner)
+        return b / self.volume[:, None, None]
+
+    def multidimensional_limiter(self, T, Tb, G, kind, k=0.3):
+        """Per-volume factor ``(n, c)`` that keeps ``T_P + G·(x_f − x_P)`` within the extrema of the volume and
+        its neighbours at every face: Barth-Jespersen's ``min(1, Δ_max/Δ)``, or Venkatakrishnan's smooth
+        version of it (``ε² = (k h)³``)."""
+        lo, hi = self.neighbour_extrema(T, Tb)
+        h = self.volume ** (1.0 / self.dim)
+        eps2 = ((k * h) ** 3)[:, None]
+
+        def factor(cell, r):
+            d2 = jnp.einsum("fcd,fd->fc", G[cell], r)
+            dmax = jnp.where(d2 > 0, hi[cell] - T[cell], lo[cell] - T[cell])
+            if kind == "barth":
+                safe = jnp.where(jnp.abs(d2) > 0, d2, 1.0)
+                return jnp.where(jnp.abs(d2) > 0, jnp.minimum(1.0, dmax / safe), 1.0)
+            e2 = eps2[cell]
+            return (dmax**2 + e2 + 2 * d2 * dmax) / (dmax**2 + 2 * d2**2 + d2 * dmax + e2)
+
+        rL = self.fcentroid - self.centroid[self.owner]
+        rR = self.fcentroid - (self.centroid[self.owner] + self.delta)
+        phi = jnp.minimum(
+            jax.ops.segment_min(factor(self.owner, rL), self.owner, num_segments=self.n),
+            jax.ops.segment_min(factor(self.neigh, rR), self.neigh, num_segments=self.n),
+        )
+        if self.b_owner.shape[0]:
+            phi = jnp.minimum(phi, jax.ops.segment_min(factor(self.b_owner, self.br), self.b_owner, num_segments=self.n))
+        return jnp.clip(phi, 0.0, 1.0)
+
     def face_value(self, T):
         """Linear interpolation of volume values to the interior faces."""
         return T[self.owner] + self.gw[:, None] * (T[self.neigh] - T[self.owner])
@@ -128,12 +164,10 @@ class FVOps:
         return Gp + (dn - jnp.einsum("fcd,fd->fc", Gp, self.bn))[:, :, None] * self.bn[:, None, :]
 
     # -- reconstruction -------------------------------------------------------------------------------
-    def reconstruct(self, T, G, limiter=None):
+    def reconstruct(self, T, G):
         """Left and right states at the interior faces ``(T_L, T_R)`` and the inner state at the boundary
-        faces, extrapolated with the volume gradient. ``limiter(T, G)`` returns a per-volume factor
-        ``(n, c)`` in ``[0, 1]``; ``None`` is the unlimited (second-order) reconstruction."""
-        phi = 1.0 if limiter is None else limiter(T, G)[:, :, None]
-        Gl = phi * G
+        faces, extrapolated with the (possibly limited) volume gradient ``G``."""
+        Gl = G
         rL = self.fcentroid - self.centroid[self.owner]
         rR = self.fcentroid - (self.centroid[self.owner] + self.delta)  # periodic-safe: neighbour seen from owner
         TL = T[self.owner] + jnp.einsum("fcd,fd->fc", Gl[self.owner], rL)

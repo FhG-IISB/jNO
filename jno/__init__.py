@@ -27,7 +27,7 @@ if _hoist_constants and not _hoist_after_import:
 from . import bayesian, fn, litho, lora, optimizers, precond, solve, space, trackers
 from . import jnp_ops as np
 from ._fem import Coupling, derived, fem, lag
-from ._fvm import fvm
+from ._fvm import fv, fvm
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -227,6 +227,7 @@ __all__ = [
     "do",
     "fem",
     "fdm",
+    "fv",
     "fvm",
     "fd",
     "rcwa",
