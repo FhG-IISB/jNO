@@ -46,7 +46,7 @@ from .._strong_form import (
     _unwrap,
     _zero_temporal,
 )
-from .geometry import cell_graph
+from .geometry import cell_graph, dual_graph
 from .ops import FVOps
 from .scheme import FVScheme
 
@@ -243,8 +243,8 @@ class _TraceFVM(StrongFormProblem):
     _who = "jno.fvm"
 
     def __init__(self, constraints, centering="cell"):
-        if centering != "cell":
-            raise NotImplementedError(f"jno.fvm([...], centering={centering!r}): only 'cell' is available yet.")
+        if centering not in ("cell", "vertex"):
+            raise ValueError(f"jno.fvm([...], centering={centering!r}): use 'cell' or 'vertex'.")
         self.centering = centering
         self._constraints = list(constraints)
         self.unknowns = _find_unknowns(constraints, "jno.fvm")
@@ -256,7 +256,8 @@ class _TraceFVM(StrongFormProblem):
         dim = int(self.domain.dimension)
         cells, kind = self.domain._cells_topo()
         self._mesh_points = np.asarray(self.domain.mesh_connectivity["points"])[:, :dim]
-        self.graph = cell_graph(self._mesh_points, cells, kind)
+        build = cell_graph if centering == "cell" else dual_graph
+        self.graph = build(self._mesh_points, cells, kind)
         self._N = self.graph.n
         self._ncomp = [int(np.prod(np.shape(w.module.value)[1:], dtype=int)) for w in self.unknowns]
         self._block0 = [int(b) for b in np.cumsum([0] + self._ncomp)[:-1]]
@@ -484,7 +485,8 @@ class _TraceFVM(StrongFormProblem):
     def _boundary_conditions(self):
         """``[(field, face_ids, expr)]``: every condition that lives on boundary faces."""
         out, claimed = [], {}
-        for c in self._dirichlet + self._neumann:
+        vertex = self.centering == "vertex"
+        for c in self._neumann if vertex else self._dirichlet + self._neumann:  # vertex: values are strong rows
             tag = self._condition_region(c)
             faces = self._region_faces(tag) if self._has_boundary_faces(tag) else None
             if faces is None:
@@ -514,6 +516,9 @@ class _TraceFVM(StrongFormProblem):
         out = []
         for c in self._dirichlet:
             tag = self._condition_region(c)
+            if self.centering == "vertex":  # a value on a boundary region holds at its nodes (as in jno.fdm)
+                out.append((self._field_of(c), jnp.asarray(self._region_mesh_nodes(tag), dtype=jnp.int32), _unwrap(c)))
+                continue
             if self._has_boundary_faces(tag):
                 continue
             nodes = self._region_mesh_nodes(tag)
@@ -893,7 +898,9 @@ class _TraceFVM(StrongFormProblem):
         else:
             nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True)
             linear = linear if linear is not None else _solve.lu()
-            steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+            steppers = compose_transient_step_solvers(
+                nonlinear, linear, precond, self._host(), block, scheme=time, state=state0
+            )
         from ..fdm import _integrate_transient
 
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
@@ -924,7 +931,7 @@ class _TraceFVM(StrongFormProblem):
                 linear, precond = self._defaults(self._operator("steady", make_probe(), zc), linear, precond)
                 precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), zc))
             A = self._operator("steady", residual, zeros)
-            return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
+            return compose_linear_solve_fn(linear, precond, x0, fem=self._host())(A, -residual(zeros))
         u0 = zeros if x0 is None else jnp.asarray(x0)
         tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
         u0c = probe_at  # the concrete start, for setups that need values
@@ -938,7 +945,7 @@ class _TraceFVM(StrongFormProblem):
         # no linear= given: Newton's direct variant factorises the assembled tangent (sparse LU), as jno.fdm does
         with jax.ensure_compile_time_eval():
             precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), u0c))
-        return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)(residual, u0, jacobian=tangent)
+        return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self._host())(residual, u0, jacobian=tangent)
 
     def _constraint_rows(self, n=None):
         """Boolean mask of the DOFs that are multipliers of a constraint equation (the pressure), over a state
@@ -950,6 +957,23 @@ class _TraceFVM(StrongFormProblem):
         if not rows.any():
             raise ValueError("jno.solve.simple / piso: this problem has no constraint equation (no saddle pair).")
         return rows if n is None or n == rows.size else np.concatenate([rows, np.zeros(n - rows.size, dtype=bool)])
+
+    def _host(self):
+        """What the solver composers see as the owning problem: this one, with the structured-grid descriptor
+        of the CONTROL VOLUMES (``jno.precond.gmg`` reads it): the cell lattice of a quad / hex structured
+        mesh, whose cells come in lattice order, or the node lattice for the vertex-centred dual."""
+        grid = (getattr(self.domain, "mesh_connectivity", {}) or {}).get("grid")
+        if grid is not None and self.centering == "cell":
+            if self.graph.cell_type in ("quad", "hexahedron") and self._N == int(np.prod(np.asarray(grid["shape"]) - 1)):
+                h = np.asarray(grid["spacing"], dtype=float)
+                grid = {
+                    "shape": tuple(int(n) - 1 for n in grid["shape"]),
+                    "spacing": tuple(grid["spacing"]),
+                    "origin": tuple(np.asarray(grid["origin"], dtype=float) + h / 2),
+                }
+            else:
+                grid = None
+        return _PrecondHost(self, grid)
 
     def _frozen(self, precond, representative):
         """A preconditioner that needs a concrete matrix (amg, ilu) is set up once on the tangent at the
@@ -967,9 +991,10 @@ class _TraceFVM(StrongFormProblem):
 
         if not _untraceable_leaves(precond)[1]:
             return precond
-        prepare_precond(precond, self)
+        host = self._host()
+        prepare_precond(precond, host)
         return _FrozenMarchPrecond(
-            materialize_precond(precond, PrecondContext(LinearOperator(representative()), self)), precond
+            materialize_precond(precond, PrecondContext(LinearOperator(representative()), host)), precond
         )
 
     # -- what the user reads --------------------------------------------------------------------------
@@ -986,6 +1011,8 @@ class _TraceFVM(StrongFormProblem):
     def to_nodes(self, sol):
         """Volume-weighted average of cell values at the mesh nodes, ``(..., n_nodes)``."""
         sol = np.asarray(sol)
+        if self.centering == "vertex":
+            return sol
         cells, V = self.graph.cells, self.graph.volume
         n_nodes = self._mesh_points.shape[0]
         w = np.zeros(n_nodes)
@@ -1006,6 +1033,19 @@ def _iter_vars(node):
     return [v for c in _iter(n) for v in _iter_vars(c)]
 
 
+class _PrecondHost:
+    """The problem as the solver composers read it, with the control volumes' grid descriptor."""
+
+    def __init__(self, problem, grid):
+        import types
+
+        self._problem = problem
+        self.domain = types.SimpleNamespace(mesh_connectivity={"grid": grid} if grid is not None else {})
+
+    def __getattr__(self, name):
+        return getattr(self._problem, name)
+
+
 class _Evaluator:
     """One evaluation of the residual: the unknowns' volume and boundary values, and the trace evaluated at
     volumes, interior faces or boundary faces with derivatives replaced by finite-volume gradients."""
@@ -1014,6 +1054,7 @@ class _Evaluator:
         self.p, self.ops, self.q, self.qb, self.t = prob, prob.ops, list(q), list(qb), t
         self.scope = scope
         self.first_order = False  # first-order face states (the CFL bound reads that operator)
+        self.gn = [jnp.zeros_like(b) for b in self.qb]  # vertex-centred: normal derivatives of the boundary pieces
         self._grad_cache = {}
 
     # sites: "cells", "faces", ("cells", idx), ("bfaces", idx), "bfaces"
@@ -1153,6 +1194,26 @@ class _Evaluator:
             out = self.ops.green_gauss(Tc, Tb) if self.p._is_multiplier(target) else G
         elif kind == "faces":
             out = self.ops.face_gradient(Tc, G)
+        elif self.ops.vertex:  # the node's gradient, its normal part the boundary piece's normal derivative
+            sel = self.ops.b_owner if idx is None else self.ops.b_owner[idx]
+            Gp = G[sel]
+            k = next(
+                (
+                    kk
+                    for kk, w in enumerate(self.p.unknowns)
+                    if _unwrap(target) is not None and getattr(_unwrap(target), "model", None) is w
+                ),
+                None,
+            )
+            if k is None:
+                return Gp
+            trial = getattr(self, "_gn_trial", None)
+            if trial is not None and trial[0] == k and trial[1] is idx:
+                gn = trial[2]
+            else:
+                gn = self.gn[k] if idx is None else self.gn[k][idx]
+            nrm = self.ops.bn if idx is None else self.ops.bn[idx]
+            return Gp + (gn - jnp.einsum("fcd,fd->fc", Gp, nrm))[:, :, None] * nrm[:, None, :]
         else:
             Tsite = (
                 Tb if override is None else self.rows_of(self.values(target, ("bfaces", idx), override), ("bfaces", idx))
@@ -1183,6 +1244,18 @@ class _Evaluator:
         o = self.ops
         if not o.b_owner.shape[0]:
             return
+        if o.vertex:  # boundary values are the nodes' own; flux conditions give the normal derivative
+            self.qb = [qk[o.b_owner] for qk in self.q]
+            self.gn = [jnp.zeros_like(qb) for qb in self.qb]
+            self._grad_cache = {}
+            for k, faces, expr in self.p._conditions:
+                z = jnp.zeros((int(faces.shape[0]), self._width(k)), self.q[k].dtype)
+                affine = self.p._condition_affine.get(id(expr), False)
+                for _ in range(1 if affine else _NEWTON_STEPS):
+                    z = self._newton_step(k, faces, expr, z)
+                self.gn[k] = self.gn[k].at[faces].set(z)
+                self._grad_cache = {}
+            return
         G = [o.cell_gradient(self.q[k], self.qb[k]) for k in range(len(self.q))]
         new = [o.owner_at_face(self.q[k], G[k]) for k in range(len(self.q))]
         self._grad_cache = {}
@@ -1196,7 +1269,23 @@ class _Evaluator:
         self.qb = new
         self._grad_cache = {}
 
+    def _width(self, k):
+        return self.q[k].shape[1]
+
     def _condition(self, k, faces, expr, qf):
+        if self.ops.vertex:  # qf is the normal derivative of the boundary pieces; their value is the node's
+            self._gn_trial = (k, faces, qf)
+            self._grad_cache = {}
+            try:
+                r = self.rows_of(self.values(expr, ("bfaces", faces)), ("bfaces", faces))
+            finally:
+                self._gn_trial = None
+                self._grad_cache = {}
+            if r.shape[1] != qf.shape[1]:
+                raise NotImplementedError(
+                    "jno.fvm([...], centering='vertex'): a partial boundary condition is not supported."
+                )
+            return r
         r = self.rows_of(self.values(expr, ("bfaces", faces), {k: qf}), ("bfaces", faces))
         if r.shape[1] > qf.shape[1]:
             raise ValueError(

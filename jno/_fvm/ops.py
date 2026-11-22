@@ -53,7 +53,10 @@ class FVOps:
         self.bcentroid = to(g.b_centroid)
         r = g.b_centroid - g.centroid[g.b_owner]
         dperp = np.einsum("fd,fd->f", r, bn)
-        if dperp.size and dperp.min() <= 0:
+        self.vertex = g.centering == "vertex"  # the node lies on its boundary faces: no two-point relation there
+        if self.vertex:
+            dperp = np.ones_like(dperp)
+        elif dperp.size and dperp.min() <= 0:
             raise ValueError("jno.fvm: a boundary face lies behind its cell centroid (an inverted cell).")
         self.br, self.bdperp = to(r), to(dperp)
         self.br_t = to(r - dperp[:, None] * bn)  # the tangential offset of the face centroid
@@ -64,11 +67,13 @@ class FVOps:
         rt = np.linalg.norm(r - dperp[:, None] * bn, axis=1) if r.size else np.zeros(0)
         from .trace import _BOUNDARY_PASSES
 
-        self.boundary_passes = 1 if not rt.size or rt.max() <= 1e-12 * dperp.max() else _BOUNDARY_PASSES
+        self.boundary_passes = 1 if self.vertex or not rt.size or rt.max() <= 1e-12 * dperp.max() else _BOUNDARY_PASSES
 
         # least squares on the neighbours (and boundary faces), weights 1/|d|^2; the normal matrix per volume
         w = 1.0 / dmag**2
         wb = 1.0 / np.maximum(np.einsum("fd,fd->f", r, r), np.finfo(float).tiny)
+        if self.vertex:  # a boundary piece carries the node's own value: no information for the gradient
+            wb = np.zeros_like(wb)
         A = np.zeros((g.n, g.dim, g.dim))
         outer = w[:, None, None] * g.delta[:, :, None] * g.delta[:, None, :]
         np.add.at(A, g.owner, outer)

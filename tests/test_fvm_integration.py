@@ -116,3 +116,17 @@ def test_simple_needs_a_saddle_pair():
     ui = u.bind(x=x, y=y)
     with pytest.raises(ValueError, match="saddle"):
         jno.fvm([-(ui.xx + ui.yy) + ui**3 - 1.0, u(xb, yb) - 0.0]).solve(nonlinear=jno.solve.simple())
+
+
+def test_geometric_multigrid_on_the_cell_lattice():
+    """A structured quad mesh's cells come in lattice order, so jno.precond.gmg preconditions the
+    cell-centred operator on the cell grid."""
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=16).quad().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    cons = [-(ui.xx + ui.yy) - 2 * PI**2 * jnn.sin(PI * x) * jnn.sin(PI * y), u(xb, yb) - 0.0]
+    a = np.asarray(jno.fvm(cons).solve())
+    b = np.asarray(jno.fvm(cons).solve(linear=jno.solve.cg(tol=1e-12), precond=jno.precond.gmg()))
+    np.testing.assert_allclose(a, b, atol=1e-11)

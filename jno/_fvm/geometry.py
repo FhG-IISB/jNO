@@ -24,7 +24,7 @@ import dataclasses
 
 import numpy as np
 
-__all__ = ["FVGraph", "cell_graph", "face_geometry"]
+__all__ = ["FVGraph", "cell_graph", "dual_graph", "face_geometry"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,6 +66,7 @@ class FVGraph:
     points: np.ndarray
     cells: np.ndarray
     cell_type: str
+    centering: str = "cell"  # "vertex": the control volumes are the median-dual cells of the mesh nodes
 
     @property
     def n(self) -> int:
@@ -209,4 +210,110 @@ def cell_graph(points, cells, cell_type: str) -> FVGraph:
         points=points,
         cells=cells,
         cell_type=cell_type,
+    )
+
+
+def _cell_edges(cell_type):
+    """``[(a, b, faces)]``: the local edges of a cell type and the local faces that contain each."""
+    from ..utils.solver.fem_facets import _face_table
+
+    local, k = _face_table(cell_type)
+    faces = [tuple(f[:k]) for f in local]
+    if k <= 2:  # 1-D and 2-D: the faces are the edges
+        return [(f[0], f[-1], (i,)) for i, f in enumerate(faces)] if k == 2 else []
+    edges = {}
+    for i, f in enumerate(faces):
+        for a, b in zip(f, f[1:] + f[:1]):
+            edges.setdefault(tuple(sorted((a, b))), []).append(i)
+    return [(a, b, tuple(fs)) for (a, b), fs in edges.items()]
+
+
+def dual_graph(points, cells, cell_type: str) -> FVGraph:
+    """The vertex-centred :class:`FVGraph` of a mesh: one control volume per mesh node, the median dual.
+
+    Inside every cell, the dual face between the nodes of an edge runs from the edge midpoint to the cell
+    centroid (in 3-D through the centroids of the two cell faces at the edge); the pieces of all cells sharing
+    the edge add up to one dual face. A boundary facet is shared equally by its nodes. Volumes: a simplex
+    gives each vertex ``1/(d+1)`` of itself (exact for the median dual), a quadrilateral or hexahedron
+    ``1/2^d`` (exact for a parallelogram or parallelepiped). The control volume's point is the node itself.
+    In 1-D a node's volume is half of each adjacent cell and the dual face is the cell midpoint.
+
+    Based on: Barth, T. J. (1994). Aspects of unstructured grids and finite-volume solvers for the Euler and
+    Navier-Stokes equations. VKI Lecture Series 1994-05 -- the median-dual control volume.
+    """
+    points = np.asarray(points, dtype=float)
+    cells = np.asarray(cells, dtype=np.int64)
+    dim = points.shape[1]
+    n_nodes = points.shape[0]
+    cg = cell_graph(points, cells, cell_type)  # the boundary facets and cell volumes
+    nv = cells.shape[1]
+    volume = np.zeros(n_nodes)
+    np.add.at(volume, cells.ravel(), np.repeat(cg.volume / nv, nv))
+    cent = points[cells].mean(axis=1)
+
+    if dim == 1:
+        a, b = cells[:, 0], cells[:, 1]
+        S = np.sign(points[b, 0] - points[a, 0])[:, None]
+        pieces = [(a, b, S, cent)]
+    else:
+        from ..utils.solver.fem_facets import _face_table
+
+        local, k = _face_table(cell_type)
+        local = np.asarray(local, dtype=np.int64)[:, :k]
+        pieces = []
+        for la, lb, fs in _cell_edges(cell_type):
+            a, b = cells[:, la], cells[:, lb]
+            m = 0.5 * (points[a] + points[b])
+            if dim == 2:
+                t = cent - m
+                S = np.stack([t[:, 1], -t[:, 0]], axis=1)
+                c = 0.5 * (m + cent)
+            else:
+                f1 = points[cells[:, local[fs[0]]]].mean(axis=1)
+                f2 = points[cells[:, local[fs[1]]]].mean(axis=1)
+                S, c = face_geometry(np.stack([m, f1, cent, f2], axis=1))
+            flip = np.einsum("fd,fd->f", S, points[b] - points[a]) < 0
+            S = np.where(flip[:, None], -S, S)
+            pieces.append((a, b, S, c))
+    a = np.concatenate([p[0] for p in pieces])
+    b = np.concatenate([p[1] for p in pieces])
+    S = np.concatenate([p[2] for p in pieces])
+    C = np.concatenate([p[3] for p in pieces])
+    lo, hi = np.minimum(a, b), np.maximum(a, b)
+    S = np.where((a > b)[:, None], -S, S)  # every piece from the lower node to the higher one
+    key, inv = np.unique(np.stack([lo, hi], axis=1), axis=0, return_inverse=True)
+    inv = np.asarray(inv).ravel()
+    area = np.zeros((key.shape[0], dim))
+    np.add.at(area, inv, S)
+    w = np.linalg.norm(S, axis=1)
+    wsum = np.zeros(key.shape[0])
+    np.add.at(wsum, inv, w)
+    fc = np.zeros((key.shape[0], dim))
+    np.add.at(fc, inv, w[:, None] * C)
+    fc = fc / np.maximum(wsum, np.finfo(float).tiny)[:, None]
+
+    # boundary: each facet shared equally by its nodes
+    kb = cg.b_nodes.shape[1]
+    b_owner = cg.b_nodes.ravel()
+    b_area = np.repeat(cg.b_area / kb, kb, axis=0)
+    b_centroid = 0.5 * (points[b_owner] + np.repeat(cg.b_centroid, kb, axis=0))
+    b_nodes = np.repeat(cg.b_nodes, kb, axis=0)
+    return FVGraph(
+        dim=dim,
+        centroid=points.copy(),
+        volume=volume,
+        owner=key[:, 0],
+        neigh=key[:, 1],
+        area=area,
+        fcentroid=fc,
+        f_nodes=key.copy(),
+        delta=points[key[:, 1]] - points[key[:, 0]],
+        b_owner=b_owner,
+        b_area=b_area,
+        b_centroid=b_centroid,
+        b_nodes=b_nodes,
+        points=points,
+        cells=cells,
+        cell_type=cell_type,
+        centering="vertex",
     )
