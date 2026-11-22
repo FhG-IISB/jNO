@@ -663,10 +663,51 @@ class _TraceFVM(StrongFormProblem):
         raise ValueError("jno.fvm: could not assemble the residual's Jacobian on the face graph.")
 
     def _operator(self, key, fun, u):
+        """``fun``'s Jacobian at ``u`` as a BCOO, by colouring; the assembly is jitted once per function (an eager
+        ``jax.linearize`` of a fresh function re-traced the whole residual every call: 0.55 s at 946 cells)."""
         from ..fdm import _assemble_sparse
 
         pattern, color, n_colors = self._pattern(key, fun, u)
-        return _assemble_sparse(fun, u, pattern, color, n_colors)
+        entry = self._lru().get(("assemble", key, id(fun)))
+        if entry is None or entry[0] is not fun:  # the function is kept with it: a recycled id cannot alias
+            entry = (fun, jax.jit(lambda w: _assemble_sparse(fun, w, pattern, color, n_colors)))
+            self._lru_put(("assemble", key, id(fun)), entry)
+        return entry[1](u)
+
+    # -- caches for repeated eager solves ---------------------------------------------------------
+    def _lru(self):
+        import collections
+
+        return self.__dict__.setdefault("_fast_cache", collections.OrderedDict())
+
+    def _lru_put(self, key, value, keep=16):
+        cache = self._lru()
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > keep:
+            cache.popitem(last=False)
+        return value
+
+    def _fingerprint(self):
+        """Identity of every model the constraints read (data fields, networks, parameters): an eager swap of a
+        data field (``eqx.tree_at`` on its module) gives a new module and so a new key."""
+        self._referenced_models()
+        models = self.__dict__.get("_models_cache", {}) or {}
+        return tuple(sorted((lid, id(getattr(m, "module", None))) for lid, m in models.items()))
+
+    def _eager(self, extra_params=None):
+        """Is this a solve at the stored values, outside any trace (the case whose pieces can be kept)?"""
+        from jax._src import core as _core
+
+        return extra_params is None and getattr(self, "_override", None) is None and _core.trace_state_clean()
+
+    def _residual_kept(self, first_order=False):
+        """The jitted residual at the stored values, built once per fingerprint."""
+        key = ("residual", first_order, self._fingerprint())
+        hit = self._lru().get(key)
+        if hit is None:
+            hit = self._lru_put(key, jax.jit(self._residual_fn(first_order=first_order)))
+        return hit
 
     def _defaults(self, A, linear, precond):
         """``cg`` + ``amg`` for a symmetric operator, ``gmres`` + ``ilu`` otherwise."""
@@ -826,16 +867,34 @@ class _TraceFVM(StrongFormProblem):
         """Method of lines: ``M u̇ + R(u, t) = 0`` with ``M = diag(c·V)`` (zero on pinned cells), marched by
         ``time=`` (backward Euler by default, any ``jno.solve`` scheme, ``jno.solve.erk`` explicitly).
         A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``."""
-        import jax.experimental.sparse as jsparse
-
-        from ..utils.solver.backend_blocks import SemidiscreteTimeBlock, _block_time_grid
-        from ..utils.solver.solver_api import compose_transient_step_solvers
+        from ..utils.solver.backend_blocks import _block_time_grid
         from ..utils.solver.time_route import _infer_time_window
-        from ..utils.solver.timeschemes import _ERKScheme
 
         t0, t1, dt = _infer_time_window(self.domain)
         if dt is None:
             raise ValueError("jno.fvm([...]): domain.time must give n_steps >= 2 for a transient march.")
+        eager = self._eager()
+        key = ("march", *(repr(v) for v in (time, nonlinear, linear, precond)), self._fingerprint() if eager else None)
+        kept = self._lru().get(key) if eager else None
+        if kept is None:
+            kept = self._march_parts(nonlinear, linear, precond, time, t0, t1, dt)
+            if eager:  # the block carries its compiled march (backend_blocks / erk), so keeping it keeps that too
+                self._lru_put(key, kept)
+        block, steppers, second, n = kept
+        from ..fdm import _integrate_transient
+
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        traj = _integrate_transient(block, ts, time, *steppers)
+        return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)
+
+    def _march_parts(self, nonlinear, linear, precond, time, t0, t1, dt):
+        """``(block, steppers, second order?, n)`` of a march: the semidiscrete block and its step solvers."""
+        import jax.experimental.sparse as jsparse
+
+        from ..utils.solver.backend_blocks import SemidiscreteTimeBlock
+        from ..utils.solver.solver_api import compose_transient_step_solvers
+        from ..utils.solver.timeschemes import _ERKScheme
+
         scope = self._params_scope()
         spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
         spatial_first = self._residual_fn(extra_params=getattr(self, "_override", None), first_order=True)
@@ -906,11 +965,7 @@ class _TraceFVM(StrongFormProblem):
             steppers = compose_transient_step_solvers(
                 nonlinear, linear, precond, self._host(), block, scheme=time, state=state0
             )
-        from ..fdm import _integrate_transient
-
-        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
-        traj = _integrate_transient(block, ts, time, *steppers)
-        return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)
+        return block, steppers, second, n
 
     def _shape(self, u):
         u = jnp.asarray(u)
@@ -919,38 +974,85 @@ class _TraceFVM(StrongFormProblem):
         return u.reshape(self._nf, self._N)
 
     def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, linear=None, precond=None):
+        from ..utils.solver.segregated import _Segregated
         from ..utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
-        residual = jax.jit(self._residual_fn(extra_params=extra_params))
+        eager = self._eager(extra_params)
+        residual = self._residual_kept() if eager else jax.jit(self._residual_fn(extra_params=extra_params))
+        make_probe = (
+            (lambda: residual) if eager else (lambda: jax.jit(self._residual_fn(extra_params=self._current_params())))
+        )  # noqa: E731
         zeros = jnp.zeros(self._Ntot)
-        make_probe = lambda: jax.jit(self._residual_fn(extra_params=self._current_params()))  # noqa: E731
         with jax.ensure_compile_time_eval():  # structure is decided on concrete values, also inside jno.core
             zc = jnp.zeros(self._Ntot)
             probe_at = zc if x0 is None or isinstance(x0, jax.core.Tracer) else jnp.asarray(x0)  # m/rho is undefined at 0
             linear_problem = self._is_affine("steady", make_probe, self._Ntot)
             self._pattern("steady", make_probe(), probe_at)
+        fp = self._fingerprint() if eager else None
         if linear_problem:
             if nonlinear is not None:
                 raise ValueError("jno.fvm: nonlinear= given, but this problem is linear.")
-            with jax.ensure_compile_time_eval():  # the defaults are chosen on the concrete operator
-                linear, precond = self._defaults(self._operator("steady", make_probe(), zc), linear, precond)
-                precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), zc))
-            A = self._operator("steady", residual, zeros)
-            return compose_linear_solve_fn(linear, precond, x0, fem=self._host())(A, -residual(zeros))
+            key = ("linear", linear, precond, fp)
+            kept = self._lru().get(key) if eager else None
+            if kept is None:
+                with jax.ensure_compile_time_eval():  # the defaults and the setup read the concrete operator, once
+                    Ap = self._operator("steady", make_probe(), zc)
+                    lin, pre = self._defaults(Ap, linear, precond)
+                    pre = self._frozen(pre, lambda: Ap)
+                A = Ap if eager else self._operator("steady", residual, zeros)
+                rhs = -residual(zeros)
+                solve = compose_linear_solve_fn(lin, pre, None, fem=self._host())
+                if eager:  # compiled once: run eagerly, the Krylov solve recompiled itself on every call
+                    import jax.experimental.sparse as jsparse
+
+                    idx, shape = A.indices, A.shape
+                    solve = jax.jit(lambda data, b, _s=solve: _s(jsparse.BCOO((data, idx), shape=shape), b))
+                kept = (A, rhs, lin, pre, solve)
+                if eager:
+                    self._lru_put(key, kept)
+            A, rhs, lin, pre, solve = kept
+            if x0 is not None:  # a start for an iterative solver: composed for it
+                return compose_linear_solve_fn(lin, pre, x0, fem=self._host())(A, rhs)
+            return solve(A.data, rhs) if eager else solve(A, rhs)
         u0 = zeros if x0 is None else jnp.asarray(x0)
         tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
-        u0c = probe_at  # the concrete start, for setups that need values
-        from ..utils.solver.segregated import _Segregated
-
+        if eager:  # the same function object every solve, so Newton's compiled loop is found again (2.3 s otherwise)
+            kept_t = self._lru().get(("tangent", id(residual)))
+            if kept_t is None or kept_t[0] is not residual:
+                kept_t = self._lru_put(("tangent", id(residual)), (residual, tangent))
+            tangent = kept_t[1]
         if isinstance(nonlinear, _Segregated):  # SIMPLE: the problem says which rows are constraints
             with jax.ensure_compile_time_eval():
-                pattern = np.asarray(self._operator("steady", make_probe(), u0c).indices)
+                pattern = np.asarray(self._operator("steady", make_probe(), probe_at).indices)
             return nonlinear.with_constraint(self._constraint_rows(), pattern)(residual, u0, jacobian=tangent)
+        key = ("newton", nonlinear, linear, precond, fp)  # the spec as given: a default made below is new each call
         nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True, line_search=True)
         # no linear= given: Newton's direct variant factorises the assembled tangent (sparse LU), as jno.fdm does
-        with jax.ensure_compile_time_eval():
-            precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), u0c))
-        return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self._host())(residual, u0, jacobian=tangent)
+        kept = self._lru().get(key) if eager else None
+        if kept is None:
+            with jax.ensure_compile_time_eval():
+                pre = self._frozen(precond, lambda: self._operator("steady", make_probe(), probe_at))
+            driver = compose_nonlinear_solve_fn(nonlinear, linear, pre, fem=self._host())
+            # eager: the whole Newton compiled once (as jno.fdm's _compiled_steady); run uncompiled, it re-traced
+            # and recompiled its loop on every solve (2.3 s of a 3.2 s repeat solve of a 24 x 24 cavity)
+            fn = jax.jit(lambda u_init: driver(residual, u_init, jacobian=tangent)) if eager else None
+            kept = (driver, fn)
+            if eager:
+                self._lru_put(key, kept)
+        driver, fn = kept
+        if fn is None:
+            return driver(residual, u0, jacobian=tangent)
+        from ..utils.solver.solver_api import record_nonlinear_verdict
+
+        sol = fn(u0)
+        who = getattr(nonlinear, "name", None) or "newton"
+        r_end, bound, ok = record_nonlinear_verdict(residual, sol, u0, nonlinear, who)
+        if ok is False:  # the driver's own guard is blind under jit: the verdict is taken on the result
+            raise RuntimeError(
+                f"jno.fvm: {who} did not converge: residual norm {r_end:.3e} against the tolerance {bound:.3e}. "
+                "The last iterate is NOT a root -- raise max_steps, loosen atol/rtol, or start from a better x0."
+            )
+        return sol
 
     def _constraint_rows(self, n=None):
         """Boolean mask of the DOFs that are multipliers of a constraint equation (the pressure), over a state
