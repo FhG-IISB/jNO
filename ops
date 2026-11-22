@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795290365,"nonce":"HiF7yG5PSvADNQRDo1+oqAmoSgQ=","added":["branch:feat/jno-flow","bug"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795348541,"nonce":"D87QrtSIKtzk6sD1kpw8bqy8upI=","target":"302b484b3fc308a7203669c8b4ef27cf5953864973a66ae42c309f2cb21b0323","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABhfAMcQ","github-url":"https://github.com/FhG-IISB/jNO/issues/343"}}]}
