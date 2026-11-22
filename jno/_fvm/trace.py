@@ -59,6 +59,13 @@ _BOUNDARY_PASSES = 6  # boundary values and volume gradients, alternated to thei
 # -- the trace ------------------------------------------------------------------------------------------
 
 
+def _concrete_literal(node):
+    """A ``Literal`` with a concrete value (not a value traced by ``jax.grad``, which stays a coefficient)."""
+    from ..trace import Literal
+
+    return isinstance(node, Literal) and not isinstance(node.value, jax.core.Tracer)
+
+
 def _mentions(node, model):
     """Does ``node`` contain the unknown ``model``, inside a time derivative ``u.t`` too (the generic walk does
     not enter a ``TemporalDerivative``'s target)?"""
@@ -81,13 +88,13 @@ def _is_normal(v):
 
 def _signed_terms(node, sign=1.0, distribute=True):
     """``node`` as a signed sum ``[(±1, term), ...]`` over ``+``, ``-`` and a literal factor ``-1``."""
-    from ..trace import BinaryOp, Literal
+    from ..trace import BinaryOp
 
     n = _unwrap(node)
     if isinstance(n, BinaryOp) and n.op in ("+", "-"):
         right = sign if n.op == "+" else -sign
         return _signed_terms(n.left, sign, distribute) + _signed_terms(n.right, right, distribute)
-    if isinstance(n, BinaryOp) and n.op == "*" and isinstance(n.left, Literal) and np.ndim(n.left.value) == 0:
+    if isinstance(n, BinaryOp) and n.op == "*" and _concrete_literal(n.left) and np.ndim(n.left.value) == 0:
         if float(n.left.value) == -1.0:
             return _signed_terms(n.right, -sign, distribute)
     if not distribute:
@@ -384,8 +391,8 @@ class _TraceFVM(StrongFormProblem):
             divs = [f for f in factors if _is_divergence(f)]
             rest = [f for f in factors if not _is_divergence(f)]
             if len(divs) == 1 and not any(self._has_unknown(f) for f in rest):
-                literal = [f for f in rest if isinstance(f, Literal)]
-                coef = [f for f in rest if not isinstance(f, Literal)]
+                literal = [f for f in rest if _concrete_literal(f)]  # a traced number is a coefficient
+                coef = [f for f in rest if not _concrete_literal(f)]
                 scale = sign * float(np.prod([float(np.asarray(f.value)) for f in literal])) if literal else sign
                 key = id(coef[0]) if len(coef) == 1 else (None if not coef else tuple(id(c) for c in coef))
                 grp = groups.setdefault(key, {"coef": _product(coef) if coef else None, "central": {}, "convective": {}})
@@ -528,7 +535,7 @@ class _TraceFVM(StrongFormProblem):
         eqs = self._equations
         scope = self._params_scope(extra_params)
         nB = self.graph.b_owner.shape[0]
-        self._decide_condition_affinity(scope)
+        self._decide_condition_affinity(self._params_scope(self._current_params()))  # decided on concrete values
 
         def residual(dofs, t=None):
             q = self._split_dofs(dofs)
@@ -625,7 +632,10 @@ class _TraceFVM(StrongFormProblem):
         from ..fdm import _assemble_sparse, _color_columns, _stencil_pattern
 
         pairs = np.stack([self.graph.owner, self.graph.neigh], axis=1)
-        n = int(np.asarray(u).size)
+        if isinstance(u, jax.core.Tracer):  # decided on concrete values: a traced probe point becomes zeros
+            with jax.ensure_compile_time_eval():
+                u = jnp.zeros(u.shape, u.dtype)
+        n = int(np.prod(jnp.shape(u)))
         rng = np.random.default_rng(0)
         v = jnp.asarray(rng.standard_normal(n), dtype=jnp.asarray(u).dtype)
         # verified at a GENERIC state near `u`: at a piecewise-constant one a limiter's dependence on the second
@@ -667,11 +677,44 @@ class _TraceFVM(StrongFormProblem):
             linear: a ``jno.solve`` linear solver; default ``cg`` (symmetric) or ``gmres``.
             precond: a ``jno.precond`` spec; default ``amg`` (symmetric) or ``ilu``.
         """
+        trainable = self._trainable_params()
+        if trainable:
+            return self._parametric_node(
+                trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts
+            )
+        self._record_fixed_networks()
+        return self._solve_now(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, time=time, save_ts=save_ts)
+
+    def _solve_now(self, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None, extra_params=None):
         if self._transient:
             traj = self._march(nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts)
             return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
-        u = self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
+        u = self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond, extra_params=extra_params)
         return self._shape(u)
+
+    def _parametric_node(self, trainable, **slots):
+        """With a trainable ``jno.np.parameter`` or network in the constraints, the solve is a trace node, as
+        ``fem.solve()`` and ``fdm(...).solve()`` are, so it composes into ``jno.core``: at every step the
+        parameters resolve to their current values and the solve runs again, differentiated through its
+        Newton (``custom_root``) or its march."""
+        from ..trace import FunctionCall
+
+        lids = list(trainable)
+        args = [self._trainable_arg(trainable[lid]) for lid in lids]
+
+        def _solve(*values):
+            extra = {lid: self._trainable_module(trainable[lid], v) for lid, v in zip(lids, values)}
+            if not self._transient:
+                return self._solve_now(**slots, extra_params=extra)
+            self._override = extra
+            try:
+                return self._solve_now(**slots)
+            finally:
+                self._override = None
+
+        node = FunctionCall(_solve, args, name="fvm_solve")
+        node._domain = self.domain  # jno.core infers the domain from the graph
+        return node
 
     # -- transient ------------------------------------------------------------------------------------
     def _time_coefficients(self, scope):
@@ -838,6 +881,13 @@ class _TraceFVM(StrongFormProblem):
             jacobian=jac,
             **common,
         )
+        from ..utils.solver.segregated import _Segregated
+
+        if isinstance(nonlinear, _Segregated):
+            with jax.ensure_compile_time_eval():
+                pattern = np.asarray(self._operator("march", lambda y: residual(y, float(t0), {}), state0).indices)
+            # the step tangent M/dt + dR/du has the same pattern (M is diagonal, its entries already in it)
+            nonlinear = nonlinear.with_constraint(self._constraint_rows(N2), pattern)
         if isinstance(time, _ERKScheme):
             steppers = (None, None)
         else:
@@ -861,23 +911,45 @@ class _TraceFVM(StrongFormProblem):
 
         residual = jax.jit(self._residual_fn(extra_params=extra_params))
         zeros = jnp.zeros(self._Ntot)
-        probe_at = zeros if x0 is None else jnp.asarray(x0)  # a flux like m/rho is undefined at 0
         make_probe = lambda: jax.jit(self._residual_fn(extra_params=self._current_params()))  # noqa: E731
-        with jax.ensure_compile_time_eval():
+        with jax.ensure_compile_time_eval():  # structure is decided on concrete values, also inside jno.core
+            zc = jnp.zeros(self._Ntot)
+            probe_at = zc if x0 is None or isinstance(x0, jax.core.Tracer) else jnp.asarray(x0)  # m/rho is undefined at 0
             linear_problem = self._is_affine("steady", make_probe, self._Ntot)
             self._pattern("steady", make_probe(), probe_at)
         if linear_problem:
             if nonlinear is not None:
                 raise ValueError("jno.fvm: nonlinear= given, but this problem is linear.")
+            with jax.ensure_compile_time_eval():  # the defaults are chosen on the concrete operator
+                linear, precond = self._defaults(self._operator("steady", make_probe(), zc), linear, precond)
+                precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), zc))
             A = self._operator("steady", residual, zeros)
-            linear, precond = self._defaults(A, linear, precond)
             return compose_linear_solve_fn(linear, precond, x0, fem=self)(A, -residual(zeros))
         u0 = zeros if x0 is None else jnp.asarray(x0)
         tangent = lambda w: self._operator("steady", residual, w)  # noqa: E731
+        u0c = probe_at  # the concrete start, for setups that need values
+        from ..utils.solver.segregated import _Segregated
+
+        if isinstance(nonlinear, _Segregated):  # SIMPLE: the problem says which rows are constraints
+            with jax.ensure_compile_time_eval():
+                pattern = np.asarray(self._operator("steady", make_probe(), u0c).indices)
+            return nonlinear.with_constraint(self._constraint_rows(), pattern)(residual, u0, jacobian=tangent)
         nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True, line_search=True)
         # no linear= given: Newton's direct variant factorises the assembled tangent (sparse LU), as jno.fdm does
-        precond = self._frozen(precond, lambda: tangent(u0))
+        with jax.ensure_compile_time_eval():
+            precond = self._frozen(precond, lambda: self._operator("steady", make_probe(), u0c))
         return compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=self)(residual, u0, jacobian=tangent)
+
+    def _constraint_rows(self, n=None):
+        """Boolean mask of the DOFs that are multipliers of a constraint equation (the pressure), over a state
+        of length ``n`` (the DOF vector, or ``[u; v]`` of a second-order march, whose first half it marks)."""
+        rows = np.zeros(self._Ntot, dtype=bool)
+        for k in self._saddle:
+            for b in range(self._block0[k], self._block0[k] + self._ncomp[k]):
+                rows[b * self._N : (b + 1) * self._N] = True
+        if not rows.any():
+            raise ValueError("jno.solve.simple / piso: this problem has no constraint equation (no saddle pair).")
+        return rows if n is None or n == rows.size else np.concatenate([rows, np.zeros(n - rows.size, dtype=bool)])
 
     def _frozen(self, precond, representative):
         """A preconditioner that needs a concrete matrix (amg, ilu) is set up once on the tangent at the
@@ -1476,3 +1548,47 @@ def fvm(constraints, centering: str = "cell"):
         The problem; ``.solve()`` returns the volume values, ``.centroids`` says where they live.
     """
     return _TraceFVM(constraints, centering=centering)
+
+
+def _info_fvm(o, deep: bool):
+    """``jno.info`` for a finite-volume problem: the mesh it partitions, the unknowns and how each equation
+    was read (fluxes, volume terms, constraints), the scheme, and the regime."""
+    from ..info import Info, _equation_rows, _fmt_n
+
+    g = o.graph
+    rows = [
+        ("centering", f"{o.centering} · {g.cell_type}"),
+        (
+            "control volumes",
+            f"{_fmt_n(g.n)} · interior faces {_fmt_n(g.owner.size)} · boundary faces {_fmt_n(g.b_owner.size)}",
+        ),
+        ("regime", "transient (method of lines)" if o._transient else "steady"),
+        ("unknowns", f"{len(o.unknowns)} · {_fmt_n(o._nf)} components · {_fmt_n(o._Ntot)} dofs"),
+    ]
+    for k, eq in enumerate(o._equations):
+        kinds = []
+        if eq["volume"] is not None:
+            kinds.append("volume terms")
+        if any(gr["central"] for gr in eq["groups"]):
+            kinds.append("diffusive fluxes")
+        if any(gr["convective"] for gr in eq["groups"]):
+            kinds.append("convective fluxes")
+        if eq.get("mass"):
+            kinds.append(f"constraint on unknown {eq['partner']} (Rhie-Chow)")
+        rows.append((f"equation {k}", ", ".join(kinds) or "-"))
+    if any(gr["convective"] for eq in o._equations for gr in eq["groups"]):
+        rows.append(("scheme", str(o._convective_scheme())[len("finite_difference:") :]))
+    rows.append(("boundary conditions", f"{len(o._conditions)} on faces · {len(o._pins)} pinned cell sets"))
+    if o.domain is not None and getattr(o.domain, "time", None):
+        t0, t1, nt = o.domain.time
+        rows.append(("time", f"[{t0}, {t1}] · {nt} steps"))
+    return Info("fvm (finite volume)", [("equations", _equation_rows(list(o._constraints))), ("discretisation", rows)])
+
+
+def _register_info():
+    from .. import info as _info
+
+    _info.REGISTRY["_TraceFVM"] = _info_fvm
+
+
+_register_info()

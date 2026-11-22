@@ -74,6 +74,8 @@ __all__ = [
     "rosenbrock",
     "theta",
     "erk",
+    "piso",
+    "simple",
     "exponential",
     "adaptive",
     "arclength",
@@ -2108,6 +2110,45 @@ def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):
         raise ValueError(f"jno.solve.erk: method={method!r} is not one of {sorted(_ERK_TABLEAUS)}; or pass tableau=.")
     A, b, c, order = _ERK_TABLEAUS[method]
     return _ERKScheme(A, b, c, order, method, cfl)
+
+
+def simple(
+    *,
+    alpha_u: float = 0.7,
+    alpha_p: float = 0.3,
+    max_iters: int = 500,
+    rtol: float = 1e-8,
+    atol: float = 1e-10,
+    linear=None,
+):
+    """**SIMPLE** segregated solve of a saddle system (incompressible flow, Darcy, any constraint pair that
+    ``jno.fvm`` detects), for ``.solve(nonlinear=jno.solve.simple())``: a momentum predictor with the multiplier
+    held, under-relaxed by ``alpha_u``, then one correction of the multiplier on the Schur complement
+    ``D − C diag(A)⁻¹ B`` of the assembled tangent, relaxed by ``alpha_p``; repeated until the residual falls
+    by ``rtol``. A fallback where Newton from a poor start diverges (a high Reynolds number). The outer
+    iteration decides convergence on values, so it runs eagerly; inside ``jno.core`` keep the default Newton.
+
+    Reference: Patankar & Spalding, *Int. J. Heat Mass Transfer* **15** (1972) 1787-1806."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "simple", alpha_u=alpha_u, alpha_p=alpha_p, corrections=1, max_iters=max_iters, rtol=rtol, atol=atol, linear=linear
+    )
+
+
+def piso(*, n_corr: int = 2, n_outer: int = 20, rtol: float = 1e-8, atol: float = 1e-8, linear=None):
+    """**PISO** for a transient saddle system, ``.solve(time=..., nonlinear=jno.solve.piso())``: each implicit
+    step is a momentum predictor and ``n_corr`` multiplier corrections on the Schur complement of the step's
+    assembled tangent (Issa 1986). One such sweep leaves the splitting error, so the sweep is repeated until the
+    step's residual falls by ``rtol`` (at most ``n_outer`` times; the PIMPLE form), and the march checks every
+    step as it does for Newton. A fixed-length loop, so the march stays traceable and differentiable.
+
+    Reference: Issa, *J. Comput. Phys.* **62** (1986) 40-65."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "piso", alpha_u=1.0, alpha_p=1.0, corrections=n_corr, max_iters=n_outer, rtol=rtol, atol=atol, linear=linear
+    )
 
 
 def bdf(order: int | None = None, *, ndf: bool = True):
