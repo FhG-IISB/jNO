@@ -1343,8 +1343,10 @@ class _Evaluator:
         return ev.evaluate(expr, context=context, var_bindings={})
 
     def _nodal_data(self, model, kind, idx):
-        """A data field given at the mesh nodes, averaged to the site (a volume's or a face's nodes)."""
-        value = getattr(getattr(model, "module", None), "value", None)
+        """A data field given at the mesh nodes, read at the site through the mesh's P1/Q1 interpolant. Its value is
+        the evaluation scope's (``extra_params`` of a traced solve, a coupling's interface data), else the stored one."""
+        module = self.scope.get(getattr(model, "layer_id", None), getattr(model, "module", None))
+        value = getattr(module, "value", None)
         g, o = self.p.graph, self.ops
         if value is None or np.ndim(value) == 0:
             return None

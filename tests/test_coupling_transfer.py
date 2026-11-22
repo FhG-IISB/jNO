@@ -79,3 +79,14 @@ def test_consistent_map_converges_at_second_order_on_a_curved_interface():
 
     e1, e2 = err(0.2), err(0.1)
     assert 1.6 < np.log2(e1 / e2) < 2.6
+
+
+@pytest.mark.parametrize("measure", [None, "axisymmetric"])
+def test_conservative_map_passes_a_linear_flux_across_a_straight_interface(measure):
+    # the L2 projection is exact for data its target space holds; the transpose of the consistent map is not:
+    # it turns even a uniform flux into a non-uniform one across non-matching nodes
+    a = Interface.of(jno.shape.rect(0.0, 0.5, 1.0, 1.5, size=0.1).domain(), "right", measure=measure)
+    b = Interface.of(jno.shape.rect(1.0, 0.5, 2.0, 1.5, size=0.07).domain(), "left", measure=measure)
+    for t, s in ((a, b), (b, a)):
+        np.testing.assert_allclose(conservative(t, s) @ _linear(s.points), _linear(t.points), atol=1e-11)
+        np.testing.assert_allclose(conservative(t, s) @ np.full(s.points.shape[0], 0.9), 0.9, atol=1e-12)

@@ -73,6 +73,7 @@ __all__ = [
     "sdirk",
     "rosenbrock",
     "theta",
+    "coupling",
     "erk",
     "piso",
     "simple",
@@ -2080,6 +2081,49 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def coupling(
+    scheme="gauss-seidel",
+    *,
+    tol=1e-8,
+    max_iter=50,
+    accel="aitken",
+    dirichlet=None,
+    alpha=None,
+    measure=None,
+):
+    """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
+    meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
+
+    Every interface condition goes to one problem as its own boundary condition, the other side's part read
+    from that problem's current solution and carried across the interface (values by interpolation, fluxes by
+    an L2 projection that keeps their total). A value and a flux condition between two problems are a
+    Dirichlet-Neumann pair, the value going to the side with the smaller interface stiffness (Giles 1997).
+    The problems are then solved in turn until the interface data stop changing.
+
+    Args:
+        scheme: ``"gauss-seidel"`` (each problem reads what the ones before it in the sweep just produced) or
+            ``"jacobi"`` (all read the last sweep's data).
+        tol: the relative change of the interface data at which the iteration stops.
+        max_iter: the most sweeps.
+        accel: ``"aitken"`` (dynamic relaxation, Küttler & Wall 2008), ``None`` (none), or a fixed relaxation
+            factor.
+        dirichlet: the problem that takes the value condition of a pair, in place of the stiffness probe.
+        alpha: Robin-Robin in place of Dirichlet-Neumann: each side of a pair takes ``flux + alpha * value``
+            (Quarteroni & Valli 1999); ``"auto"`` sets ``alpha = sqrt(S_a S_b)`` from the two interface
+            stiffnesses. Robust when neither side is much stiffer than the other.
+        measure: the interface measure: ``None`` (length or area), ``"axisymmetric"`` (``2π r ds``, ``r`` the
+            second coordinate) or a callable of the points. It must match the measure the problems' own
+            forms integrate with.
+
+    The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
+    """
+    from ._coupling.driver import CouplingSpec
+
+    return CouplingSpec(
+        scheme=scheme, tol=tol, max_iter=max_iter, accel=accel, dirichlet=dirichlet, alpha=alpha, measure=measure
+    )
 
 
 def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):

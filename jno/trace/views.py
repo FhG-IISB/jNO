@@ -183,6 +183,27 @@ def _directional(view, components, scheme):
     return out
 
 
+def _coord_sets_of(*operands) -> tuple:
+    """Every distinct coordinate binding among ``operands``, kept whole.
+
+    ``_coord_vars`` is one merged binding, so an expression that combines two bindings -- the two sides of a
+    periodic tie, or an interface condition between problems on two meshes, ``Tg - Ts`` -- keeps at most one
+    (or a tie stamp). The full list survives here for a reader that needs each side's region, such as a
+    partitioned coupling that hands each problem its own part."""
+    out = []
+    for o in operands:
+        if o is None:
+            continue
+        sets = getattr(o, "_coord_sets", None)
+        if sets is None:
+            cv = getattr(o, "_coord_vars", None)
+            sets = (dict(cv),) if cv else ()
+        for cv in sets:
+            if not any(len(cv) == len(c) and all(c.get(k) is v for k, v in cv.items()) for c in out):
+                out.append(cv)
+    return tuple(out)
+
+
 def _tag_of_coord_vars(cv) -> Optional[str]:
     """The single region tag shared by a bound view's coordinate Variables, or ``None``."""
     tags = {getattr(v, "tag", None) for v in (cv or {}).values()}
@@ -2929,6 +2950,7 @@ class FieldViewWithPartials(ScalarView):
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
+        object.__setattr__(new, "_coord_sets", _coord_sets_of(self, other))
         object.__setattr__(new, "_spatial_coords", sc)
         _with_scheme(new, getattr(self, "_bind_scheme", None))  # `.bind(..., scheme=...)` survives arithmetic
         if tie_tags is not None:
@@ -3188,6 +3210,7 @@ def _make_named_with_partials_cls(view_cls):
                 # the stamp, because the outer op discards the tie's own view.
                 tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
             res = _with_scheme(type(self)(new_expr, cv), getattr(self, "_bind_scheme", None))
+            object.__setattr__(res, "_coord_sets", _coord_sets_of(self, other))
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
             extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)

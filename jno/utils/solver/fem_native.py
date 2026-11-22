@@ -1919,8 +1919,12 @@ def assemble_fem_native(
             and getattr(_vn.model, "_is_parameter", False)
             and getattr(_vn.model, "_opt_fn", None) is None
             and np.asarray(_vn.model.module.value).size > 1
+            and not getattr(_vn.model, "_runtime_field", False)
         ):
             continue  # nodal data field -- the per-node gather branch owns it
+        # A nodal field marked `_runtime_field` (a partitioned coupling's interface data, which changes between
+        # solves) is NOT frozen at build: it becomes a runtime row like a trainable parameter, its values given
+        # by name at solve time and gathered at the boundary nodes in `_dirichlet_pairs_at`.
         _found: Dict[str, Any] = {}
         _collect_runtime_parameter_exprs(_vnode, _found)
         if _found:
@@ -5009,11 +5013,24 @@ def assemble_fem_native(
                     pts = _moved_dof_points(fidx, a)[jnp.asarray(node_ids, dtype=jnp.int32)]
                 from ..._fem import _follows_moving_mesh
 
+                # a runtime nodal field (`_runtime_field`) reads its own values at these boundary nodes
+                a_here, a_one = dict(a), dict(a)
+                for _pn, _pnode in _dir_param_exprs.items():
+                    _pb = _bare_node(_pnode)
+                    if getattr(getattr(_pb, "model", None), "_runtime_field", False) and _pn in a:
+                        if vecs[fidx] != 1 or len(np.asarray(pts_f_all[fidx])) != np.asarray(a[_pn]).reshape(-1).size:
+                            raise NotImplementedError(
+                                "jno.fem: an interface value read as a nodal field needs a scalar P1 field "
+                                "on the side that takes it as its essential condition."
+                            )
+                        _ids = jnp.asarray(node_ids, dtype=jnp.int32)
+                        a_here[_pn] = jnp.asarray(a[_pn]).reshape(-1)[_ids]
+                        a_one[_pn] = a_here[_pn][:1]
                 with _follows_moving_mesh():  # `pts` are the moved boundary nodes (or nothing moves)
-                    raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a)).reshape(-1)
+                    raw = jnp.asarray(_eval_at(value_node, jnp.asarray(pts), params=a_here)).reshape(-1)
                     # Constant vs spatial profile: a constant returns the same shape for ANY batch (the
                     # static-path trick) -- one extra single-point evaluation decides, shapes are static.
-                    one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a)).reshape(-1)
+                    one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a_one)).reshape(-1)
                 if raw.shape == one.shape or not node_ids:
                     gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
                 else:

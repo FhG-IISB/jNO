@@ -1267,6 +1267,15 @@ class _TraceFDM(StrongFormProblem):
         walk(g_node)
         params.update(extra_params or {})
         params.update(self._live_params())
+        # a nodal field (one value per mesh node, e.g. a neighbour's interface data injected as extra_params) is
+        # read at these nodes: evaluated whole it would be a field of the wrong length
+        import equinox as eqx
+
+        jidx = jnp.asarray(np.asarray(idx, dtype=int))
+        for lid, module in list(params.items()):
+            value = getattr(module, "value", None)
+            if value is not None and np.ndim(value) >= 1 and np.shape(value)[0] == self._N and self._N != len(idx):
+                params[lid] = eqx.tree_at(lambda m: m.value, module, jnp.asarray(value)[jidx])
         with self._fd_scope():
             out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
         self._require_real(out, "a condition's value")

@@ -857,6 +857,18 @@ class core:
                 "`jno.core([sol.L / L0 + jno.np.max(T) / T0, jno.le(...)])`."
             )
 
+        # Problems on their OWN meshes (`jno.fem`, `jno.fdm`, `jno.fvm`, no shared-mesh region) joined by
+        # interface conditions that mix their unknowns: a partitioned coupling, solved by `.solve(coupling=...)`.
+        from ._coupling.driver import detect as _detect_coupled
+
+        self._coupled = _detect_coupled(constraints)
+        if self._coupled is not None:
+            self.domain = self._coupled[0][0].domain
+            self.models = {}
+            self._module_refs = {}
+            self._dd_subdomains = None
+            return
+
         _detected = _detect_subdomains(constraints)
         self._dd_subdomains = None
         if _detected is not None:
@@ -2433,6 +2445,7 @@ class core:
         profile: bool = False,
         callbacks: Optional[List] = None,
         substeps: list | None = None,
+        coupling=None,
     ) -> "statistics":
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -2533,6 +2546,18 @@ class core:
                     substeps=substeps,
                 ),
                 callbacks,
+            )
+        # Partitioned coupling of problems on their own meshes: iterate their solves until the interface
+        # conditions hold (jno/_coupling). `coupling=jno.solve.coupling(...)` says how.
+        if getattr(self, "_coupled", None) is not None:
+            from ._coupling.driver import Coupled, CouplingSpec
+
+            self.coupled = Coupled(*self._coupled, coupling if coupling is not None else CouplingSpec())
+            return self.coupled.solve()
+        if coupling is not None:
+            raise ValueError(
+                "jno.core([...]).solve(coupling=...) couples problems on their own meshes; this core holds none. "
+                "List the problems and their interface conditions: jno.core([gas, wall, Tg - Ts, ...])."
             )
         # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
         # couple them by the inferred method (line Dirichlet-Neumann or overlapping Schwarz), no PINN

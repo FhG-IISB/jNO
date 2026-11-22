@@ -13,10 +13,13 @@ nodal fields:
 - **values** (a temperature, a displacement) by the *consistent* map ``H(t <- s)``: every target node reads the
   source's piecewise-linear field at the closest point of the source's facets. Constants and linear fields
   pass exactly where the two discretisations describe the same surface.
-- **fluxes and loads** (a heat flux, a traction) by the *conservative* map ``W_t^-1 H(s <- t)^T W_s``, the
-  transpose of the consistent map the other way, with ``W`` the lumped facet weights ``w_i = ∫ φ_i dμ``. The
-  total ``Σ w q`` is the same on both sides to round-off, whatever the meshes, which is what a coupled
-  energy or force balance needs.
+- **fluxes and loads** (a heat flux, a traction) by the *conservative* map, the L2 (mortar) projection
+  ``M_tt^-1 M_ts``: ``M_tt`` the target's interface mass matrix, ``M_ts`` the mixed one, integrated over the
+  source's facets with the target's shape functions read at the closest point. The target's shape functions
+  sum to one, so the total ``Σ w q`` is the same on both sides to round-off, whatever the meshes; and in 2-D
+  the source segments are split where the target's nodes fall, so the integrals are exact and a linear flux
+  crosses a shared straight interface unchanged. (The transpose of the consistent map is conservative too,
+  but turns a uniform flux into a non-uniform one across non-matching nodes, measured at 3 % in a slab.)
 
 ``measure`` sets ``dμ``: plain length/area, ``"axisymmetric"`` (``2π r ds`` with ``r`` the second coordinate,
 for an ``(x, r)`` meridian plane), or any callable of the points.
@@ -35,6 +38,19 @@ _SEG_X = np.array([0.5 - np.sqrt(15.0) / 10.0, 0.5, 0.5 + np.sqrt(15.0) / 10.0])
 _SEG_W = np.array([5.0, 8.0, 5.0]) / 18.0
 _TRI_L = np.array([[2 / 3, 1 / 6, 1 / 6], [1 / 6, 2 / 3, 1 / 6], [1 / 6, 1 / 6, 2 / 3]])  # barycentric points
 _TRI_W = np.full(3, 1.0 / 3.0)
+# Dunavant's degree-4 rule (6 points) for the mass matrices: φ_i φ_j μ is cubic for a linear measure
+_D4_A, _D4_B = 0.445948490915965, 0.091576213509771
+_D4_L = np.array(
+    [
+        [_D4_A, _D4_A, 1 - 2 * _D4_A],
+        [_D4_A, 1 - 2 * _D4_A, _D4_A],
+        [1 - 2 * _D4_A, _D4_A, _D4_A],
+        [_D4_B, _D4_B, 1 - 2 * _D4_B],
+        [_D4_B, 1 - 2 * _D4_B, _D4_B],
+        [1 - 2 * _D4_B, _D4_B, _D4_B],
+    ]
+)
+_D4_W = np.array([0.223381589678011] * 3 + [0.109951743655322] * 3)
 
 
 def _measure_fn(measure):
@@ -67,12 +83,14 @@ class Interface:
         points: ``(m, dim)`` their coordinates.
         facets: ``(f, k)`` the boundary facets, as indices into ``nodes`` (segments, triangles or quadrilaterals).
         weights: ``(m,)`` the lumped facet weights ``w_i = ∫ φ_i dμ``.
+        measure: the ``measure`` the weights were integrated with.
     """
 
     nodes: np.ndarray
     points: np.ndarray
     facets: np.ndarray
     weights: np.ndarray
+    measure: object = None
 
     @classmethod
     def of(cls, domain, tag, measure=None):
@@ -108,12 +126,57 @@ class Interface:
                 m = mu(np.einsum("j,fjd->fd", lam, v)) * area * wq
                 for j in range(3):
                     np.add.at(w, tri[:, j], lam[j] * m)
-        return cls(nodes=np.asarray(nodes), points=points, facets=facets, weights=w)
+        return cls(nodes=np.asarray(nodes), points=points, facets=facets, weights=w, measure=measure)
 
     @property
     def total(self):
         """``∫ dμ`` over the interface."""
         return float(self.weights.sum())
+
+    @property
+    def mass(self):
+        """The interface mass matrix ``M_ij = ∫ φ_i φ_j dμ`` (sparse); its row sums are :attr:`weights`."""
+        cached = self.__dict__.get("_mass")
+        if cached is not None:
+            return cached
+        mu = _measure_fn(self.measure)
+        rows, cols, vals = [], [], []
+        if self.facets.shape[1] == 2:
+            a, b = self.points[self.facets[:, 0]], self.points[self.facets[:, 1]]
+            length = np.linalg.norm(b - a, axis=1)
+            for x, wq in zip(_SEG_X, _SEG_W):
+                m = mu(a + x * (b - a)) * length * wq
+                phi = (1.0 - x, x)
+                for i in range(2):
+                    for j in range(2):
+                        rows.append(self.facets[:, i])
+                        cols.append(self.facets[:, j])
+                        vals.append(phi[i] * phi[j] * m)
+        else:
+            tri = _simplices(self.facets)
+            v = self.points[tri]
+            area = 0.5 * np.linalg.norm(np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=-1)
+            for lam, wq in zip(_D4_L, _D4_W):
+                m = mu(np.einsum("j,fjd->fd", lam, v)) * area * wq
+                for i in range(3):
+                    for j in range(3):
+                        rows.append(tri[:, i])
+                        cols.append(tri[:, j])
+                        vals.append(lam[i] * lam[j] * m)
+        n = self.points.shape[0]
+        M = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
+        object.__setattr__(self, "_mass", M)
+        return M
+
+    def project(self, loads):
+        """Nodal densities whose loads ``∫ q φ_i dμ`` are ``loads``: ``M^-1 loads``."""
+        lu = self.__dict__.get("_mass_lu")
+        if lu is None:
+            from scipy.sparse.linalg import splu
+
+            lu = splu(sp.csc_matrix(self.mass))
+            object.__setattr__(self, "_mass_lu", lu)
+        return lu.solve(np.asarray(loads, dtype=float))
 
 
 def _closest_on_segments(p, a, b):
@@ -151,40 +214,117 @@ def _closest_on_triangles(p, v0, v1, v2):
     return best, best_d
 
 
+def _stencil(iface: Interface, qpts, k: int = 8):
+    """Each query point at the closest point of ``iface``'s facets: ``(nodes (q, k_f), shape values (q, k_f),
+    facet (q,), parameter)`` -- ``parameter`` the position along the segment in 2-D (``None`` in 3-D)."""
+    from scipy.spatial import cKDTree
+
+    qpts = np.asarray(qpts, dtype=float)
+    simp = _simplices(iface.facets)
+    v = iface.points[simp]  # (f, k_f, d)
+    kk = int(min(k, simp.shape[0]))
+    _, cand = cKDTree(v.mean(axis=1)).query(qpts, k=kk)
+    cand = np.asarray(cand).reshape(qpts.shape[0], kk)
+    vc = v[cand]  # (q, kk, k_f, d)
+    t = None
+    if simp.shape[1] == 2:
+        tt, d2 = _closest_on_segments(qpts, vc[:, :, 0], vc[:, :, 1])
+        lam = np.stack([1.0 - tt, tt], axis=-1)
+    else:
+        lam, d2 = _closest_on_triangles(qpts, vc[:, :, 0], vc[:, :, 1], vc[:, :, 2])
+    pick = np.argmin(d2, axis=1)
+    q = np.arange(qpts.shape[0])
+    facet = cand[q, pick]
+    if simp.shape[1] == 2:
+        t = tt[q, pick]
+    return simp[facet], lam[q, pick], facet, t
+
+
 def consistent(target: Interface, source: Interface, k: int = 8):
     """``H (m_t, m_s)``: ``H @ u_s`` is the source's piecewise-linear nodal field read at the target's nodes, each
     at the closest point of the source's facets. Rows sum to one, so constants pass exactly; linear fields pass
     exactly where the two sides describe the same surface."""
-    from scipy.spatial import cKDTree
-
-    simp = _simplices(source.facets)
-    v = source.points[simp]  # (f, k_f, d)
-    kk = int(min(k, simp.shape[0]))
-    _, cand = cKDTree(v.mean(axis=1)).query(target.points, k=kk)
-    cand = np.asarray(cand).reshape(target.points.shape[0], kk)
-    vc = v[cand]  # (q, kk, k_f, d)
-    if simp.shape[1] == 2:
-        t, d2 = _closest_on_segments(target.points, vc[:, :, 0], vc[:, :, 1])
-        lam = np.stack([1.0 - t, t], axis=-1)
-    else:
-        lam, d2 = _closest_on_triangles(target.points, vc[:, :, 0], vc[:, :, 1], vc[:, :, 2])
-    pick = np.argmin(d2, axis=1)
-    q = np.arange(target.points.shape[0])
-    cols = simp[cand[q, pick]]  # (q, k_f) source-local node indices
-    vals = lam[q, pick]
-    rows = np.repeat(q, cols.shape[1])
+    cols, vals, _, _ = _stencil(source, target.points, k)
+    rows = np.repeat(np.arange(target.points.shape[0]), cols.shape[1])
     H = sp.csr_matrix((vals.ravel(), (rows, cols.ravel())), shape=(target.points.shape[0], source.points.shape[0]))
     H.sum_duplicates()
     return H
 
 
+def mixed_mass(target: Interface, source: Interface, k: int = 8, refine: int = 4):
+    """``M_ts (m_t, m_s) = ∫_source φ_i^t φ_j^s dμ``, the target's shape functions read at the closest point of its
+    facets. In 2-D every source segment is split where the target's nodes fall onto it, so each piece is a product
+    of two linear functions (times a linear measure) and Gauss-Legendre integrates it exactly; in 3-D each source
+    triangle is subdivided ``refine`` times per edge (exact totals, linear data to the subdivision's accuracy)."""
+    mu = _measure_fn(source.measure)
+    qp, qw, sj, sphi = [], [], [], []  # quadrature points, weights, source nodes (q, k), source shapes (q, k)
+    if source.facets.shape[1] == 2:
+        a_id, b_id = source.facets[:, 0], source.facets[:, 1]
+        A, B = source.points[a_id], source.points[b_id]
+        # where the target's nodes fall on each source segment
+        _, _, fac, tpar = _stencil(source, target.points, k)
+        cuts = [[0.0, 1.0] for _ in range(A.shape[0])]
+        for f, t in zip(fac, tpar):
+            if 0.0 < t < 1.0:
+                cuts[f].append(float(t))
+        for f in range(A.shape[0]):
+            c = np.unique(np.asarray(cuts[f]))
+            lo, hi = c[:-1], c[1:]
+            for x, wq in zip(_SEG_X, _SEG_W):
+                t = lo + x * (hi - lo)
+                pts = A[f] + t[:, None] * (B[f] - A[f])
+                qp.append(pts)
+                qw.append(wq * (hi - lo) * np.linalg.norm(B[f] - A[f]) * mu(pts))
+                sj.append(np.repeat([[a_id[f], b_id[f]]], t.size, axis=0))
+                sphi.append(np.stack([1.0 - t, t], axis=1))
+    else:
+        tri = _simplices(source.facets)
+        v = source.points[tri]
+        area = 0.5 * np.linalg.norm(np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]), axis=-1)
+        n = int(refine)
+        subs = []  # sub-triangles of the reference triangle, as barycentric vertex triples
+        for i in range(n):
+            for j in range(n - i):
+                p0 = np.array([i, j]) / n
+                p1, p2 = p0 + np.array([1, 0]) / n, p0 + np.array([0, 1]) / n
+                subs.append((p0, p1, p2))
+                if i + j < n - 1:
+                    subs.append((p1, p0 + np.array([1, 1]) / n, p2))
+        for s0, s1, s2 in subs:
+            for lam_r, wq in zip(_D4_L, _D4_W):
+                xi = lam_r[0] * s0 + lam_r[1] * s1 + lam_r[2] * s2  # reference (ξ, η)
+                bary = np.array([1.0 - xi[0] - xi[1], xi[0], xi[1]])
+                pts = np.einsum("j,fjd->fd", bary, v)
+                qp.append(pts)
+                qw.append(wq * area / (n * n) * mu(pts))
+                sj.append(tri)
+                sphi.append(np.broadcast_to(bary, (tri.shape[0], 3)))
+    qp, qw = np.concatenate(qp), np.concatenate(qw)
+    sj, sphi = np.concatenate(sj), np.concatenate(sphi)
+    tj, tphi, _, _ = _stencil(target, qp, k)
+    rows = np.repeat(tj[:, :, None], sj.shape[1], axis=2).ravel()
+    cols = np.repeat(sj[:, None, :], tj.shape[1], axis=1).ravel()
+    vals = (tphi[:, :, None] * sphi[:, None, :] * qw[:, None, None]).ravel()
+    M = sp.csr_matrix((vals, (rows, cols)), shape=(target.points.shape[0], source.points.shape[0]))
+    M.sum_duplicates()
+    return M
+
+
+class _Projection:
+    """``M_tt^-1 M_ts``, applied without forming the inverse."""
+
+    def __init__(self, target, mixed):
+        self.target, self.mixed = target, mixed
+        self.shape = mixed.shape
+
+    def __matmul__(self, q):
+        return self.target.project(self.mixed @ np.asarray(q, dtype=float))
+
+
 def conservative(target: Interface, source: Interface, k: int = 8):
-    """``C (m_t, m_s) = W_t^-1 H(s <- t)^T W_s``: maps a nodal flux density so that ``Σ w_t (C q_s) = Σ w_s q_s``
-    exactly (the rows of ``H(s <- t)`` sum to one)."""
-    Hst = consistent(source, target, k=k)  # (m_s, m_t)
-    if np.any(target.weights <= 0.0):
-        raise ValueError("conservative transfer: a target node carries no weight (a zero or negative measure there).")
-    return sp.diags(1.0 / target.weights) @ Hst.T @ sp.diags(source.weights)
+    """The L2 (mortar) projection of a nodal flux density onto the target: ``Σ w_t (C q_s) = Σ w_s q_s`` exactly,
+    and a linear density on a shared straight interface (2-D) passes unchanged."""
+    return _Projection(target, mixed_mass(target, source, k))
 
 
 def to_jax(M):
