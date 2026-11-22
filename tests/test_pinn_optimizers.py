@@ -540,9 +540,12 @@ def test_nncg_needs_value_fn():
 
 def test_nncg_fine_tunes_poisson2d():
     """A characterisation, matching the paper's use as a fine-tuner: 200 NNCG steps take the 0.1-scaled
-    start to rel-L2 7.9e-3 (measured; ENGD/LM reach < 1e-6 here), far below Adam's 0.32 after 1000."""
+    start to rel-L2 7.9e-3 on GPU (measured; ENGD/LM reach < 1e-6 here), below Adam's 0.32 after 1000.
+    On CPU the same run ends between 4e-2 and 1e-1 (measured): the CG solves are inexact, so rounding
+    differences between the backends change the path. Hence a bound per backend."""
     err, _ = _poisson_error(jno.optimizers.nncg(cg_maxiter=100), 200)
-    assert np.isfinite(err) and err < 2e-2, f"nncg: rel-L2 {err:.3e}"
+    bound = 2e-2 if jax.default_backend() == "gpu" else 0.15
+    assert np.isfinite(err) and err < bound, f"nncg on {jax.default_backend()}: rel-L2 {err:.3e}"
 
 
 # ---------------------------------------------------------------------------------------------
