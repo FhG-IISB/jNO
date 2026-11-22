@@ -125,3 +125,50 @@ def test_erk_refuses_a_bad_tableau():
         jno.solve.erk(tableau=([[0.0, 1.0], [0.0, 0.0]], [0.5, 0.5], [0.0, 1.0], 2))
     with pytest.raises(ValueError, match="method"):
         jno.solve.erk("dopri5")
+
+
+def test_periodic_advection_returns_after_one_period():
+    """``u(left) - u(right)`` joins the two ends: a sine carried at speed 1 comes back after t = 1, and the
+    total is conserved to round-off."""
+    _, x, t, xl, xr, xi, u, ui = _line(0.02, 1.0, 101)
+    p = jno.fvm([ui.t + ui.d(x, scheme=jno.fv()), u(xl) - u(xr), u(xi) - jnn.sin(2 * PI * xi)])
+    traj = np.asarray(p.solve(time=jno.solve.erk("ssprk3", cfl=0.5)))
+    c = p.centroids[:, 0]
+    assert np.abs(traj[-1] - np.sin(2 * PI * c)).max() < 0.08
+    assert abs((traj[-1] - traj[0]) @ p.volumes) < 1e-13
+
+
+@pytest.mark.slow
+def test_taylor_green_vortex_decays_at_its_rate():
+    """Periodic in x and y (ties for U and p on the same faces join them once), a pressure gauge, and
+    Crank-Nicolson: the kinetic energy decays as exp(-4 nu t)."""
+    nu, T = 0.1, 0.5
+    L = 2 * PI
+    d = jno.shape.rect(0.0, 0.0, L, L).structured(n=24).quad().domain(time=(0.0, T, 26))
+    d.point_region("ppin", (0.0, 0.0))
+    x, y, t = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xp, yp, _ = d.variable("ppin", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    U, P = d.unknown.vector(2), d.unknown()
+    Ui, pi = U.bind(x=x, y=y, t=t), P.bind(x=x, y=y, t=t)
+    u, v = Ui[0], Ui[1]
+    s = jno.fv()
+    mom = Ui.t + (u * Ui).d(x, scheme=s) + (v * Ui).d(y, scheme=s) - nu * (Ui.xx + Ui.yy) + jnn.stack([pi.x, pi.y], axis=-1)
+    u0 = jnn.stack([-jnn.cos(xi) * jnn.sin(yi), jnn.sin(xi) * jnn.cos(yi)], axis=-1)
+    cons = [
+        mom,
+        Ui[0].x + Ui[1].y,
+        U(xl, yl) - U(xr, yr),
+        U(xb, yb) - U(xt, yt),
+        P(xl, yl) - P(xr, yr),
+        P(xb, yb) - P(xt, yt),
+    ]
+    cons += [P(xp, yp) - 0.0, U(xi, yi) - u0]
+    prob = jno.fvm(cons)
+    traj = np.asarray(prob.solve(time=jno.solve.theta(0.5)))
+    energy = (traj[:, 0] ** 2 + traj[:, 1] ** 2) @ prob.volumes
+    assert energy[-1] / energy[0] == pytest.approx(np.exp(-4 * nu * T), rel=2e-2)

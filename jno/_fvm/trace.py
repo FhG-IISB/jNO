@@ -264,7 +264,12 @@ class _TraceFVM(StrongFormProblem):
         self._nf = int(sum(self._ncomp))
         self._Ntot = self._nf * self._N
         self._classify(constraints)
-        for tie in self._periodic_ties:
+        joined = set()
+        for tie in self._periodic_ties:  # one pairing per pair of regions, whichever unknowns the ties name
+            key = frozenset(tie)
+            if key in joined:
+                continue
+            joined.add(key)
             fa, fb = (self.graph.boundary_faces_on(self._region_mesh_nodes(t)) for t in tie)
             shift = self.graph.b_centroid[fa].mean(axis=0) - self.graph.b_centroid[fb].mean(axis=0)
             self.graph = self.graph.with_periodic(fa, fb, shift)
