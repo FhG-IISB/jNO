@@ -177,6 +177,7 @@ nav:
     - FEM:
       - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
+      - "Residual norms: an H^-1 PINN loss": tutorials/08-fem-and-varpinns/h-minus-1-residual-loss.md
       - Deep Ritz (Energy Method): tutorials/08-fem-and-varpinns/deep-ritz-poisson-2d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md

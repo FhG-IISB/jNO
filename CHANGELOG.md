@@ -1,8 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## Unreleased
 
 ### Added
+- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh (sampled points) the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss`.
 - PINN optimizers from the literature in `jno.optimizers`, each module citing its paper at the top:
   `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent,
   dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()`

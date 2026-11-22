@@ -249,3 +249,72 @@ def test_a_curved_mesh_still_loads_and_gains_regions(tmp_path):
     assert "tetra10" in {c.type for c in d.mesh.cells}, "the fixture is not actually order 2"
     assert {"interior", "boundary"} <= set(d.avaiable_mesh_tags)
     assert len(np.atleast_1d(d.tag_indices["interior"])) > len(np.atleast_1d(d.tag_indices["boundary"]))
+
+
+# ------------------------------------------------------------- what a CAD export names, and how it lands
+
+
+def _gmsh_inclusion(tmp_path, *, dim=2, corner=False):
+    """A gmsh-written .msh 4.1 of a material inside a matrix (disk in a square, or ball in a box), both
+    named, with the outer boundary named ``outer``; ``corner=True`` also names one corner point. This is
+    what a CAD part exported through gmsh looks like: gmsh writes the facet blocks BEFORE the volume
+    blocks, so a group's cells are never in block 0."""
+    gmsh = pytest.importorskip("gmsh")
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
+        occ = gmsh.model.occ
+        if dim == 2:
+            outer, inner = occ.addRectangle(0, 0, 0, 1, 1), occ.addDisk(0.5, 0.5, 0, 0.25, 0.25)
+        else:
+            outer, inner = occ.addBox(0, 0, 0, 1, 1, 1), occ.addSphere(0.5, 0.5, 0.5, 0.25)
+        occ.fragment([(dim, outer)], [(dim, inner)])
+        occ.synchronize()
+        gmsh.option.setNumber("Mesh.MeshSizeMax", 0.1 if dim == 2 else 0.2)
+        ents = [t for _, t in gmsh.model.getEntities(dim)]
+        core = [e for e in ents if gmsh.model.getBoundingBox(dim, e)[0] > 0.1]
+        gmsh.model.addPhysicalGroup(dim, core, name="core")
+        gmsh.model.addPhysicalGroup(dim, [e for e in ents if e not in core], name="matrix")
+        skin = gmsh.model.getBoundary([(dim, e) for e in ents], oriented=False, combined=True)
+        gmsh.model.addPhysicalGroup(dim - 1, [abs(t) for _, t in skin], name="outer")
+        if corner:
+            pt = next(t for _, t in gmsh.model.getEntities(0) if np.allclose(gmsh.model.getValue(0, t, []), 0.0))
+            gmsh.model.addPhysicalGroup(0, [pt], name="corner")
+        gmsh.model.mesh.generate(dim)
+        p = str(tmp_path / f"inclusion{dim}d.msh")
+        gmsh.write(p)
+    finally:
+        gmsh.finalize()
+    return p
+
+
+@pytest.mark.parametrize("dim", [2, 3])
+def test_an_enclosed_material_is_a_region_not_a_boundary(tmp_path, dim):
+    """A named material that does not touch the outer boundary was listed among ``boundary_tags()``
+    (it got PCA "normals" because its volume cells were looked for in block 0 only), while the material
+    around it was not. Both are regions; only the facet group is a boundary."""
+    d = jno.domain(_gmsh_inclusion(tmp_path, dim=dim), compute_mesh_connectivity=False)
+    assert "core" not in d.boundary_tags() and "matrix" not in d.boundary_tags()
+    assert "outer" in d.boundary_tags()
+    assert "core" not in d.normals_by_tag
+    core = np.asarray(d.mesh.points)[np.atleast_1d(d.tag_indices["core"]), :dim]
+    assert np.linalg.norm(core - 0.5, axis=1).max() < 0.25 + 1e-9  # the inclusion's nodes, nothing else
+
+
+def test_a_named_point_group_is_a_node_region(tmp_path):
+    """A physical point (dim 0) was dropped with the geometry-construction vertices, so the name the
+    author gave it was no tag at all. It is now a single-node region, like ``point_region``: a Dirichlet
+    value on it alone fixes the constant of a pure-Neumann Laplace problem, so u is that value everywhere."""
+    d = jno.domain(_gmsh_inclusion(tmp_path, corner=True), compute_mesh_connectivity=False)
+    assert "corner" in d._boundary_regions  # a node region, as point_region makes (not a facet tag)
+    d.variable("corner", split=True)
+    at = np.asarray(d.context["corner"]).reshape(-1, np.asarray(d.context["corner"]).shape[-1])
+    assert at.shape[0] == 1 and np.allclose(at[0, :2], 0.0)
+
+    u, v = d.fem_symbols()
+    x, y = d.variable("interior", split=True)[:2]
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    cx, cy = d.variable("corner", split=True)[:2]
+    sol = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y, u(cx, cy) - 5.0]).solve()).ravel()
+    assert np.allclose(sol, 5.0, atol=1e-6)
