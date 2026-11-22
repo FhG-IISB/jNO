@@ -624,8 +624,12 @@ class _TraceFVM(StrongFormProblem):
             for k, faces, expr in todo:
                 q0 = jnp.zeros((int(faces.shape[0]), self._ncomp[k]))
                 tangent = jnp.ones_like(q0)
-                j0 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0,), (tangent,))[1]
-                j1 = jax.jvp(lambda z: ev._condition(k, faces, expr, z), (q0 + 0.71,), (tangent,))[1]
+                slope = jax.jit(
+                    lambda z, tz, k=k, faces=faces, expr=expr: jax.jvp(
+                        lambda w: ev._condition(k, faces, expr, w), (z,), (tz,)
+                    )[1]
+                )
+                j0, j1 = slope(q0, tangent), slope(q0 + 0.71, tangent)  # compiled once: eagerly it ran op by op
                 cache[id(expr)] = bool(jnp.all(jnp.abs(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.abs(j0).max()) + 1.0)))
                 partial = int(j0.shape[1]) < self._ncomp[k]
                 self._condition_partial[id(expr)] = partial
@@ -652,13 +656,19 @@ class _TraceFVM(StrongFormProblem):
         # ring vanishes, a too-narrow pattern passes, and the tangents assembled later are wrong
         u = jnp.asarray(u)
         u = u + 0.01 * (jnp.abs(u) + 1.0) * jnp.asarray(rng.standard_normal(n), dtype=u.dtype)
-        ref = jax.jvp(fun, (u,), (v,))[1]
-        for radius in (1, 2, 3, 4):
+        # Compiled: run eagerly, a jvp of the residual executes one primitive at a time and XLA compiles each of
+        # them on its own -- 555 one-op programs and 18 s of a 21 s first march of a 24 x 24 shallow-water problem.
+        ref = jax.jit(lambda w, t: jax.jvp(fun, (w,), (t,))[1])(u, v)
+        # Two rings carry everything the scheme reads (least-squares gradients, MUSCL states, the boundary
+        # foot); one verification, and wider rings only if it fails.
+        for radius in (2, 3, 4):
             pattern = _stencil_pattern(pairs, self._N, radius, n_fields=n // self._N)
             color, n_colors = _color_columns(pattern)
-            A = _assemble_sparse(fun, u, pattern, color, n_colors)
+            assemble = jax.jit(lambda w, _p=pattern, _c=color, _n=n_colors: _assemble_sparse(fun, w, _p, _c, _n))
+            A = assemble(u)
             if float(jnp.linalg.norm(A @ v - ref)) <= _rtol(ref.dtype) * (float(jnp.linalg.norm(ref)) or 1.0):
                 cache[key] = (pattern, color, n_colors)
+                self._lru_put(("assemble", key, id(fun)), (fun, assemble))  # the solve reuses this compile
                 return cache[key]
         raise ValueError("jno.fvm: could not assemble the residual's Jacobian on the face graph.")
 
@@ -773,11 +783,11 @@ class _TraceFVM(StrongFormProblem):
         ``(c(t), m(t))``, each ``(n, nf)``; probed as ``F(u.t=1) − F(0)``, and refused when they depend on u."""
         exprs = [e["volume"] for e in self._equations]
 
-        def coef(t_val, tt_val, t, state):
+        def coef(t_val, tt_val, t, state, with_scale=False):
             q = [jnp.full((self._N, c), state) for c in self._ncomp]
             qb = [jnp.full((self.graph.b_owner.shape[0], c), state) for c in self._ncomp]
             ev = self._evaluator(q, qb, t, scope)
-            cols = []
+            cols, scale = [], jnp.zeros(())
             for k, e in enumerate(exprs):
                 c = self._ncomp[k] if len(exprs) > 1 else self._nf
                 if e is None:
@@ -786,16 +796,25 @@ class _TraceFVM(StrongFormProblem):
                 on = ev.rows(ev.values(_set_temporal(e, t_val, tt_val), "cells"), c, "cells")
                 off = ev.rows(ev.values(_set_temporal(e, 0.0, 0.0), "cells"), c, "cells")
                 cols.append(on - off)
-            return jnp.concatenate(cols, axis=1)
+                scale = jnp.maximum(scale, jnp.max(jnp.abs(off)))
+            out = jnp.concatenate(cols, axis=1)
+            return (out, scale) if with_scale else out
 
-        out = []
+        out, start = [], self._start_time()
         for t_val, tt_val, what in ((1.0, 0.0, "u.t"), (0.0, 1.0, "u.tt")):
+            # compiled once per probe: evaluated eagerly it ran op by op, and the march calls it every step
+            probe = jax.jit(lambda state, t, a=t_val, b=tt_val: coef(a, b, t, state))
+            check = jax.jit(lambda state, t, a=t_val, b=tt_val: coef(a, b, t, state, with_scale=True))
             with jax.ensure_compile_time_eval():
-                if not self._same(coef(t_val, tt_val, None, 0.0), coef(t_val, tt_val, None, 0.83)):
+                # compiled, the on and off evaluations may round differently: judge the difference against the size of
+                # the terms themselves, not only against the coefficient (which is exactly 0 for a missing u.tt)
+                (c0, s0), (c1, s1) = check(0.0, start), check(0.83, start)
+                size = float(jnp.maximum(jnp.maximum(jnp.max(jnp.abs(c0)), jnp.max(jnp.abs(c1))), jnp.maximum(s0, s1)))
+                if float(jnp.max(jnp.abs(c1 - c0))) > _rtol(c0.dtype) * max(size, np.finfo(float).tiny):
                     raise ValueError(
                         f"jno.fvm([...]): the coefficient of {what} depends on u; only coordinates and time are supported."
                     )
-            out.append(lambda t=None, a=t_val, b=tt_val: coef(a, b, t, 0.0))
+            out.append(lambda t=None, f=probe: f(0.0, start if t is None else t))
         return out
 
     def _initial_values(self, scope, velocity=False):
@@ -823,12 +842,15 @@ class _TraceFVM(StrongFormProblem):
                 off, slope = res(q0[k])
                 q0[k] = -off / jnp.where(slope != 0, slope, 1.0)
                 continue
-            z = q0[k]
-            for _ in range(_NEWTON_STEPS):
-                r = res(z)[0]
-                d = jax.jvp(lambda w: res(w)[0], (z,), (jnp.ones_like(z),))[1]
-                z = z - r / jnp.where(d != 0, d, 1.0)
-            q0[k] = z
+
+            def newton(z, res=res):  # per cell; compiled, since eagerly every step ran op by op
+                def step(_, z):
+                    r, d = jax.jvp(lambda w: res(w)[0], (z,), (jnp.ones_like(z),))
+                    return z - r / jnp.where(d != 0, d, 1.0)
+
+                return jax.lax.fori_loop(0, _NEWTON_STEPS, step, z)
+
+            q0[k] = jax.jit(newton)(q0[k])
         return jnp.concatenate(q0, axis=1).T.reshape(-1)
 
     def _cfl_dt(self, residual_first_order, mass_diag):
@@ -896,8 +918,11 @@ class _TraceFVM(StrongFormProblem):
         from ..utils.solver.timeschemes import _ERKScheme
 
         scope = self._params_scope()
-        spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
-        spatial_first = self._residual_fn(extra_params=getattr(self, "_override", None), first_order=True)
+        if self._eager():  # the jitted residuals the probes and the march share: compiled once per problem
+            spatial, spatial_first = self._residual_kept(), self._residual_kept(first_order=True)
+        else:
+            spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
+            spatial_first = self._residual_fn(extra_params=getattr(self, "_override", None), first_order=True)
         c_of, m_of = self._time_coefficients(scope)
         V = jnp.tile(self.ops.volume, self._nf)
         pinned = np.zeros(self._Ntot, dtype=bool)
@@ -937,8 +962,9 @@ class _TraceFVM(StrongFormProblem):
         diag = jnp.stack([jnp.arange(N2), jnp.arange(N2)], axis=1)
         common = dict(state0=state0, t0=float(t0), t1=float(t1), dt=float(dt), metadata={})
         jac = lambda w, t, args: self._operator("march", lambda y: residual(y, t, args), w)  # noqa: E731
-        with jax.ensure_compile_time_eval():
-            self._pattern("march", lambda y: residual(y, float(t0), {}), state0)  # where the flux is defined
+        if not isinstance(time, _ERKScheme):  # only an implicit step reads the tangent; erk never assembles it
+            with jax.ensure_compile_time_eval():
+                self._pattern("march", lambda y: residual(y, float(t0), {}), state0)  # where the flux is defined
         if second:
             first = lambda y, t, args: jnp.concatenate([-y[n:], spatial_first(y[:n], t)])  # noqa: E731
         else:
