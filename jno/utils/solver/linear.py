@@ -242,17 +242,41 @@ def _sparse_lu_solve(A, b):
 
     Module level and array-only, so ``jax.jit`` keys on shapes and hits across calls and across
     problems of the same size; under an enclosing trace it simply inlines.
+
+    ``A`` and ``b`` are divided by ``max |A|`` first: on the GPU ``spsolve`` calls a pivot below its
+    ``tol=1e-6`` singular, an ABSOLUTE threshold, so a form in SI units on millimetre cells (entries
+    ~1e-12) was rejected as singular while the same form in other units solved. ``tol`` is a static
+    parameter and cannot follow a traced scale; dividing makes it relative to the largest entry, which is
+    what it was for an operator of order one. The solution is unchanged, and the scale is held constant
+    for differentiation (``x`` does not depend on it).
+
+    ``lax.custom_linear_solve``, as for the other backends: ``spsolve``'s own derivative rule solves again for the
+    tangent's right-hand side and differentiates through both, so one reverse pass ran one extra solve in its forward
+    pass and two in its backward pass, a whole factorisation each.
     """
     b = jnp.asarray(b).reshape(-1)
     n = b.shape[0]
-    A = A.sum_duplicates(nse=A.nse)  # static nse -> jit-safe; merges any repeated (i, j) entries
-    idx = A.indices
-    order = jnp.lexsort((idx[:, 1], idx[:, 0]))  # CSR ordering: by row, then column
-    rows = idx[order, 0]
-    cols = idx[order, 1].astype(jnp.int32)
-    data = A.data[order]
-    indptr = jnp.searchsorted(rows, jnp.arange(n + 1, dtype=rows.dtype)).astype(jnp.int32)
-    return spsolve(data, cols, indptr, b)
+    # static nse -> jit-safe; merges any repeated (i, j) entries. `remove_zeros=False`: by default an entry whose value is
+    # 0 is dropped WITH its derivative, so a stored zero that varies (a right-angled P1 cell, a coefficient at 0) gave a
+    # silently wrong gradient
+    A = A.sum_duplicates(nse=A.nse, remove_zeros=False)
+    idx = jax.lax.stop_gradient(A.indices)
+    data0 = jax.lax.stop_gradient(A.data)
+    scale = jnp.max(jnp.abs(data0), initial=0.0)
+    scale = jnp.where(scale > 0.0, scale, 1.0)
+
+    def _solve(first, second, rhs):
+        order = jnp.lexsort((second, first))  # CSR ordering: by row, then column
+        rows = first[order]
+        indptr = jnp.searchsorted(rows, jnp.arange(n + 1, dtype=rows.dtype)).astype(jnp.int32)
+        return spsolve(data0[order] / scale, second[order].astype(jnp.int32), indptr, rhs / scale.astype(rhs.dtype))
+
+    return jax.lax.custom_linear_solve(
+        lambda x: A @ x,
+        b,
+        lambda _matvec, rhs: _solve(idx[:, 0], idx[:, 1], rhs),
+        transpose_solve=lambda _matvec, rhs: _solve(idx[:, 1], idx[:, 0], rhs),
+    )
 
 
 def sparse_lu_solve(A, b):

@@ -5829,7 +5829,7 @@ def sum_duplicate_triplets(A, nse: int | None = None):
     if nse is not None:
         return _sum_duplicates_static(A, nse=int(nse))
     try:
-        return A.sum_duplicates()  # nse inferred -> requires concrete indices
+        return A.sum_duplicates(remove_zeros=False)  # nse inferred -> concrete indices; a stored 0 keeps its derivative
     except Exception:  # noqa: BLE001 — traced operator: leave it alone rather than fail the assembly
         return A
 
