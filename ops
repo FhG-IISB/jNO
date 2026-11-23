@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":3,"timestamp":1795452621,"nonce":"rrUhtWe6LuqDW3Lzrik6TRNBaAE=","message":"Fixed in c3db3301 on feat/fvm: the comparison allows 1e-14 of the scale (one-ulp GPU differences in 4 of 10 repeats).","files":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":4,"timestamp":1795452636,"nonce":"Q5K3nyC3GaArSyn+MVCoIpH/+5k=","status":2}]}
