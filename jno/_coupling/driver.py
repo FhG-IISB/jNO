@@ -342,7 +342,12 @@ class Coupled:
         values of its OTHER interfaces held (the diagonal of its Steklov-Poincaré operator): solved with every
         value condition it takes part in as its Dirichlet condition, this one's data at 0 and at 1 (a linear
         probe; the mean over the interface, per unit weight). Held open, another interface would let a floating
-        participant follow the probe and read no stiffness at all."""
+        participant follow the probe and read no stiffness at all.
+
+        A transient participant is probed over one window from its initial state, its data at what the senders
+        send from theirs, this one's raised by a small step: the linearisation the first window sees. For a linear
+        problem that is the response from rest; a nonlinear one (a gas, whose zero state has no density) has
+        none at rest."""
         key = (i, kv)
         if key in self.stiffness:
             return self.stiffness[key]
@@ -356,22 +361,36 @@ class Coupled:
         prob, data = probe[i]
         iface = part.interface(self.conditions[kv].tags[i], self.spec.measure)
         flux = self._own_part(cf.expr, i)
+        windowed = part.transient(prob) and self._window is not None
+        base = {}  # the data the probe starts from, per (condition, data index)
+        for k, ds in data.items():
+            face = part.interface(self.conditions[k].tags[i], self.spec.measure)
+            for j, d in enumerate(ds):
+                sender = self.parts[d.sender]
+                if windowed and sender.transient():  # its own problem: the coupled ones are not built yet
+                    src = sender.interface(d.sender_tag, self.spec.measure)
+                    vals = sender.sample(sender.problem, sender.initial(sender.problem), d.expr, d.sender_tag, src)
+                    base[k, j] = np.asarray(self._map(d, face, src) @ np.asarray(vals), float)
+                else:
+                    base[k, j] = np.zeros(face.points.shape[0])
+        step = 1.0
+        if windowed:  # a small step about the start for a nonlinear problem; exact either way for a linear one
+            step = 1e-3 * max(1.0, max(float(np.abs(base[kv, j]).max(initial=0.0)) for j in range(len(data[kv]))))
         out = []
-        for level in (0.0, 1.0):
+        for level in (0.0, step):
             extra = {}
             for k, ds in data.items():
-                for d in ds:
-                    face = part.interface(self.conditions[k].tags[i], self.spec.measure)
-                    lv = level if k == kv else 0.0
-                    extra.update(d.setter(part.nodal(face, np.full(face.points.shape[0], lv)), prob))
-            if part.transient(prob) and self._window is not None:  # a window's stiffness: from rest, one window
+                face = part.interface(self.conditions[k].tags[i], self.spec.measure)
+                for j, d in enumerate(ds):
+                    lv = base[k, j] + (level if k == kv else 0.0)
+                    extra.update(d.setter(part.nodal(face, lv), prob))
+            if windowed:
                 window, t0, _ = self._window
-                rest = np.zeros(np.asarray(part.initial(prob)).size)
-                state = part.march(prob, rest, t0, window, extra, time=self._time_of(i))
+                state = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i))
             else:
                 state = part.solve(prob, extra)
             out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra)))
-        self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / iface.total
+        self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / (step * iface.total)
         return self.stiffness[key]
 
     def _unfloat(self):
@@ -555,15 +574,41 @@ class Coupled:
 
     # -- iteration ---------------------------------------------------------------------------------------
     def _produce(self, d, states):
-        """Data ``d`` from its sender's current state, carried to the receiver's interface nodes."""
+        """Data ``d`` from its sender's current state, carried to the receiver's interface nodes.
+
+        A flux from a sender that just marched a window is its mean over the window, from the sender's own
+        steps: what the receiver takes in over the window is then what the sender gave out. Its end value is
+        not, when the sender takes several steps (an explicit march, a finer step) while the flux changes."""
         s, r = self.parts[d.sender], self.parts[d.receiver]
         src = s.interface(d.sender_tag, self.spec.measure)
         dst = r.interface(d.receiver_tag, self.spec.measure)
-        vals = np.asarray(
-            s.sample(self.problems[d.sender], states[d.sender], d.expr, d.sender_tag, src, self._last.get(d.sender))
-        )
+        prob, data = self.problems[d.sender], self._last.get(d.sender)
+        frames = s.frames(prob, states[d.sender]) if d.flux else None
+        if frames is None or frames.shape[0] < 2:
+            vals = np.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data))
+        else:
+            w = self._window_weights(d.sender, frames.shape[0] - 1)
+            vals = sum(
+                wk * np.asarray(s.sample(prob, frames[k], d.expr, d.sender_tag, src, data))
+                for k, wk in enumerate(w)
+                if wk != 0.0
+            )
         M = self._map(d, dst, src)
         return np.asarray(M @ vals)
+
+    def _window_weights(self, i, m):
+        """Weights of a window's ``m + 1`` frames in its mean: the trapezoid rule for an explicit (or IMEX) march,
+        whose flux is continuous across its steps, the step ends for an implicit Euler step, whose step takes the
+        flux at its end -- exactly what it gave out."""
+        from ..utils.solver.imex import IMEXScheme
+        from ..utils.solver.timeschemes import _ERKScheme
+
+        w = np.full(m + 1, 1.0 / m)
+        if isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)):
+            w[0] = w[-1] = 0.5 / m
+        else:
+            w[0] = 0.0
+        return w
 
     def _map(self, d, dst, src):
         cache = self.__dict__.setdefault("_maps", {})

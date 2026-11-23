@@ -76,6 +76,20 @@ def test_two_solids_in_contact_hold_the_contact_temperature(accel):
     np.testing.assert_allclose(ta[-1], exact(pts[:, 0], T_END), atol=0.02)
 
 
+def test_an_imex_participant_takes_its_cfl_substeps_in_every_window():
+    # jno.solve.imex(cfl=) decides its substeps from the state; inside a coupling's compiled window march the
+    # state is traced, so the participant decides them per window (as for erk) -- it raised a concretization error
+    pa, ua, fa, da = _fem_cold(0.02)
+    pb, ub, fb, db = _fvm_hot(0.03)  # explicit diffusion: 4x fewer substeps than at 0.015
+    spec = CouplingSpec(tol=1e-8, max_iter=40, time={pb: jno.solve.imex("ars222", cfl=0.5), pa: None})
+    ta, tb = couple([pa, pb], [ua - ub, K1 * fa + K2 * fb], spec).solve()
+    pts = np.asarray(da.mesh_connectivity["points"])
+    iface = np.flatnonzero(np.abs(pts[:, 0]) < 1e-12)
+    # the same bounds as backward Euler on that side: the mesh and the cold side's step set them
+    np.testing.assert_allclose(ta[-1][iface], TC, atol=0.012)
+    np.testing.assert_allclose(tb[-1], exact(np.asarray(pb.centroids)[:, 0], T_END), atol=0.02)
+
+
 def test_loose_coupling_takes_one_sweep_per_window_and_stays_close():
     pa, ua, fa, da = _fem_cold(0.02)
     pb, ub, fb, db = _fvm_hot(0.015)
@@ -129,3 +143,53 @@ def test_a_steady_problem_couples_quasi_steadily_to_a_transient_one():
     # Robin term by O(h²) (h 0.04-0.05 here: a few 1e-5), the transfer's own discretisation, not the coupling's
     np.testing.assert_allclose(tb, tref, atol=2e-4)
     assert np.abs(tb[-1] - tb[0]).max() > 0.1  # the wall did cool
+
+
+def _heat_of_fem(d, u):
+    """∫ u dA of a P1 field: the mean of its corner values times each triangle's area."""
+    pts = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    tri = np.asarray(d.mesh_connectivity["triangles"])
+    e1, e2 = pts[tri[:, 1]] - pts[tri[:, 0]], pts[tri[:, 2]] - pts[tri[:, 0]]
+    return np.asarray(u)[..., tri].mean(axis=-1) @ (0.5 * np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]))
+
+
+def _contact_heat_drift(n_b):
+    """Two insulated bars brought into contact (heat conserved): the fem bar [-1, 0] at 0 (k 1) one backward
+    Euler step per window, the fvm bar [0, 1] at 1 (k 0.25, the softer side: it takes the temperature) on its own
+    ``n_b - 1`` explicit steps over the same time. The largest drift of their total heat, over the heat moved."""
+    t_end, kb = 0.02, 0.25
+    da = jno.shape.rect(-1.0, 0.0, 0.0, 0.1, size=0.02).domain(time=(0.0, t_end, 11))
+    u, v = da.fem_symbols()
+    xi, yi, ti = da.variable("interior", split=True)
+    ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pa = jno.fem([ub.t * vb + K1 * (ub.x * vb.x + ub.y * vb.y), u(*da.variable("initial", split=True)) - 0.0])
+    xr, yr, _ = da.variable("right", split=True)
+    ua = u.bind(x=xr, y=yr)
+    db = jno.shape.rect(0.0, 0.0, 1.0, 0.1, size=0.015).domain(time=(0.0, t_end, n_b))
+    x, y, t = db.variable("interior", split=True)
+    xb0, yb0, _ = db.variable("initial", split=True)
+    w = db.unknown()
+    wi = w.bind(x=x, y=y, t=t)
+    pb = jno.fvm([wi.t - kb * (wi.xx + wi.yy), w(xb0, yb0) - (1.0 + 0.0 * xb0)])
+    xl, yl, _ = db.variable("left", split=True)
+    wl = w.bind(x=xl, y=yl)
+    c = couple(
+        [pa, pb],
+        [ua - wl, K1 * ua.d(da.variable("right", normals=True)) + kb * wl.d(db.variable("left", normals=True))],
+        CouplingSpec(tol=1e-10, max_iter=40, time={pb: jno.solve.imex("ars222", cfl=0.5), pa: None}),
+    )
+    ta, tb = c.solve()
+    assert c.parts[c.assign[0]].problem is pb  # the softer bar takes the temperature, the fem bar the flux
+    heat = _heat_of_fem(da, ta) + np.asarray(tb) @ np.asarray(pb.volumes)
+    return float(np.abs(heat - heat[0]).max() / abs(_heat_of_fem(da, ta)[-1] - _heat_of_fem(da, ta)[0]))
+
+
+def test_a_substepping_sender_passes_its_window_mean_flux_and_heat_is_conserved():
+    # The flux the fem bar takes over a window must be what the fvm bar gave out: its mean over the window, not
+    # its end value. After the contact jump the flux falls fast within a window; the end value lost 24 % of the
+    # heat moved. The mean, by the trapezoid rule over the sender's steps, is off only on the first step after
+    # the jump, where the flux is singular, and shrinks with that step.
+    coarse, fine = _contact_heat_drift(101), _contact_heat_drift(201)
+    # measured 2.4 % and 0.8 % (ten and twenty sender steps per window; the end value: 24 %): the first-step
+    # error falls faster than the step
+    assert coarse < 0.03 and fine < 0.5 * coarse, (coarse, fine)

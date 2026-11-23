@@ -168,6 +168,18 @@ class Participant:
         """The state after the window ``[t0, t0 + window]`` from ``state``, the data held over it."""
         raise NotImplementedError
 
+    def frames(self, problem, end):
+        """The states of the last window ``problem`` marched, at its own steps from the window's start, if it
+        ended in ``end`` (a flux it sends is their mean over the window); ``None`` otherwise."""
+        kept = self.__dict__.get("_frames", {}).get(id(problem))
+        return kept[0] if kept is not None and kept[1] is end else None
+
+    def _keep(self, problem, traj):
+        """Keep the window's frames ``(n_steps + 1, n)`` and return its last state."""
+        end = traj[-1].reshape(-1)
+        self.__dict__.setdefault("_frames", {})[id(problem)] = (traj, end)
+        return end
+
     def initial(self, problem):
         """The state its initial condition gives."""
         raise NotImplementedError
@@ -279,7 +291,8 @@ class FDMParticipant(_StrongForm):
         import jax.numpy as jnp
 
         traj = problem._march(time=time, x0=jnp.asarray(state).reshape(-1), span=self._span(t0, window))
-        return jnp.asarray(traj)[-1].reshape(-1)
+        traj = jnp.asarray(traj)
+        return self._keep(problem, traj.reshape(traj.shape[0], -1))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -336,6 +349,9 @@ class FVMParticipant(_StrongForm):
         keys = tuple(sorted(data))
         faces = np.asarray(problem._region_faces(tag))
         A = jnp.asarray(self._attachment(problem, faces, iface))
+        # how its boundary rule treats each condition is decided on concrete values, once; a problem sampled
+        # before it was ever solved (a coupling's probe reads its initial state) has not decided it yet
+        problem._decide_condition_affinity(problem._concrete_scope())
         cache = problem.__dict__.setdefault("_cpl_sample", {})
         fn = cache.get((id(expr), tag, keys))
         if fn is None:
@@ -349,39 +365,31 @@ class FVMParticipant(_StrongForm):
 
     def march(self, problem, state, t0, window, data, time=None):
         """One window, compiled once per window length for an autonomous problem: the data are traced inputs
-        (the march reads them through ``_override``). An explicit scheme with ``cfl=`` gets its substeps here,
-        from the state at the window's start, as a static number."""
-        import copy
-
+        (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
+        substeps inside the program, from the state at the window's start, so every window runs the same one."""
         import jax
         import jax.numpy as jnp
-
-        from ..utils.solver.timeschemes import _ERKScheme
 
         keys = tuple(sorted(data))
         span = self._span(t0, window)
         state = jnp.asarray(state).reshape(-1)
-        scheme, sub = time, None
-        if isinstance(time, _ERKScheme) and time.cfl is not None:
-            sub = self._cfl_substeps(problem, state, time)
-            scheme = copy.copy(time)
-            scheme.cfl = None
 
         def run(values, x0):
             problem._override = self._scope(problem, dict(zip(keys, values)))
             try:
-                traj = problem._march(time=scheme, x0=x0, span=span, substeps=sub)
+                traj = problem._march(time=time, x0=x0, span=span)
             finally:
                 problem._override = None
-            return jnp.asarray(traj)[-1].reshape(-1)
+            traj = jnp.asarray(traj)
+            return traj.reshape(traj.shape[0], -1)
 
         if not self.autonomous():  # its own times: compiled per window
-            return jax.jit(run)([data[k] for k in keys], state)
+            return self._keep(problem, jax.jit(run)([data[k] for k in keys], state))
         cache = problem.__dict__.setdefault("_cpl_march", {})
-        key = (keys, span, sub, repr(scheme))
+        key = (keys, span, repr(time))
         if key not in cache:
             cache[key] = jax.jit(run)
-        return cache[key]([data[k] for k in keys], state)
+        return self._keep(problem, cache[key]([data[k] for k in keys], state))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -389,18 +397,6 @@ class FVMParticipant(_StrongForm):
         if getattr(problem, "_time_order", 1) == 2:
             raise NotImplementedError("coupling: a u.tt problem marches [u; v]; its windows are not coupled yet.")
         return jnp.asarray(problem._initial_values(problem._params_scope())).reshape(-1)
-
-    def _cfl_substeps(self, problem, state, time):
-        """Substeps per step for the stable explicit step at ``state`` (the problem's CFL estimate)."""
-        from ..utils.solver.time_route import _infer_time_window
-
-        block = self.__dict__.get("_cfl_block")
-        if block is None:
-            t0, t1, dt = _infer_time_window(problem.domain)
-            block = problem._march_parts(None, None, None, time, t0, t1, dt)[0]
-            self._cfl_block = block
-        limit = float(block.metadata["cfl_dt"](state, time.cfl))
-        return max(1, int(np.ceil(float(block.dt) / limit - 1e-12)))
 
     def _face_values(self, problem, state, expr, faces, data):
         import jax.numpy as jnp
