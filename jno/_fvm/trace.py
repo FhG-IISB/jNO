@@ -540,10 +540,46 @@ class _TraceFVM(StrongFormProblem):
     def _evaluator(self, q, qb, t, scope):
         return _Evaluator(self, q, qb, t, scope)
 
-    def _residual_fn(self, *, spatial=True, extra_params=None, first_order=False):
+    def _local_split(self):
+        """Per equation, its volume terms as ``(local, rest)``: a term that differentiates no unknown in space
+        acts on each cell alone (a reaction, a source, an algebraic closure); the rest (a non-conservative
+        ``b·∇u``) reads the neighbours through a gradient. What ``jno.solve.imex`` steps implicitly is the local part."""
+        cached = self.__dict__.get("_local_split_cache")
+        if cached is not None:
+            return cached
+        from ..trace import Hessian, Jacobian
+
+        def spatial_derivative(node):
+            n = _unwrap(node)
+            if isinstance(n, (Jacobian, Hessian)) and any(_mentions(n.target, w) for w in self.unknowns):
+                return True
+            return any(spatial_derivative(c) for c in _iter(n))
+
+        out = []
+        for eq in self._equations:
+            vol = eq["volume"]
+            if vol is None:
+                out.append((None, None))
+                continue
+            loc, rest = None, None
+            for sg, tm in _signed_terms(vol, distribute=False):
+                tm = tm if sg > 0 else -1.0 * tm
+                if spatial_derivative(tm):
+                    rest = tm if rest is None else rest + tm
+                else:
+                    loc = tm if loc is None else loc + tm
+            out.append((loc, rest))
+        self._local_split_cache = out
+        return out
+
+    def _residual_fn(self, *, spatial=True, extra_params=None, first_order=False, part=None):
         """The finite-volume residual ``R(dofs)`` (blocked DOF layout), volume terms integrated (``V·term``)
-        and fluxes summed over faces. ``spatial=True`` drops the ``u.t`` terms."""
+        and fluxes summed over faces. ``spatial=True`` drops the ``u.t`` terms. ``part="local"`` keeps only the
+        cell-local volume terms (:meth:`_local_split`), ``part="flux"`` everything else."""
+        if part not in (None, "local", "flux"):
+            raise ValueError(f"_residual_fn(part={part!r})")
         eqs = self._equations
+        split = self._local_split() if part is not None else None
         scope = self._params_scope(extra_params)
         nB = self.graph.b_owner.shape[0]
         self._decide_condition_affinity(self._concrete_scope())  # decided on concrete values
@@ -556,13 +592,17 @@ class _TraceFVM(StrongFormProblem):
             for i in range(self.ops.boundary_passes):
                 ev.solve_boundary(first=i == 0)
             out = []
-            conv = ev.convective_divergence(eqs)  # (n, nf) or None, all equations' convective fluxes
+            conv = ev.convective_divergence(eqs) if part != "local" else None  # all equations' convective fluxes
             for k, eq in enumerate(eqs):
                 c = self._ncomp[k] if len(eqs) > 1 else self._nf
                 cols = slice(self._block0[k], self._block0[k] + c) if len(eqs) > 1 else slice(0, self._nf)
                 r = jnp.zeros((self._N, c), dtype=jnp.asarray(dofs).dtype)
-                if eq["volume"] is not None:
-                    r = r + self.ops.volume[:, None] * ev.rows(ev.values(_zero_temporal(eq["volume"]), "cells"), c, "cells")
+                vol = eq["volume"] if part is None else split[k][0 if part == "local" else 1]
+                if vol is not None:
+                    r = r + self.ops.volume[:, None] * ev.rows(ev.values(_zero_temporal(vol), "cells"), c, "cells")
+                if part == "local":
+                    out.append(r)
+                    continue
                 for grp in eq["groups"]:
                     if grp["central"]:
                         fi, fb = ev.central_flux(grp["central"], c)
@@ -576,7 +616,7 @@ class _TraceFVM(StrongFormProblem):
                     r = r + self.ops.divergence(*ev.mass_flux(eq["mass"], eq["partner"], k, c))
                 out.append(r)
             R = jnp.concatenate(out, axis=1)  # (n, nf)
-            for k, cells, expr in self._pins:
+            for k, cells, expr in self._pins if part != "local" else ():
                 cols = slice(self._block0[k], self._block0[k] + self._ncomp[k])
                 R = R.at[cells, cols].set(ev.rows(ev.values(expr, ("cells", cells)), self._ncomp[k], ("cells", cells)))
             R = self._require_real(R, "the finite-volume residual (a complex coefficient or source)")
@@ -585,6 +625,8 @@ class _TraceFVM(StrongFormProblem):
         eq_expr = self._equilibrium()
         if eq_expr is None:
             return residual
+        if part is not None:
+            raise NotImplementedError("jno.fvm: equilibrium= (well-balancing) with a split residual (jno.solve.imex).")
         keep = np.ones(self._Ntot, dtype=bool)
         for k, cells, _ in self._pins:
             for b in range(self._block0[k], self._block0[k] + self._ncomp[k]):
@@ -979,6 +1021,7 @@ class _TraceFVM(StrongFormProblem):
         import jax.experimental.sparse as jsparse
 
         from ..utils.solver.backend_blocks import SemidiscreteTimeBlock
+        from ..utils.solver.imex import IMEXScheme
         from ..utils.solver.solver_api import compose_transient_step_solvers
         from ..utils.solver.timeschemes import _ERKScheme
 
@@ -1044,7 +1087,19 @@ class _TraceFVM(StrongFormProblem):
                 self._override = saved
             common["metadata"]["mass_structure"] = (("diag", np.arange(N2)), md == 0)
         jac = lambda w, t, args: self._operator("march", lambda y: residual(y, t, args), w)  # noqa: E731
-        if not isinstance(time, _ERKScheme):  # only an implicit step reads the tangent; erk never assembles it
+        if isinstance(time, IMEXScheme):  # the split it steps: local terms implicit per cell, the rest explicit
+            if self._pins or second:
+                raise NotImplementedError(
+                    "jno.solve.imex: a vertex-centred problem's pinned rows, or a u.tt problem, are not split yet."
+                )
+            override = getattr(self, "_override", None)
+            local_fn = self._residual_fn(part="local", extra_params=override)
+            flux_first = self._residual_fn(part="flux", first_order=True, extra_params=override)
+            common["metadata"]["local_residual"] = local_fn
+            common["metadata"]["local_layout"] = (self._nf, self._N)
+            common["metadata"]["mass_diag"] = mass_diag
+            common["metadata"]["cfl_dt_flux"] = self._cfl_dt(lambda y, t, args: flux_first(y, t), mass_diag)
+        if not isinstance(time, (_ERKScheme, IMEXScheme)):  # only an implicit step reads the tangent
             with jax.ensure_compile_time_eval():
                 if getattr(self, "_override", None) is not None and not second:
                     # where the flux is defined is structural: decided on the stored values, as the residual of a
@@ -1075,7 +1130,7 @@ class _TraceFVM(StrongFormProblem):
                 pattern = np.asarray(self._operator("march", lambda y: residual(y, float(t0), {}), state0).indices)
             # the step tangent M/dt + dR/du has the same pattern (M is diagonal, its entries already in it)
             nonlinear = nonlinear.with_constraint(self._constraint_rows(N2), pattern)
-        if isinstance(time, _ERKScheme):
+        if isinstance(time, (_ERKScheme, IMEXScheme)):
             steppers = (None, None)
         else:
             nonlinear = nonlinear if nonlinear is not None else _solve.newton(direct=True)

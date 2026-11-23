@@ -75,6 +75,7 @@ __all__ = [
     "theta",
     "coupling",
     "erk",
+    "imex",
     "ptc",
     "piso",
     "simple",
@@ -2082,6 +2083,24 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
+    """IMEX Runge-Kutta (Ascher, Ruuth & Spiteri 1997): the transport explicit, the stiff cell-local terms implicit.
+
+    For a problem whose residual has terms that act on each cell alone -- a reaction, a drag, a relaxation, an
+    algebraic closure (the temperature of an energy) -- next to its fluxes: ``jno.fvm`` splits its volume terms
+    that differentiate no unknown in space from the rest. The local part is solved per cell by Newton on its
+    ``nf x nf`` block, so a stiff source costs no smaller step; the explicit part keeps its CFL limit.
+
+    Args:
+        method: ``"ars222"`` (second order, L-stable implicit part) or ``"ars443"`` (third order).
+        cfl: substeps per step from the transport's stable step, as ``jno.solve.erk(cfl=)``.
+        newton_tol, newton_steps: the per-cell Newton's step tolerance and its most iterations.
+    """
+    from .utils.solver.imex import IMEXScheme
+
+    return IMEXScheme(method=method, cfl=cfl, newton_tol=newton_tol, newton_steps=newton_steps)
 
 
 def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12):
