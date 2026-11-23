@@ -1331,6 +1331,8 @@ class _TraceFVM(StrongFormProblem):
             carry = {}
             if getattr(nonlinear, "positive", None) is not None:  # quantities the driver keeps positive, per cell
                 carry["positive"] = self._cell_values_fn(nonlinear.positive, extra_params)
+            if getattr(nonlinear, "name", None) == "ptc":  # one pseudo-time step per control volume
+                carry["row_groups"] = np.tile(np.arange(self._N), self._nf)
             # eager: the whole Newton compiled once (as jno.fdm's _compiled_steady); run uncompiled, it re-traced
             # and recompiled its loop on every solve (2.3 s of a 3.2 s repeat solve of a 24 x 24 cavity)
             fn = jax.jit(lambda u_init: driver(residual, u_init, jacobian=tangent, **carry)) if eager else None

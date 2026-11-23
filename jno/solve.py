@@ -2104,15 +2104,15 @@ def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
     return IMEXScheme(method=method, cfl=cfl, newton_tol=newton_tol, newton_steps=newton_steps)
 
 
-def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, positive=None, keep=0.2):
+def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, positive=None, keep=0.2, ramp=1.2):
     """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
     ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
 
-    Each step solves ``(J + D / Δτ) δ = -F(u)``, ``D`` the row sums of ``|J|`` (a backward-Euler step in
-    pseudo-time), and ``Δτ`` grows as the residual falls (switched evolution relaxation, Mulder & van Leer 1985),
-    so it follows the transient path where it must -- a shock or a front that has not formed in the start state --
-    and ends as Newton. Every row is damped, a saddle point's constraint too (its row sum is not zero where its
-    diagonal is).
+    Each step solves ``(J + D / Δτ) δ = -F(u)`` (a backward-Euler step in pseudo-time), ``D`` the row sums of
+    ``|J|``: on ``jno.fvm`` one value per cell, the largest of its unknowns', so a cell's unknowns advance together
+    as in a march. ``Δτ`` grows as the residual falls (switched evolution relaxation, Mulder & van Leer 1985), so it
+    follows the transient path where it must -- a shock or a front that has not formed in the start state -- and ends
+    as Newton. Every row is damped, a saddle point's constraint too (its row sum is not zero where its diagonal is).
 
     Args:
         dtau0: the first pseudo-time step, in units of ``D`` (smaller is more cautious).
@@ -2125,11 +2125,20 @@ def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, posi
             at least ``keep`` of its value; without it a step into a state where the residual is still finite (a
             negative density) is taken, and the march does not come back.
         keep: the share of a positive quantity a step must leave (0.2: a step takes at most 80 % of it away).
+        ramp: the least growth of ``Δτ`` after a full step (1: switched evolution relaxation alone, which creeps
+            while a shock forms and the residual hardly falls: the Mach 3 wedge stalled at 200 steps with it).
     """
     from .utils.solver.ptc import PseudoTransient
 
     return PseudoTransient(
-        dtau0=dtau0, dtau_max=dtau_max, max_steps=max_steps, rtol=rtol, atol=atol, positive=positive, keep=keep
+        dtau0=dtau0,
+        dtau_max=dtau_max,
+        max_steps=max_steps,
+        rtol=rtol,
+        atol=atol,
+        positive=positive,
+        keep=keep,
+        ramp=ramp,
     )
 
 
