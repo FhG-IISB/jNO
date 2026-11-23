@@ -52,6 +52,7 @@ class FVScheme(str):
         equilibrium=None,
         entropy_fix=0.1,
         venkat_k=0.3,
+        smooth=False,
     ):
         def name(v):
             return v if isinstance(v, str) or v is None else f"#{id(v)}"
@@ -63,6 +64,8 @@ class FVScheme(str):
             parts.append(f"speed=#{id(speed)}")
         if equilibrium is not None:
             parts.append(f"equilibrium=#{id(equilibrium)}")
+        if smooth:
+            parts.append("smooth")
         self = super().__new__(cls, "finite_difference:fv(" + ",".join(parts) + ")")
         if isinstance(flux, str) and flux not in _FLUXES:
             raise ValueError(f"jno.fv: flux={flux!r} is not one of {_FLUXES} (or a callable flux(qL, qR, n, Fn)).")
@@ -75,6 +78,7 @@ class FVScheme(str):
         self.flux, self.limiter, self.recon, self.average = flux, limiter, recon, average
         self.speed, self.equilibrium, self.entropy_fix = speed, equilibrium, float(entropy_fix)
         self.venkat_k = float(venkat_k)
+        self.smooth = bool(smooth)
         return self
 
     def __reduce__(self):
@@ -89,6 +93,7 @@ class FVScheme(str):
                 self.equilibrium,
                 self.entropy_fix,
                 self.venkat_k,
+                self.smooth,
             ),
         )
 
@@ -121,7 +126,7 @@ class FVScheme(str):
         return self.limiter in ("barth", "venkat")
 
 
-def _rebuild(flux, limiter, recon, average, speed, equilibrium, entropy_fix, venkat_k):
+def _rebuild(flux, limiter, recon, average, speed, equilibrium, entropy_fix, venkat_k, smooth=False):
     return FVScheme(
         flux=flux,
         limiter=limiter,
@@ -131,6 +136,7 @@ def _rebuild(flux, limiter, recon, average, speed, equilibrium, entropy_fix, ven
         equilibrium=equilibrium,
         entropy_fix=entropy_fix,
         venkat_k=venkat_k,
+        smooth=smooth,
     )
 
 
@@ -144,6 +150,7 @@ def fv(
     equilibrium=None,
     entropy_fix=0.1,
     venkat_k=0.3,
+    smooth=False,
 ):
     """The finite-volume scheme of a flux, for ``scheme=`` on the flux's outer derivative::
 
@@ -176,6 +183,10 @@ def fv(
         venkat_k: Venkatakrishnan's ``K``, with ``ε² = (K h)³``: how far a smooth extremum may pass the
             neighbours' bounds (0.3 kept a unit step within 0.1% on a triangulation; his 5 let it overshoot
             by 13%).
+        smooth: round the min / max of the wave speeds (HLL's bounds, the spectral radius of Rusanov and Roe)
+            within 1e-3 of their size, so the flux has a derivative at a sonic face and at a gas at rest: Newton
+            keeps its quadratic convergence there, and a gradient is the derivative, not one side of a kink.
+            The flux moves by O(1e-3) of the jump.
     """
     return FVScheme(
         flux=flux,
@@ -186,4 +197,5 @@ def fv(
         equilibrium=equilibrium,
         entropy_fix=entropy_fix,
         venkat_k=venkat_k,
+        smooth=smooth,
     )

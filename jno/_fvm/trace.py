@@ -1900,16 +1900,12 @@ class _Evaluator:
 
                 return 0.5 * (fL + fR) - 0.5 * a[:, None] * (QR - QL)
             if scheme.flux == "hll":
-                lo_L, hi_L = _eig_extremes(_flux_jacobian(Fn, QL))
-                lo_R, hi_R = _eig_extremes(_flux_jacobian(Fn, QR))
-                sl = jnp.minimum(jnp.minimum(lo_L, lo_R), 0.0)[:, None]
-                sr = jnp.maximum(jnp.maximum(hi_L, hi_R), 0.0)[:, None]
-                width = jnp.where(sr - sl > 0, sr - sl, 1.0)
-                hll = (sr * fL - sl * fR + sl * sr * (QR - QL)) / width
-                return jnp.where(sr - sl > 0, hll, 0.5 * (fL + fR))
+                ext_L = _eig_extremes(_flux_jacobian(Fn, QL))
+                ext_R = _eig_extremes(_flux_jacobian(Fn, QR))
+                return _hll(fL, fR, QL, QR, ext_L, ext_R, smooth=scheme.smooth)
             # "roe": the jump damped by |A| at the mean state, |A| = sqrt(A^2 + d^2 I) (entropy fix built in)
             A = _flux_jacobian(Fn, 0.5 * (QL + QR))
-            rho = _spectral_radius(A)
+            rho = _spectral_radius(A, smooth=scheme.smooth)
             absA = _abs_matrix(A, scheme.entropy_fix * rho)
             return 0.5 * (fL + fR) - 0.5 * jnp.einsum("mij,mj->mi", absA, QR - QL)
 
@@ -1966,7 +1962,37 @@ class _Evaluator:
         ``∂(F·n)/∂Q``."""
         if scheme.speed is not None:
             return self.rows(self.values(scheme.speed, site, split(Q)), 1, site)[:, 0]
-        return _spectral_radius(_flux_jacobian(Fn, Q))
+        return _spectral_radius(_flux_jacobian(Fn, Q), smooth=scheme.smooth)
+
+
+def _smax(a, b, delta):
+    """``max(a, b)`` rounded within ``δ`` of a tie: exact at a tie (``_smax(a, a) = a``), within ``δ/2`` of the max
+    elsewhere, and smooth (the max's kink stalls Newton and leaves the jvp one-sided)."""
+    gap = a - b
+    return 0.5 * (a + b + jnp.sqrt(gap * gap + delta * delta + jnp.finfo(gap.dtype).tiny) - delta)
+
+
+def _smin(a, b, delta):
+    return -_smax(-a, -b, delta)
+
+
+def _hll(fL, fR, QL, QR, ext_L, ext_R, smooth=False):
+    """The HLL flux of the face states ``QL``, ``QR`` (fluxes ``fL``, ``fR``, extreme wave speeds ``ext = (lo, hi)``
+    per side): ``(s_R f_L - s_L f_R + s_L s_R (Q_R - Q_L)) / (s_R - s_L)``, ``s_L = min(lo_L, lo_R, 0)``,
+    ``s_R = max(hi_L, hi_R, 0)``. ``smooth`` rounds the min / max within ``δ = 1e-3`` of the wave speeds' size, so the
+    flux has a derivative at a sonic face (where a wave speed crosses 0) and where the two sides' speeds tie."""
+    (lo_L, hi_L), (lo_R, hi_R) = ext_L, ext_R
+    if smooth:
+        delta = 1e-3 * jnp.sqrt(lo_L * lo_L + hi_L * hi_L + lo_R * lo_R + hi_R * hi_R + jnp.finfo(lo_L.dtype).tiny)
+        sl = _smin(_smin(lo_L, lo_R, delta), 0.0, delta)[:, None]
+        sr = _smax(_smax(hi_L, hi_R, delta), 0.0, delta)[:, None]
+    else:
+        sl = jnp.minimum(jnp.minimum(lo_L, lo_R), 0.0)[:, None]
+        sr = jnp.maximum(jnp.maximum(hi_L, hi_R), 0.0)[:, None]
+    wide = sr - sl > 0
+    width = jnp.where(wide, sr - sl, 1.0)  # both branches finite, so the unused one gives no NaN gradient
+    hll = (sr * fL - sl * fR + sl * sr * (QR - QL)) / width
+    return jnp.where(wide, hll, 0.5 * (fL + fR))
 
 
 def _flux_jacobian(Fn, Q):
@@ -2028,11 +2054,16 @@ def _smooth_abs(a, delta=1e-8):
     return jnp.where(jnp.abs(a) >= delta, jnp.abs(a), 0.5 * (a * a / delta + delta))
 
 
-def _spectral_radius(A):
-    """``max |λ|`` of each ``A`` (real eigenvalues, as for a hyperbolic system)."""
+def _spectral_radius(A, smooth=False):
+    """``max |λ|`` of each ``A`` (real eigenvalues, as for a hyperbolic system). ``smooth`` rounds the max of the two
+    extremes' sizes within ``δ = 1e-3`` of them (a gas at rest has ``|u - c| = |u + c|``, where the max has a kink)."""
     if A.shape[1] == 1:
         return _smooth_abs(A[:, 0, 0])
     lo, hi = _eig_extremes(A)
+    if smooth:
+        delta = 1e-3 * jnp.sqrt(lo * lo + hi * hi + jnp.finfo(lo.dtype).tiny)
+        size = lambda v: jnp.sqrt(v * v + (delta * delta))  # noqa: E731
+        return _smax(size(lo), size(hi), delta)
     return jnp.maximum(jnp.abs(lo), jnp.abs(hi))
 
 

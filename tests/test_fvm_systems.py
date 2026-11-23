@@ -285,3 +285,62 @@ def test_a_steady_conducting_gas_with_an_algebraic_temperature():
     (e1, p1), (e2, p2) = _steady_conducting_gas_error(10), _steady_conducting_gas_error(20)
     assert e1 < 1e-2 and max(p1, p2) < 1e-2
     assert 1.6 < np.log2(e1 / e2) < 2.2
+
+
+def _euler1d_flux(Q):
+    rho, m, E = Q[:, 0], Q[:, 1], Q[:, 2]
+    p = (GAMMA - 1.0) * (E - 0.5 * m * m / rho)
+    return jnp.stack([m, m * m / rho + p, m * (E + p) / rho], axis=1)
+
+
+def _state(rho, u, p):
+    return jnp.asarray([[rho, rho * u, p / (GAMMA - 1.0) + 0.5 * rho * u * u]])
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+def test_a_smooth_hll_flux_has_a_derivative_at_a_sonic_face(smooth):
+    # A sonic left state (u = c, so its slowest wave speed is 0) next to a supersonic right one: the HLL wave bound
+    # s_L = min(min(lo_L, lo_R), 0) sits exactly on its kinks, and the flux, which depends on s_L through fL - fR,
+    # has no derivative there: the jvp picks one side, a central difference averages them. Smoothed (smooth=True),
+    # the jvp is the derivative: central differences agree to O(h^2), and the flux moves by O(delta) = 1e-3 of the
+    # wave speeds.
+    from jno._fvm.trace import _eig_extremes, _flux_jacobian, _hll
+
+    QL, QR = _state(1.0, np.sqrt(GAMMA * (1.0 / GAMMA) / 1.0), 1.0 / GAMMA), _state(0.8, 1.5, 0.5)
+
+    def flux(ql, qr, sm=smooth):
+        ext = [_eig_extremes(_flux_jacobian(_euler1d_flux, q)) for q in (ql, qr)]
+        return _hll(_euler1d_flux(ql), _euler1d_flux(qr), ql, qr, ext[0], ext[1], smooth=sm)
+
+    lo_L, _ = _eig_extremes(_flux_jacobian(_euler1d_flux, QL))
+    assert abs(float(lo_L[0])) < 1e-12  # sonic indeed
+    v = jnp.asarray([[0.3, -0.2, 0.5]])
+    jvp = jax.jvp(lambda q: flux(q, QR), (QL,), (v,))[1]
+    h = 1e-6
+    fd = (flux(QL + h * v, QR) - flux(QL - h * v, QR)) / (2 * h)
+    mismatch = float(jnp.abs(jvp - fd).max() / jnp.abs(fd).max())
+    if smooth:
+        assert mismatch < 1e-6
+        rel = float(jnp.abs(flux(QL, QR) - flux(QL, QR, False)).max() / jnp.abs(flux(QL, QR, False)).max())
+        assert rel < 1e-2
+    else:
+        assert mismatch > 1e-3  # the kink the smooth form removes
+
+
+@pytest.mark.parametrize("smooth", [False, True])
+def test_a_smooth_spectral_radius_is_smooth_for_a_gas_at_rest(smooth):
+    # At rest |u - c| = |u + c|: the spectral radius max(|lo|, |hi|) (Rusanov's speed, Roe's entropy fix) has a kink
+    # in u there, its slope jumping from -1 to +1 (JAX splits a tie, so the jump shows on either side, not at it).
+    # Smoothed within delta = 1e-3 c, the slope a micro-step either side differs by O(1e-3), not by 2.
+    from jno._fvm.trace import _flux_jacobian, _spectral_radius
+
+    def slope(u):
+        q = _state(1.0, u, 1.0)
+        return float(jax.jvp(lambda w: _spectral_radius(_flux_jacobian(_euler1d_flux, w), smooth=smooth),
+                             (q,), (jnp.asarray([[0.0, 1.0, 0.0]]),))[1][0])  # fmt: skip
+
+    jump = abs(slope(1e-6) - slope(-1e-6))
+    if smooth:
+        assert jump < 1e-2
+    else:
+        assert jump > 1.0
