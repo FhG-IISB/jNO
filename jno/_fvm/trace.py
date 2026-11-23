@@ -413,10 +413,15 @@ class _TraceFVM(StrongFormProblem):
                     factors = _factors(sub)
                     divs = [f for f in factors if _is_divergence(f)]
                     rest = [f for f in factors if not _is_divergence(f)]
+                    # only a diffusive flux (one holding a derivative: T.xx, (k*T.x).x) is taken out: a first-order
+                    # divergence stays in the stack, as before -- a multiplier's gradient (stack([p.x, p.y])) is read
+                    # in Green-Gauss form there, which the pressure-velocity coupling relies on, and a convected
+                    # product would need the equation's convective scheme
                     if not (
                         len(divs) == 1
                         and self._has_unknown(_unwrap(divs[0]).target)
                         and not any(self._has_unknown(f) for f in rest)
+                        and all(_has_derivative(F) for _, F in _divergence_vars(divs[0]))
                     ):
                         left[i].append((s, sub))
                         continue
