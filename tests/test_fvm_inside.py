@@ -123,3 +123,72 @@ def test_inside_belongs_to_a_finite_volume_problem():
     ui, ur = u.bind(x=x, y=y), u.bind(x=xr, y=yr)
     with pytest.raises(ValueError, match="inside"):
         jno.fdm([ui.xx + ui.yy, ur - 0.5 * ur.inside, u(xl, yl) - 1.0])
+
+
+def _steady_duct(p_back):
+    """The plenum-fed duct of _plenum_tube, steady, by ptc (positivity, a smooth HLL); ``p_back`` a number or a
+    trainable parameter. Returns the solve (an array, or a differentiable node for a parameter)."""
+    import jax.numpy as jnp
+
+    L, n = 0.5, 20
+    d = jno.shape.rect(0.0, 0.0, L, L / n).structured(n=(n, 1)).quad().domain()
+    x, y, _ = d.variable("interior", split=True)
+    q = d.unknown.vector(4)
+    qi = q.bind(x=x, y=y)
+    rho, mx, my, En = qi[0], qi[1], qi[2], qi[3]
+    u, v = mx / rho, my / rho
+    p = _pressure(qi)
+    fv = jno.fv(flux="hll", smooth=True)
+    Fx = jnn.stack([mx, mx * u + p, my * u, u * (En + p)], axis=-1)
+    Fy = jnn.stack([my, mx * v, my * v + p, v * (En + p)], axis=-1)
+    cons = [Fx.d(x, scheme=fv) + Fy.d(y, scheme=fv)]
+    for tag in ("top", "bottom"):
+        xe, ye, _ = d.variable(tag, split=True)
+        cons.append(q.bind(x=xe, y=ye)[2] - 0.0)
+    xl, yl, _ = d.variable("left", split=True)
+    ql = q.bind(x=xl, y=yl)
+    qin = ql.inside
+    pr = jnn.minimum(jnn.maximum(_pressure(qin) / P0, PR_CRIT), 1.0)
+    rho_j = RHO0 * pr ** (1.0 / GAMMA)
+    vel = jnn.sqrt(jnn.maximum(2.0 * CP * T0 * (1.0 - pr ** ((GAMMA - 1.0) / GAMMA)), 0.0))
+    jet = jnn.stack([rho_j, rho_j * vel, 0.0 * vel, P0 * pr / (GAMMA - 1.0) + 0.5 * rho_j * vel * vel], axis=-1)
+    cons.append(ql - jet)
+    xr, yr, _ = d.variable("right", split=True)
+    qr = q.bind(x=xr, y=yr)
+    qo = qr.inside
+    e_out = p_back / (GAMMA - 1.0) + 0.5 * (qo[1] * qo[1] + qo[2] * qo[2]) / qo[0]
+    cons.append(qr - jnn.stack([qo[0], qo[1], qo[2], e_out], axis=-1))
+    prob = jno.fvm(cons)
+    N = prob._N
+    start = jnp.concatenate([jnp.full(N, 1.8), jnp.full(N, 0.5), jnp.zeros(N), jnp.full(N, 1.8 / (GAMMA - 1.0) + 0.07)])
+    return prob.solve(nonlinear=jno.solve.ptc(positive=[rho, p]), x0=start), N
+
+
+def test_the_mass_flux_of_a_steady_duct_differentiates_by_its_back_pressure():
+    # The steady duct is the plenum gas expanded isentropically to the back pressure, so its mass flux is a closed
+    # form m(p_b) = rho0 pr^(1/g) sqrt(2 cp T0 (1 - pr^((g-1)/g))), pr = p_b / p0, and so is dm/dp_b. The solve by
+    # ptc gives m to its convergence, and its gradient by the back pressure, a trainable parameter, through
+    # custom_root at the root.
+    import jax.numpy as jnp
+    import optax
+
+    def exact(pb):
+        pr = pb / P0
+        return RHO0 * pr ** (1.0 / GAMMA) * jnp.sqrt(2.0 * CP * T0 * (1.0 - pr ** ((GAMMA - 1.0) / GAMMA)))
+
+    import equinox as eqx
+
+    pb = jno.np.parameter((1,), name="p_back")
+    pb.dtype(jnp.float64)
+    pb.optimizer(optax.adam(1e-2))
+    # the stored value too (initialize() applies at a jno.core setup): the solve's structural checks run at it, and
+    # at 0 the outlet would have no pressure
+    pb.model.module = eqx.tree_at(lambda m: m.value, pb.model.module, jnp.asarray([1.5]))
+    node, N = _steady_duct(pb)
+
+    def mass_flux(value):
+        return jnp.mean(jnp.asarray(node.fn(value)).reshape(4, N)[1])
+
+    v = jnp.asarray([1.5])
+    np.testing.assert_allclose(float(mass_flux(v)), float(exact(1.5)), rtol=1e-8)
+    np.testing.assert_allclose(float(jax.grad(mass_flux)(v)[0]), float(jax.grad(exact)(1.5)), rtol=1e-6)
