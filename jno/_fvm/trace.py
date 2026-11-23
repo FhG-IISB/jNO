@@ -777,18 +777,25 @@ class _TraceFVM(StrongFormProblem):
                 cache[key] = (pattern, color, n_colors)
                 self._lru_put(("assemble", key, id(fun)), (fun, assemble))  # the solve reuses this compile
                 return cache[key]
-        raise ValueError("jno.fvm: could not assemble the residual's Jacobian on the face graph.")
+        raise ValueError(
+            "jno.fvm: could not assemble the residual's Jacobian on the face graph. Its stencil is checked at the "
+            "solve's starting state (the initial state of a march, x0= of a steady solve, zeros if neither is "
+            "given), and a residual that is not defined there (a gas at zero density) fails the check: give the "
+            "solve a state it is defined at, solve(x0=...), or in a coupling jno.solve.coupling(x0={problem: state})."
+        )
 
     def _concrete_probe_point(self, u):
-        """A concrete state in place of the traced ``u`` (a march inside ``jax.jit``, a coupling window): the
-        initial state at the stored parameter values, zeros where the problem has none. At zeros a gas has no
-        state to linearise about: its density is the probe's 1 % noise, so ``p/rho`` and the sound speed blow
-        up and no stencil verifies."""
+        """A concrete state in place of the traced ``u`` (a march inside ``jax.jit``, a coupling window, the steady
+        solve of a coupling participant): the initial state at the stored parameter values for a march, the
+        starting state a caller recorded (``_probe_state``) for a steady solve, zeros where there is neither. At
+        zeros a gas has no state to linearise about: its density is the probe's 1 % noise, so ``p/rho`` and the
+        sound speed blow up and no stencil verifies."""
+        n = int(np.prod(u.shape))
         if self._transient:
             u0 = jnp.asarray(self._initial_values(self._concrete_scope()), dtype=u.dtype)
-            if u0.size == int(np.prod(u.shape)):
-                return u0.reshape(u.shape)
-        return jnp.zeros(u.shape, u.dtype)
+        else:
+            u0 = jnp.asarray(self.__dict__.get("_probe_state", np.zeros(0)), dtype=u.dtype)
+        return u0.reshape(u.shape) if u0.size == n else jnp.zeros(u.shape, u.dtype)
 
     def _operator(self, key, fun, u):
         """``fun``'s Jacobian at ``u`` as a BCOO, by colouring; the assembly is jitted once per function (an eager
@@ -1257,7 +1264,8 @@ class _TraceFVM(StrongFormProblem):
         zeros = jnp.zeros(self._Ntot)
         with jax.ensure_compile_time_eval():  # structure is decided on concrete values, also inside jno.core
             zc = jnp.zeros(self._Ntot)
-            probe_at = zc if x0 is None or isinstance(x0, jax.core.Tracer) else jnp.asarray(x0)  # m/rho is undefined at 0
+            # where the residual is defined (m/rho is not at 0): the given start, else one a caller recorded
+            probe_at = self._concrete_probe_point(zc) if x0 is None or isinstance(x0, jax.core.Tracer) else jnp.asarray(x0)
             linear_problem = self._is_affine("steady", make_probe, self._Ntot)
             self._pattern("steady", make_probe(), probe_at)
         fp = self._fingerprint() if eager else None

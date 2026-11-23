@@ -145,6 +145,15 @@ def _contains_unknown(node, model):
 def _region_tag(constraint):
     cv = getattr(constraint, "_coord_vars", None) or {}
     tags = {v.tag for v in cv.values() if getattr(v, "axis", None) != "temporal"}  # spatial region only
+    if not tags:
+        # A raw expression with no bound view on top (`F.d(x) - jnn.stack(...)`, a steady vector equation of
+        # stacked fluxes) carries no binding of its own: its region is the one its coordinates are sampled on.
+        # Without it the equation had none, and an algebraic row beside it was taken for a pin.
+        tags = {
+            v.tag
+            for v in _iter_variables(constraint)
+            if getattr(v, "axis", "spatial") != "temporal" and v.tag is not None and not str(v.tag).startswith("n_")
+        }
     return next(iter(tags)) if len(tags) == 1 else (tags or {None})
 
 

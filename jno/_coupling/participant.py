@@ -254,6 +254,9 @@ class _StrongForm(Participant):
                 return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=_solve.lu()))
 
             fn = cache[keys] = jax.jit(run)
+        if x0 is not None and "_probe_state" not in problem.__dict__:
+            # traced inside the compiled solve, the start cannot decide the Jacobian's stencil: record it concretely
+            problem._probe_state = np.asarray(x0, dtype=float).reshape(-1)
         x0 = jnp.zeros(problem._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)  # one signature: no retrace
         return fn([data[k] for k in keys], x0).reshape(-1)
 

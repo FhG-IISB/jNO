@@ -2139,6 +2139,7 @@ def coupling(
     window=None,
     time=None,
     reuse=0,
+    x0=None,
 ):
     """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
     meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
@@ -2171,6 +2172,10 @@ def coupling(
         time: the time scheme of the transient problems: one for all, or ``{problem: scheme}``; default each
             problem's own default (backward Euler).
         reuse: IQN-ILS keeps the columns of this many earlier windows.
+        x0: where steady ``jno.fvm`` / ``jno.fdm`` problems start, ``{problem: state}`` (a state as their
+            ``solve(x0=)`` takes): their first sweep and the stiffness probe. A steady gas needs one, as it has no
+            state at zero. The interface data then start from the starting states too (each sender's value there, or
+            the value that holds its condition at the receiver's start), not from zero.
 
     The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
     """
@@ -2188,6 +2193,7 @@ def coupling(
         window=window,
         time=time,
         reuse=reuse,
+        x0=x0,
     )
 
 

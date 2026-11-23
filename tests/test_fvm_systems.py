@@ -249,3 +249,39 @@ def test_a_stacked_laplacian_beside_a_bare_number(source):
 
     # the same explicit steps on the same fluxes: equal to round-off
     np.testing.assert_allclose(run(True), run(False), atol=1e-12)
+
+
+def _steady_conducting_gas_error(n):
+    """A gas at rest in a tube between a reservoir (p = 1, T = 1) and a wall held at T = 2: the steady Euler
+    equations with conduction of T = p/rho, written as stacked fluxes only. The pressure is the reservoir's and the
+    temperature linear; returns the largest error of T and of p."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.1).structured(n=(n, 1)).quad().domain()
+    x, y, _ = d.variable("interior", split=True)
+    q, T = d.unknown.vector(3), d.unknown()
+    qi, Ti = q.bind(x=x, y=y), T.bind(x=x, y=y)
+    rho, m, En = qi[0], qi[1], qi[2]
+    u = m / rho
+    p = (GAMMA - 1.0) * (En - 0.5 * m * u)
+    F = jnn.stack([m, m * u + p, u * (En + p)], axis=-1)
+    cons = [F.d(x, scheme=jno.fv(flux="roe")) - jnn.stack([0, 0, 0.1 * Ti.xx], axis=-1), Ti - p / rho]
+    xl, yl, _ = d.variable("left", split=True)
+    cons += [q(xl, yl) - jnn.stack([1.0 + 0.0 * xl, 0.0 * xl, 1.0 / (GAMMA - 1.0) + 0.0 * xl], axis=-1), T(xl, yl) - 1.0]
+    xr, yr, _ = d.variable("right", split=True)
+    cons += [q.bind(x=xr, y=yr)[1] - 0.0, T(xr, yr) - 2.0]
+    gas = jno.fvm(cons)
+    N = gas.centroids.shape[0]
+    at_rest = np.concatenate([np.ones(N), np.zeros(N), np.full(N, 1.0 / (GAMMA - 1.0)), np.ones(N)])
+    s = np.asarray(gas.solve(x0=at_rest)).reshape(4, N)
+    xc = np.asarray(gas.centroids)[:, 0]
+    pressure = (GAMMA - 1.0) * (s[2] - 0.5 * s[1] ** 2 / s[0])
+    return np.abs(s[3] - (1.0 + xc)).max(), np.abs(pressure - 1.0).max()
+
+
+def test_a_steady_conducting_gas_with_an_algebraic_temperature():
+    # Name the break: with no bound view on top of the vector equation (no qi.t, as in a march), it had no region,
+    # so the algebraic row T - p/rho beside it was taken for a pin and the system refused ("one PDE equation per
+    # unknown"). Solved, the flux's dissipation on the density jump (a stationary contact) drives a small flow, an
+    # error of second order: measured 5.2e-3 and 1.5e-3 on 10 and 20 cells (order 1.76), 4.2e-4 on 40 (1.88).
+    (e1, p1), (e2, p2) = _steady_conducting_gas_error(10), _steady_conducting_gas_error(20)
+    assert e1 < 1e-2 and max(p1, p2) < 1e-2
+    assert 1.6 < np.log2(e1 / e2) < 2.2

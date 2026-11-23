@@ -59,6 +59,7 @@ class CouplingSpec:
     window: object = None
     time: object = None
     reuse: int = 0
+    x0: object = None
 
     def __post_init__(self):
         if self.scheme not in ("gauss-seidel", "jacobi"):
@@ -85,6 +86,8 @@ class _Data:
     node: object = None
     setter: object = None
     values: np.ndarray = None  # at the receiver's interface nodes
+    cond: int = None  # the index of the condition it was made for
+    received: object = None  # that condition as its receiver imposes it (this field's node in it)
 
 
 @dataclass
@@ -95,6 +98,14 @@ class _Condition:
     tags: dict = field(default_factory=dict)  # participant -> its boundary tag in this condition
     coords: dict = field(default_factory=dict)  # participant -> its coordinate binding {name: Variable}
     receiver: int = None  # fixed by construction (a Robin condition), else decided by structure
+
+
+def _nodes(node):
+    """Every node of an expression."""
+    n = _unwrap(node)
+    yield n
+    for c in _iter(n):
+        yield from _nodes(c)
 
 
 def _spatial_tags(node):
@@ -122,6 +133,7 @@ class Coupled:
         if not self.conditions:
             raise ValueError("jno.core([...]): problems on their own meshes need interface conditions between them.")
         self.stiffness = {}
+        self._guess = self._guesses()  # participant -> the state a steady one starts from (x0=)
         transient = [i for i, part in enumerate(self.parts) if part.transient()]
         self._window = self._windows(transient) if transient else None  # (window, t0, t1)
         if self.spec.alpha is not None:
@@ -357,24 +369,24 @@ class Coupled:
         probe = self.__dict__.setdefault("_probe", {})
         if i not in probe:
             received = [(k, *self._receive(i, self.conditions[k])) for k in mine]
+            for k, c, ds in received:
+                for d in ds:
+                    d.cond, d.received = k, c
             probe[i] = (part.rebuild([c for _, c, _ in received]), {k: d for k, _, d in received})
         prob, data = probe[i]
         iface = part.interface(self.conditions[kv].tags[i], self.spec.measure)
         flux = self._own_part(cf.expr, i)
         windowed = part.transient(prob) and self._window is not None
+        about = windowed or i in self._guess  # probed about where it starts, not from zero
+        starts = self._starts(windowed)
         base = {}  # the data the probe starts from, per (condition, data index)
         for k, ds in data.items():
             face = part.interface(self.conditions[k].tags[i], self.spec.measure)
             for j, d in enumerate(ds):
-                sender = self.parts[d.sender]
-                if windowed and sender.transient():  # its own problem: the coupled ones are not built yet
-                    src = sender.interface(d.sender_tag, self.spec.measure)
-                    vals = sender.sample(sender.problem, sender.initial(sender.problem), d.expr, d.sender_tag, src)
-                    base[k, j] = np.asarray(self._map(d, face, src) @ np.asarray(vals), float)
-                else:
-                    base[k, j] = np.zeros(face.points.shape[0])
+                peers = [o for os in data.values() for o in os]
+                base[k, j] = self._start_values(d, starts, peers) if about else np.zeros(face.points.shape[0])
         step = 1.0
-        if windowed:  # a small step about the start for a nonlinear problem; exact either way for a linear one
+        if about:  # a small step about the start for a nonlinear problem; exact either way for a linear one
             step = 1e-3 * max(1.0, max(float(np.abs(base[kv, j]).max(initial=0.0)) for j in range(len(data[kv]))))
         out = []
         for level in (0.0, step):
@@ -388,10 +400,99 @@ class Coupled:
                 window, t0, _ = self._window
                 state = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i))
             else:
-                state = part.solve(prob, extra)
+                state = part.solve(prob, extra, x0=self._guess.get(i))
             out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra)))
         self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / (step * iface.total)
         return self.stiffness[key]
+
+    def _guesses(self):
+        """``{participant: state}`` from ``coupling(x0={problem: state})``: where a steady participant starts (its first
+        sweep and the stiffness probe). A gas has no state at zero, so a steady gas needs one."""
+        given = self.spec.x0 or {}
+        if not isinstance(given, dict):
+            raise ValueError("jno.solve.coupling(x0=...): give a dict {problem: state}.")
+        out = {}
+        for prob, state in given.items():
+            i = next((k for k, part in enumerate(self.parts) if part.problem is prob), None)
+            if i is None:
+                raise ValueError("jno.solve.coupling(x0=...): a problem that is not one of the coupled ones.")
+            part = self.parts[i]
+            if part.transient():
+                raise ValueError(
+                    "jno.solve.coupling(x0=...): a transient problem starts from its initial condition; x0= is where a "
+                    "steady one starts."
+                )
+            if part.kind == "fem":
+                raise NotImplementedError("jno.solve.coupling(x0=...): a jno.fem problem's steady solve takes no start.")
+            v = np.asarray(state, dtype=float).reshape(-1)
+            if v.size != int(part.problem._Ntot):
+                raise ValueError(
+                    f"jno.solve.coupling(x0=...): the state has {v.size} values, the problem {int(part.problem._Ntot)} "
+                    "(one per unknown component and cell or node, as its solve(x0=) takes)."
+                )
+            out[i] = v
+        return out
+
+    def _starts(self, windowed=True):
+        """Each participant's starting state: its initial state (transient, in a windowed coupling), its x0=, or None."""
+        return [
+            part.initial(part.problem) if windowed and part.transient() else self._guess.get(i)
+            for i, part in enumerate(self.parts)
+        ]
+
+    def _start_values(self, d, starts, peers):
+        """Where data field ``d`` starts, at its receiver's interface nodes. What its sender gives from the state it
+        starts at (read on its own problem as built: the coupled ones may not exist yet); for a value whose sender has
+        no state, the value that makes the received condition hold at the receiver's own start (the interface where
+        the receiver already is: a gas starting at rest reads its wall at its own temperature, not at 0); else 0.
+        ``peers`` are the data fields the receiver reads: a condition that also reads another one is left at 0."""
+        r = self.parts[d.receiver]
+        dst = r.interface(d.receiver_tag, self.spec.measure)
+        s = self.parts[d.sender]
+        if starts[d.sender] is not None:
+            src = s.interface(d.sender_tag, self.spec.measure)
+            vals = s.sample(s.problem, starts[d.sender], d.expr, d.sender_tag, src)
+            return np.asarray(self._map(d, dst, src) @ np.asarray(vals), float)
+        zero = np.zeros(dst.points.shape[0])
+        if d.flux or starts[d.receiver] is None or d.received is None:
+            return zero
+        coef, rest = self._solve_for(d)
+        if coef is None:
+            return zero
+        if rest is not None and any(_unwrap(n) is _unwrap(o.node) for o in peers for n in _nodes(rest)):
+            return zero
+        vals = 0.0 if rest is None else np.asarray(r.sample(r.problem, starts[d.receiver], rest, d.receiver_tag, dst))
+        return np.broadcast_to(-np.asarray(vals, float) / coef, zero.shape).copy()
+
+    def _solve_for(self, d):
+        """``(c, rest)`` with the received condition ``= c * d.node + rest`` and ``rest`` free of ``d.node``; ``(None,
+        None)`` when it is not affine in it in that plain way (the node inside a product of unknowns, a function)."""
+        from .._fvm.trace import _concrete_literal, _factors, _signed_terms
+
+        coef, rest = 0.0, []
+        for sg, term in _signed_terms(d.received, distribute=False):
+            factors = _factors(term)
+            hits = [f for f in factors if _unwrap(f) is _unwrap(d.node)]
+            if not hits:
+                if any(_unwrap(n) is _unwrap(d.node) for n in _nodes(term)):
+                    return None, None
+                rest.append(term if sg > 0 else -1.0 * term)
+                continue
+            others = [f for f in factors if f is not hits[0]]
+            if len(hits) > 1 or not all(_concrete_literal(f) for f in others):
+                return None, None
+            coef += sg * float(np.prod([float(np.asarray(_unwrap(f).value)) for f in others]))
+        if coef == 0.0:
+            return None, None
+        total = None
+        for t in rest:
+            total = t if total is None else total + t
+        return coef, total
+
+    def _start_data(self, states):
+        """Every data field at its start (:meth:`_start_values`) before the first sweep, in place of zeros."""
+        for d in self.data:
+            d.values = self._start_values(d, states, [o for o in self.data if o.receiver == d.receiver])
 
     def _unfloat(self):
         """A steady participant with no essential condition of its own that takes only fluxes is singular (a
@@ -504,6 +605,8 @@ class Coupled:
         for k, c in enumerate(self.conditions):
             r = self.assign[k]
             cond, data = self._receive(r, c)
+            for d in data:
+                d.cond, d.received = k, cond
             self._all_data.extend(data)
             extra[r].append(self._as_condition(r, cond, c))
         problems = [p.rebuild(extra[i]) if extra[i] else p.problem for i, p in enumerate(self.parts)]
@@ -714,13 +817,16 @@ class Coupled:
         self._accel = _accelerator(self.spec)
         transient = [i for i in range(n) if self.parts[i].transient(self.problems[i])]
         if not transient:
-            states = self._iterate([None] * n, [None] * n)
+            states = [self._guess.get(i) for i in range(n)]
+            self._start_data(states)
+            states = self._iterate([None] * n, states)
             self.iterations = len(self.history)
             self.states = states
             return [self._shape(i, st) for i, st in enumerate(states)]
         window, t0, t1 = self._window
         start = [self.parts[i].initial(self.problems[i]) if i in transient else None for i in range(n)]
-        states = list(start)
+        states = [start[i] if i in transient else self._guess.get(i) for i in range(n)]
+        self._start_data(states)
         frames = [[] for _ in range(n)]
         self.window_iterations, self.times = [], [t0]
         t = t0

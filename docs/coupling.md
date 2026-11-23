@@ -29,6 +29,7 @@ The whole of such an example, with all three kinds of condition, is the tutorial
     | three slabs in series (fvm, fem, fdm), the middle one floating | exact to 1e-7 |
     | two solids brought into contact (fem k 1, fvm k 4) | the contact temperature (Carslaw & Jaeger) to 1.2 %, the erf profiles to 2 % at h ≈ 0.02, dt 1e-3 |
     | a capacity-free slab on a heating wall (quasi-steady partner) | the equivalent Robin problem to the O(h²) of the transfer |
+    | a steady conducting gas at rest (started with `x0=`) on a steady fem wall | the gas alone with the wall as its Robin condition, to 1e-8 |
     | a thick cylinder under an fvm gas at rest and a radial temperature (plane strain) | the radial displacement (Timoshenko & Goodier) to 0.2 % |
     | the axisymmetric meridian of a Lamé cylinder under an axisymmetric gas | to 1 % |
     | two insulated bars brought into contact, the fvm bar on ten explicit steps per window | their heat conserved to 2.4 % of the heat moved, 0.8 % at twenty steps (the end-of-window flux: 24 %) |
@@ -78,6 +79,11 @@ With transient problems in the list, the coupling advances **window by window**:
 - Each transient problem marches the window `[t, t + window]` with its own steps and the interface data held over
   it.
 - A steady problem is solved again in every sweep: it is quasi-steady, as a gas next to a slowly heating wall is.
+  A steady gas has no state at zero, so give it one to start from, `jno.solve.coupling(x0={gas: state})` (a
+  state as its `solve(x0=)` takes, e.g. at rest).
+- The interface data start where the problems do: each at what its sender gives from its initial state or `x0=`,
+  or, when the sender has neither, at the value that holds the condition at its receiver's start (a gas starting
+  at rest reads its wall at its own temperature, not at 0).
 - A flux sent by a problem that took several steps in the window is its **mean over them** (the trapezoid rule
   for an explicit or IMEX march, the step ends for backward Euler), so what the receiver takes in over the window
   is what the sender gave out. Give a fast-changing sender a step finer than the window.
@@ -97,6 +103,7 @@ window as the same compiled program.
 | `dirichlet=`, `alpha=` | see above |
 | `measure=` | `None`, `"axisymmetric"`, `"axisymmetric:0"` |
 | `implicit=`, `window=`, `time=` | see above |
+| `x0=` | `{problem: state}`: where steady `jno.fvm` / `jno.fdm` problems start (first sweep, stiffness probe) |
 
 A stall below `tol` (the participants' own solves are not that accurate) is named as such.
 
@@ -132,7 +139,6 @@ row, conservative. See the [tutorial](tutorials/15-coupling/hot-gas-vessel.md).
   fields, not conservative).
 - The window mean of an explicit sender's flux is the trapezoid rule over its steps, not its own stage
   quadrature: right after a jump (two bodies brought into contact) its first step is off.
-- The stiffness probe of a steady participant starts from zero, which a gas has no state at.
 - A gas wall moved by its wall (two-way fluid–structure interaction), turbulence models and grain burnback are
   outside it.
 

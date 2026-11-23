@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import jno
+import jno.jnp_ops as jnn
 from jno._coupling.driver import CouplingSpec, couple
 
 KA, KB = 1.0, 10.0
@@ -156,3 +157,71 @@ def test_three_problems_in_series():
     np.testing.assert_allclose(sa, exact3(_coords(pa, da)), atol=1e-7)
     np.testing.assert_allclose(sb, exact3(_coords(pb, db)), atol=1e-7)
     np.testing.assert_allclose(sc, exact3(_coords(pc, dc)), atol=1e-7)
+
+
+GAMMA, T_L, T_R = 1.4, 1.0, 2.0
+
+
+def _resting_gas(robin=False):
+    """A gas at rest in a tube 0 < x < 1 (a strip of cells): the Euler equations with heat conduction (KA) of an
+    algebraic temperature T = p/rho in the energy row, fed by a reservoir at rest (p = 1, T = T_L) on the left,
+    closed by a wall on the right. ``robin``: that wall is a slab [1, 2] of conductivity KB held at T_R, written as
+    the condition it puts on the gas, KA dT/dn + KB (T - T_R) = 0."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.1).structured(n=(10, 1)).quad().domain()
+    x, y, _ = d.variable("interior", split=True)
+    q, T = d.unknown.vector(3), d.unknown()  # (rho, m, E) and T
+    qi, Ti = q.bind(x=x, y=y), T.bind(x=x, y=y)
+    rho, m, En = qi[0], qi[1], qi[2]
+    u = m / rho
+    p = (GAMMA - 1.0) * (En - 0.5 * m * u)
+    F = jnn.stack([m, m * u + p, u * (En + p)], axis=-1)
+    # Roe: it holds a stationary contact (a density jump at one pressure) all but exactly; HLL diffuses it into a flow
+    cons = [F.d(x, scheme=jno.fv(flux="roe")) - jnn.stack([0, 0, KA * Ti.xx], axis=-1), Ti - p / rho]
+    xl, yl, _ = d.variable("left", split=True)
+    cons += [q(xl, yl) - jnn.stack([1.0 / T_L + 0.0 * xl, 0.0 * xl, 1.0 / (GAMMA - 1.0) + 0.0 * xl], axis=-1)]
+    cons += [T(xl, yl) - T_L]
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    cons.append(q.bind(x=xr, y=yr)[1] - 0.0)
+    Tr = T.bind(x=xr, y=yr)
+    if robin:
+        cons.append(KA * Tr.d(nr) + KB * (Tr - T_R))
+    gas = jno.fvm(cons)
+    n = gas.centroids.shape[0]
+    at_rest = np.concatenate([np.full(n, 1.0 / T_L), np.zeros(n), np.full(n, 1.0 / (GAMMA - 1.0)), np.full(n, T_L)])
+    return gas, Tr, Tr.d(nr), at_rest
+
+
+def test_a_steady_gas_couples_from_a_starting_state():
+    # Name the break: a steady participant is solved inside a compiled program from a traced state, and its
+    # Jacobian's pattern was checked at zeros, where a gas has no density; the stiffness probe solved it from zeros
+    # and with its wall at 0 too. Started at rest (x0=), the gas and a steady wall [1, 2] held at T_R reach what the
+    # gas alone reaches with the wall as its Robin condition: the wall holds a linear field exactly and its interface
+    # temperature is uniform along the face, so the two agree to the coupling tolerance.
+    gas, Tg, fg, at_rest = _resting_gas()
+    dw = jno.shape.rect(1.0, 0.0, 2.0, 0.1, size=0.05).domain()
+    u, v = dw.fem_symbols()
+    xw, yw, _ = dw.variable("interior", split=True)
+    ui, vi = u.bind(x=xw, y=yw), v.bind(x=xw, y=yw)
+    xo, yo, _ = dw.variable("right", split=True)
+    wall = jno.fem([KB * (ui.x * vi.x + ui.y * vi.y), u(xo, yo) - T_R])
+    xs, ys, _ = dw.variable("left", split=True)
+    Ts = u.bind(x=xs, y=ys)
+    core = jno.core([gas, wall, Tg - Ts, KA * fg + KB * Ts.d(dw.variable("left", normals=True))])
+    sg, sw = core.solve(coupling=jno.solve.coupling(tol=1e-10, x0={gas: at_rest}))
+    ref_gas, *_ = _resting_gas(robin=True)
+    ref = np.asarray(ref_gas.solve(x0=at_rest)).reshape(np.shape(sg))
+    np.testing.assert_allclose(sg, ref, atol=1e-8)
+    pts = np.asarray(dw.mesh_connectivity["points"])[:, 0]
+    sw = np.asarray(sw)
+    Ti = sw[np.isclose(pts, 1.0)].mean()
+    assert T_L < Ti < T_R
+    np.testing.assert_allclose(sw, Ti + (T_R - Ti) * (pts - 1.0), atol=1e-8)  # the wall: linear
+
+
+def test_a_steady_gas_without_a_starting_state_says_so():
+    # From zeros a gas has no density: whichever check meets it first (the stencil check, Newton) raises and names
+    # the remedy, a starting state.
+    gas, *_ = _resting_gas()
+    with pytest.raises((ValueError, RuntimeError), match="x0"):
+        gas.solve()
