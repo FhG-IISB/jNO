@@ -159,6 +159,7 @@ class IMEXScheme:
         from functools import partial
 
         from .backend_blocks import _block_time_grid, _resample_trajectory
+        from .timeschemes import _cfl_substeps
 
         s0 = jnp.asarray(block.state0).reshape(-1)
         grid = jnp.asarray(_block_time_grid(block), s0.dtype)
@@ -188,10 +189,10 @@ class IMEXScheme:
                 u = cache[("run", ident, sub)](u, grid[k - 1])
                 states.append(u)
             return _resample_trajectory(jnp.stack(states), grid, save_ts, s0.dtype, self._order)
-        sub = (
-            1 if self.cfl is None else max(1, int(np.ceil(dt / float(cfl_dt(jax.lax.stop_gradient(s0), self.cfl)) - 1e-12)))
-        )
-        march = cache.get(("march", ident, sub))
+        # traced (a coupling's window, a gradient): one number of substeps from the initial state, itself traced
+        # when that state is
+        sub = 1 if self.cfl is None else _cfl_substeps(dt, cfl_dt(jax.lax.stop_gradient(s0), self.cfl))
+        march = cache.get(("march", ident, sub)) if isinstance(sub, int) else None
         if march is None:
 
             def advance(u, t_next):
@@ -202,6 +203,6 @@ class IMEXScheme:
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
                 return jnp.concatenate([s0[None, :], ys], axis=0)
 
-            if not traced:
+            if not traced and isinstance(sub, int):
                 march = cache[("march", ident, sub)] = jax.jit(march)
         return _resample_trajectory(march(s0, grid), grid, save_ts, s0.dtype, self._order)

@@ -29,6 +29,17 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _cfl_substeps(dt, limit):
+    """How many substeps of ``dt`` the stable step ``limit`` asks for: a number when ``limit`` is known, a traced
+    count inside a compiled program (a coupling's window march, the same program for every window), which
+    ``fori_loop`` takes as a dynamic bound. A program compiled per count would be traced again whenever the
+    count changes."""
+    try:
+        return max(1, int(np.ceil(dt / float(limit) - 1e-12)))
+    except jax.errors.ConcretizationTypeError:
+        return jnp.maximum(1, jnp.ceil(dt / limit - 1e-12)).astype(jnp.int32)
+
+
 class _TimeScheme:
     """Base for the ``fem.solve(time=…)`` schemes.
 
@@ -1898,11 +1909,10 @@ class _ERKScheme(_TimeScheme):
                 states.append(u)
             traj = jnp.stack(states)
             return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
-        # Traced (a gradient through the march): a fixed number of substeps, from the initial state.
-        sub = (
-            1 if self.cfl is None else max(1, int(np.ceil(dt / float(cfl_dt(jax.lax.stop_gradient(s0), self.cfl)) - 1e-12)))
-        )
-        march = cache.get(("march", ident, sub))
+        # Traced (a gradient through the march, a coupling's window): one number of substeps, from the initial
+        # state -- a traced count when that state is traced too
+        sub = 1 if self.cfl is None else _cfl_substeps(dt, cfl_dt(jax.lax.stop_gradient(s0), self.cfl))
+        march = cache.get(("march", ident, sub)) if isinstance(sub, int) else None
         if march is None:
 
             def advance(u, t_next):
@@ -1913,7 +1923,7 @@ class _ERKScheme(_TimeScheme):
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
                 return jnp.concatenate([s0[None, :], ys], axis=0)
 
-            if not traced:
+            if not traced and isinstance(sub, int):
                 march = cache[("march", ident, sub)] = jax.jit(march)
         traj = march(s0, grid)
         return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)

@@ -3268,6 +3268,11 @@ def _make_named_with_partials_cls(view_cls):
                         continue
                     result = result.d(var, scheme=scheme)
                     i += 1
+                if all(getattr(cv[name], "axis", None) == "temporal" for name in seq):
+                    # A time derivative lives where the field is bound, so it keeps the binding (as the scalar
+                    # field view's does): unbound, a vector equation `q.bind(...).t + ...` said nowhere where it
+                    # holds, and an algebraic row beside it read as a pin. A spatial partial stays the plain view.
+                    return _with_scheme(type(self)(result, cv), getattr(self, "_bind_scheme", None))
                 return type(self)._base_view(result)
             return getattr(object.__getattribute__(self, "_expr"), key)
 

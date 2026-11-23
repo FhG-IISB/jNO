@@ -121,6 +121,56 @@ def test_an_algebraic_temperature_is_solved_with_the_local_terms():
     np.testing.assert_allclose(ev, (C0 + C1 * Tv) * Tv, atol=1e-9)
 
 
+def test_an_algebraic_unknown_beside_a_vector_equation_is_one_more_equation():
+    # A vector `q.t` and `jnn.stack` keep no coordinate binding of their own, so the vector equation's region read
+    # as unknown and the algebraic row s = q0 + q1 beside it was taken for a pin: "one PDE equation per unknown".
+    d, x, y, t, xi, yi = _box()
+    q, s = d.unknown.vector(2), d.unknown()
+    qi, si = q.bind(x=x, y=y, t=t), s.bind(x=x, y=y, t=t)
+    prob = jno.fvm(
+        [
+            qi.t + jnn.stack([qi[0], 2.0 * qi[1]], axis=-1),
+            si - (qi[0] + qi[1]),
+            q(xi, yi) - jnn.stack([1.0 + 0.0 * xi, 1.0 + 0.0 * xi], axis=-1),
+            s(xi, yi) - (2.0 + 0.0 * xi),
+        ]
+    )
+    traj = np.asarray(prob.solve(time=jno.solve.imex("ars222"))).reshape(N_TIME, 3, -1)
+    times = np.linspace(0.0, T_END, N_TIME)[:, None]
+    np.testing.assert_allclose(traj[:, 2], traj[:, 0] + traj[:, 1], atol=1e-10)  # the algebraic row, to Newton's tol
+    # ARS(2,2,2) at h = 5e-3 on rates 1 and 2: a second-order error of ~1e-5 relative
+    np.testing.assert_allclose(traj[:, 0], np.exp(-times) + 0.0 * traj[:, 0], rtol=1e-4)
+    np.testing.assert_allclose(traj[:, 1], np.exp(-2.0 * times) + 0.0 * traj[:, 1], rtol=1e-4)
+
+
+def test_a_flux_through_an_algebraic_unknown_gets_its_stable_step():
+    # e conducted through an algebraic T = e/c: the flux depends on e only through T, so a stable-step estimate
+    # that leaves the algebraic rows out saw no flux at all, took one step where the diffusion needed several, and
+    # the march blew up. Filled in from the local algebraic rows, it is the scalar u.t = (k/c) Δu, step for step.
+    k, c = 0.1, 2.5
+    d = jno.shape.rect(0.0, 0.0, 0.5, 0.5).sized(0.05).domain(time=(0.0, 0.05, 11))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    e, T = d.unknown(), d.unknown()
+    ei, Ti = e.bind(x=x, y=y, t=t), T.bind(x=x, y=y, t=t)
+    pair = jno.fvm(
+        [
+            ei.t - k * (Ti.xx + Ti.yy),
+            Ti - ei / c,
+            T(xr, yr) - 1.0,
+            e(xi, yi) - (2.0 * c + 0.0 * xi),
+            T(xi, yi) - (2.0 + 0.0 * xi),
+        ]
+    )
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    scalar = jno.fvm([ui.t - (k / c) * (ui.xx + ui.yy), u(xr, yr) - 1.0, u(xi, yi) - (2.0 + 0.0 * xi)])
+    got = np.asarray(pair.solve(time=jno.solve.imex("ars222", cfl=0.5))).reshape(11, 2, -1)[:, 1]
+    want = np.asarray(scalar.solve(time=jno.solve.imex("ars222", cfl=0.5))).reshape(11, -1)
+    np.testing.assert_allclose(got, want, atol=1e-10)  # the same steps of the same ODE: round-off and Newton tol
+
+
 FLAME = dict(a=100.0, ta=10.0, q=3.0, t0=1.0, tc=1.2, width=0.02)
 
 

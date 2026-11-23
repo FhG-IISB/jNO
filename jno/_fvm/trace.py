@@ -956,25 +956,57 @@ class _TraceFVM(StrongFormProblem):
             q0[k] = jax.jit(newton)(q0[k])
         return jnp.concatenate(q0, axis=1).T.reshape(-1)
 
-    def _cfl_dt(self, residual_first_order, mass_diag):
+    def _cfl_dt(self, residual_first_order, mass_diag, local=None):
         """``(state, cfl) -> Δt``: ``2·cfl / ρ`` with ``ρ`` the spectral radius of the scaled first-order
         tangent ``M⁻¹ ∂R/∂u``, by Gelfand's formula on 40 matrix-free products (it converges for complex
         eigenvalue pairs too). For upwinded convection ``ρ = 2a/Δx``, so ``cfl`` is the classical Courant
         number; diffusion and reaction enter the same way. The first-order operator is read because a
-        limiter's derivatives would inflate the bound."""
+        limiter's derivatives would inflate the bound.
 
-        m = mass_diag(None)
+        ``local = (L, (n_fields, n_cells))``, the cell-local residual, makes rows without mass (algebraic) follow
+        the differential ones: each product first fills them in from ``∂L/∂u`` cell by cell, as the IMEX Newton
+        holds them. A flux that reads the state only through an algebraic unknown (the conduction of a
+        temperature that an energy defines) is otherwise invisible to the estimate."""
+
+        with jax.ensure_compile_time_eval():  # concrete where it can be: the mass is structural
+            m = mass_diag(None)
         dyn = m > 0
-        f = lambda y: residual_first_order(y, self._start_time(), {})  # noqa: E731
+        t0 = self._start_time()
+        f = lambda y: residual_first_order(y, t0, {})  # noqa: E731
         v0 = jnp.where(dyn, jnp.asarray(np.random.default_rng(3).standard_normal(m.shape[0])), 0.0)
+        try:
+            algebraic = local is not None and not bool(np.all(np.asarray(dyn)))
+        except jax.errors.TracerArrayConversionError:  # a traced mass: fill in anyway (identity on dynamic rows)
+            algebraic = local is not None
+        if algebraic:
+            local_fn, (nf, nc) = local
+            alg = ~jnp.asarray(dyn).reshape(nf, nc).T  # (cells, fields)
+
+        def completion(w):
+            """``v -> v`` with its algebraic part solving the linearised local algebraic rows at ``w``."""
+            if not algebraic:
+                return lambda v: v
+            cols = []
+            for k in range(nf):  # column k of every cell's (nf, nf) block of ∂L/∂u, from one jvp
+                tang = jnp.zeros((nf, nc), w.dtype).at[k].set(1.0).reshape(-1)
+                cols.append(jax.jvp(lambda z: local_fn(z, t0), (w,), (tang,))[1].reshape(nf, nc).T)
+            B = jnp.stack(cols, axis=2)
+            A = jnp.where(alg[:, :, None], B, jnp.eye(nf, dtype=w.dtype)[None])  # dynamic rows: keep v there
+
+            def fill(v):
+                rhs = jnp.where(alg, 0.0, v.reshape(nf, nc).T)
+                return jnp.linalg.solve(A, rhs[..., None])[..., 0].T.reshape(-1)
+
+            return fill
 
         @jax.jit
         def rho_of(w):
             _, lin = jax.linearize(f, w)
+            fill = completion(w)
 
             def body(i, carry):
                 v, acc = carry
-                v = jnp.where(dyn, lin(v) / jnp.where(dyn, m, 1.0), 0.0)
+                v = jnp.where(dyn, lin(fill(v)) / jnp.where(dyn, m, 1.0), 0.0)
                 nrm = jnp.linalg.norm(v)
                 acc = acc + jnp.where(i >= 20, jnp.log(jnp.maximum(nrm, jnp.finfo(v.dtype).tiny)), 0.0)
                 return v / jnp.maximum(nrm, jnp.finfo(v.dtype).tiny), acc
@@ -982,9 +1014,9 @@ class _TraceFVM(StrongFormProblem):
             _, acc = jax.lax.fori_loop(0, 40, body, (v0 / jnp.linalg.norm(v0), 0.0))
             return jnp.exp(acc / 20.0)
 
-        def stable(w, cfl):
-            rho = float(rho_of(jnp.asarray(w)))
-            return 2.0 * float(cfl) / max(rho, np.finfo(float).tiny)
+        def stable(w, cfl):  # an array: traced inside a compiled march (a coupling's window), concrete outside
+            rho = rho_of(jnp.asarray(w))
+            return 2.0 * float(cfl) / jnp.maximum(rho, np.finfo(float).tiny)
 
         return stable
 
@@ -1098,7 +1130,9 @@ class _TraceFVM(StrongFormProblem):
             common["metadata"]["local_residual"] = local_fn
             common["metadata"]["local_layout"] = (self._nf, self._N)
             common["metadata"]["mass_diag"] = mass_diag
-            common["metadata"]["cfl_dt_flux"] = self._cfl_dt(lambda y, t, args: flux_first(y, t), mass_diag)
+            common["metadata"]["cfl_dt_flux"] = self._cfl_dt(
+                lambda y, t, args: flux_first(y, t), mass_diag, local=(local_fn, (self._nf, self._N))
+            )
         if not isinstance(time, (_ERKScheme, IMEXScheme)):  # only an implicit step reads the tangent
             with jax.ensure_compile_time_eval():
                 if getattr(self, "_override", None) is not None and not second:

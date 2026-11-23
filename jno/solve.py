@@ -2096,7 +2096,8 @@ def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
     Args:
         method: ``"ars222"`` (second order, L-stable implicit part) or ``"ars443"`` (third order).
         cfl: substeps per step from the transport's stable step, as ``jno.solve.erk(cfl=)``.
-        newton_tol, newton_steps: the per-cell Newton's step tolerance and its most iterations.
+        newton_tol: the per-cell Newton's step tolerance.
+        newton_steps: the per-cell Newton's most iterations.
     """
     from .utils.solver.imex import IMEXScheme
 
@@ -2107,16 +2108,18 @@ def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12):
     """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
     ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
 
-    Each step solves ``(J + |diag J| / Δτ) δ = -F(u)`` (a backward-Euler step in pseudo-time) and ``Δτ`` grows as the
-    residual falls (switched evolution relaxation, Mulder & van Leer 1985), so it follows the transient path
-    where it must -- a shock or a front that has not formed in the start state -- and ends as Newton. A row with
-    no diagonal (a saddle point's constraint) stays algebraic.
+    Each step solves ``(J + D / Δτ) δ = -F(u)``, ``D`` the row sums of ``|J|`` (a backward-Euler step in
+    pseudo-time), and ``Δτ`` grows as the residual falls (switched evolution relaxation, Mulder & van Leer 1985),
+    so it follows the transient path where it must -- a shock or a front that has not formed in the start state --
+    and ends as Newton. Every row is damped, a saddle point's constraint too (its row sum is not zero where its
+    diagonal is).
 
     Args:
-        dtau0: the first pseudo-time step, in units of the diagonal (``1`` doubles it; smaller is more cautious).
+        dtau0: the first pseudo-time step, in units of ``D`` (smaller is more cautious).
         dtau_max: the largest pseudo-time step.
         max_steps: the most steps.
-        rtol, atol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
+        rtol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
+        atol: see ``rtol``.
     """
     from .utils.solver.ptc import PseudoTransient
 
