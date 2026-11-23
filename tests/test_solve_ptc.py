@@ -149,3 +149,33 @@ def test_ptc_keeps_a_declared_positive_quantity_positive():
     assert not np.allclose(plain, 1.0, atol=1e-3)  # the failure the positivity guards against
     kept = np.asarray(jno.solve.ptc(max_steps=80)(R, u0, jacobian=J, linear_solve=solve, positive=lambda u: u))
     np.testing.assert_allclose(kept, 1.0, atol=1e-10)
+
+
+def test_a_gradient_flows_through_ptc():
+    # Name the break: ptc's pseudo-time march is a lax.while_loop, which reverse mode cannot differentiate, so a
+    # gradient through a steady solve by ptc raised. With the implicit function theorem at the root (custom_root,
+    # one solve with J^T), d/ds of a functional of -div((1 + u^2) grad u) = s f matches central finite differences;
+    # and it equals Newton's gradient of the same problem (the same root, so the same derivative).
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as jnn
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.12).domain()
+
+    def functional(s, nonlinear):
+        x, y, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y)
+        f = 10.0 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+        prob = jno.fvm([-((1.0 + ui * ui) * ui.x).x - ((1.0 + ui * ui) * ui.y).y - s * f, u(xb, yb) - 0.0])
+        sol = jnp.asarray(prob.solve(nonlinear=nonlinear))
+        return jnp.sum(sol**3)
+
+    s0, h = 1.3, 1e-5
+    g = float(jax.grad(functional)(s0, jno.solve.ptc()))
+    fd = (float(functional(s0 + h, jno.solve.ptc())) - float(functional(s0 - h, jno.solve.ptc()))) / (2 * h)
+    assert abs(g) > 1e-3
+    assert abs(g - fd) <= 1e-6 * abs(fd)  # central differences: O(h^2) of a smooth functional
+    g_newton = float(jax.grad(functional)(s0, None))
+    assert abs(g - g_newton) <= 1e-8 * abs(g_newton)

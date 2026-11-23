@@ -89,6 +89,22 @@ class PseudoTransient:
 
             linear_solve = compose_linear_solve_fn(_solve.lu(), None, None)
 
+        # The march must carry no tangents: the gradient comes from custom_root at the root (the implicit function
+        # theorem, one solve with J^T), never from the loop, which reverse mode cannot differentiate. So the residual,
+        # the tangent and the positive quantities run on their constants held out of the gradient, as newton_direct.
+        f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)  # noqa: E731
+        u0 = jnp.asarray(u0).reshape(-1)
+        f_c, f_consts = jax.closure_convert(f0, u0)
+        J_c, J_consts = jax.closure_convert(jacobian, u0)
+        f_consts, J_consts = jax.lax.stop_gradient((f_consts, J_consts))
+        f_fwd = lambda u: f_c(u, *f_consts)  # noqa: E731
+        J_fwd = lambda u: J_c(u, *J_consts)  # noqa: E731
+        g_fwd = None
+        if positive is not None:
+            g_c, g_consts = jax.closure_convert(positive, u0)
+            g_consts = jax.lax.stop_gradient(g_consts)
+            g_fwd = lambda u: g_c(u, *g_consts)  # noqa: E731
+
         groups = None if row_groups is None else np.asarray(row_groups, dtype=np.int32)
         n_groups = None if groups is None else int(groups.max()) + 1
 
@@ -107,8 +123,7 @@ class PseudoTransient:
             J = jnp.asarray(J)
             return J + jnp.diag(per_group(jnp.abs(J).sum(axis=1))) / dtau
 
-        u0 = jnp.asarray(u0)
-        n0 = jnp.linalg.norm(residual_fn(u0))
+        n0 = jnp.linalg.norm(f_fwd(u0))
         tol = self.atol + self.rtol * n0
         tiny = jnp.finfo(u0.dtype).tiny
 
@@ -121,12 +136,12 @@ class PseudoTransient:
         def step_fraction(u, du):
             """The largest of 1, 1/2, ... that leaves every positive quantity positive and >= keep of its value
             (0 if none does)."""
-            if positive is None:
+            if g_fwd is None:
                 return jnp.asarray(1.0, u.dtype)
-            g0 = positive(u)
+            g0 = g_fwd(u)
 
             def admissible(a):
-                g1 = positive(u + a * du)
+                g1 = g_fwd(u + a * du)
                 return jnp.all((g1 > 0.0) & (g1 >= self.keep * g0))
 
             ok = jax.vmap(admissible)(fractions)
@@ -138,12 +153,12 @@ class PseudoTransient:
             grow = jnp.minimum(n_prev / jnp.maximum(n_now, tiny), 2.0)
             grow = jnp.maximum(grow, jnp.where(full, self.ramp, 1.0))
             dtau = jnp.where(k > 0, jnp.minimum(dtau * grow, self.dtau_max), dtau)
-            du = linear_solve(damped(jacobian(u), dtau), -residual_fn(u))
+            du = linear_solve(damped(J_fwd(u), dtau), -f_fwd(u))
             alpha = step_fraction(u, du)
             cand = u + alpha * du
             if project is not None:
                 cand = project(cand)
-            n_cand = jnp.linalg.norm(residual_fn(cand))
+            n_cand = jnp.linalg.norm(f_fwd(cand))
             # a step that leaves the problem (a negative density, an overflow), that no fraction keeps positive, or
             # that blows the residual up is refused, and the pseudo-time step cut: the march takes the smaller step
             # from the same state. A step cut short for positivity shortens the pseudo-time step with it.
@@ -154,6 +169,17 @@ class PseudoTransient:
             return u, dtau, jnp.where(ok, n_now, n_prev), k + 1, n_new, ok & (alpha == 1.0)
 
         init = (u0, jnp.asarray(self.dtau0, u0.dtype), n0, jnp.asarray(0), n0, jnp.asarray(False))
-        u, _, _, k, n, _ = jax.lax.while_loop(cond, body, init)
-        self.last = (k, n, tol)  # concrete only when called eagerly
-        return u
+        root, _, _, k, n, _ = jax.lax.while_loop(cond, body, init)
+        if not isinstance(k, jax.core.Tracer):  # concrete only when called eagerly; a tracer must not leak out
+            self.last = (k, n, tol)
+
+        from .newton_krylov import _gated_direct, _solve_at
+
+        def tangent(g, y):  # solve J x = y (J^T on the reverse pass) at the root: the implicit-function gradient
+            J = jacobian(root)
+            who = "the ptc tangent"
+            fwd = lambda _mv, rhs: _solve_at(root, _gated_direct, J, rhs, linear_solve, who, "forward")  # noqa: E731
+            tsp = lambda _mv, rhs: _solve_at(root, _gated_direct, J.T, rhs, linear_solve, who, "transpose")  # noqa: E731
+            return jax.lax.custom_linear_solve(g, y, fwd, transpose_solve=tsp)
+
+        return jax.lax.custom_root(f0, root, lambda _f, _x0: root, tangent)
