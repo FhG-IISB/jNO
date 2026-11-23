@@ -1517,3 +1517,17 @@ def test_a_march_owning_argument_is_still_refused_on_a_moving_mesh():
     ):
         with pytest.raises(NotImplementedError, match=why):
             _heat(d, yb.d(tb) - 0.1).solve(**kw)
+
+
+def test_an_unknown_freezes_like_its_trial_symbol():
+    """`d.unknown().bind(...).freeze(values)` is the known field with those nodal values, as `fem_symbols()`'s trial
+    function frozen the same way (a geometry law reads the solved field through it)"""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    xb, yb, _tb = d.variable("boundary", split=True)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    values = 1.0 + 2.0 * pts[:, 0] - 3.0 * pts[:, 1]
+    u = d.unknown(name="w")
+    got = np.asarray(u.bind(x=xb, y=yb).freeze(values).eval()).reshape(-1)
+    U, _V = d.fem_symbols()
+    want = np.asarray(U.bind(x=xb, y=yb).freeze(values).eval()).reshape(-1)
+    np.testing.assert_allclose(got, want, atol=1e-12)
