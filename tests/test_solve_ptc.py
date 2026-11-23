@@ -65,3 +65,22 @@ def test_ptc_ends_where_newton_does_on_a_well_posed_nonlinear_problem():
     ref = np.asarray(prob.solve())
     assert np.abs(ref).max() > 0.05
     np.testing.assert_allclose(np.asarray(prob.solve(nonlinear=jno.solve.ptc())), ref, atol=1e-9)
+
+
+def test_ptc_keeps_a_declared_positive_quantity_positive():
+    # R(u) = 1 - 1/u: one root, u = 1, increasing and concave. From u = 50 a pseudo-time step lands below zero, where
+    # R is finite (it tends to 1) and has no root, so the march runs off to minus infinity (measured: -inf after 80
+    # steps): the residual never grows by the 100x the step check refuses. Declared positive (a step may take at most
+    # 80 % of it away), the march stays on the side of the root and ends on it.
+    import jax.numpy as jnp
+
+    def R(u):
+        return 1.0 - 1.0 / u
+
+    u0 = jnp.array([50.0])
+    J = jax.jacfwd(R)
+    solve = jnp.linalg.solve
+    plain = np.asarray(jno.solve.ptc(max_steps=80)(R, u0, jacobian=J, linear_solve=solve))
+    assert not np.allclose(plain, 1.0, atol=1e-3)  # the failure the positivity guards against
+    kept = np.asarray(jno.solve.ptc(max_steps=80)(R, u0, jacobian=J, linear_solve=solve, positive=lambda u: u))
+    np.testing.assert_allclose(kept, 1.0, atol=1e-10)

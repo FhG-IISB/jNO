@@ -2104,7 +2104,7 @@ def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
     return IMEXScheme(method=method, cfl=cfl, newton_tol=newton_tol, newton_steps=newton_steps)
 
 
-def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12):
+def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, positive=None, keep=0.2):
     """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
     ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
 
@@ -2120,10 +2120,17 @@ def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12):
         max_steps: the most steps.
         rtol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
         atol: see ``rtol``.
+        positive: expressions of the unknowns that must stay positive in every cell, e.g. ``[rho, p]`` of a gas
+            (``jno.fvm``). A step is cut to the largest of ``1, 1/2, 1/4, ...`` that keeps each of them positive and
+            at least ``keep`` of its value; without it a step into a state where the residual is still finite (a
+            negative density) is taken, and the march does not come back.
+        keep: the share of a positive quantity a step must leave (0.2: a step takes at most 80 % of it away).
     """
     from .utils.solver.ptc import PseudoTransient
 
-    return PseudoTransient(dtau0=dtau0, dtau_max=dtau_max, max_steps=max_steps, rtol=rtol, atol=atol)
+    return PseudoTransient(
+        dtau0=dtau0, dtau_max=dtau_max, max_steps=max_steps, rtol=rtol, atol=atol, positive=positive, keep=keep
+    )
 
 
 def coupling(

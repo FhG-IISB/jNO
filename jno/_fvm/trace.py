@@ -594,6 +594,21 @@ class _TraceFVM(StrongFormProblem):
     def _evaluator(self, q, qb, t, scope):
         return _Evaluator(self, q, qb, t, scope)
 
+    def _cell_values_fn(self, exprs, extra_params=None):
+        """``u -> (n_cells, len(exprs))``: each expression of the unknowns evaluated in every control volume (what
+        ``jno.solve.ptc(positive=[...])`` keeps positive)."""
+        exprs = [_unwrap(e) for e in exprs]
+        scope = self._params_scope(extra_params)
+        nB = self.graph.b_owner.shape[0]
+
+        def values(dofs):
+            q = self._split_dofs(dofs)
+            qb = [qk[self.ops.b_owner] if nB else jnp.zeros((0, qk.shape[1]), qk.dtype) for qk in q]
+            ev = self._evaluator(q, qb, None, scope)
+            return jnp.concatenate([ev.rows(ev.values(e, "cells"), 1, "cells") for e in exprs], axis=1)
+
+        return values
+
     def _local_split(self):
         """Per equation, its volume terms as ``(local, rest)``: a term that differentiates no unknown in space
         acts on each cell alone (a reaction, a source, an algebraic closure); the rest (a non-conservative
@@ -1313,15 +1328,18 @@ class _TraceFVM(StrongFormProblem):
             with jax.ensure_compile_time_eval():
                 pre = self._frozen(precond, lambda: self._operator("steady", make_probe(), probe_at))
             driver = compose_nonlinear_solve_fn(nonlinear, linear, pre, fem=self._host())
+            carry = {}
+            if getattr(nonlinear, "positive", None) is not None:  # quantities the driver keeps positive, per cell
+                carry["positive"] = self._cell_values_fn(nonlinear.positive, extra_params)
             # eager: the whole Newton compiled once (as jno.fdm's _compiled_steady); run uncompiled, it re-traced
             # and recompiled its loop on every solve (2.3 s of a 3.2 s repeat solve of a 24 x 24 cavity)
-            fn = jax.jit(lambda u_init: driver(residual, u_init, jacobian=tangent)) if eager else None
-            kept = (driver, fn)
+            fn = jax.jit(lambda u_init: driver(residual, u_init, jacobian=tangent, **carry)) if eager else None
+            kept = (driver, fn, carry)
             if eager:
                 self._lru_put(key, kept)
-        driver, fn = kept
+        driver, fn, carry = kept
         if fn is None:
-            return driver(residual, u0, jacobian=tangent)
+            return driver(residual, u0, jacobian=tangent, **carry)
         from ..utils.solver.solver_api import record_nonlinear_verdict
 
         sol = fn(u0)
