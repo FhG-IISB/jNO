@@ -944,8 +944,9 @@ def _time_value_components(value_node, coords, vt, comp, region):
 
 #: The field key of a test function evaluated as a seeded trial field (see ``_seeded_element_residual``).
 _SEED_KEY = ("__test_seed__",)
-#: Internal A/B switch (tests): ``[False]`` evaluates every term per test DOF, as before. Read at build time.
-_SEEDED_TEST = [True]
+#: Internal A/B switch, read at build time: ``[None]`` seeds a kernel whose test field has more than one
+#: component (:func:`_seeding_pays`), ``[True]`` seeds every provably linear piece, ``[False]`` none (tests).
+_SEEDED_TEST = [None]
 
 
 class _NotSeedable(Exception):
@@ -962,7 +963,7 @@ _SEED_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 def _seeded_piece(piece):
     """``(rewritten, test_nodes)`` -- ``piece`` with its test function as a trial field keyed ``_SEED_KEY``
     -- or ``None`` when ``piece`` is not provably linear in it (see ``_seeded_element_residual``)."""
-    if not _SEEDED_TEST[0]:
+    if _SEEDED_TEST[0] is False:
         return None
     try:
         return _SEED_CACHE[piece]
@@ -3220,7 +3221,7 @@ def assemble_fem_native(
         # The TANGENT is forward over this SEEDED evaluation. Forward-over-reverse is symmetric only to
         # round-off (3e-17 measured), so its element block is averaged within the solver's symmetry gate
         # (``_symmetrise_own_block``) -- bitwise symmetric, as LDLᵀ and the eigs symmetry guard need.
-        seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded else []
+        seeds = [p for p in (_seeded_piece(pc) for pc in pieces) if p is not None] if seeded and _seeding_pays(tfi) else []
         out = _seeded_element_residual(seeds, tfi, per, loc, w) if seeds else None
         plain = pieces if out is None else [pc for pc in pieces if _seeded_piece(pc) is None]
         for piece in plain:
@@ -3241,6 +3242,19 @@ def assemble_fem_native(
     # Only where linearity is PROVEN (``linear_degree(..., strict=True) == 1``): a test function under
     # ``stop_gradient``, a network, or a call the walk does not know keeps the per-DOF evaluation, which
     # is the same number for every linear term and the old number for anything else.
+    #
+    # Seeding pays only for a test field with SEVERAL components. Per DOF, a vector field's test basis is
+    # n_local x n_comp one-hot columns, n_comp - 1 of every n_comp of them zero, and seeding removes that
+    # waste; a scalar field has none to remove, and the reverse pass (forward-over-reverse in the tangent)
+    # then only adds work. Measured on CPU and GPU over scalar and vector P1/P2 triangles and tetrahedra, an
+    # SUPG advection-diffusion form, a St. Venant-Kirchhoff and a stabilised flow form: every seeded kernel
+    # traces slower (10-25 % per program, which a rebuilt-per-call march pays on every call); the scalar
+    # forms run no faster seeded on either device (the tangent of a scalar P2 tetrahedron is slower), while
+    # the 3-D vector tangents run faster seeded on the GPU (vector P2 tetrahedron, stabilised flow).
+    def _seeding_pays(tfi):
+        mode = _SEEDED_TEST[0]
+        return mode if mode is not None else int(vecs[tfi]) > 1
+
     def _seeded_element_residual(seeded, tfi, per, loc, w):
         """``r = ∂/∂s Σ_q w_q I(s)`` for the seeded pieces, or ``None`` if one of them does not reduce to a
         real scalar per quadrature point (the per-DOF path then takes every piece, and raises as before)."""
