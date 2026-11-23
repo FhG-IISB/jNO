@@ -139,6 +139,7 @@ nav:
       - Limits & build time: fem/limitations.md
     - Finite Difference Method: fdm.md
     - Finite Volume Method: fvm.md
+    - Coupling problems on their own meshes: coupling.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
     - Partial-Element Equivalent Circuits: peec.md
     - Solvers & preconditioners: solvers.md
@@ -218,6 +219,8 @@ nav:
       - Burgers shock: tutorials/14-fvm/burgers-shock-fvm.md
       - Sod shock tube: tutorials/14-fvm/sod-shock-tube-fvm.md
       - Lid-driven cavity: tutorials/14-fvm/lid-driven-cavity-fvm.md
+    - Coupling:
+      - Rocket nozzle wall: tutorials/15-coupling/rocket-nozzle-wall.md
     - Bayesian:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md

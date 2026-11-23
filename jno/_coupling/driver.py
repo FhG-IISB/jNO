@@ -277,30 +277,54 @@ class Coupled:
                 continue
             values = [k for k in ks if not self.conditions[k].flux]
             fluxes = [k for k in ks if self.conditions[k].flux]
-            if len(values) > 1 or len(fluxes) > 1:
-                raise NotImplementedError(
-                    "jno.core([...]): between two problems, one value condition and one flux condition per "
-                    "interface (several coupled fields are not supported yet)."
-                )
-            if values and fluxes:
-                d = self._dirichlet_side(a, b, values[0], fluxes[0])
-                assign[values[0]] = d
-                assign[fluxes[0]] = b if d == a else a
-            elif fluxes:
-                k = fluxes[0]
+            paired = set()
+            for kv in values:  # a value pairs with the flux condition of the same field: Dirichlet-Neumann
+                mine = self._fields(self.conditions[kv].expr, derivative=False)
+                match = [kf for kf in fluxes if kf not in paired and self._fields(self.conditions[kf].expr, True) & mine]
+                if len(match) != 1:
+                    raise ValueError(
+                        "jno.core([...]): a value condition couples two problems only with the flux condition of the "
+                        f"same field (what leaves one side enters the other); found {len(match)} for one of them."
+                    )
+                kf = match[0]
+                paired.add(kf)
+                d = self._dirichlet_side(a, b, kv, kf)
+                assign[kv] = d
+                assign[kf] = b if d == a else a
+            for k in fluxes:  # any other flux condition is a load on the side it differentiates
+                if k in paired:
+                    continue
                 diff = [i for i in (a, b) if has_derivative(self.conditions[k].expr, self.parts[i].owns)]
                 if len(diff) != 1:
                     raise ValueError(
-                        "jno.core([...]): a flux condition without a value condition is a load on one side; this "
-                        "one differentiates both. Add the value condition (the fields agree) to make a pair."
+                        "jno.core([...]): a flux condition without a value condition is a load on one side; this one "
+                        "differentiates both. Add the value condition (the fields agree) to make a pair."
                     )
                 assign[k] = diff[0]
-            else:
-                raise ValueError(
-                    "jno.core([...]): a value condition alone does not couple two problems; add the flux "
-                    "condition (what leaves one side enters the other)."
-                )
         return assign
+
+    def _fields(self, expr, derivative):
+        """The (participant, field) pairs ``expr`` reads: every unknown, or only those it differentiates."""
+        from ..trace import Hessian, Jacobian
+
+        out = set()
+
+        def key(n):
+            for i, part in enumerate(self.parts):
+                if part.owns(n):
+                    return (i, getattr(n, "field_key", None) or id(getattr(n, "model", n)))
+            return None
+
+        def walk(n, inside):
+            n = _unwrap(n)
+            k = key(n)
+            if k is not None and (inside or not derivative):
+                out.add(k)
+            for c in _iter(n):
+                walk(c, inside or isinstance(n, (Jacobian, Hessian)))
+
+        walk(expr, False)
+        return out
 
     def _dirichlet_side(self, a, b, kv, kf):
         """The participant that receives the value condition of a Dirichlet-Neumann pair."""

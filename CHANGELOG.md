@@ -15,6 +15,14 @@ jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `
 - `jno.solve.simple()` and `jno.solve.piso()`: pressure-correction solvers on the assembled tangent of any saddle system. `jno.precond.saddle(schur="simple")`: the SIMPLE Schur approximation, built from the assembled operator alone.
 - `jno.fvm(...).solve()` composes into `jno.core` for inverse problems and differentiates under `jax.grad`. `jno.precond.gmg()` runs on the cell lattice of a structured quad or hex mesh, and `jno.info` reports how each equation was read.
 - Docs: `docs/fvm.md`, and five tutorials in `tutorials/14-fvm` (Poisson, advection-diffusion, Burgers shock, Sod shock tube, lid-driven cavity).
+- Coupling of problems on their own meshes: `jno.core([p1, p2, ..., interface conditions]).solve(coupling=jno.solve.coupling(...))` joins `jno.fem`, `jno.fdm` and `jno.fvm` problems through conditions written as for one problem (a value, a flux, a load). Each condition goes to one side by its structure (Dirichlet-Neumann by probed interface stiffness, Robin-Robin with `alpha=`, a floating steady side made Robin, one-way loads); values cross non-matching interfaces by interpolation and fluxes by an L2 (mortar) projection that keeps their total, also axisymmetric (`measure=`). Transient couplings advance window by window (quasi-steady partners, Aitken or IQN-ILS, implicit or loose). Checked against series slabs, two solids in contact, and a thick cylinder under gas pressure and a radial temperature. See `docs/coupling.md`.
+- `solve(time=..., x0=state, span=(t0, t1))` on fem, fdm and fvm marches a window of `domain.time` from a given state.
+- `jno.solve.ptc()`: pseudo-transient continuation for steady solves Newton cannot start. `jno.solve.imex()`: IMEX Runge-Kutta (ARS(2,2,2), ARS(4,4,3)) with the cell-local terms of a `jno.fvm` problem (reactions, sources, algebraic closures) solved per cell; for stiff chemistry written as species transport.
+
+### Fixed
+- `jno.fem`: a nodal field parameter in a boundary term failed with a broadcast error; a coupling's nodal data in an essential condition are read at solve time.
+- `jno.fvm`: a nodal data field is read at a site through the mesh's P1/Q1 interpolant (vertex-centred sites were 0.4 % off); the `u.t` coefficient probe reads only the time-derivative terms (an axisymmetric gas's source made it NaN).
+- A window copy of a transient block shares the block's compiled marches (the march cache keys scalars by value and leaves out the start state).
 
 ### Changed
 - `jno.fdm` and `jno.fvm` share their constraint classification, DOF layout and parameter machinery in `jno._strong_form.StrongFormProblem`. `jno.fdm` behaves as before.
