@@ -748,9 +748,9 @@ class _TraceFVM(StrongFormProblem):
         from ..fdm import _assemble_sparse, _color_columns, _stencil_pattern
 
         pairs = np.stack([self.graph.owner, self.graph.neigh], axis=1)
-        if isinstance(u, jax.core.Tracer):  # decided on concrete values: a traced probe point becomes zeros
+        if isinstance(u, jax.core.Tracer):  # decided on concrete values: a traced probe point is replaced
             with jax.ensure_compile_time_eval():
-                u = jnp.zeros(u.shape, u.dtype)
+                u = self._concrete_probe_point(u)
         n = int(np.prod(jnp.shape(u)))
         rng = np.random.default_rng(0)
         v = jnp.asarray(rng.standard_normal(n), dtype=jnp.asarray(u).dtype)
@@ -773,6 +773,17 @@ class _TraceFVM(StrongFormProblem):
                 self._lru_put(("assemble", key, id(fun)), (fun, assemble))  # the solve reuses this compile
                 return cache[key]
         raise ValueError("jno.fvm: could not assemble the residual's Jacobian on the face graph.")
+
+    def _concrete_probe_point(self, u):
+        """A concrete state in place of the traced ``u`` (a march inside ``jax.jit``, a coupling window): the
+        initial state at the stored parameter values, zeros where the problem has none. At zeros a gas has no
+        state to linearise about: its density is the probe's 1 % noise, so ``p/rho`` and the sound speed blow
+        up and no stencil verifies."""
+        if self._transient:
+            u0 = jnp.asarray(self._initial_values(self._concrete_scope()), dtype=u.dtype)
+            if u0.size == int(np.prod(u.shape)):
+                return u0.reshape(u.shape)
+        return jnp.zeros(u.shape, u.dtype)
 
     def _operator(self, key, fun, u):
         """``fun``'s Jacobian at ``u`` as a BCOO, by colouring; the assembly is jitted once per function (an eager

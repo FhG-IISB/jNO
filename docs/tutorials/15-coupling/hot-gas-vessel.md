@@ -38,6 +38,7 @@ seven to eleven times per window; the pressure is a load. It runs in under two m
 - **Steps of their own.** The wall takes one backward Euler step per window; the gas takes twenty explicit steps
   (`jno.solve.imex`: the fluxes explicit with its CFL substeps, the algebraic temperature solved in every cell).
   The heat flux the wall receives is the gas's mean over the window, so the heat the wall takes in is the heat the
-  gas gave out.
+  gas gave out. The gas can also step implicitly (`time={gas: None, ...}`, backward Euler): one step per window,
+  about five times its acoustic step limit, gives the same pressure, wall temperature and energy balance.
 
 See [Coupling problems on their own meshes](../../coupling.md).

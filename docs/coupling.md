@@ -132,8 +132,7 @@ row, conservative. See the [tutorial](tutorials/15-coupling/hot-gas-vessel.md).
   fields, not conservative).
 - The window mean of an explicit sender's flux is the trapezoid rule over its steps, not its own stage
   quadrature: right after a jump (two bodies brought into contact) its first step is off.
-- Backward Euler cannot yet assemble the Jacobian of a gas with an algebraic temperature; march it with
-  `jno.solve.imex`. The stiffness probe of a steady participant starts from zero, which a gas has no state at.
+- The stiffness probe of a steady participant starts from zero, which a gas has no state at.
 - A gas wall moved by its wall (two-way fluid–structure interaction), turbulence models and grain burnback are
   outside it.
 

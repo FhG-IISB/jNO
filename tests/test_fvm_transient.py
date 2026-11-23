@@ -172,3 +172,47 @@ def test_taylor_green_vortex_decays_at_its_rate():
     traj = np.asarray(prob.solve(time=jno.solve.theta(0.5)))
     energy = (traj[:, 0] ** 2 + traj[:, 1] ** 2) @ prob.volumes
     assert energy[-1] / energy[0] == pytest.approx(np.exp(-4 * nu * T), rel=2e-2)
+
+
+def _conducting_gas():
+    """A gas at rest in a closed box (slip walls): the Euler equations with conduction of an algebraic
+    temperature ``T = p/rho`` in the energy row, held at T = 1 on the left wall; a hot spot in the middle."""
+    gamma, k = 1.4, 0.05
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(8, 8)).quad().domain(time=(0.0, 0.04, 3))
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    q, T = d.unknown.vector(4), d.unknown()
+    qi, Ti = q.bind(x=x, y=y, t=t), T.bind(x=x, y=y, t=t)
+    rho, mx, my, En = qi[0], qi[1], qi[2], qi[3]
+    u, v = mx / rho, my / rho
+    p = (gamma - 1.0) * (En - 0.5 * (mx * u + my * v))
+    fv = jno.fv(flux="hll")
+    Fx = jnn.stack([mx, mx * u + p, my * u, u * (En + p)], axis=-1)
+    Fy = jnn.stack([my, mx * v, my * v + p, v * (En + p)], axis=-1)
+    cons = [qi.t + Fx.d(x, scheme=fv) + Fy.d(y, scheme=fv) - jnn.stack([0, 0, 0, k * (Ti.xx + Ti.yy)], axis=-1)]
+    cons.append(Ti - p / rho)
+    for tag in ("left", "right", "top", "bottom"):
+        xe, ye, _ = d.variable(tag, split=True)
+        ne = d.variable(tag, normals=True)
+        qe = q.bind(x=xe, y=ye)
+        cons.append(qe[1] * ne[..., 0] + qe[2] * ne[..., 1])
+    xl, yl, _ = d.variable("left", split=True)
+    cons.append(T(xl, yl) - 1.0)
+    T0 = 1.0 + 0.5 * jnn.exp(-20.0 * ((xi - 0.5) ** 2 + (yi - 0.5) ** 2))
+    cons += [q(xi, yi) - jnn.stack([1.0 / T0, 0.0 * xi, 0.0 * xi, 1.0 / (gamma - 1.0) + 0.0 * xi], axis=-1)]
+    cons += [T(xi, yi) - T0]
+    return jno.fvm(cons)
+
+
+def test_a_gas_steps_implicitly_inside_a_compiled_program():
+    # Name the break: inside jax.jit (a coupling window) the state is traced, and the sparsity of the Jacobian
+    # was probed at zeros plus 1 % noise: negative densities and pressures, where the flux has complex wave
+    # speeds and the assembled tangent missed the jvp by 1-10 % at every stencil width, so the march raised
+    # "could not assemble". Slip walls close the box: the backward Euler steps keep the mass to round-off.
+    gas = _conducting_gas()
+    x0 = jax.numpy.asarray(gas._initial_values(gas._params_scope())).reshape(-1)
+    traj = np.asarray(jax.jit(lambda s: gas.solve(x0=s))(x0)).reshape(3, 5, -1)
+    assert np.isfinite(traj).all()
+    mass = traj[:, 0] @ np.asarray(gas.volumes)
+    np.testing.assert_allclose(mass, mass[0], rtol=1e-13)
+    assert np.abs(traj[-1, 1:3]).max() > 1e-6  # the hot spot has started to push the gas: the steps did march
