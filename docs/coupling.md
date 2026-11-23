@@ -19,6 +19,8 @@ sol = jno.core([gas, wall,
 
 `sol` holds each problem's solution, in the order given; for a transient coupling, its states at the window
 ends. The coupled problem is kept as `core.coupled` (`.iterations`, `.history`, `.assign`, `.window_iterations`).
+The whole of such an example, with all three kinds of condition, is the tutorial
+[Hot gas in a thick-walled vessel](tutorials/15-coupling/hot-gas-vessel.md).
 
 !!! measured "Checked against closed forms"
     | case | result |
@@ -29,6 +31,7 @@ ends. The coupled problem is kept as `core.coupled` (`.iterations`, `.history`, 
     | a capacity-free slab on a heating wall (quasi-steady partner) | the equivalent Robin problem to the O(h²) of the transfer |
     | a thick cylinder under an fvm gas at rest and a radial temperature (plane strain) | the radial displacement (Timoshenko & Goodier) to 0.2 % |
     | the axisymmetric meridian of a Lamé cylinder under an axisymmetric gas | to 1 % |
+    | two insulated bars brought into contact, the fvm bar on ten explicit steps per window | their heat conserved to 2.4 % of the heat moved, 0.8 % at twenty steps (the end-of-window flux: 24 %) |
 
 ## Who takes which condition
 
@@ -75,6 +78,9 @@ With transient problems in the list, the coupling advances **window by window**:
 - Each transient problem marches the window `[t, t + window]` with its own steps and the interface data held over
   it.
 - A steady problem is solved again in every sweep: it is quasi-steady, as a gas next to a slowly heating wall is.
+- A flux sent by a problem that took several steps in the window is its **mean over them** (the trapezoid rule
+  for an explicit or IMEX march, the step ends for backward Euler), so what the receiver takes in over the window
+  is what the sender gave out. Give a fast-changing sender a step finer than the window.
 - `implicit=True` (the default) iterates each window until the data stop changing. `implicit=False` takes one
   sweep per window, which is cheaper and first order in the window.
 
@@ -105,6 +111,16 @@ A stall below `tol` (the participants' own solves are not that accurate) is name
   sources. A 0-D ignition matches scipy's Radau to 1 % in the delay at a step two thousand times past the explicit
   limit, and a premixed flame runs at its travelling-wave speed to 2 %.
 
+## A gas that takes a wall temperature
+
+An inviscid gas has no conduction and cannot take a temperature on its wall; with conduction in its energy
+equation it can. `jno.fvm` takes one condition per unknown and face, and a condition names one unknown, so the
+temperature is an unknown of its own with the algebraic row `T - p/rho` (solved in every cell by
+`jno.solve.imex`), beside the vector of conserved variables that takes the slip condition. In a vector equation,
+write the conduction as the divergence of a stacked flux,
+`jnn.stack([0, 0, 0, -k*T.x]).d(x, scheme="finite_difference") + ...`: a face flux, conservative. See the
+[tutorial](tutorials/15-coupling/hot-gas-vessel.md).
+
 ## Limitations
 
 - Gradients do not reach a parameter through the coupled fixed point yet.
@@ -114,6 +130,12 @@ A stall below `tol` (the participants' own solves are not that accurate) is name
 - A vector load on a `jno.fem` side must be a coefficient times the boundary normal (`p * n`).
 - A vertex-centred fvm side sends a Dirichlet interface's flux from its least-squares gradient (exact for linear
   fields, not conservative).
+- The window mean of an explicit sender's flux is the trapezoid rule over its steps, not its own stage
+  quadrature: right after a jump (two bodies brought into contact) its first step is off.
+- A Laplacian inside `jnn.stack` in a vector `jno.fvm` equation is evaluated cell by cell, not as a face flux, and
+  is not conservative; use the divergence form above.
+- Backward Euler cannot yet assemble the Jacobian of a gas with an algebraic temperature; march it with
+  `jno.solve.imex`. The stiffness probe of a steady participant starts from zero, which a gas has no state at.
 - A gas wall moved by its wall (two-way fluid–structure interaction), turbulence models and grain burnback are
   outside it.
 

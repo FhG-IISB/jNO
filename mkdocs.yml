@@ -221,6 +221,7 @@ nav:
       - Lid-driven cavity: tutorials/14-fvm/lid-driven-cavity-fvm.md
     - Coupling:
       - Rocket nozzle wall: tutorials/15-coupling/rocket-nozzle-wall.md
+      - Hot gas in a thick-walled vessel: tutorials/15-coupling/hot-gas-vessel.md
     - Bayesian:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
