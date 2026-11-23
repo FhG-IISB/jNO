@@ -7742,6 +7742,9 @@ def fem(
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
     prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
+    from ._strong_form import _refuse_inside
+
+    _refuse_inside(constraints if isinstance(constraints, (list, tuple)) else [constraints], "jno.fem")
     _fn._CHUNK_CONSUMED[0] = False
     _fn._QUAD_EXPLICIT[0] = quad_degree is not None
     _fn._QUAD_REPORTED.clear()

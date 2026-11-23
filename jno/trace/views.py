@@ -397,6 +397,20 @@ class ScalarView(_DelegatesToPlaceholder):
         """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
 
+    # Comparisons give a boolean node for `jnn.where`, as the Placeholder's do (Python looks operator methods up on
+    # the class, so `__getattr__` never forwarded them and `p >= p0` on a view raised a TypeError).
+    def __gt__(self, other):
+        return self._expr > getattr(other, "_expr", other)
+
+    def __lt__(self, other):
+        return self._expr < getattr(other, "_expr", other)
+
+    def __ge__(self, other):
+        return self._expr >= getattr(other, "_expr", other)
+
+    def __le__(self, other):
+        return self._expr <= getattr(other, "_expr", other)
+
     def __getattr__(self, name: str):
         if name.startswith("_"):
             raise AttributeError(name)
@@ -2857,6 +2871,16 @@ class FieldViewWithPartials(ScalarView):
         if spatial_coords:
             self._validate_field_coords(np)
 
+    @property
+    def inside(self) -> "FieldViewWithPartials":
+        """At a boundary face of a ``jno.fvm`` problem: this field read in the cell next to the face, where the view
+        itself is the face's value. ``ub - G(ub.inside)`` gives the face its outer state from the inside one (an
+        open outflow, an outlet at a back pressure, an inflow from a plenum, a valve closing into a wall)."""
+        from . import InsideValue
+
+        cv = object.__getattribute__(self, "_coord_vars")
+        return _with_scheme(type(self)(InsideValue(self._expr), dict(cv)), getattr(self, "_bind_scheme", None))
+
     def _validate_field_coords(self, np_mod) -> None:
         import warnings
 
@@ -3275,6 +3299,16 @@ def _make_named_with_partials_cls(view_cls):
                     return _with_scheme(type(self)(result, cv), getattr(self, "_bind_scheme", None))
                 return type(self)._base_view(result)
             return getattr(object.__getattribute__(self, "_expr"), key)
+
+        @property
+        def inside(self):
+            """At a boundary face of a ``jno.fvm`` problem: this field read in the cell next to the face, where the view
+            itself is the face's value. ``qb - G(qb.inside)`` gives the face its outer state from the inside one (an
+            open outflow, an outlet at a back pressure, an inflow from a plenum, a valve closing into a wall)."""
+            from . import InsideValue
+
+            cv = object.__getattribute__(self, "_coord_vars")
+            return _with_scheme(type(self)(InsideValue(self._expr), cv), getattr(self, "_bind_scheme", None))
 
         # No no-args ``grad()`` / ``laplacian()`` convenience methods —
         # tutorials write the explicit form ``u.xx + u.yy`` etc., which reads

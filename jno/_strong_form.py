@@ -55,6 +55,24 @@ def _refuse_fem_only_unknowns(constraints, who="jno.fdm"):
         walk(c)
 
 
+def _refuse_inside(constraints, who):
+    """``.inside`` reads a field in the cell next to a boundary face: only a finite-volume problem has one."""
+    from .trace import InsideValue
+
+    def walk(n):
+        n = _unwrap(n)
+        if isinstance(n, InsideValue):
+            raise ValueError(
+                f"{who}([...]): `.inside` reads a field in the cell next to a boundary face, which only a "
+                "finite-volume problem has. Give the boundary value itself, or solve with jno.fvm([...])."
+            )
+        for c in _iter(n):
+            walk(c)
+
+    for c in constraints:
+        walk(c)
+
+
 def _has_time_variable(node):
     """Does a value expression use the temporal Variable (``tb`` in ``g(xb, yb, tb)``)?"""
     from .trace import Variable
@@ -77,6 +95,8 @@ def _find_unknowns(constraints, who="jno.fdm"):
     from .trace import ModelCall
 
     _refuse_fem_only_unknowns(constraints, who)
+    if who != "jno.fvm":
+        _refuse_inside(constraints, who)
     seen, order = set(), []
 
     def walk(n):
@@ -281,10 +301,12 @@ def _context_leaf(tag, component, domain):
 
 def _map_children(node, fn):
     """``node`` with ``fn`` applied to its children (the node types a strong-form condition is made of)."""
-    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Placeholder
+    from .trace import BinaryOp, FunctionCall, Hessian, InsideValue, Jacobian, Placeholder
 
     if isinstance(node, BinaryOp):
         return BinaryOp(node.op, fn(node.left), fn(node.right))
+    if isinstance(node, InsideValue):
+        return InsideValue(fn(node.target))
     if isinstance(node, FunctionCall):
         return node.copy_with_args([fn(a) if isinstance(a, Placeholder) else a for a in node.args])
     if isinstance(node, Hessian):

@@ -89,6 +89,7 @@ from ._strong_form import (  # noqa: F401  (re-exported: tests and fvm import th
     _normal_jacobians,
     _periodic_axis,
     _refuse_fem_only_unknowns,
+    _refuse_inside,
     _region_tag,
     _rtol,
     _set_temporal,
@@ -488,6 +489,7 @@ def _find_unknown(constraints):
     from .trace import ModelCall
 
     _refuse_fem_only_unknowns(constraints)
+    _refuse_inside(constraints, "jno.fdm")
 
     models = {}
 

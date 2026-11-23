@@ -1421,7 +1421,7 @@ class _Evaluator:
     def values(self, expr, site, override=None):
         """``expr`` evaluated at a site, ``(m, ...)``; ``override`` maps an unknown's index to its values there."""
         from .._strong_form import _map_children
-        from ..trace import Jacobian, ModelCall
+        from ..trace import InsideValue, Jacobian, ModelCall
         from ..trace_evaluator import TraceEvaluator
 
         kind, idx = self._site(site)
@@ -1445,6 +1445,15 @@ class _Evaluator:
                     mean = 0.5 * (a + b) if marker.mode == "arithmetic" else 2.0 * a * b / (a + b)
                     return leaf("mean", mean if idx is None else mean[idx])
                 return leaf("mean", self.values(marker.expr, site, override))
+            if isinstance(n, InsideValue):  # the cell next to a boundary face (a cell's own value in a cell)
+                if kind == "cells":
+                    return rewrite(n.target)
+                if kind != "bfaces":
+                    raise ValueError(
+                        "jno.fvm([...]): `.inside` reads the cell next to a boundary face; an interior face has two."
+                    )
+                cells = self.rows_of(self.values(n.target, "cells"), "cells")
+                return leaf("inside", cells[self.ops.b_owner if idx is None else self.ops.b_owner[idx]])
             if isinstance(n, ModelCall):
                 for k, w in enumerate(self.p.unknowns):
                     if n.model is w:

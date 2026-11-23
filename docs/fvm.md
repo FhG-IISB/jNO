@@ -88,6 +88,22 @@ qb = q.bind(x=xb, y=yb)
 qb[1] * nb[..., 0] + qb[2] * nb[..., 1]     # slip: (hu, hv)·n = 0
 ```
 
+A face can also be given its outer state as a function of the inside one. `qb.inside` is the field read in the
+cell next to the face, where `qb` is the face's own value, and the full condition `qb - G(qb.inside)` makes `G`
+the state on the other side of the face's Riemann problem: an open outflow (`G` the identity), an outlet at a
+back pressure (the inside state with its pressure replaced), an inflow from a plenum at the inside pressure, or a
+valve that closes into a mirror. Comparisons such as `p_in >= p0` give the switch for `jnn.where`. Only finite
+volumes have an inside of a face; `jno.fdm` and `jno.fem` refuse `.inside`.
+
+```python
+qb = q.bind(x=xb, y=yb)
+qin = qb.inside
+pin = pressure(qin)
+jet = plenum_gas_expanded_to(pin)                                   # choked or subsonic
+wall = jnn.stack([qin[0], qin[1], -qin[2], qin[3]], axis=-1)       # mirror (y-normal face)
+qb - jnn.where(pin >= p0, wall, jet)                               # an injector that shuts above p0
+```
+
 A value condition on a region without boundary faces, such as `d.point_region("ppin", (0, 0))`, pins the
 nearest cell. That is how a pressure gauge is set. A periodic tie `u(left) - u(right)` joins the two faces.
 The mesh must be periodic-conforming, and ties for several unknowns on the same faces join them once.
