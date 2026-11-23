@@ -777,7 +777,11 @@ class _TraceFVM(StrongFormProblem):
         # verified at a GENERIC state near `u`: at a piecewise-constant one a limiter's dependence on the second
         # ring vanishes, a too-narrow pattern passes, and the tangents assembled later are wrong
         u = jnp.asarray(u)
-        u = u + 0.01 * (jnp.abs(u) + 1.0) * jnp.asarray(rng.standard_normal(n), dtype=u.dtype)
+        # 1 % of each entry, and of the state's size where an entry is 0 (of 1 for an all-zero state): an absolute
+        # 0.01 was a negative density for a gas at low pressure, a NaN residual where no pattern verifies
+        size = float(jnp.abs(u).max()) if n else 0.0
+        floor = 1e-3 * size if size > 0.0 else 1.0
+        u = u + 0.01 * (jnp.abs(u) + floor) * jnp.asarray(rng.standard_normal(n), dtype=u.dtype)
         # Compiled: run eagerly, a jvp of the residual executes one primitive at a time and XLA compiles each of
         # them on its own -- 555 one-op programs and 18 s of a 21 s first march of a 24 x 24 shallow-water problem.
         ref = jax.jit(lambda w, t: jax.jvp(fun, (w,), (t,))[1])(u, v)

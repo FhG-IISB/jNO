@@ -83,9 +83,10 @@ def _oblique_shock(mach, theta, gamma):
     return beta, 1.0 + 2.0 * gamma / (gamma + 1.0) * ((mach * np.sin(beta)) ** 2 - 1.0)
 
 
-def _wedge(h=0.06, mach=3.0, theta_deg=15.0, gamma=1.4, flux="hll", limiter="minmod"):
-    """Mach 3 over a 15-degree ramp, steady: the freestream (p 1, sound speed 1) on the inflow and the far field,
-    slip on the plate and the ramp, an open supersonic exit. Returns the problem and the freestream state."""
+def _wedge(h=0.06, mach=3.0, theta_deg=15.0, gamma=1.4, flux="hll", limiter="minmod", scale=1.0, smooth=False):
+    """Mach 3 over a 15-degree ramp, steady: the freestream (p and rho ``scale`` times 1 and gamma, sound speed 1) on
+    the inflow and the far field, slip on the plate and the ramp, an open supersonic exit. Returns the problem and the
+    freestream state."""
     import jno.jnp_ops as jnn
 
     th, x0, L, H = np.deg2rad(theta_deg), 0.3, 1.2, 1.0
@@ -96,10 +97,10 @@ def _wedge(h=0.06, mach=3.0, theta_deg=15.0, gamma=1.4, flux="hll", limiter="min
     rho, mx, my, E = qi[0], qi[1], qi[2], qi[3]
     u, v = mx / rho, my / rho
     p = (gamma - 1.0) * (E - 0.5 * (mx * u + my * v))
-    s = jno.fv(flux=flux, limiter=limiter)
+    s = jno.fv(flux=flux, limiter=limiter, smooth=smooth)
     Fx = jnn.stack([mx, mx * u + p, my * u, u * (E + p)], axis=-1)
     Fy = jnn.stack([my, mx * v, my * v + p, v * (E + p)], axis=-1)
-    free = (gamma, gamma * mach, 0.0, 1.0 / (gamma - 1.0) + 0.5 * gamma * mach**2)
+    free = tuple(scale * f for f in (gamma, gamma * mach, 0.0, 1.0 / (gamma - 1.0) + 0.5 * gamma * mach**2))
     cons = [Fx.d(x, scheme=s) + Fy.d(y, scheme=s)]
     for e in ("e4", "e3"):  # the inflow and the far field above: the freestream
         xe, ye, _ = d.variable(e, split=True)
@@ -112,14 +113,18 @@ def _wedge(h=0.06, mach=3.0, theta_deg=15.0, gamma=1.4, flux="hll", limiter="min
     return jno.fvm(cons), free, (rho, p)
 
 
-def test_ptc_reaches_the_steady_supersonic_wedge():
+@pytest.mark.parametrize("scale", [1.0, 1e-2])
+def test_ptc_reaches_the_steady_supersonic_wedge(scale):
     # Name the break: from the freestream, the pseudo-time march let the density go negative while the shock formed
     # (rho_min -0.7 at step 29, git-bug d7f66c4) and never recovered; kept positive, it still ate the pressure of one
     # cell away (a damping factor per conserved variable advances them at different rates) and stalled at |R| 2.1. Expected: the weak oblique shock of the
-    # theta-beta-M relation, p2/p1 = 2.82 at Mach 3 and 15 degrees, on the plateau next to the ramp. h = 0.06 with
-    # minmod smears the shock over a few cells, not the plateau: 3 %.
+    # theta-beta-M relation, p2/p1 = 2.82 at Mach 3 and 15 degrees, on the plateau next to the ramp. h = 0.06 smears
+    # the shock over a few cells, not the plateau: 3 %. Smooth settings (van Albada, a smooth HLL): with minmod the
+    # end phase rides its kinks, and on the GPU (reductions in a varying order) 1 run in 3 stalled at |R| 2e-3. The Euler equations do not see a common scale of
+    # density and pressure, so a freestream at 1 % of them gives the same ratio; there the stencil check's probe used
+    # to add an absolute 0.01 to every entry, a negative density (a NaN residual: "could not assemble").
     gamma, theta = 1.4, np.deg2rad(15.0)
-    prob, free, (rho, p) = _wedge()
+    prob, free, (rho, p) = _wedge(scale=scale, limiter="vanalbada", smooth=True)
     n = prob._N
     start = np.concatenate([np.full(n, f) for f in free])
     sol = np.asarray(prob.solve(nonlinear=jno.solve.ptc(positive=[rho, p]), x0=start)).reshape(4, n)
@@ -129,7 +134,7 @@ def test_ptc_reaches_the_steady_supersonic_wedge():
     beside_ramp = (c[:, 0] > 0.7) & (c[:, 1] < (c[:, 0] - 0.3) * np.tan(theta) + 0.05)
     _, ratio = _oblique_shock(3.0, theta, gamma)
     assert abs(ratio - 2.822) < 2e-3  # the closed form itself
-    np.testing.assert_allclose(np.median(pres[beside_ramp]), ratio, rtol=0.03)
+    np.testing.assert_allclose(np.median(pres[beside_ramp]) / scale, ratio, rtol=0.03)
 
 
 def test_ptc_keeps_a_declared_positive_quantity_positive():
