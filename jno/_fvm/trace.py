@@ -159,19 +159,24 @@ def _is_divergence(node):
     return False
 
 
-def _divergence_parts(node):
-    """``[(axis, F)]`` with ``node = Σ ∂F/∂x_axis``: a first derivative is one part, a Laplacian
+def _divergence_vars(node):
+    """``[(x_k, F)]`` with ``node = Σ ∂F/∂x_k``: a first derivative is one part, a Laplacian
     ``Hessian(T, vars, trace)`` one part ``(v, ∂T/∂v)`` per variable, a mixed ``∂²T/∂a∂b`` the part
     ``(a, ∂T/∂b)``."""
     from ..trace import Jacobian
 
     n = _unwrap(node)
     if isinstance(n, Jacobian):
-        return [(int(n.variables[0].dim[0]), n.target)]
+        return [(n.variables[0], n.target)]
     if n.trace:
-        return [(int(v.dim[0]), Jacobian(n.target, [v], n.scheme)) for v in n.variables]
+        return [(v, Jacobian(n.target, [v], n.scheme)) for v in n.variables]
     a, b = n.variables
-    return [(int(a.dim[0]), Jacobian(n.target, [b], n.scheme))]
+    return [(a, Jacobian(n.target, [b], n.scheme))]
+
+
+def _divergence_parts(node):
+    """``[(axis, F)]`` with ``node = Σ ∂F/∂x_axis`` (:func:`_divergence_vars` by axis index)."""
+    return [(int(v.dim[0]), F) for v, F in _divergence_vars(node)]
 
 
 def _expand_hessians(node):
@@ -385,6 +390,50 @@ class _TraceFVM(StrongFormProblem):
             return True
         return any(self._has_unknown_derivative(c) for c in _iter(n))
 
+    def _unstacked_terms(self, expr):
+        """``_signed_terms(expr)`` with each stacked term (``jnn.stack([...], axis=-1)``) whose components hold
+        a divergence of an unknown taken apart: ``r*∂F/∂x`` in component ``i`` (no unknown in ``r``) becomes
+        ``r*∂(e_i F)/∂x``, a flux of the vector equation like any other, and the rest of the components stay one
+        stacked volume term. Left in the stack, a Laplacian was a volume gradient of a volume gradient: a
+        stencil twice as wide, and not conservative."""
+        from ..trace import BinaryOp, FunctionCall, Jacobian, Literal
+
+        out = []
+        for sign, term in _signed_terms(expr):
+            n = _unwrap(term)
+            if not (isinstance(n, FunctionCall) and getattr(n, "_name", None) == "concat"):
+                out.append((sign, term))
+                continue
+            comps, zero = [_unwrap(a) for a in n.args], Literal(0.0)
+            left, fluxes, var0 = [[] for _ in comps], [], None
+            for i, comp in enumerate(comps):
+                for s, sub in _signed_terms(comp):
+                    if _concrete_literal(sub) and not np.any(np.asarray(_unwrap(sub).value)):
+                        continue  # a bare 0
+                    factors = _factors(sub)
+                    divs = [f for f in factors if _is_divergence(f)]
+                    rest = [f for f in factors if not _is_divergence(f)]
+                    if not (
+                        len(divs) == 1
+                        and self._has_unknown(_unwrap(divs[0]).target)
+                        and not any(self._has_unknown(f) for f in rest)
+                    ):
+                        left[i].append((s, sub))
+                        continue
+                    for var, F in _divergence_vars(divs[0]):
+                        var0 = var if var0 is None else var0
+                        unit = FunctionCall(n.fn, [F if k == i else zero for k in range(len(comps))], name="concat")
+                        flux = Jacobian(unit, [var], _unwrap(divs[0]).scheme)
+                        fluxes.append((sign * s, _product(rest + [flux])))
+            if not fluxes:
+                out.append((sign, term))
+                continue
+            if any(left):  # its zeros one per point (0*x), so a constant left in another row is broadcast to them
+                pad = BinaryOp("*", Literal(0.0), var0)
+                out.append((sign, FunctionCall(n.fn, [_signed_sum(t) if t else pad for t in left], name="concat")))
+            out += fluxes
+        return out
+
     def _split_equation(self, expr):
         """``{"volume": expr | None, "groups": [...], "nonconservative": bool}`` of one equation.
 
@@ -393,7 +442,7 @@ class _TraceFVM(StrongFormProblem):
         from ..trace import BinaryOp, Literal
 
         volume, groups, noncons, schemes = [], {}, False, set()
-        for sign, term in _signed_terms(expr):
+        for sign, term in self._unstacked_terms(expr):
             factors = _factors(term)
             divs = [f for f in factors if _is_divergence(f)]
             rest = [f for f in factors if not _is_divergence(f)]

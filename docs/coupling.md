@@ -116,10 +116,10 @@ A stall below `tol` (the participants' own solves are not that accurate) is name
 An inviscid gas has no conduction and cannot take a temperature on its wall; with conduction in its energy
 equation it can. `jno.fvm` takes one condition per unknown and face, and a condition names one unknown, so the
 temperature is an unknown of its own with the algebraic row `T - p/rho` (solved in every cell by
-`jno.solve.imex`), beside the vector of conserved variables that takes the slip condition. In a vector equation,
-write the conduction as the divergence of a stacked flux,
-`jnn.stack([0, 0, 0, -k*T.x]).d(x, scheme="finite_difference") + ...`: a face flux, conservative. See the
-[tutorial](tutorials/15-coupling/hot-gas-vessel.md).
+`jno.solve.imex`), beside the vector of conserved variables that takes the slip condition. The conduction goes
+into the energy row, `jnn.stack([0, 0, 0, k*(T.xx + T.yy)], axis=-1)`, or as the divergence of a stacked flux,
+`jnn.stack([0, 0, 0, -k*T.x], axis=-1).d(x, scheme="finite_difference") + ...`: either is a face flux of that
+row, conservative. See the [tutorial](tutorials/15-coupling/hot-gas-vessel.md).
 
 ## Limitations
 
@@ -132,8 +132,6 @@ write the conduction as the divergence of a stacked flux,
   fields, not conservative).
 - The window mean of an explicit sender's flux is the trapezoid rule over its steps, not its own stage
   quadrature: right after a jump (two bodies brought into contact) its first step is off.
-- A Laplacian inside `jnn.stack` in a vector `jno.fvm` equation is evaluated cell by cell, not as a face flux, and
-  is not conservative; use the divergence form above.
 - Backward Euler cannot yet assemble the Jacobian of a gas with an algebraic temperature; march it with
   `jno.solve.imex`. The stiffness probe of a steady participant starts from zero, which a gas has no state at.
 - A gas wall moved by its wall (two-way fluid–structure interaction), turbulence models and grain burnback are

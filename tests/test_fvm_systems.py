@@ -195,3 +195,57 @@ def test_power_iteration_extremes_match_eigenvalues():
     absA = np.asarray(_abs_matrix(A, jnp.zeros(4)))
     ref = R @ (np.abs(lam)[:, :, None] * np.linalg.inv(R))
     np.testing.assert_allclose(absA, ref, atol=1e-8)
+
+
+def _two_diffusions(stacked):
+    """Two decoupled diffusion problems, ``c*(u.xx + u.yy) + f = 0`` with ``u = g`` on the boundary: one vector
+    unknown whose equation is a stack of Laplacians, or two scalar unknowns."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(12, 12)).quad().domain()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    c = 1.0 + x  # a variable coefficient outside the Laplacian: the scalar meaning is c times div(grad u)
+    f0, f1 = jnn.sin(3.0 * x) * y, 1.0 + 0.0 * x
+    g0, g1 = xb * yb, 0.0 * xb
+    if stacked:
+        q = d.unknown.vector(2)
+        qi = q.bind(x=x, y=y)
+        lap = jnn.stack([c * (qi[0].xx + qi[0].yy) + f0, 2.0 * (qi[1].xx + qi[1].yy) + f1], axis=-1)
+        cons = [lap, q(xb, yb) - jnn.stack([g0, g1], axis=-1)]
+    else:
+        a, b = d.unknown(), d.unknown()
+        ai, bi = a.bind(x=x, y=y), b.bind(x=x, y=y)
+        cons = [c * (ai.xx + ai.yy) + f0, 2.0 * (bi.xx + bi.yy) + f1, a(xb, yb) - g0, b(xb, yb) - g1]
+    return np.asarray(jno.fvm(cons).solve())
+
+
+def test_a_laplacian_inside_a_stacked_equation_is_a_face_flux():
+    # Name the break: a Laplacian inside jnn.stack evaluated cell by cell (the volume gradient of the volume
+    # gradient: a stencil twice as wide, and not conservative) gives another answer than the scalar unknowns'
+    # face fluxes. Both are direct linear solves on 144 cells: equal to round-off.
+    np.testing.assert_allclose(_two_diffusions(True), _two_diffusions(False), atol=1e-10)
+
+
+@pytest.mark.parametrize("source", [0, 1.0])
+def test_a_stacked_laplacian_beside_a_bare_number(source):
+    """``q.t - stack([source, K*(b.xx + b.yy)])``: what is left of the stack once its Laplacian is a flux is a bare
+    number, which must still be one value per cell (it was the constant vector (2,), refused as a cell term)."""
+    K = 0.3
+
+    def run(stacked):
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=(10, 10)).quad().domain(time=(0.0, 0.1, 6))
+        x, y, t = d.variable("interior", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        g = jnn.sin(np.pi * xi) * jnn.cos(2.0 * yi)
+        if stacked:
+            q = d.unknown.vector(2)
+            qi = q.bind(x=x, y=y, t=t)
+            rhs = jnn.stack([source, K * (qi[1].xx + qi[1].yy)], axis=-1)
+            cons = [qi.t - rhs, q(xi, yi) - jnn.stack([1.0 + g, g], axis=-1)]
+        else:
+            a, b = d.unknown(), d.unknown()
+            ai, bi = a.bind(x=x, y=y, t=t), b.bind(x=x, y=y, t=t)
+            cons = [ai.t - source + 0.0 * ai, bi.t - K * (bi.xx + bi.yy), a(xi, yi) - (1.0 + g), b(xi, yi) - g]
+        return np.asarray(jno.fvm(cons).solve(time=jno.solve.erk("ssprk3", cfl=0.4)))
+
+    # the same explicit steps on the same fluxes: equal to round-off
+    np.testing.assert_allclose(run(True), run(False), atol=1e-12)
