@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540040,"nonce":"lS5hSbL6P/RDWpq8eiNBKliCgJU=","target":"3c78460febffeee94606feac730a3ac6f61be20ab152b907bd3448f550805508","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKErog","github-url":"https://github.com/FhG-IISB/jNO/issues/354"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543746,"nonce":"VxzKtEwT/cSZsDL4+tWFfil02uQ=","added":["bug","branch:feat/fvm"],"removed":null}]}
