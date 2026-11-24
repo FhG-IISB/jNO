@@ -355,10 +355,13 @@ class FDMParticipant(_StrongForm):
         u = jnp.asarray(state).reshape(-1)
         idx = np.asarray(iface.nodes)
         if has_derivative(expr, self.owns):  # the boundary stencil the flux conditions use
-            nodes, _ = problem._node_normals(tag)
-            nodes = np.asarray(nodes, dtype=int)
-            skeleton = problem._flux_skeleton(expr, nodes)
-            k = problem._flux_owner(expr, nodes)
+            import jax
+
+            with jax.ensure_compile_time_eval():  # mesh work (normals, the stencil), concrete inside a trace too
+                nodes, _ = problem._node_normals(tag)
+                nodes = np.asarray(nodes, dtype=int)
+                skeleton = problem._flux_skeleton(expr, nodes)
+                k = problem._flux_owner(expr, nodes)
             scope = self._scope(problem, data or {}, params)
             out = problem._flux_row_fn(skeleton, scope, problem._ncomp[k])(u, None)
             out = jnp.asarray(out)
@@ -524,6 +527,7 @@ class FEMParticipant(Participant):
 
         node = jno.np.parameter(self.domain.fem_symbols()[0], name=name)  # a P1 field, valued at solve time
         node.model._runtime_field = True  # an essential value reads it per solve too, not frozen at build
+        self.__dict__.setdefault("_data_names", set()).add(name)
 
         def setter(values, problem=None):
             import jax.numpy as jnp
@@ -549,9 +553,13 @@ class FEMParticipant(Participant):
                 out.append((model.layer_id, e))
         return out
 
-    def _args(self, problem, data, params=None):
+    def _args(self, problem, data, params=None, with_data=True):
         """The runtime arguments of the problem's forms: the data by their field names, the trainable parameters
-        (``{layer_id: value}``) by the names the forms know them by."""
+        (``{layer_id: value}``) by the names the forms know them by, and every other parameter at its stored value,
+        as a strong-form problem reads it (fem.solve wants a value for each one; fem.eval reads a missing one as 0).
+        ``with_data=False`` leaves the data fields out."""
+        import jax.numpy as jnp
+
         args = dict(data)
         if params:
             names = self._names(problem)
@@ -559,12 +567,25 @@ class FEMParticipant(Participant):
             if missing:
                 raise ValueError(f"coupling: params= names layer ids {missing}, which this jno.fem problem does not read.")
             args.update({names[lid]: v for lid, v in params.items()})
+        data_names = self.__dict__.get("_data_names", set())
+        exprs = getattr(problem._op, "runtime_parameter_exprs", None) or getattr(problem._op, "param_exprs", {})
+        for name, e in exprs.items():
+            if name in args or (not with_data and name in data_names):
+                continue
+            value = getattr(getattr(getattr(_unwrap(e), "model", None), "module", None), "value", None)
+            if value is not None:
+                args[name] = jnp.asarray(value)
         return args
 
     def solve(self, problem, data, x0=None, params=None):
+        """A direct solve, as the strong-form participants' and this one's window steps: exact to round-off, so the
+        coupling converges below an iterative solver's tolerance (fem's default BiCGStab stalled a coupling with a
+        floating fem middle at 2e-8)."""
         import jax.numpy as jnp
 
-        out = problem.solve(**self._args(problem, data, params))
+        from .. import solve as _solve
+
+        out = problem.solve(linear=_solve.lu(), **self._args(problem, data, params))
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
@@ -633,8 +654,8 @@ class FEMParticipant(Participant):
             for c in terms[1:]:
                 total = total + c
             # the problem's own weak terms never read the interface data (those are in the received conditions):
-            # only the trainable parameters are arguments
-            args = self._args(problem, {}, params)
+            # only the parameters are arguments (read as 0 when missing: a trainable conductivity's reaction was 0)
+            args = self._args(problem, {}, params, with_data=False)
             r = jnp.asarray(problem.eval(total, jnp.asarray(state), args=args or None))
             field = self._flux_field(expr)
             sl = problem.blocks[problem.block_index(field)]

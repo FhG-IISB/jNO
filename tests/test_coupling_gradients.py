@@ -35,9 +35,10 @@ def _trainable(name, value):
     return k
 
 
-def _fvm_slab(k, x0, h, outer_tag, outer_value, iface_tag, time=None):
+def _fvm_slab(k, x0, h, outer_tag, outer_value, iface_tag, time=None, make=jno.fvm):
     """-k Δu = 0 (or u.t = k Δu from u = outer_value) on [x0, x0 + 1] x [0, h_y], held at ``outer_value`` on
-    ``outer_tag``, insulated top and bottom; its value and flux views on ``iface_tag``."""
+    ``outer_tag``, insulated top and bottom; its value and flux views on ``iface_tag``. ``make``: jno.fvm or
+    jno.fdm."""
     d = jno.shape.rect(x0, 0.0, x0 + 1.0, 0.1 if time else 1.0, size=h).domain(**({"time": time} if time else {}))
     x, y, t = d.variable("interior", split=True)
     xo, yo, _ = d.variable(outer_tag, split=True)
@@ -52,7 +53,7 @@ def _fvm_slab(k, x0, h, outer_tag, outer_value, iface_tag, time=None):
         cons.append(u.bind(x=xt, y=yt).d(d.variable(tag, normals=True)) - 0.0)
     xs, ys, _ = d.variable(iface_tag, split=True)
     ub = u.bind(x=xs, y=ys)
-    return jno.fvm(cons), ub, ub.d(d.variable(iface_tag, normals=True)), d
+    return make(cons), ub, ub.d(d.variable(iface_tag, normals=True)), d
 
 
 def _fem_slab(k, x0, h, outer_tag, outer_value, iface_tag, time=None):
@@ -138,3 +139,37 @@ def test_jno_core_trains_a_conductivity_through_a_coupling():
     crux.solve(120)
     rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
     assert abs(rec - ka_true) < 2e-2, f"the coupling did not train k_a: {rec:.4f}"
+
+
+def test_three_kinds_in_series_differentiate_by_the_middle_conductivity():
+    # Name the break: the fixed point of three participants of three kinds (fvm | fem | fdm), the floating fem middle
+    # on Robin-Robin pairs, differentiates through all three solves. Closed form: slabs [0,1], [1,2], [2,3] with k_1,
+    # k_2, k_3, held at 0 and 1 at the ends: q = 1/S with S = Σ 1/k_i, the second interface T_2 = (1/k_1 + 1/k_2)/S,
+    # and dT_2/dk_2 = -(1/k_2²)(1/k_3)/S².
+    k1, k20, k3 = 1.0, 10.0, 2.0
+    k = _trainable("k2", k20)
+    pa, ua, fa, _ = _fvm_slab(k1, 0.0, 0.1, "left", 0.0, "right")
+    pc, uc, fc, dc = _fvm_slab(k3, 2.0, 0.09, "right", 1.0, "left", make=jno.fdm)
+    db = jno.shape.rect(1.0, 0.0, 2.0, 1.0, size=0.07).domain()
+    T, v = db.fem_symbols()
+    xi, yi, _ = db.variable("interior", split=True)
+    pb = jno.fem([k * (T.bind(x=xi, y=yi).x * v.bind(x=xi, y=yi).x + T.bind(x=xi, y=yi).y * v.bind(x=xi, y=yi).y)])
+    sides = {}
+    for tag in ("left", "right"):
+        xs, ys, _ = db.variable(tag, split=True)
+        tb = T.bind(x=xs, y=ys)
+        sides[tag] = (tb, tb.d(db.variable(tag, normals=True)))
+    conds = [ua - sides["left"][0], k1 * fa + k * sides["left"][1], sides["right"][0] - uc]
+    conds.append(k * sides["right"][1] + k3 * fc)
+    c = couple([pa, pb, pc], conds, CouplingSpec(tol=1e-12, max_iter=80))
+    left = jnp.asarray(np.isclose(np.asarray(dc.mesh_connectivity["points"])[:, 0], 2.0))
+    lid = k.model.layer_id
+
+    def t2(k2):
+        _, _, sc = c.solve(params={lid: k2})
+        return jnp.sum(jnp.where(left, jnp.asarray(sc).reshape(-1), 0.0)) / jnp.sum(left)
+
+    S = 1.0 / k1 + 1.0 / k20 + 1.0 / k3
+    k2 = jnp.asarray([k20])
+    np.testing.assert_allclose(float(t2(k2)), (1.0 / k1 + 1.0 / k20) / S, atol=1e-9)
+    np.testing.assert_allclose(float(jax.grad(t2)(k2)[0]), -(1.0 / k20**2) * (1.0 / k3) / S**2, rtol=1e-7)
