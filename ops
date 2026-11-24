@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540047,"nonce":"eP/InuahtnfLXbl5oHxZ+VDRwF4=","target":"859bab200b5713471d66a34f8060ebf2843a25026779d04d66b7dc412590a469","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKE07w","github-url":"https://github.com/FhG-IISB/jNO/issues/357"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543747,"nonce":"ttTUnZUQ1Je03w6u9bAvxlq8FaY=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
