@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540062,"nonce":"6Y7LAKm2qTHz9ntwR5G7XEEN4NA=","target":"1c3985540a822453a773258253738c01e50a80c803d2429b26e10e3526453d19","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKFIKA","github-url":"https://github.com/FhG-IISB/jNO/issues/366"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543751,"nonce":"lVSZt+mf+lipYWl2sMvqgj5ozr0=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
