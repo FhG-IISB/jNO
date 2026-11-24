@@ -1087,7 +1087,7 @@ class _TraceFVM(StrongFormProblem):
 
             def fill(v):
                 rhs = jnp.where(alg, 0.0, v.reshape(nf, nc).T)
-                return jnp.linalg.solve(A, rhs[..., None])[..., 0].T.reshape(-1)
+                return _small_solve(A, rhs[..., None])[..., 0].T.reshape(-1)
 
             return fill
 
@@ -1741,8 +1741,8 @@ class _Evaluator:
         ]
         J = jnp.stack(cols, axis=-1)  # (m, p, c): d r_i / d q_j, face by face
         if J.shape[1] == c:
-            return qf - jnp.linalg.solve(J, r[..., None])[..., 0]
-        lam = jnp.linalg.solve(J @ jnp.swapaxes(J, 1, 2), r[..., None])
+            return qf - _small_solve(J, r[..., None])[..., 0]
+        lam = _small_solve(J @ jnp.swapaxes(J, 1, 2), r[..., None])
         return qf - (jnp.swapaxes(J, 1, 2) @ lam)[..., 0]
 
     # -- fluxes ---------------------------------------------------------------------------------------
@@ -2079,11 +2079,34 @@ def _abs_matrix(A, delta, iters=20):
         return jnp.sqrt(A * A + (delta * delta)[:, None, None])
     eye = jnp.eye(A.shape[1], dtype=A.dtype)
     Y = A @ A + (delta * delta)[:, None, None] * eye + jnp.finfo(A.dtype).tiny * eye
-    Z = jnp.broadcast_to(eye, Y.shape)
-    for _ in range(iters):
-        Yi, Zi = jnp.linalg.inv(Y), jnp.linalg.inv(Z)
-        Y, Z = 0.5 * (Y + Zi), 0.5 * (Z + Yi)
-    return Y
+    ident = jnp.broadcast_to(eye, Y.shape)
+
+    def step(_, yz):
+        Y, Z = yz
+        return 0.5 * (Y + _small_solve(Z, ident)), 0.5 * (Z + _small_solve(Y, ident))
+
+    # a loop, not unrolled: the program holds one step whatever iters is (a fixed count, so reverse-differentiable)
+    return jax.lax.fori_loop(0, iters, step, (Y, ident))[0]
+
+
+def _small_solve(A, B):
+    """``X`` with ``A X = B`` for a batch of small systems, ``A (..., n, n)`` and ``B (..., n, m)``: Gauss-Jordan
+    elimination with partial pivoting, unrolled over the ``n`` rows in jnp.
+
+    Not ``jnp.linalg.solve``: on the CPU (JAX 0.10.1) each batched LAPACK kernel splits its batch over XLA's thread
+    pool and waits for the pieces, and a solve's program runs several side by side (a Roe flux's ``|A|`` at interior
+    and boundary faces, the face conditions); on four threads or fewer every thread waited and the solve deadlocked.
+    For the blocks here, one to a handful of unknowns per cell or face, the elimination is also the cheaper one."""
+    n = A.shape[-1]
+    M = jnp.concatenate([A, B.astype(jnp.result_type(A, B))], axis=-1)
+    rows = jnp.arange(n)
+    for k in range(n):
+        p = k + jnp.argmax(jnp.abs(M[..., k:, k]), axis=-1)
+        swap = jnp.where(rows == k, p[..., None], jnp.where(rows == p[..., None], k, rows))
+        M = jnp.take_along_axis(M, swap[..., None], axis=-2)
+        pivot = M[..., k : k + 1, :] / M[..., k : k + 1, k : k + 1]
+        M = jnp.where((rows == k)[:, None], pivot, M - M[..., :, k : k + 1] * pivot)
+    return M[..., n:]
 
 
 def fvm(constraints, centering: str = "cell"):

@@ -112,6 +112,32 @@ def test_a_steady_gas_participant_solves_from_its_start():
     np.testing.assert_allclose(coupled, np.asarray(alone.solve(x0=at_rest)).reshape(-1), atol=1e-12)
 
 
+def test_a_steady_roe_gas_solves_on_a_cpu_with_two_threads():
+    # Name the break: on a CPU with four threads or fewer (a CI runner) XLA:CPU (JAX 0.10.1) deadlocked this solve.
+    # The small per-face blocks (the Roe |A| inverses, the face Newton steps) went to batched LAPACK kernels; run side
+    # by side, each split its batch over the same thread pool and waited for it, every thread blocked. A fresh
+    # process pinned to two threads, since JAX sizes its CPU thread pool when it starts.
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = (
+        "import os, sys; os.sched_setaffinity(0, sorted(os.sched_getaffinity(0))[:2]); "
+        f"sys.path.insert(0, {str(Path(__file__).parent)!r}); "
+        "import jax; jax.config.update('jax_enable_x64', True); import numpy as np; "
+        "from test_coupling_participants import _steady_gas_2d; gas, x0 = _steady_gas_2d(); "
+        "print(float(np.abs(np.asarray(gas.solve(x0=x0))).max()))"
+    )
+    env = dict(os.environ, JAX_PLATFORMS="cpu")
+    try:
+        run = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=400)
+    except subprocess.TimeoutExpired:
+        pytest.fail("a steady Roe gas on 8 x 8 cells did not finish in 400 s on two CPU threads (an XLA:CPU deadlock)")
+    assert run.returncode == 0, run.stderr[-3000:]
+    assert np.isfinite(float(run.stdout.split()[-1]))
+
+
 def _k_strip(kind, k0=2.0, transient=False):
     """-k Δu = 0 on the strip [0, 1] x [0, 0.2], u = 0 on the left, k ∂u/∂n = q on the right (q a data field of the
     participant), insulated top and bottom: u = q x / k, linear, so every discretisation holds it exactly. k is a

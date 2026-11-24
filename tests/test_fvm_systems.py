@@ -197,6 +197,24 @@ def test_power_iteration_extremes_match_eigenvalues():
     np.testing.assert_allclose(absA, ref, atol=1e-8)
 
 
+@pytest.mark.parametrize("n", [1, 2, 5])
+def test_small_block_solves_recover_a_known_solution_where_rows_must_be_swapped(n):
+    # Name the break: the per-cell and per-face blocks are solved by an elimination of their own (batched LAPACK
+    # deadlocked XLA:CPU on few threads); a wrong pivot or elimination step gives a wrong X. Each A is a row
+    # permutation of a well-conditioned matrix, so its leading entry is zero for n > 1 and a step without the row swap
+    # divides by zero. X is chosen, B = A X; the solve recovers X to round-off.
+    from jno._fvm.trace import _small_solve
+
+    rng = np.random.default_rng(n)
+    base = rng.standard_normal((6, n, n)) + 3.0 * np.eye(n)
+    A = base[:, np.roll(np.arange(n), 1)]  # row i of A is row i-1 of base
+    if n > 1:
+        A[:, 0, 0] = 0.0
+    X = rng.standard_normal((6, n, 3))
+    got = np.asarray(_small_solve(jnp.asarray(A), jnp.asarray(A @ X)))
+    np.testing.assert_allclose(got, X, atol=1e-11)
+
+
 def _two_diffusions(stacked):
     """Two decoupled diffusion problems, ``c*(u.xx + u.yy) + f = 0`` with ``u = g`` on the boundary: one vector
     unknown whose equation is a stack of Laplacians, or two scalar unknowns."""
