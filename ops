@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540026,"nonce":"mu4bwTQ6QnneZj93qLhExnEjyrA=","target":"caa7d1a8fa9b7f1473b993c3965c99d315eddb6fd988a52ae8eb2156e0ff6d3d","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKEavg","github-url":"https://github.com/FhG-IISB/jNO/issues/349"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543745,"nonce":"uSfSrE5XQHQC3Uly2aoIXn2ua0w=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
