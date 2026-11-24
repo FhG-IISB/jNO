@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543751,"nonce":"lVSZt+mf+lipYWl2sMvqgj5ozr0=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":2,"timestamp":1795543751,"nonce":"2OjEuxIdhQ3iDZazLr800H0YUTk=","title":"coupling: IQN-ILS in the compiled and differentiated window fixed point","was":"coupling: IQN-ILS in jnp for compiled and differentiated windows (fixed-depth, masked)"}]}
