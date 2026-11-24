@@ -129,10 +129,31 @@ into the energy row, `jnn.stack([0, 0, 0, k*(T.xx + T.yy)], axis=-1)`, or as the
 `jnn.stack([0, 0, 0, -k*T.x], axis=-1).d(x, scheme="finite_difference") + ...`: either is a face flux of that
 row, conservative. See the [tutorial](tutorials/15-coupling/hot-gas-vessel.md).
 
+## Training through a coupling
+
+When a coupled problem has a trainable parameter (a `jno.np.parameter` or a network with an optimizer, in a problem
+or in an interface condition), `core.solve(coupling=...)` returns the coupled solution as trace nodes, one per
+problem, and a `jno.core` loss on them trains the parameter through the coupling:
+
+```python
+k = jno.np.parameter((1,), name="k")
+k.initialize(jax.nn.initializers.constant(1.0))
+k.optimizer(optax.adam(1e-1))
+sa, sb = jno.core([pa, pb, ua - ub, k * fa + kb * fb]).solve(coupling=jno.solve.coupling(tol=1e-12))
+jno.core([(sb - observed).mse]).solve(120)  # recovers k from the second problem's field
+```
+
+Every window's interface fixed point is differentiated implicitly at its root (`custom_root`; a tangent is one GMRES
+solve), and the windows chain through their states, so a gradient crosses them. Checked against the series
+resistance of two slabs (dT/dk to 1e-8) and against a central difference of a transient contact (1e-6).
+
 ## Limitations
 
-- Gradients do not reach a parameter through the coupled fixed point yet.
-- `jno.solve.ptc` loses positivity on a steady supersonic Euler problem; march such a gas in time.
+- A differentiated or compiled coupling relaxes with Aitken or a fixed factor; `accel="iqn-ils"` runs step by step
+  only. The structural probes (which side takes the value, `alpha="auto"`) read parameters at their stored values,
+  so set them before coupling.
+- `jno.solve.ptc` needs `positive=[rho, p]` on a supersonic gas, and smooth settings (`limiter="vanalbada"`,
+  `jno.fv(smooth=True)`): with minmod its end phase can stall.
 - A `u.tt` problem cannot take part in a transient coupling, and a transient `jno.fem` side cannot send a flux (it
   takes the flux side of a pair).
 - A vector load on a `jno.fem` side must be a coefficient times the boundary normal (`p * n`).

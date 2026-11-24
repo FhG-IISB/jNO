@@ -1001,7 +1001,7 @@ class Coupled:
             else:
                 states, _ = self._iterate([None] * n, states, values, params=params)
                 self.iterations = len(self.history)
-            self.states = states
+                self.states = states
             return [self._shape(i, st) for i, st in enumerate(states)]
         window, t0, t1 = self._window
         start = [self.parts[i].initial(self.problems[i]) if i in transient else None for i in range(n)]
@@ -1034,9 +1034,59 @@ class Coupled:
             start = [states[i] if i in transient else None for i in range(n)]
             t += window
             self.times.append(t)
-        self.iterations = int(sum(self.window_iterations))
-        self.states = states
+        if not traced:
+            self.iterations = int(sum(self.window_iterations))
+            self.states = states
         return [stack([self._shape(i, f) for f in frames[i]]) for i in range(n)]
+
+    def trainable_nodes(self):
+        """``[(layer_id, node)]`` of the trainable parameters the coupled problems read, each once (a parameter in an
+        interface condition is read by the problem that receives it too)."""
+        found = {}
+        for part, prob in zip(self.parts, self.problems):
+            for lid, node in part.param_nodes(prob):
+                found.setdefault(lid, node)
+        return list(found.items())
+
+    def nodes(self):
+        """The coupled solution as trace nodes of its trainable parameters, one per problem in the order given: a
+        ``jno.core`` loss on them trains the parameters through the coupling. They share one node that runs the
+        coupled solve (:meth:`solve` with ``params=``) once per evaluation."""
+        import jax
+        import jax.numpy as jnp
+
+        from ..trace import FunctionCall, ModelWeights
+
+        specs = self.trainable_nodes()
+        lids = [lid for lid, _ in specs]
+
+        def solved(*values):
+            return self.solve(params=dict(zip(lids, values)))
+
+        def stored(node):  # what the node evaluates to, for the shapes only
+            n = _unwrap(node)
+            return n.model.module if isinstance(n, ModelWeights) else jnp.asarray(n.model.module.value)
+
+        shapes = jax.eval_shape(solved, *[stored(n) for _, n in specs])
+        whole = FunctionCall(
+            lambda *v: jnp.concatenate([jnp.ravel(jnp.asarray(o)) for o in solved(*v)]),
+            [n for _, n in specs],
+            name="coupled_solve",
+        )
+        whole._per_evaluation = True  # one coupled solve per evaluation, whichever problems the loss reads
+        whole._domain = self.parts[0].domain
+        out, at = [], 0
+        for i, sh in enumerate(shapes):
+            size = int(np.prod(sh.shape))
+            node = FunctionCall(
+                lambda w, at=at, size=size, shape=tuple(sh.shape): w[at : at + size].reshape(shape),
+                [whole],
+                name=f"coupled_solve[{i}]",
+            )
+            node._domain = self.parts[i].domain  # so jno.core infers the domain of a loss on this problem
+            out.append(node)
+            at += size
+        return out
 
     def _one_sweep(self):
         """Is every window one sweep: data flowing one way (no back data), or a loose coupling?"""

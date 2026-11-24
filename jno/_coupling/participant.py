@@ -210,7 +210,12 @@ class Participant:
 
     # -- solving and reading back -----------------------------------------------------------------------
     def trainables(self, problem) -> set:
-        """The layer ids of the trainable parameters ``problem`` reads (what ``params=`` may name)."""
+        """The layer ids of the parameters ``problem`` reads (what ``params=`` may name)."""
+        raise NotImplementedError
+
+    def param_nodes(self, problem):
+        """``[(layer_id, node)]`` of the trainable parameters ``problem`` reads (with an optimizer): the arguments of a
+        coupled solve's trace node, each evaluating to the value ``params=`` takes."""
         raise NotImplementedError
 
     def solve(self, problem, data, x0=None, params=None):
@@ -259,6 +264,9 @@ class _StrongForm(Participant):
 
     def trainables(self, problem) -> set:
         return set(problem._trainable_params())
+
+    def param_nodes(self, problem):
+        return [(lid, problem._trainable_arg(n)) for lid, n in problem._trainable_params().items()]
 
     def _scope(self, problem, data, params=None):
         """``extra_params`` for ``data`` (``{layer_id: values}``) and ``params`` (``{layer_id: value}`` of trainable
@@ -531,6 +539,15 @@ class FEMParticipant(Participant):
 
     def trainables(self, problem) -> set:
         return set(self._names(problem)) - {None}
+
+    def param_nodes(self, problem):
+        exprs = getattr(problem._op, "runtime_parameter_exprs", None) or getattr(problem._op, "param_exprs", {})
+        out = []
+        for e in exprs.values():
+            model = getattr(_unwrap(e), "model", None)
+            if getattr(model, "_opt_fn", None) is not None:  # trainable: it has an optimizer (data have none)
+                out.append((model.layer_id, e))
+        return out
 
     def _args(self, problem, data, params=None):
         """The runtime arguments of the problem's forms: the data by their field names, the trainable parameters

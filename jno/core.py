@@ -2553,6 +2553,8 @@ class core:
             from ._coupling.driver import Coupled, CouplingSpec
 
             self.coupled = Coupled(*self._coupled, coupling if coupling is not None else CouplingSpec())
+            if self.coupled.trainable_nodes():  # trace nodes: a jno.core loss on them trains through the coupling
+                return self.coupled.nodes()
             return self.coupled.solve()
         if coupling is not None:
             raise ValueError(

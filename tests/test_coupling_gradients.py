@@ -116,3 +116,25 @@ def test_a_transient_coupling_differentiates_by_a_conductivity_like_a_central_di
     fd = (float(heat(kb + h)) - float(heat(kb - h))) / (2 * h)
     assert abs(fd) > 1e-3  # the conductivity does move the contact
     np.testing.assert_allclose(g, fd, rtol=1e-6)
+
+
+def test_jno_core_trains_a_conductivity_through_a_coupling():
+    # Name the break: with a trainable parameter in a coupled problem, core.solve(coupling=...) returns the coupled
+    # solution as trace nodes of that parameter, so a jno.core loss on it trains the parameter through the coupling
+    # (as fem.solve() and jno.dd's coupled solves do). Returned as arrays, the loss has no parameter to train.
+    # Target: the fem slab's exact solution at k_a = 2, T = T_i + (1 - T_i)(x - 1) with T_i = k_b/(k_a + k_b).
+    from jno.trace import FunctionCall
+
+    ka_true, kb = 2.0, 10.0
+    k = _trainable("ka", 1.0)
+    k.optimizer(optax.adam(1e-1))
+    pa, ua, fa, _ = _fvm_slab(k, 0.0, 0.1, "left", 0.0, "right")
+    pb, ub, fb, db = _fem_slab(kb, 1.0, 0.07, "right", 1.0, "left")
+    sa, sb = jno.core([pa, pb, ua - ub, k * fa + kb * fb]).solve(coupling=jno.solve.coupling(tol=1e-12, max_iter=60))
+    assert isinstance(sb, FunctionCall)
+    x = np.asarray(db.mesh_connectivity["points"])[:, 0]
+    t_i = kb / (ka_true + kb)
+    crux = jno.core([(sb - jnp.asarray(t_i + (1.0 - t_i) * (x - 1.0))).mse])
+    crux.solve(120)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - ka_true) < 2e-2, f"the coupling did not train k_a: {rec:.4f}"
