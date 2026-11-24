@@ -953,7 +953,15 @@ class Coupled:
                 return (it < max_iter) & (err > tol) & ~stalled
 
             x, warm = z0
-            init = (jnp.int32(0), x, warm, jnp.zeros_like(x), jnp.asarray(omega0), jnp.asarray(jnp.inf), jnp.zeros(max(max_iter, 3)))
+            init = (
+                jnp.int32(0),
+                x,
+                warm,
+                jnp.zeros_like(x),
+                jnp.asarray(omega0),
+                jnp.asarray(jnp.inf),
+                jnp.zeros(max(max_iter, 3)),
+            )
             it, x, warm, _, _, err, hist = jax.lax.while_loop(cond, body, init)
             return (x, warm), (it.astype(err.dtype), err, hist)  # all floating: custom_root's jvp rejects an int aux
 

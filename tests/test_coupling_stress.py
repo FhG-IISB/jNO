@@ -10,11 +10,10 @@ The traction condition σ·n_s + p_g n_s = 0 differentiates only the wall, so it
 never hears back: one sweep per window, nothing to iterate.
 """
 
+import jax
 import numpy as np
 import pytest
 from scipy.integrate import quad
-
-import jax
 
 import jno
 import jno.jnp_ops as jnn

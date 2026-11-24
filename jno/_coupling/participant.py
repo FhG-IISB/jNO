@@ -298,6 +298,7 @@ class _StrongForm(Participant):
             # tolerance, and robust on the traced path (matrix-free BiCGStab diverged on fdm flux rows there)
             scope = self._scope(problem, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
             return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=_solve.lu()))
+
         if x0 is not None and "_probe_state" not in problem.__dict__ and not isinstance(x0, jax.core.Tracer):
             # traced inside the compiled solve, the start cannot decide the Jacobian's stencil: record it concretely
             problem._probe_state = np.asarray(x0, dtype=float).reshape(-1)
@@ -389,7 +390,6 @@ class FVMParticipant(_StrongForm):
         """Evaluated on the tag's boundary faces with the problem's own boundary rule (face values and normal
         derivatives as its fluxes see them), then lumped to the nodes: ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with
         ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly. Compiled once per expression."""
-        import jax
         import jax.numpy as jnp
 
         data, params = data or {}, params or {}
@@ -412,7 +412,6 @@ class FVMParticipant(_StrongForm):
         """One window, compiled once per window length for an autonomous problem: the data are traced inputs
         (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
         substeps inside the program, from the state at the window's start, so every window runs the same one."""
-        import jax
         import jax.numpy as jnp
 
         params = params or {}
