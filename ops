@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543747,"nonce":"ttTUnZUQ1Je03w6u9bAvxlq8FaY=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":2,"timestamp":1795543747,"nonce":"IoRDF/dbBqyaKTdfNEOa/D/lcMs=","title":"jno.solve.imex: no check of a 1-D detonation against the Chapman-Jouguet speed","was":"coupling plan step 8: the 1-D detonation against the Chapman-Jouguet speed is not checked"}]}
