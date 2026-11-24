@@ -18,7 +18,8 @@ sol = jno.core([gas, wall,
 ```
 
 `sol` holds each problem's solution, in the order given; for a transient coupling, its states at the window
-ends. The coupled problem is kept as `core.coupled` (`.iterations`, `.history`, `.assign`, `.window_iterations`).
+ends. The coupled problem is kept as `core.coupled` (`.iterations`, `.history`, `.assign`, `.window_iterations`,
+`.compiles`).
 The whole of such an example, with all three kinds of condition, is the tutorial
 [Hot gas in a thick-walled vessel](tutorials/15-coupling/hot-gas-vessel.md).
 
@@ -110,9 +111,10 @@ A stall below `tol` (the participants' own solves are not that accurate) is name
 
 ## Solvers that come with it
 
-- **`jno.solve.ptc()`**, pseudo-transient continuation (Kelley & Keyes 1998), is a steady solve for problems that
-  Newton cannot start. Its pseudo-time step is a local CFL number and grows as the residual falls. On steady
-  viscous Burgers from rest it reaches the state the time march reaches, where Newton lands elsewhere.
+- **`jno.solve.ptc()`**, pseudo-transient continuation (Kelley & Keyes 1998), is the steady solve for a gas, which
+  Newton cannot start: a pseudo-time step per control volume that grows as the residual falls, the quantities named
+  in `positive=` kept positive, and an implicit gradient at the root. See
+  [Finite Volume Method](fvm.md).
 - **`jno.solve.imex()`**, IMEX Runge–Kutta (Ascher, Ruuth & Spiteri 1997), takes a `jno.fvm` problem's fluxes
   explicitly and its cell-local volume terms (reactions, sources, an algebraic closure) implicitly, with a Newton
   on the `nf × nf` block of each cell. That is the chemistry route: species as extra unknowns, Arrhenius rates as
@@ -137,7 +139,7 @@ problem, and a `jno.core` loss on them trains the parameter through the coupling
 
 ```python
 k = jno.np.parameter((1,), name="k")
-k.initialize(jax.nn.initializers.constant(1.0))
+k.initialize(jax.nn.initializers.constant(1.0))  # the structural probes read it there too
 k.optimizer(optax.adam(1e-1))
 sa, sb = jno.core([pa, pb, ua - ub, k * fa + kb * fb]).solve(coupling=jno.solve.coupling(tol=1e-12))
 jno.core([(sb - observed).mse]).solve(120)  # recovers k from the second problem's field
@@ -150,10 +152,7 @@ resistance of two slabs (dT/dk to 1e-8) and against a central difference of a tr
 ## Limitations
 
 - A differentiated or compiled coupling relaxes with Aitken or a fixed factor; `accel="iqn-ils"` runs step by step
-  only. The structural probes (which side takes the value, `alpha="auto"`) read parameters at their stored values,
-  so set them before coupling.
-- `jno.solve.ptc` needs `positive=[rho, p]` on a supersonic gas, and smooth settings (`limiter="vanalbada"`,
-  `jno.fv(smooth=True)`): with minmod its end phase can stall.
+  only.
 - A `u.tt` problem cannot take part in a transient coupling, and a transient `jno.fem` side cannot send a flux (it
   takes the flux side of a pair).
 - A vector load on a `jno.fem` side must be a coefficient times the boundary normal (`p * n`).

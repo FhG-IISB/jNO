@@ -50,6 +50,7 @@ returns nodal values, as `jno.fdm` and `jno.fem` do.
 | `c(x) * (F).x` | the coefficient at the volume, times the face sum |
 | `ui.t`, a source, a reaction | evaluated at the centroid (the midpoint rule) and multiplied by the volume |
 | `b*ui.x`, `ui*ui.x` | **not** a divergence: the volume gradient is used, and a warning says the term is not conservative |
+| `jnn.stack([0, k*(T.xx + T.yy)], axis=-1)` in a vector equation | each row's diffusive term is a face flux of that row; a first-order row (`jnn.stack([p.x, p.y])`) stays a volume term, in Green–Gauss form |
 
 Inside a flux, a sub-term that holds a derivative of an unknown is **diffusive**. It gets the face gradient:
 least-squares gradients interpolated to the face, with the component along the centroid line replaced by the
@@ -125,6 +126,7 @@ s = jno.fv(flux="hll", limiter="minmod")
 | `average=` | a diffusive coefficient at the face as the `"arithmetic"` or `"harmonic"` mean of its cells |
 | `speed=` | the wave speed as an expression, in place of the spectral radius |
 | `equilibrium=` | a steady state to preserve exactly (well-balancing) |
+| `smooth=` | `True` rounds the wave speeds' min / max (HLL's bounds, Rusanov's spectral radius) over 10⁻³ of their rms, so the flux has a derivative at a sonic face and at rest: for steady solves and gradients |
 
 Nothing in the scheme knows about a particular PDE:
 - **The flux Jacobian** `∂(F·n)/∂q` comes from JAX.
@@ -154,6 +156,28 @@ Nothing in the scheme knows about a particular PDE:
 Newton is the default for nonlinear problems. It factorises the assembled tangent, with a line search. Use a
 smooth limiter (van Albada, Venkatakrishnan) for steady solves. Barth–Jespersen's `min()` and minmod are for
 explicit time marching.
+
+## Steady compressible flow: `jno.solve.ptc`
+
+Newton started far from a steady shock does not converge. Pseudo-transient continuation (Kelley & Keyes 1998)
+solves `(J + D/Δτ) δ = −R` instead: `D` is the row sum of `|J|`, one value per control volume for all its
+components, and `Δτ` grows as the residual falls (Mulder & van Leer 1985). `positive=` cuts every step so the
+quantities it names stay positive. The root is differentiated implicitly, so `jax.grad` goes through a steady gas.
+
+```python
+s = jno.fv(flux="hll", limiter="vanalbada", smooth=True)
+rho, p = qi[0], (gamma - 1) * (qi[3] - 0.5 * (qi[1]**2 + qi[2]**2) / qi[0])
+sol = prob.solve(nonlinear=jno.solve.ptc(positive=[rho, p]), x0=at_rest)
+```
+
+!!! measured "Steady compressible flow by `ptc`"
+    - **Mach 3 over a 15° wedge:** the oblique-shock pressure ratio within 3 %, the density positive everywhere,
+      and the same at 1 % of the unit density and pressure.
+    - **A duct at a back pressure:** the mass flux and its derivative by the back pressure match the closed forms
+      to 1e-8 and 1e-6.
+    - **A converging-diverging nozzle** (25,647 cells, γ = 1.2): 89 s on the GPU against 12 min of explicit
+      march; the mass flow within 1 % of the choked one in the chamber, the throat and the divergent part, the
+      exit Mach number 3.247 against 3.278 from the area–Mach relation.
 
 ## Transient problems and `jno.solve.erk`
 
@@ -191,6 +215,9 @@ u = mom / rho; p = (gamma - 1) * (E - 0.5 * mom * u)
 F = jnn.stack([mom, mom * u + p, u * (E + p)], axis=-1)    # axis=-1: one row per point
 jno.fvm([qi.t + F.d(x, scheme=jno.fv(flux="roe", limiter="minmod")), q(xi) - q0])
 ```
+
+An equation with neither a time derivative nor a flux of its own unknown, such as `T - p/rho` beside a gas, is an
+algebraic row: it holds in every cell, and `jno.solve.imex` solves it cell by cell with the stiff terms.
 
 `equilibrium=q_eq` subtracts the discrete residual of a steady state (Berberich, Chandrashekar & Klingenberg
 2021), so that state is preserved to round-off for any balance law. That covers a lake at rest over a bed, or a
@@ -242,7 +269,7 @@ Newton on the assembled tangent is the default. Three alternatives work on any d
 - **`jno.precond.gmg()`:** on a structured quadrilateral or hexahedral mesh the cells come in lattice order,
   so `gmg` works on the cell grid. `cg` + `gmg` equals the default to 2e-14 from 16² to 64² cells.
 - **Inverse problems:** a trainable `jno.np.parameter` or network in the constraints makes `.solve()` a node
-  that `jno.core` trains, and `jax.grad` differentiates a solve directly.
+  that `jno.core` trains, and `jax.grad` differentiates a solve directly, a steady one by `ptc` too.
 
 ```python
 s = jno.np.parameter((1,), name="s"); s.optimizer(optax.adam(1e-1))
@@ -261,6 +288,8 @@ jno.core([(node - observed).mse]).solve(120)     # s -> 1.0 within 2e-3
 - The automatic wave speed costs `O(n³)` per face for an `n`-component system. Give `speed=` for large ones.
 - A steady problem whose solution is fixed only by exponentially small terms (a thin stationary shock between
   two Dirichlet values) has a numerically singular Jacobian. March it in time instead.
+- `jno.solve.ptc` with minmod or without `smooth=True` can stall near the end on the kinks of the limiter and the
+  wave-speed bounds (one of three runs of the wedge on the GPU); use van Albada and `smooth=True`.
 
 ## References
 
@@ -277,3 +306,5 @@ jno.core([(node - observed).mse]).solve(120)     # s -> 1.0 within 2e-3
 - Patankar & Spalding (1972), *Int. J. Heat Mass Transfer* 15, 1787–1806.
 - Issa (1986), *J. Comput. Phys.* 62, 40–65.
 - Ghia, Ghia & Shin (1982), *J. Comput. Phys.* 48, 387–411.
+- Kelley & Keyes (1998), *SIAM J. Numer. Anal.* 35, 508–523.
+- Mulder & van Leer (1985), *J. Comput. Phys.* 59, 232–246.

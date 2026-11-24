@@ -367,7 +367,7 @@ fine-tuning plug into the same `jno.core`.
 | [Inverse & design](https://fhg-iisb.github.io/jNO/inverse-problems/) | gradients through any solve: coefficients, fields, geometry, topology optimisation (MMA) | stable |
 | [Geometry](https://fhg-iisb.github.io/jNO/Domain-and-Geometry/) | CSG via gmsh-OCC, multi-material regions, signed distance, mesh import | stable |
 | [Domain decomposition](https://fhg-iisb.github.io/jNO/domain-decomposition/) | FEM, FDM and PINN subdomains in one problem | beta |
-| [Coupling](https://fhg-iisb.github.io/jNO/coupling/) | FEM, FDM and FVM problems on their own meshes through interface conditions (values, fluxes, loads), steady or window by window, axisymmetric; IMEX for stiff local sources | beta |
+| [Coupling](https://fhg-iisb.github.io/jNO/coupling/) | FEM, FDM and FVM problems on their own meshes through interface conditions (values, fluxes, loads), steady or window by window, axisymmetric, differentiable (train parameters through it); IMEX for stiff local sources | beta |
 | [PINNs](https://fhg-iisb.github.io/jNO/tutorials/01-basics/laplace-1d/) | forward, variational (VPINN, Deep Ritz), stochastic PDEs, adaptive resampling | stable |
 | [Operator learning](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | FNO, DeepONet, U-Net, transformers via [foundax](https://github.com/FhG-IISB/foundax); physics or data losses | stable |
 | [Bayesian](https://fhg-iisb.github.io/jNO/training/bayesian/) | NUTS, HMC, MALA, SGLD, VI per parameter | stable |
