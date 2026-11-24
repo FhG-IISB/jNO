@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543753,"nonce":"k+5P5fK3S6QP4xBfAu4pKjlXnZc=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":2,"timestamp":1795543753,"nonce":"ZAxjUJG4wiheyvOZawfklh/+/2M=","title":"ptc: first-order or frozen-limiter left-hand-side Jacobian for non-smooth limiters","was":"ptc: a first-order or frozen-limiter LHS Jacobian (plan A4) deferred, no failing case"}]}
