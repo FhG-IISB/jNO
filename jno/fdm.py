@@ -779,11 +779,9 @@ class _TraceFDM(StrongFormProblem):
             k = self._field_index(c)
             for b in self._blocks_of(k):
                 mask[b * self._N + nodes] = True
-            g_node = self._value_side(c)
-            if self._is_nodal_data(g_node):
-                g = self._eval_g(g_node, nodes)  # a known nodal field: gathered at the region's nodes
-            else:
-                g = self._eval_value(g_node, nodes, getattr(self, "_override", None), t)
+            # a known nodal field is gathered at the region's nodes, from its injected value when the march has
+            # one (`_override`, a coupling's window): read from the stored value, the boundary ignored it
+            g = self._eval_value(self._value_side(c), nodes, getattr(self, "_override", None), t)
             for b, gb in zip(self._blocks_of(k), self._split_components(k, g, len(nodes))):
                 vals = vals.at[jnp.asarray(b * self._N + nodes)].set(gb)
         return mask, vals

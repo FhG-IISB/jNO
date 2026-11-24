@@ -394,16 +394,21 @@ class StrongFormProblem:
         found = {}
         for lid, model in models.items():
             module = getattr(model, "module", None)
-            value = getattr(module, "value", None)
-            if value is not None and np.ndim(value) == 1 and np.shape(value)[0] == self._N:
-                # one value per node: a per-node scalar field, shaped (N, 1) like every other one in the
-                # strong form. As (N,) it broadcast against an (N, 1) derivative to (N, N).
-                import equinox as eqx
-
-                module = eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
             if module is not None:
-                found[lid] = module
+                found[lid] = self._nodal_module(module)
         return found
+
+    def _nodal_module(self, module):
+        """``module``, with a value of one entry per node (``(N,)``) shaped ``(N, 1)``: a per-node scalar field,
+        laid out like every other one in the strong form. As ``(N,)`` it broadcast against an ``(N, 1)``
+        derivative to ``(N, N)``. Applied to every module an evaluation reads, stored or injected, so a value
+        evaluates the same whichever route it takes."""
+        value = getattr(module, "value", None)
+        if value is None or np.ndim(value) != 1 or np.shape(value)[0] != self._N:
+            return module
+        import equinox as eqx
+
+        return eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
 
     def _params_scope(self, extra_params=None):
         """The module every trainable parameter resolves to in an evaluation: its current value, then the
@@ -414,7 +419,10 @@ class StrongFormProblem:
         scope.update({lid: n.model.module for lid, n in self._trainable_params().items()})
         scope.update(getattr(self, "_override", None) or {})
         scope.update(extra_params or {})
-        return scope
+        # an injected per-node field takes the (N, 1) layout its stored value has: injected as (N,), a data field
+        # in a Neumann row `∇u·n - g` broadcast the row to (N, N), lost its gradient part and made the solve
+        # singular (NaN with lu)
+        return {lid: self._nodal_module(m) for lid, m in scope.items()}
 
     def _current_params(self):
         """``{layer_id: module}`` of every trainable parameter at its current value."""

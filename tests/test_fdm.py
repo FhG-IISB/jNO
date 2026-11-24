@@ -3327,6 +3327,79 @@ def test_structure_is_decided_for_every_value_of_a_trainable_parameter():
     np.testing.assert_allclose(sol, ref, atol=1e-8 * np.abs(ref).max())
 
 
+def _slab_with_data(make_cons, **domain_kw):
+    """The unit square with a nodal data field ``g`` (one value per mesh node, no optimizer: the kind a coupling
+    injects), the constraints from ``make_cons(d, g)``, and the problem's node coordinates."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, **domain_kw)
+    g = jno.np.parameter((_nodes(d).shape[0],), name="g")
+    prob = jno.fdm(make_cons(d, g))
+    return prob, g, np.asarray(prob._pts)
+
+
+def test_a_neumann_flux_injected_as_traced_data_gives_the_linear_solution_and_its_gradient():
+    """-Δu = 0, u = 1 on the left, ∂u/∂n = g on the right, insulated top and bottom: u = 1 + g·x, exact for the
+    boundary fit. ``g`` enters as ``extra_params`` (traced under jit), the route a coupling and a jno.core
+    inverse take. It used to return NaN: the injected (N,) value replaced the (N, 1) a data field is read as, so
+    the flux row ``∇u·n - g`` broadcast to (N, N) and lost its gradient part, and the system was singular.
+    Gradient: a uniform change δ of g moves u by δ·x, so the mean right-edge value moves by δ."""
+
+    def cons(d, g):
+        x, y, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        u = d.unknown()
+        out = [-(u.bind(x=x, y=y).d2(x) + u.bind(x=x, y=y).d2(y)), u(xl, yl) - 1.0]
+        out.append(u.bind(x=xr, y=yr).d(d.variable("right", normals=True)) - g)
+        for tag in ("top", "bottom"):
+            xt, yt, _ = d.variable(tag, split=True)
+            out.append(u.bind(x=xt, y=yt).d(d.variable(tag, normals=True)) - 0.0)
+        return out
+
+    prob, g, pts = _slab_with_data(cons)
+    right = jnp.asarray(np.isclose(pts[:, 0], 1.0))
+    lid = g.model.layer_id
+
+    @jax.jit
+    def solve(values):
+        scope = {lid: prob._trainable_module(g, values)}
+        return jnp.asarray(prob._steady_solve(extra_params=scope, linear=jno.solve.lu())).reshape(-1)
+
+    v = jnp.full(prob._N, 2.0)
+    # a direct solve of an exact discretisation: round-off of the LU (cond ~1e3 at h = 0.1)
+    np.testing.assert_allclose(np.asarray(solve(v)), 1.0 + 2.0 * pts[:, 0], atol=1e-10)
+    mean_right = lambda w: jnp.sum(jnp.where(right, solve(w), 0.0)) / jnp.sum(right)  # noqa: E731
+    np.testing.assert_allclose(float(jnp.sum(jax.grad(mean_right)(v))), 1.0, atol=1e-10)
+
+
+def test_a_dirichlet_value_injected_as_data_holds_in_a_march():
+    """A march reads injected data through ``_override`` (how a coupling's window passes its data). A Dirichlet
+    value that is a nodal data field used to be read from its STORED value there (0 here), so the boundary
+    ignored the injected 2. Backward Euler makes the Dirichlet row algebraic, so every saved state holds u = g on
+    the left. (Eager: tracing the fdm march itself is a later step.)"""
+
+    def cons(d, g):
+        x, y, t = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y, t=t)
+        return [ui.t - (ui.d2(x) + ui.d2(y)), u(xl, yl) - g, u(xr, yr) - 0.0, u(xi, yi) - 0.0]
+
+    prob, g, pts = _slab_with_data(cons, time=(0.0, 0.05, 5))
+    left = np.isclose(pts[:, 0], 0.0)
+
+    def march(values):
+        prob._override = {g.model.layer_id: prob._trainable_module(g, values)}
+        try:
+            return jnp.asarray(prob._march(x0=jnp.zeros(prob._N)))
+        finally:
+            prob._override = None
+
+    traj = np.asarray(march(jnp.full(prob._N, 2.0))).reshape(-1, prob._N)
+    np.testing.assert_allclose(traj[1:, left], 2.0, atol=1e-12)  # an algebraic row: exact to round-off
+
+
 def test_the_grid_linear_path_is_differentiable_in_the_source():
     """d/da of a misfit through -Δu = a·f on a structured grid: the adjoint through custom_linear_solve
     against a central difference of the same solve."""
