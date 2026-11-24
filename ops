@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540052,"nonce":"NEU907ij1tIwVH9X9aXWPO4z1yA=","target":"6110c2898e342cdb8f8c3882ae7dca6b53f287b72194b16748c2d3a4d15f7daa","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKE7hw","github-url":"https://github.com/FhG-IISB/jNO/issues/359"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543748,"nonce":"OmzuhaLJZvQAnDiPL76E3rlsvW8=","added":["bug","branch:feat/fvm"],"removed":null}]}
