@@ -190,21 +190,16 @@ class Participant:
         return not any(walk(c) for c in self.constraints())
 
     def march(self, problem, state, t0, window, data, time=None, params=None):
-        """The state after the window ``[t0, t0 + window]`` from ``state``, the data held over it. ``params``
+        """``(end, frames)``: the state after the window ``[t0, t0 + window]`` from ``state``, the data held over it,
+        and the states at the problem's own steps from the window's start, ``(n_steps + 1, n)`` (a flux it sends is
+        their mean over the window), or ``None`` when it sends its end state's flux. ``params``
         (``{layer_id: value}``) gives trainable parameters their (possibly traced) values, as in :meth:`solve`."""
         raise NotImplementedError
 
-    def frames(self, problem, end):
-        """The states of the last window ``problem`` marched, at its own steps from the window's start, if it
-        ended in ``end`` (a flux it sends is their mean over the window); ``None`` otherwise."""
-        kept = self.__dict__.get("_frames", {}).get(id(problem))
-        return kept[0] if kept is not None and kept[1] is end else None
-
-    def _keep(self, problem, traj):
-        """Keep the window's frames ``(n_steps + 1, n)`` and return its last state."""
-        end = traj[-1].reshape(-1)
-        self.__dict__.setdefault("_frames", {})[id(problem)] = (traj, end)
-        return end
+    @staticmethod
+    def _frames(traj):
+        """``(end, frames)`` of a window's trajectory ``(n_steps + 1, n)``."""
+        return traj[-1].reshape(-1), traj
 
     def initial(self, problem):
         """The state its initial condition gives."""
@@ -325,7 +320,7 @@ class FDMParticipant(_StrongForm):
         finally:
             problem._override = None
         traj = jnp.asarray(traj)
-        return self._keep(problem, traj.reshape(traj.shape[0], -1))
+        return self._frames(traj.reshape(traj.shape[0], -1))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -418,9 +413,9 @@ class FVMParticipant(_StrongForm):
 
         args = ([data[k] for k in keys], [params[k] for k in pkeys], state)
         if not self.autonomous():  # its own times: compiled per window
-            return self._keep(problem, _compiled({}, None, run, *args))
+            return self._frames(_compiled({}, None, run, *args))
         cache = problem.__dict__.setdefault("_cpl_march", {})
-        return self._keep(problem, _compiled(cache, (keys, pkeys, span, repr(time)), run, *args))
+        return self._frames(_compiled(cache, (keys, pkeys, span, repr(time)), run, *args))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -566,7 +561,7 @@ class FEMParticipant(Participant):
             ys = time.integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
         else:
             ys = _default_transient_integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
-        return jnp.asarray(ys)[-1].reshape(-1)
+        return jnp.asarray(ys)[-1].reshape(-1), None  # its flux is read from the end state
 
     def initial(self, problem):
         import jax.numpy as jnp

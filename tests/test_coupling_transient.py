@@ -193,3 +193,29 @@ def test_a_substepping_sender_passes_its_window_mean_flux_and_heat_is_conserved(
     # measured 2.4 % and 0.8 % (ten and twenty sender steps per window; the end value: 24 %): the first-step
     # error falls faster than the step
     assert coarse < 0.03 and fine < 0.5 * coarse, (coarse, fine)
+
+
+@pytest.mark.parametrize("implicit", [True, False], ids=["one-way", "loose"])
+def test_a_window_of_one_sweep_runs_as_one_compiled_program(implicit):
+    # Name the break: a window that takes one sweep (a one-way coupling, or a loose one) is one compiled program,
+    # traced once for every window after the first (eager) one. Run eagerly window by window, the participants'
+    # Python glue between their compiled pieces dominated a long march (the nozzle start-up: 80 windows, 5.4 min).
+    # Oracle: the same coupling with compile=False, window by window as before.
+
+    def coupled(compile):  # fresh problems for each run (git-bug 44958ea: a fem build re-tags shared Variables)
+        pa, ua, fa, _ = _fem_cold(0.04)
+        pb, ub, fb, _ = _fvm_hot(0.03)
+        if implicit:  # cooling of the cold side by the hot one's surface temperature: data flow one way only
+            conds = [K1 * fa + 5.0 * (ua - ub)]
+        else:  # the contact pair, one sweep per window
+            conds = [ua - ub, K1 * fa + K2 * fb]
+        return couple([pa, pb], conds, CouplingSpec(implicit=implicit, compile=compile, tol=1e-8, max_iter=40))
+
+    ra, rb = coupled(False).solve()
+    c = coupled(True)
+    ta, tb = c.solve()
+    assert c.compiles == 1 and len(c.times) == N_TIME
+    # the same arithmetic, compiled: round-off of the step solves
+    np.testing.assert_allclose(ta, ra, atol=1e-12)
+    np.testing.assert_allclose(tb, rb, atol=1e-12)
+    assert np.abs(ta[-1] - ta[0]).max() > 0.01  # the cold side did warm

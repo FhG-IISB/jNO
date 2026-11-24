@@ -60,6 +60,7 @@ class CouplingSpec:
     time: object = None
     reuse: int = 0
     x0: object = None
+    compile: bool = True
 
     def __post_init__(self):
         if self.scheme not in ("gauss-seidel", "jacobi"):
@@ -143,6 +144,7 @@ class Coupled:
         self.order = self._order()
         self.data, self.problems = self._build()
         self.history = []
+        self.compiles = 0  # traces of the compiled window program (a window of one sweep)
 
     # -- structure ------------------------------------------------------------------------------------
     def _who(self, node):
@@ -397,7 +399,7 @@ class Coupled:
                     extra.update(d.setter(part.nodal(face, lv), prob))
             if windowed:
                 window, t0, _ = self._window
-                state = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i))
+                state, _ = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i))
             else:
                 state = part.solve(prob, extra, x0=self._guess.get(i))
             out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra)))
@@ -672,29 +674,31 @@ class Coupled:
         return found[0].bind(**original.coords[i])
 
     # -- iteration ---------------------------------------------------------------------------------------
-    def _produce(self, d, states, values):
+    def _produce(self, d, states, values, frames=None):
         """Data ``d`` from its sender's current state, carried to the receiver's interface nodes; ``values`` the data
-        the sender read (its boundary conditions, which its own samples read too).
+        the sender read (its boundary conditions, which its own samples read too), ``frames`` the window's frames of
+        the participants that marched one (:meth:`Participant.march`). Traceable.
 
         A flux from a sender that just marched a window is its mean over the window, from the sender's own
         steps: what the receiver takes in over the window is then what the sender gave out. Its end value is
         not, when the sender takes several steps (an explicit march, a finer step) while the flux changes."""
+        import jax.numpy as jnp
+
         s, r = self.parts[d.sender], self.parts[d.receiver]
         src = s.interface(d.sender_tag, self.spec.measure)
         dst = r.interface(d.receiver_tag, self.spec.measure)
         prob, data = self.problems[d.sender], self._extra(d.sender, values)
-        frames = s.frames(prob, states[d.sender]) if d.flux else None
-        if frames is None or frames.shape[0] < 2:
-            vals = np.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data))
+        fr = (frames or {}).get(d.sender) if d.flux else None
+        if fr is None or fr.shape[0] < 2:
+            vals = jnp.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data))
         else:
-            w = self._window_weights(d.sender, frames.shape[0] - 1)
+            w = self._window_weights(d.sender, fr.shape[0] - 1)
             vals = sum(
-                wk * np.asarray(s.sample(prob, frames[k], d.expr, d.sender_tag, src, data))
+                wk * jnp.asarray(s.sample(prob, fr[k], d.expr, d.sender_tag, src, data))
                 for k, wk in enumerate(w)
                 if wk != 0.0
             )
-        M = self._map(d, dst, src)
-        return np.asarray(M @ vals)
+        return self._map_jnp(d, dst, src) @ vals
 
     def _window_weights(self, i, m):
         """Weights of a window's ``m + 1`` frames in its mean: the trapezoid rule for an explicit (or IMEX) march,
@@ -717,6 +721,17 @@ class Coupled:
             cache[key] = (conservative if d.flux else consistent)(dst, src)
         return cache[key]
 
+    def _map_jnp(self, d, dst, src):
+        """:meth:`_map` as a sparse JAX matrix (BCOO), for the traceable transfer."""
+        from .transfer import _Projection, to_jax
+
+        cache = self.__dict__.setdefault("_maps_jnp", {})
+        key = (d.receiver, d.receiver_tag, d.sender, d.sender_tag, d.flux)
+        if key not in cache:
+            M = self._map(d, dst, src)
+            cache[key] = M if isinstance(M, _Projection) else to_jax(M)  # a projection is traceable itself
+        return cache[key]
+
     def _extra(self, i, values):
         """What participant ``i``'s solve takes for the data fields it reads, from their ``values``."""
         part, prob = self.parts[i], self.problems[i]
@@ -729,12 +744,13 @@ class Coupled:
 
     def _advance(self, i, start, states, values, t, window):
         """Participant ``i`` with the data ``values``: a window's march from ``start`` for a transient problem, a
-        (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady."""
+        (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady. Returns its
+        state and the window's frames (``None`` for a solve)."""
         part, prob = self.parts[i], self.problems[i]
         extra = self._extra(i, values)
         if window is not None and part.transient(prob):
             return part.march(prob, start[i], t, window, extra, time=self._time_of(i))
-        return part.solve(prob, extra, x0=states[i])
+        return part.solve(prob, extra, x0=states[i]), None
 
     def _time_of(self, i):
         tm = self.spec.time
@@ -753,33 +769,37 @@ class Coupled:
     def _sweep(self, x, start, states, values, back, t=None, window=None):
         """One sweep from the back data ``x``: every participant advanced once. Returns the states, the data values
         each participant read, and the back data its senders produce from them."""
+        import jax.numpy as jnp
+
         values = self._unpack(values, back, x)
         n = len(self.parts)
+        states, frames = list(states), {}
         if self.spec.scheme == "jacobi":
-            states = [self._advance(i, start, states, values, t, window) for i in range(n)]
+            for i, (state, fr) in enumerate([self._advance(i, start, states, values, t, window) for i in range(n)]):
+                states[i], frames[i] = state, fr
         else:
-            states = list(states)
             for i in self.order:
                 fresh = {  # forward data: fresh from senders already run in this sweep
-                    k: self._produce(d, states, values)
+                    k: self._produce(d, states, values, frames)
                     for k, d in enumerate(self.data)
                     if d.receiver == i and k not in back
                 }
                 values = tuple(fresh.get(k, v) for k, v in enumerate(values))
-                states[i] = self._advance(i, start, states, values, t, window)
-        x_new = np.concatenate([self._produce(self.data[k], states, values) for k in back]) if back else np.zeros(0)
-        return states, values, x_new
+                states[i], frames[i] = self._advance(i, start, states, values, t, window)
+        produced = [self._produce(self.data[k], states, values, frames) for k in back]
+        return states, values, jnp.concatenate(produced) if back else jnp.zeros(0)
 
     def _iterate(self, start, states, values, t=None, window=None):
         """One coupled solve -- the steady problem, or one window -- iterated until the interface data stop
         changing (or a single sweep, ``implicit=False``). Returns the participants' states and the data values."""
         states = list(states)
         back = self._back()
-        x = np.concatenate([values[k] for k in back]) if back else np.zeros(0)
+        x = np.concatenate([np.asarray(values[k]) for k in back]) if back else np.zeros(0)
         self._accel.start()
         history = []
         for it in range(1, self.spec.max_iter + 1):
             states, values, x_new = self._sweep(x, start, states, values, back, t, window)
+            x_new = np.asarray(x_new)
             err = float(np.linalg.norm(x_new - x)) / max(float(np.linalg.norm(x_new)), 1e-300)
             history.append(err)
             self.history = history
@@ -845,9 +865,14 @@ class Coupled:
         values = self._start_data(states)
         frames = [[] for _ in range(n)]
         self.window_iterations, self.times = [], [t0]
+        program = self._window_program(transient) if self._one_sweep(transient) else None
         t = t0
         for w in range(int(round((t1 - t0) / window))):
-            states, values = self._iterate(start, states, values, t, window)
+            if program is not None and w > 0:  # the first window eagerly: it makes the structural decisions
+                states, values, err = program(states, values)
+                self.history = [float(err)]
+            else:
+                states, values = self._iterate(start, states, values, t, window)
             if w == 0:  # a quasi-steady problem's first frame is its state in the first window
                 for i in range(n):
                     frames[i].append(start[i] if i in transient else states[i])
@@ -860,6 +885,34 @@ class Coupled:
         self.iterations = int(sum(self.window_iterations))
         self.states = states
         return [np.stack([self._shape(i, f) for f in frames[i]]) for i in range(n)]
+
+    def _one_sweep(self, transient):
+        """Is every window one sweep that one compiled program can run: data flowing one way (no back data) or a
+        loose coupling, and transient participants whose windows do not depend on their start time?"""
+        if not self.spec.compile:
+            return False
+        if self._back() and self.spec.implicit:
+            return False
+        return all(self.parts[i].autonomous() for i in transient)
+
+    def _window_program(self, transient):
+        """One window of one sweep as a single compiled program: every participant's march or solve, its samples
+        and the transfers between them, traced once for every window (``self.compiles`` counts the traces)."""
+        import jax
+        import jax.numpy as jnp
+
+        window, t0, _ = self._window
+        back = self._back()
+
+        def run(states, values):
+            self.compiles += 1
+            start = [states[i] if i in transient else None for i in range(len(self.parts))]
+            x = jnp.concatenate([jnp.asarray(values[k]) for k in back]) if back else jnp.zeros(0)
+            states, values, x_new = self._sweep(x, start, states, values, back, t0, window)
+            err = jnp.linalg.norm(x_new - x) / jnp.maximum(jnp.linalg.norm(x_new), 1e-300)
+            return states, self._unpack(values, back, x_new), err
+
+        return jax.jit(run)
 
     def _brief(self):
         h = self.history

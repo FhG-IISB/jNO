@@ -356,14 +356,20 @@ def mixed_mass(target: Interface, source: Interface, k: int = 8, refine: int = 4
 
 
 class _Projection:
-    """``M_tt^-1 M_ts``, applied without forming the inverse."""
+    """``M_tt^-1 M_ts``, applied without forming the inverse; traceable (the mixed mass as a sparse JAX matrix, the
+    target's projection by CG)."""
 
     def __init__(self, target, mixed):
         self.target, self.mixed = target, mixed
         self.shape = mixed.shape
+        self._mixed = None
 
     def __matmul__(self, q):
-        return self.target.project(self.mixed @ np.asarray(q, dtype=float))
+        import jax.numpy as jnp
+
+        if self._mixed is None:
+            self._mixed = to_jax(self.mixed)
+        return self.target.project(self._mixed @ jnp.asarray(q, dtype=self._mixed.dtype))
 
 
 def conservative(target: Interface, source: Interface, k: int = 8):

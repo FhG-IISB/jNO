@@ -106,7 +106,7 @@ def test_a_participant_marches_window_by_window_like_one_march(case, window):
     state, t = full[0], 0.0
     steps = int(round(window / 0.01))
     for k in range(int(round(T / window))):
-        state = np.asarray(p.march(prob, state, t, window, {}, time=time))
+        state = np.asarray(p.march(prob, state, t, window, {}, time=time)[0])  # (end, frames)
         t += window
         # an autonomous problem marches every window as [0, window]: one compiled march for all of them
         np.testing.assert_allclose(state, full[(k + 1) * steps], atol=1e-10 * np.abs(full).max())

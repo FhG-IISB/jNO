@@ -197,7 +197,7 @@ def test_a_participant_marches_a_window_under_jit_and_differentiates_by_a_parame
 
     def right_mean(q, k):
         data = setter(part.nodal(iface, q), prob)
-        state = part.march(prob, start, 0.0, 0.04, data, params={lid: k})
+        state, _ = part.march(prob, start, 0.0, 0.04, data, params={lid: k})
         vals = part.sample(prob, state, value, "right", iface, data, params={lid: k})
         return jnp.sum(jnp.asarray(iface.weights) * vals) / iface.total
 

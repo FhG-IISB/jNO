@@ -2156,6 +2156,7 @@ def coupling(
     time=None,
     reuse=0,
     x0=None,
+    compile=True,
 ):
     """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
     meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
@@ -2192,6 +2193,10 @@ def coupling(
             ``solve(x0=)`` takes): their first sweep and the stiffness probe. A steady gas needs one, as it has no
             state at zero. The interface data then start from the starting states too (each sender's value there, or
             the value that holds its condition at the receiver's start), not from zero.
+        compile: run a transient coupling's window as one compiled program where every window is one sweep (data
+            flowing one way, or ``implicit=False``) and the problems' windows do not depend on their start time:
+            traced once (``core.coupled.compiles``), after a first window run step by step. ``False`` runs every
+            window step by step.
 
     The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
     """
@@ -2210,6 +2215,7 @@ def coupling(
         time=time,
         reuse=reuse,
         x0=x0,
+        compile=compile,
     )
 
 
