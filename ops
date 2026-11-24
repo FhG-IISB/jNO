@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540068,"nonce":"bC7nA4bm7xjmrbMuHUYZ3lyCbXY=","target":"027b71784d610b30de012389d338fff4c120837664f31187e30ec4123279c19c","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKFM3Q","github-url":"https://github.com/FhG-IISB/jNO/issues/369"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543752,"nonce":"HjYMh/WOnfFJBVtRQ6wq1K5ShEI=","added":["bug","branch:feat/fvm"],"removed":null}]}
