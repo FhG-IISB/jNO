@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540043,"nonce":"gVJ/w+k/Q8dnjpUxWQpGCP8lEz8=","target":"a300f01a3da311f731fe106a2446e05e16ee9e2e7535f338dc9ae17000a60d3c","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKEs8g","github-url":"https://github.com/FhG-IISB/jNO/issues/355"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543747,"nonce":"LIL6nPcdGGRw2TnXKrFETSwh6IE=","added":["bug","branch:feat/fvm"],"removed":null}]}
