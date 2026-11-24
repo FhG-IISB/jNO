@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540069,"nonce":"8C05v1HO4sjlQH56qZlTXCMx2aA=","target":"01309e31835b3debb596d53c2e18ee294782124c2c2f88b4284982fadcc7d25a","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKFQ-Q","github-url":"https://github.com/FhG-IISB/jNO/issues/370"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543752,"nonce":"+8LW3sTof/02mMUMtFzAGUKDbqA=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
