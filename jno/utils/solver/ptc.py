@@ -33,7 +33,17 @@ import numpy as np
 
 
 class PseudoTransient:
-    """``jno.solve.ptc(...)``: a nonlinear driver with the Newton driver's calling convention."""
+    """``jno.solve.ptc(...)``: a nonlinear driver with the Newton driver's calling convention.
+
+    Args:
+        dtau0: the first pseudo-time step.
+        dtau_max: the largest pseudo-time step.
+        max_steps: the most pseudo-time steps.
+        rtol, atol: the residual tolerances at which it stops.
+        positive: expressions of the unknowns that every step keeps positive (fraction to the boundary).
+        keep: the share of each positive quantity a step must leave, in (0, 1).
+        ramp: the least growth of the pseudo-time step after a full step, >= 1.
+    """
 
     direct = True  # it needs the assembled tangent
     name = "ptc"

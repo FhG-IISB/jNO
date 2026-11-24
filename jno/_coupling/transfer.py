@@ -35,6 +35,8 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.sparse as sp
 
+from ..utils.sets import unique_values
+
 # Gauss rules on the reference segment [0, 1] and triangle, exact for the degree-2 integrands φ_i · μ
 # (a linear measure times a linear shape function) that the weights need.
 _SEG_X = np.array([0.5 - np.sqrt(15.0) / 10.0, 0.5, 0.5 + np.sqrt(15.0) / 10.0])
@@ -313,7 +315,7 @@ def mixed_mass(target: Interface, source: Interface, k: int = 8, refine: int = 4
             if 0.0 < t < 1.0:
                 cuts[f].append(float(t))
         for f in range(A.shape[0]):
-            c = np.unique(np.asarray(cuts[f]))
+            c = unique_values(np.asarray(cuts[f]))
             lo, hi = c[:-1], c[1:]
             for x, wq in zip(_SEG_X, _SEG_W):
                 t = lo + x * (hi - lo)

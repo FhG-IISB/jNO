@@ -75,6 +75,7 @@ class IMEXScheme:
         return f"jno.solve.imex({self.method!r}{cfl})"
 
     def step_order(self):
+        """The order of accuracy of the scheme in the step (2 for ARS(2,2,2), 3 for ARS(4,4,3))."""
         return self._order
 
     def _parts(self, block, args):
@@ -93,6 +94,8 @@ class IMEXScheme:
         return local, explicit, mass_diag, nf, n
 
     def stepper(self, block, args):
+        """``step(u, t, dt) -> u_next``: one IMEX step of ``block`` with its runtime arguments ``args``. The fluxes
+        are taken explicitly, the cell-local terms implicitly, by a Newton on each cell's ``nf x nf`` block."""
         local, explicit, mass_diag, nf, n = self._parts(block, args)
         A_ex, A_im, c = self.A_ex, self.A_im, self.c
         s = A_ex.shape[0]
@@ -156,6 +159,10 @@ class IMEXScheme:
         return step
 
     def integrate(self, block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
+        """March ``block`` with its runtime arguments ``args`` over its time grid and return the states at
+        ``save_ts``. With ``cfl=`` every step is split into substeps from the stable step of its start state.
+        ``linear_solve`` and ``nonlinear_solve`` are accepted for the time-scheme interface and unused: each
+        cell's implicit stage is solved by its own Newton."""
         from functools import partial
 
         from .backend_blocks import _block_time_grid, _resample_trajectory

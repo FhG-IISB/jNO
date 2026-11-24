@@ -47,6 +47,7 @@ from .._strong_form import (
     _unwrap,
     _zero_temporal,
 )
+from ..utils.sets import unique_values
 from .geometry import cell_graph, dual_graph
 from .ops import FVOps
 from .scheme import FVScheme
@@ -307,7 +308,7 @@ class _TraceFVM(StrongFormProblem):
             return np.asarray(reg["point_indices"], dtype=int)
         facets = self.domain.tag_facets(tag)
         if facets is not None:
-            return np.unique(np.asarray(facets).ravel())
+            return unique_values(np.asarray(facets))
         pool = getattr(self.domain, "_mesh_pool", {}).get(tag)
         if pool is not None:
             from scipy.spatial import cKDTree
@@ -315,7 +316,7 @@ class _TraceFVM(StrongFormProblem):
             pts = np.unique(np.asarray(pool).reshape(-1, np.asarray(pool).shape[-1])[:, : self.graph.dim], axis=0)
             dist, nodes = cKDTree(self._mesh_points).query(pts)
             if len(pts) and np.all(dist <= _rtol() * float(np.ptp(self._mesh_points, axis=0).max())):
-                return np.unique(nodes).astype(int)
+                return unique_values(nodes).astype(int)
         raise ValueError(
             f"jno.fvm([...]): no mesh nodes found for region {tag!r}. Use a boundary tag of the domain, "
             "'boundary', or a `domain.point_region(name, xy)` node."
@@ -583,7 +584,7 @@ class _TraceFVM(StrongFormProblem):
                 continue
             nodes = self._region_mesh_nodes(tag)
             _, cells = cKDTree(self.graph.centroid).query(self._mesh_points[nodes])
-            out.append((self._field_of(c), jnp.asarray(np.unique(cells), dtype=jnp.int32), _unwrap(c)))
+            out.append((self._field_of(c), jnp.asarray(unique_values(cells), dtype=jnp.int32), _unwrap(c)))
         return out
 
     # -- evaluation -----------------------------------------------------------------------------------

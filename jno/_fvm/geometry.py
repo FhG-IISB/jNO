@@ -24,6 +24,8 @@ import dataclasses
 
 import numpy as np
 
+from ..utils.sets import unique_values
+
 __all__ = ["FVGraph", "cell_graph", "dual_graph", "face_geometry"]
 
 
@@ -97,7 +99,7 @@ class FVGraph:
         shift = np.asarray(shift, dtype=float).reshape(1, self.dim)
         dist, match = cKDTree(self.b_centroid[fb] + shift).query(self.b_centroid[fa])
         extent = float(np.ptp(self.points, axis=0).max())
-        if np.unique(match).size != fa.size or dist.max() > 1e-8 * extent:
+        if unique_values(match).size != fa.size or dist.max() > 1e-8 * extent:
             raise ValueError(
                 f"jno.fvm periodic: the faces do not match under the translation {shift.ravel().tolist()} "
                 f"(largest mismatch {dist.max():.3g}). Build the mesh periodic-conforming."

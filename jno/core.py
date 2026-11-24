@@ -2521,6 +2521,10 @@ class core:
                     )
                     crux.solve(1_500, substeps=[[0, 1], [2, 3]])
                     # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
+            coupling: for a core of problems on their own meshes with the interface conditions between
+                them, how they are coupled (:func:`jno.solve.coupling`; its defaults when ``None``). The
+                call then returns each problem's solution instead of training, or, when a coupled problem
+                has a trainable parameter, the solutions as trace nodes for a ``jno.core`` loss.
 
         A domain with a ``rebuild(when=...)`` is watched: after every epoch its condition is read at
         the current parameters, and once it holds the domain and the solvers built on it are rebuilt at
