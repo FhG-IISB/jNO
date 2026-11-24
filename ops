@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795540070,"nonce":"ySz0yqcJcx2jvs1RMt2r9BAFB94=","target":"872441b866d9986cb3b0a6e55ad53c1e76d2f10aa5982aa8bfcdffd3e7ede2f6","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABiKFSOg","github-url":"https://github.com/FhG-IISB/jNO/issues/371"}}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795543753,"nonce":"AzSwAUwGqTG8AgpNat1TmbbgeaU=","added":["enhancement","branch:feat/fvm"],"removed":null}]}
