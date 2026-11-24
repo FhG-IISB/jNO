@@ -71,6 +71,33 @@ import numpy as np
 
 from . import precond as jno_precond
 from . import solve as _solve
+from ._strong_form import (  # noqa: F401  (re-exported: tests and fvm import them from here)
+    StrongFormProblem,
+    _contains_unknown,
+    _context_leaf,
+    _find_unknowns,
+    _has_temporal,
+    _has_temporal_of,
+    _has_time_variable,
+    _has_unknown_derivative,
+    _is_normal_jacobian,
+    _iter,
+    _iter_variables,
+    _map_children,
+    _mesh_nodes_in,
+    _normal_jacobian,
+    _normal_jacobians,
+    _periodic_axis,
+    _refuse_fem_only_unknowns,
+    _refuse_inside,
+    _region_tag,
+    _rtol,
+    _set_temporal,
+    _spatial_tags,
+    _temporal_order,
+    _unwrap,
+    _zero_temporal,
+)
 from .differential_operators import DifferentialOperators as _D
 from .trace_evaluator import fd_grid
 from .utils.sets import unique_values
@@ -78,14 +105,6 @@ from .utils.sets import unique_values
 __all__ = ["fdm", "laplacian", "gradient"]
 
 _MARCH_BLOCKS_KEPT = 4  # march blocks kept per problem: the configurations solved in turn (schemes, solver slots)
-
-
-def _rtol(dtype=None) -> float:
-    """The relative tolerance to which two floating-point results that should be equal are compared (an
-    affine probe, a symmetry probe, a node on a lattice): ``√ε`` of ``dtype`` (the default float if ``None``),
-    1.5e-8 in float64 and 3.5e-4 in float32. It replaces fixed 1e-10 / 1e-9 / 1e-6 thresholds, which were
-    below float32's resolution (every float32 operator probed "nonlinear" and "non-symmetric")."""
-    return float(np.sqrt(np.finfo(jnp.result_type(float) if dtype is None else dtype).eps))
 
 
 def _fd_operator_noise(residual_fn, u0) -> float:
@@ -465,43 +484,12 @@ def gradient(u, domain, method: str = "area_weighted"):
     return jnp.stack([gx, gy], axis=1)
 
 
-def _unwrap(node):
-    return getattr(node, "_expr", node)  # view -> underlying Placeholder
-
-
-def _iter(node):
-    from .utils.solver.solver_helper import iter_children
-
-    return iter_children(node) or ()
-
-
-def _refuse_fem_only_unknowns(constraints):
-    """``domain.unknown(order=2)`` (or a non-nodal space, a complex field, ``symmetric=True``) has no valued P1
-    nodal field behind it -- it is an FEM trial symbol -- so there is nothing for a strong-form solve to
-    hold. Say that, rather than reporting that no unknown was found."""
-    from .trace import TrialFunction
-
-    def walk(n):
-        n = _unwrap(n)
-        if isinstance(n, TrialFunction) and n.__dict__.get("_fem_only_unknown", False):
-            raise NotImplementedError(
-                f"jno.fdm([...]): the unknown {n.name!r} (order={n.order}, space={n.space!r}, "
-                f"value_shape={n.value_shape}) is FEM-only -- jno.fdm solves for a real P1 nodal field with "
-                "full storage, i.e. `domain.unknown(...)` with order=1, the default space, complex=False and "
-                "symmetric=False. Solve this one with jno.fem([...])."
-            )
-        for c in _iter(n):
-            walk(c)
-
-    for c in constraints:
-        walk(c)
-
-
 def _find_unknown(constraints):
     """The single ``domain.unknown()`` field (a nodal-field-parameter ModelCall's Model) in the list."""
     from .trace import ModelCall
 
     _refuse_fem_only_unknowns(constraints)
+    _refuse_inside(constraints, "jno.fdm")
 
     models = {}
 
@@ -606,264 +594,7 @@ def _fuse_fd_laplacian(expr, dim):
     return visit(expr)
 
 
-def _has_time_variable(node):
-    """Does a value expression use the temporal Variable (``tb`` in ``g(xb, yb, tb)``)?"""
-    from .trace import Variable
-
-    n = _unwrap(node) if not isinstance(node, (int, float)) else None
-    if n is None:
-        return False
-    if isinstance(n, Variable):
-        return getattr(n, "axis", None) == "temporal"
-    return any(_has_time_variable(c) for c in _iter(n))
-
-
-def _find_unknowns(constraints):
-    """All ``domain.unknown()`` fields (nodal-field-parameter ModelCalls' Models) in the constraints, in
-    **declaration** order — a **coupled** system has several, and ``.solve()`` returns one row per field in
-    this order. (It used to be first-appearance order: listing the v-equation first silently swapped the
-    returned ``u`` and ``v``.) At least one is required. The k-th PDE equation fills the k-th DOF block's
-    interior rows, and each ``u_k(region) - g`` BC the boundary rows of its own field's block; the joint
-    system is the same whichever order the equations are listed in."""
-    from .trace import ModelCall
-
-    _refuse_fem_only_unknowns(constraints)
-    seen, order = set(), []
-
-    def walk(n):
-        n = _unwrap(n)
-        if isinstance(n, ModelCall) and getattr(n.model, "_fem_field", None) == "node" and n.model.layer_id not in seen:
-            seen.add(n.model.layer_id)
-            order.append(n.model)
-        for c in _iter(n):
-            walk(c)
-
-    for c in constraints:
-        walk(c)
-    if not order:
-        raise ValueError(
-            "jno.fdm([...]): expected at least one domain.unknown() field. Author the strong form with "
-            "`u = domain.unknown()` (declare several for a coupled system)."
-        )
-    return sorted(order, key=lambda m: m.layer_id)  # layer ids come from a global, increasing counter
-
-
-def _periodic_axis(points_a, points_b):
-    """The grid axis a periodic tie ``u(A) - u(B)`` wraps, read from the geometry of its two faces: the
-    coordinate that is constant over each face, and different between them. ``None`` if the two regions
-    are not a pair of opposite axis-aligned faces. (It used to be read from the face NAMES, which silently
-    depended on which naming convention the grid used.)"""
-    pa, pb = np.asarray(points_a), np.asarray(points_b)
-    if pa.size == 0 or pb.size == 0:
-        return None
-    ax_a, ax_b = int(np.argmin(np.ptp(pa, axis=0))), int(np.argmin(np.ptp(pb, axis=0)))
-    tol = _rtol(pa.dtype) * max(float(np.ptp(np.concatenate([pa, pb]), axis=0).max()), np.finfo(float).tiny)
-    flat = np.ptp(pa[:, ax_a]) <= tol and np.ptp(pb[:, ax_b]) <= tol  # relative to the faces' extent
-    if not flat or ax_a != ax_b or abs(pa[0, ax_a] - pb[0, ax_b]) <= tol:
-        return None
-    return ax_a
-
-
-def _contains_unknown(node, model):
-    from .trace import ModelCall
-
-    n = _unwrap(node)
-    if isinstance(n, ModelCall) and n.model is model:
-        return True
-    return any(_contains_unknown(c, model) for c in _iter(n))
-
-
-def _region_tag(constraint):
-    cv = getattr(constraint, "_coord_vars", None) or {}
-    tags = {v.tag for v in cv.values() if getattr(v, "axis", None) != "temporal"}  # spatial region only
-    return next(iter(tags)) if len(tags) == 1 else (tags or {None})
-
-
-def _has_temporal(node):
-    """Does the expression contain a strong-form time derivative ``u.t`` (:class:`TemporalDerivative`)?"""
-    from .trace import TemporalDerivative
-
-    n = _unwrap(node)
-    if isinstance(n, TemporalDerivative):
-        return True
-    return any(_has_temporal(c) for c in _iter(n))
-
-
-def _has_temporal_of(node, unknown):
-    """Does ``node`` contain a time derivative ``u.t`` of this ``unknown``?"""
-    from .trace import TemporalDerivative
-
-    n = _unwrap(node)
-    if isinstance(n, TemporalDerivative) and _contains_unknown(n.target, unknown):
-        return True
-    return any(_has_temporal_of(c, unknown) for c in _iter(n))
-
-
-def _has_unknown_derivative(node, unknown):
-    """Does the expression contain a **derivative of the unknown** (a Jacobian/Hessian/TemporalDerivative
-    whose target is the unknown)? This is what distinguishes a **PDE** residual from a value-only
-    **pinning** condition ``u(region) - g`` (Dirichlet / IC / sub-region pin) — the strong-form analogue
-    of the fem "does it contain the test function?" rule."""
-    from .trace import Hessian, Jacobian, TemporalDerivative
-
-    n = _unwrap(node)
-    if isinstance(n, (Jacobian, Hessian, TemporalDerivative)) and _contains_unknown(getattr(n, "target", None), unknown):
-        return True
-    return any(_has_unknown_derivative(c, unknown) for c in _iter(n))
-
-
-def _mesh_nodes_in(pts, geom):
-    """Indices of the mesh nodes ``pts`` inside a geometric region ``geom`` (registered via
-    ``domain.region(name, region)``) — resolves the region to a node subset for pinning/solving on a
-    subdomain. A ``jno.shape`` uses the analytic, shapely-free :meth:`shape.contains` (2-D and 3-D — the
-    primary path); a shapely geometry falls back to shapely (2-D mesh-conforming regions in
-    ``polygon_domain``, which stay shapely by scope)."""
-    from .geometry import shape
-
-    p = np.asarray(pts)
-    if isinstance(geom, shape):
-        mask = np.asarray(geom.contains(p[:, : geom.dim]))
-    else:
-        import shapely
-
-        # a boundary node counts as inside: buffer by a tolerance relative to the region's size, not 1e-9
-        minx, miny, maxx, maxy = geom.bounds
-        mask = np.asarray(shapely.contains_xy(geom.buffer(_rtol() * max(maxx - minx, maxy - miny)), p[:, 0], p[:, 1]))
-    return np.nonzero(mask)[0].astype(int)
-
-
-def _temporal_order(node):
-    """Highest order of time derivative in ``node``: ``u.t`` is 1, ``u.tt`` (a chained
-    :class:`TemporalDerivative`) is 2."""
-    from .trace import TemporalDerivative
-
-    n = _unwrap(node)
-    if isinstance(n, TemporalDerivative):
-        return 1 + _temporal_order(n.target)
-    return max((_temporal_order(c) for c in _iter(n)), default=0)
-
-
-def _set_temporal(node, val, val_tt=0.0):
-    """Replace every ``u.t`` (:class:`TemporalDerivative`) in ``node`` with the constant ``val`` and every
-    ``u.tt`` with ``val_tt``, leaving the rest of the expression intact. Probes recover, for a residual
-    ``F = m·u.tt + c·u.t + R_spatial`` affine in the time derivatives, the **spatial** residual
-    ``R_spatial = F(0, 0)`` and the coefficients ``c = F(u.t=1) − F(0, 0)`` and ``m = F(u.tt=1) − F(0, 0)``
-    — so a general ``c(x)·u.t`` term (variable material, e.g. ``ρcₚ(x)·u.t``) is handled without parsing
-    its structure. (``u.tt`` used to be replaced by ``val`` as
-    if it were ``u.t``, which silently solved a wave equation as a heat equation.)"""
-    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, TemporalDerivative
-
-    if isinstance(node, TemporalDerivative):
-        return Literal(float(val_tt if _temporal_order(node) >= 2 else val))
-    if isinstance(node, BinaryOp):
-        return BinaryOp(node.op, _set_temporal(node.left, val, val_tt), _set_temporal(node.right, val, val_tt))
-    if isinstance(node, FunctionCall):
-        return node.copy_with_args([_set_temporal(a, val, val_tt) if isinstance(a, Placeholder) else a for a in node.args])
-    if isinstance(node, Jacobian):
-        return Jacobian(_set_temporal(node.target, val, val_tt), node.variables, node.scheme)
-    if isinstance(node, Hessian):
-        return Hessian(_set_temporal(node.target, val, val_tt), node.variables, node.scheme, node.trace)
-    return node
-
-
-def _zero_temporal(node):
-    """Drop the ``u.t`` terms (``_set_temporal(node, 0)``) → the spatial residual ``R_spatial`` for the
-    method-of-lines split ``M u̇ + R_spatial = 0``."""
-    return _set_temporal(node, 0.0)
-
-
-def _normal_jacobian(node):
-    """The normal-derivative node ``ui.d(n, scheme)`` (a :class:`Jacobian` w.r.t. a normal Variable —
-    tag ``n_<region>``, from ``domain.variable(region, normals=True)``) inside ``node``, or ``None``.
-    Its presence marks a Neumann/Robin (flux) condition; its ``.scheme`` is the FD stencil to honour."""
-    from .trace import Jacobian
-
-    n = _unwrap(node)
-    if isinstance(n, Jacobian) and any(str(getattr(v, "tag", "")).startswith("n_") for v in getattr(n, "variables", [])):
-        return n
-    for c in _iter(n):
-        found = _normal_jacobian(c)
-        if found is not None:
-            return found
-    return None
-
-
-def _is_normal_jacobian(node):
-    from .trace import Jacobian
-
-    return isinstance(node, Jacobian) and any(
-        str(getattr(v, "tag", "")).startswith("n_") for v in getattr(node, "variables", [])
-    )
-
-
-def _spatial_tags(c):
-    """The spatial coordinate tags a constraint is bound to: those of its bound views, and of every
-    coordinate Variable inside it. Vector-view arithmetic (``Ui.div()``, ``Ui.grad() @ Ui``) does not carry
-    the views' bindings, so reading them alone left ``interior`` out of the evaluation context (a
-    ``KeyError`` deep in a derivative). Normal tags ``n_*`` are left to the flux machinery."""
-    tags = {v.tag for v in (getattr(c, "_coord_vars", None) or {}).values() if getattr(v, "axis", None) != "temporal"}
-    tags |= {
-        v.tag
-        for v in _iter_variables(c)
-        if getattr(v, "axis", "spatial") == "spatial"
-        and not str(v.tag).startswith(("n_", "fdm_bgrad_"))
-        and v.tag not in ("cell_size", "__time__")
-    }
-    return tags
-
-
-def _context_leaf(tag, component, domain):
-    """A :class:`Variable` reading column ``component`` of the per-node array ``context[tag]`` (all columns
-    when ``component`` is ``None``) — how a rewritten boundary condition reads a value the solver supplies
-    (a boundary gradient, a normal)."""
-    from .trace import Variable
-
-    leaf = Variable.__new__(Variable)
-    leaf.tag, leaf.dim, leaf.axis, leaf.fem_meta, leaf.size, leaf._domain = (
-        tag,
-        [0, None] if component is None else [component, component + 1],
-        "spatial",
-        None,
-        1,
-        domain,
-    )
-    return leaf
-
-
-def _map_children(node, fn):
-    """``node`` with ``fn`` applied to its children (the node types a strong-form condition is made of)."""
-    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Placeholder
-
-    if isinstance(node, BinaryOp):
-        return BinaryOp(node.op, fn(node.left), fn(node.right))
-    if isinstance(node, FunctionCall):
-        return node.copy_with_args([fn(a) if isinstance(a, Placeholder) else a for a in node.args])
-    if isinstance(node, Hessian):
-        return Hessian(fn(node.target), node.variables, node.scheme, node.trace)
-    if isinstance(node, Jacobian):
-        return Jacobian(fn(node.target), node.variables, node.scheme)
-    return node
-
-
-def _iter_variables(node):
-    """Every :class:`Variable` in the expression."""
-    from .trace import Variable
-
-    n = _unwrap(node)
-    if isinstance(n, Variable):
-        return [n]
-    return [v for c in _iter(n) for v in _iter_variables(c)]
-
-
-def _normal_jacobians(node):
-    """Every normal-derivative node ``ub.d(n)`` in the expression."""
-    n = _unwrap(node)
-    if _is_normal_jacobian(n):
-        return [n]
-    return [j for c in _iter(n) for j in _normal_jacobians(c)]
-
-
-class _TraceFDM:
+class _TraceFDM(StrongFormProblem):
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
     region their coordinate variables carry — the ``interior`` → the strong-form PDE residual, a
@@ -882,6 +613,8 @@ class _TraceFDM:
     same method-of-lines stepper :func:`jno.fem` uses. The one config that stays on the object it
     describes is the FD **stencil** per operator (``u.d2(x, scheme=...)``, ``ui.d(n, scheme=...)``)."""
 
+    _who = "jno.fdm"
+
     def __init__(self, constraints):
         self._constraints = list(constraints)  # kept verbatim so a coupled solve can re-author with an interface pin
         self.unknowns = _find_unknowns(constraints)  # coupled system ⇒ several, in declaration order
@@ -898,114 +631,16 @@ class _TraceFDM:
         self._nf = int(sum(self._ncomp))
         self._Ntot = self._nf * self._N  # blocked DOF vector [block_0 (N), …, block_{nf-1} (N)]
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
-        self._pde, self._dirichlet, self._neumann, self._ic, self._vel_ic = [], [], [], [], []
+        self._classify(constraints)
         self._periodic_axes = []  # grid axes tied by a `u(A) - u(B)` periodic constraint (structured only)
-        # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
-        # a boundary edge OR a geometric sub-region (`domain.region(name, geom)`, used by coupled /
-        # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
-        #   * a periodic tie `u(A) - u(B)` (opposite faces)  → wrap the grid axis (check first);
-        #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row;
-        #   * `u.t` on the `initial` region                → the initial velocity (u_tt problems);
-        #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
-        #   * the `initial` region, value-only            → the initial condition;
-        #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
-        kinds = []
-        for c in constraints:
-            tie = getattr(c, "_periodic_tie", None)
-            if tie is not None:
-                ax = _periodic_axis(*(np.asarray(self._pts)[self._region_nodes(t)] for t in tie))
-                if ax is None:
-                    raise ValueError(
-                        f"jno.fdm([...]): a periodic tie `u(A) - u(B)` must connect two OPPOSITE faces "
-                        f"(left/right, bottom/top, or front/back); got {tie}."
-                    )
-                self._periodic_axes.append(ax)
-                kinds.append(None)
-            elif _normal_jacobian(c) is not None or self._is_boundary_derivative_condition(c):
-                kinds.append("neumann")  # a boundary row: Neumann, Robin, oblique, nonlinear flux, …
-            elif _region_tag(c) == "initial" and _has_temporal(c):
-                kinds.append("vel_ic")
-            elif any(_has_unknown_derivative(c, u) for u in self.unknowns):
-                kinds.append("pde")
-            elif _region_tag(c) == "initial":
-                kinds.append("ic")
-            else:
-                kinds.append("dirichlet")
-        # An ALGEBRAIC equation carries no derivative at all -- a constitutive law `v - u**2`, an
-        # incompressibility-like closure, a fibre reading a state. Structure alone cannot tell it from a
-        # value pin, since both are value-only; the REGION can. A pin is written on a boundary edge or a
-        # sub-region, an equation on the same region as the differential equations it sits beside, so a
-        # value-only constraint on a PDE region is one more equation (with a zero mass row: it constrains
-        # no time derivative). Without this it fell through to `_dirichlet`, and a coupled system whose
-        # second equation happened to be algebraic was rejected for having too few equations.
-        #
-        # The tags are compared, not hashed: a constraint spanning several regions carries a set of them.
-        pde_regions = [_region_tag(c) for c, k in zip(constraints, kinds) if k == "pde"]
-        kinds = [
-            "pde" if k == "dirichlet" and any(_region_tag(c) == t for t in pde_regions) else k
-            for c, k in zip(constraints, kinds)
-        ]
-        for c, k in zip(constraints, kinds):
-            if k is not None:
-                {
-                    "pde": self._pde,
-                    "neumann": self._neumann,
-                    "vel_ic": self._vel_ic,
-                    "ic": self._ic,
-                    "dirichlet": self._dirichlet,
-                }[k].append(c)
-        if not self._pde:
-            raise ValueError("jno.fdm([...]): no PDE residual found (a term with a derivative of the unknown).")
-        self._transient = bool(self._ic)
-        pde_has_dt = any(_has_temporal(c) for c in self._pde)
-        self._time_order = max(_temporal_order(c) for c in self._pde)
-        if self._time_order > 2:
-            raise NotImplementedError(
-                f"jno.fdm([...]): a time derivative of order {self._time_order} was found; only `u.t` "
-                "(first order) and `u.tt` (second order) are supported."
-            )
-        if self._vel_ic and self._time_order != 2:
-            raise ValueError(
-                "jno.fdm([...]): an initial velocity `ui0.t - v0` was given, but the PDE has no `u.tt` "
-                "term. An initial velocity only belongs to a second-order-in-time problem."
-            )
-        if self._vel_ic and not self._ic:
-            raise ValueError(
-                "jno.fdm([...]): an initial velocity `ui0.t - v0` was given without an initial displacement "
-                "`u(xi, yi) - u0` — a second-order-in-time problem needs both (the velocity defaults to 0)."
-            )
-        if self._transient:
-            if not (getattr(self.domain, "_is_time_dependent", False) and self.domain.time is not None):
+        for tie in self._periodic_ties:
+            ax = _periodic_axis(*(np.asarray(self._pts)[self._region_nodes(t)] for t in tie))
+            if ax is None:
                 raise ValueError(
-                    "jno.fdm([...]): an initial condition `u(initial) - u0` requires a time-dependent domain "
-                    "— build it with `jno.domain(..., time=(t0, t1, n_steps))`."
+                    f"jno.fdm([...]): a periodic tie `u(A) - u(B)` must connect two OPPOSITE faces "
+                    f"(left/right, bottom/top, or front/back); got {tie}."
                 )
-            if not pde_has_dt:
-                raise ValueError(
-                    "jno.fdm([...]): an initial condition was given but the PDE residual has no time derivative "
-                    "`u.t` — add the `u.t` term (e.g. `ui.t - nu*(ui.d2(x) + ui.d2(y))`)."
-                )
-        elif pde_has_dt:
-            raise ValueError(
-                "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
-                "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
-            )
-        if len(self.unknowns) > 1:  # coupled (multi-field)
-            if len(self._pde) != len(self.unknowns):
-                raise ValueError(
-                    f"jno.fdm([...]): a coupled system needs exactly one PDE equation per unknown — got "
-                    f"{len(self.unknowns)} unknowns but {len(self._pde)} PDE equation(s). Author one equation per "
-                    "field, in the order the unknowns are declared (equation k drives unknown k)."
-                )
-            for k, (eq, own) in enumerate(zip(self._pde, self.unknowns)):
-                other = [j for j, w in enumerate(self.unknowns) if w is not own and _has_temporal_of(eq, w)]
-                if other:
-                    raise NotImplementedError(
-                        f"jno.fdm([...]): equation {k} of the coupled system carries the time derivative of "
-                        f"unknown {other[0]}, not of its own unknown {k}. Equation k drives unknown k and may only "
-                        "carry that unknown's `u.t` (a diagonal mass); reorder the equations, or solve for the "
-                        "combination that appears differentiated."
-                    )
+            self._periodic_axes.append(ax)
         self._grid = None
         if self._periodic_axes:  # mark the grid axes the wrap stencil must handle (structured only)
             grid = self.domain.mesh_connectivity.get("grid")
@@ -1029,26 +664,12 @@ class _TraceFDM:
     def _fd_scope(self):
         """Context under which this problem's terms are evaluated: the finite-difference kernels wrap its
         periodic axes (:func:`jno.trace_evaluator.fd_periodic`), and no others."""
-        import contextlib
 
         from .trace_evaluator import fd_periodic
 
         if self._grid is None:
             return contextlib.nullcontext()
         return fd_periodic(self.domain.mesh_connectivity["grid"], self._grid["periodic"])
-
-    def _pde_region(self):
-        """``(region_tag, geometry)`` of the named sub-region carried by the PDE's coordinate variables
-        (from ``domain.region(name, poly)``), or ``(None, None)`` for a whole-domain problem."""
-        src = getattr(self.domain, "_source_regions", {}) or {}
-        tags = {
-            v.tag
-            for c in self._pde
-            for v in (getattr(c, "_coord_vars", None) or {}).values()
-            if getattr(v, "axis", None) != "temporal"
-        }
-        named = [t for t in tags if t in src]
-        return (named[0], src[named[0]]) if len(named) == 1 else (None, None)
 
     def _region_nodes(self, tag):
         if tag == "initial":
@@ -1100,108 +721,6 @@ class _TraceFDM:
             exprs = [_fuse_fd_laplacian(e, int(self.domain.dimension)) for e in exprs]
         return exprs
 
-    def _referenced_models(self):
-        """``{layer_id: module}`` of every model the constraints read, other than the unknowns: a known
-        nodal field (a ``jno.np.parameter`` carrying data, no optimizer), a network. A data field used as a
-        PDE coefficient used to fail with "No model for Model N": only trainable parameters were in the
-        evaluation scope, and data fields only worked inside boundary values.
-
-        The walk over the constraints is cached; the modules are read LIVE at every call. Caching the modules
-        themselves kept a data field's old value after the documented eager swap
-        ``K.model.module = eqx.tree_at(...)``: the repeat solve returned the old field's answer (measured:
-        κ 1 → 2 left max u at 0.0734 instead of 0.0367), although the data fingerprint had changed."""
-        models = self.__dict__.get("_models_cache")
-        if models is None:
-            from .trace import ModelCall
-
-            models, seen, stack = {}, set(), [_unwrap(c) for c in self._constraints]
-            while stack:
-                n = stack.pop()
-                if id(n) in seen:
-                    continue
-                seen.add(id(n))
-                if isinstance(n, ModelCall) and all(n.model is not u for u in self.unknowns):
-                    models[n.model.layer_id] = n.model
-                stack.extend(_unwrap(c) for c in _iter(n))
-            self._models_cache = models
-        found = {}
-        for lid, model in models.items():
-            module = getattr(model, "module", None)
-            value = getattr(module, "value", None)
-            if value is not None and np.ndim(value) == 1 and np.shape(value)[0] == self._N:
-                # one value per node: a per-node scalar field, shaped (N, 1) like every other one in the
-                # strong form. As (N,) it broadcast against an (N, 1) derivative to (N, N).
-                import equinox as eqx
-
-                module = eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
-            if module is not None:
-                found[lid] = module
-        return found
-
-    def _params_scope(self, extra_params=None):
-        """The module every trainable parameter resolves to in an evaluation: its current value, then the
-        values a traced solve injects (:attr:`_override`, set while a crux-driven march is traced), then
-        ``extra_params``. Every evaluator this solver builds reads it, so a parameter works wherever it is
-        written — in the PDE, a boundary value, a flux condition, a time coefficient, an initial value."""
-        scope = self._referenced_models()  # data fields and networks, at their current values
-        scope.update({lid: n.model.module for lid, n in self._trainable_params().items()})
-        scope.update(getattr(self, "_override", None) or {})
-        scope.update(extra_params or {})
-        return scope
-
-    def _current_params(self):
-        """``{layer_id: module}`` of every trainable parameter at its current value."""
-        return {lid: n.model.module for lid, n in self._trainable_params().items()}
-
-    def _live_params(self):
-        """Parameter values an evaluator applies when it is CALLED, over the ones it was built with: the
-        probe values of :meth:`_perturbed_params` while a structural decision is made, else none."""
-        return getattr(self, "_perturbation", None) or {}
-
-    @contextlib.contextmanager
-    def _perturbed_params(self):
-        """While active, every trainable parameter reads a probe value ``(1 + a)·p + b`` near its current
-        value ``p`` (``a, b`` drawn from [0.1, 0.2], fixed seed): a generic point that keeps the sign of a
-        nonzero value, so a probe does not wander into a regime (a negative diffusivity) the problem never
-        visits, while a zero moves off zero. A network's probe moves every weight the same way."""
-        import equinox as eqx
-        import jax
-
-        rng = np.random.default_rng(11)
-
-        def moved(x):
-            p = np.asarray(x)
-            a, b = rng.uniform(0.1, 0.2, p.shape), rng.uniform(0.1, 0.2, p.shape)
-            return jnp.asarray((1.0 + a) * p + b, dtype=x.dtype)
-
-        probe = {}
-        for lid, n in self._trainable_params().items():
-            m = n.model.module
-            if not getattr(n.model, "_is_parameter", False):  # a network: every floating-point weight
-                probe[lid] = jax.tree_util.tree_map(lambda x: moved(x) if eqx.is_inexact_array(x) else x, m)
-                continue
-            probe[lid] = eqx.tree_at(lambda mm: mm.value, m, moved(m.value))
-        saved = getattr(self, "_perturbation", None)
-        self._perturbation = probe
-        try:
-            yield
-        finally:
-            self._perturbation = saved
-
-    def _for_every_parameter(self, decide):
-        """``[decide(False)]``, plus ``decide(True)`` under :meth:`_perturbed_params` when the problem has
-        trainable parameters. A structural decision (is the residual affine in u? its operator symmetric?
-        constant in time?) must hold for every value a parameter takes in an inverse, not only the one it
-        starts at. Measured: with k starting at 0, ``-Δu + k·u³ = f`` looked affine, and the solve returned
-        the LINEAR solution at k = 1 (max error 5.0, true residual 1e4), with no error. ``decide(perturbed)``
-        must build what it evaluates when ``perturbed`` is set, if that is jitted (a jitted function keeps
-        its first trace); an un-jitted evaluator reads the probe values at call time."""
-        out = [decide(False)]
-        if self._trainable_params():
-            with self._perturbed_params():
-                out.append(decide(True))
-        return out
-
     def _pde_residual_fn(self, *, spatial=False, extra_params=None):
         """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
         ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
@@ -1237,50 +756,6 @@ class _TraceFDM:
 
         return residual_fn
 
-    def _inject(self, dofs):
-        """``{layer_id: module}`` with every unknown holding its slice of the blocked DOF vector — a scalar
-        field its ``(N,)`` block, a vector field its ``(N, c)`` components."""
-        import equinox as eqx
-
-        out, N = {}, self._N
-        self._require_real(dofs, "the state (an initial guess x0?)")
-        for w, b0, c in zip(self.unknowns, self._block0, self._ncomp):
-            sl = dofs[b0 * N : (b0 + c) * N]
-            value = sl if c == 1 and np.ndim(w.module.value) == 1 else sl.reshape(c, N).T.reshape(w.module.value.shape)
-            out[w.layer_id] = eqx.tree_at(lambda m: m.value, w.module, value.astype(w.module.value.dtype))
-        return out
-
-    def _as_blocks(self, value, ncomp):
-        """An equation's value at every node, laid out component by component (``(N,)`` or ``(N, c)`` →
-        ``(c·N,)``), checked against the number of components it has to drive."""
-        v = jnp.asarray(value)
-        v = jnp.broadcast_to(v.reshape(-1), (self._N,)) if v.size in (1, self._N) else v.reshape(self._N, -1)
-        c = 1 if v.ndim == 1 else int(v.shape[1])
-        if c != ncomp:
-            raise ValueError(
-                f"jno.fdm([...]): an equation has {c} component(s) but drives an unknown with {ncomp}. A vector "
-                "unknown (`domain.unknown(value_shape=(2,))`) needs a vector equation, and a scalar one a scalar."
-            )
-        return v if v.ndim == 1 else v.T.reshape(-1)
-
-    def _blocks_of(self, k):
-        """The DOF blocks of unknown ``k`` (one per component)."""
-        return list(range(self._block0[k], self._block0[k] + self._ncomp[k]))
-
-    def _split_components(self, k, vals, n_nodes):
-        """A value for unknown ``k`` at ``n_nodes`` nodes, one ``(n_nodes,)`` array per component."""
-        v = jnp.asarray(vals)
-        c = self._ncomp[k]
-        if c == 1:
-            return [jnp.broadcast_to(v.reshape(-1), (n_nodes,)) if v.size in (1, n_nodes) else v.reshape(n_nodes)]
-        v = jnp.broadcast_to(v, (n_nodes, c)) if v.size == c else v.reshape(n_nodes, -1)
-        if v.shape[1] != c:
-            raise ValueError(
-                f"jno.fdm([...]): a condition on a {c}-component unknown gives {v.shape[1]} value(s) per node. Give "
-                "every component, e.g. `U(xb, yb) - jnn.stack([gx, gy], axis=-1)`."
-            )
-        return [v[:, j] for j in range(c)]
-
     def _eval_context(self, spatial_tags):
         """Evaluation context for a strong-form term: every spatial tag collocates at the mesh nodes, and
         ``domain.cell_size`` resolves to the per-node spacing :meth:`_node_spacing`."""
@@ -1291,10 +766,6 @@ class _TraceFDM:
         # sees the start time unless the march passes the step's own (see `residual_fn(dofs, t)`).
         context["__time__"] = jnp.full((self._N, 1), self._start_time())
         return context
-
-    def _start_time(self):
-        window = getattr(self.domain, "time", None)
-        return float(window[0]) if window is not None and self._transient else 0.0
 
     def _dirichlet_values_at(self, t):
         """``(mask, values)`` of the Dirichlet rows at time ``t``. A value written with the time variable,
@@ -1308,11 +779,9 @@ class _TraceFDM:
             k = self._field_index(c)
             for b in self._blocks_of(k):
                 mask[b * self._N + nodes] = True
-            g_node = self._value_side(c)
-            if self._is_nodal_data(g_node):
-                g = self._eval_g(g_node, nodes)  # a known nodal field: gathered at the region's nodes
-            else:
-                g = self._eval_value(g_node, nodes, getattr(self, "_override", None), t)
+            # a known nodal field is gathered at the region's nodes, from its injected value when the march has
+            # one (`_override`, a coupling's window): read from the stored value, the boundary ignored it
+            g = self._eval_value(self._value_side(c), nodes, getattr(self, "_override", None), t)
             for b, gb in zip(self._blocks_of(k), self._split_components(k, g, len(nodes))):
                 vals = vals.at[jnp.asarray(b * self._N + nodes)].set(gb)
         return mask, vals
@@ -1527,30 +996,6 @@ class _TraceFDM:
                 is_d[b * self._N + nodes] = True
         return is_d
 
-    @staticmethod
-    def _symmetry_probe(K):
-        """``(wᵀKv, vᵀKw)`` for random ``v, w``: equal (to rounding) iff ``K`` is symmetric, almost surely."""
-        rng = np.random.default_rng(2)
-        v = jnp.asarray(rng.standard_normal(K.shape[0]))
-        w = jnp.asarray(rng.standard_normal(K.shape[0]))
-        return float(w @ (K @ v)), float(v @ (K @ w))
-
-    def _is_symmetric(self, make_K, key=None):
-        """Is the assembled operator ``make_K()`` symmetric, for any value of the parameters
-        (:meth:`_for_every_parameter`)? Cached per ``key``."""
-        cache = self.__dict__.setdefault("_symmetric_cache", {})
-        if key is not None and key in cache:
-            return cache[key]
-
-        def symmetric(_):
-            a, b = self._symmetry_probe(make_K())
-            return abs(a - b) <= _rtol() * max(abs(a), abs(b), np.finfo(float).tiny)
-
-        out = all(self._for_every_parameter(symmetric))
-        if key is not None:
-            cache[key] = out
-        return out
-
     def _require_symmetric(self, linear, make_K, key=None):
         """``cg`` and ``minres`` assume a symmetric operator; on a non-symmetric one they return a wrong answer
         that can still pass the residual gate. FDM operators are symmetric on a structured grid (after the
@@ -1599,26 +1044,6 @@ class _TraceFDM:
         b = jax.jvp(lambda y: residual(y, t1, {}), (z,), (v,))[1]
         return bool(jnp.linalg.norm(a - b) > _rtol(a.dtype) * (float(jnp.linalg.norm(a)) or 1.0))
 
-    def _is_affine(self, key, make, n):
-        """Is the function ``make()`` builds affine in the DOF vector? Its JVP must be the same at two
-        different states. Decided once per problem, eagerly, for the parameters' current values and a probe
-        value (:meth:`_for_every_parameter`)."""
-        cache = self.__dict__.setdefault("_affine_cache", {})
-        if key not in cache:
-            import jax
-
-            def affine(_):
-                fun = make()
-                rng = np.random.default_rng(1)
-                v = jnp.asarray(rng.standard_normal(n))
-                w = jnp.asarray(rng.standard_normal(n))
-                j0 = jax.jvp(fun, (jnp.zeros(n),), (v,))[1]
-                j1 = jax.jvp(fun, (w,), (v,))[1]
-                return bool(jnp.linalg.norm(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.linalg.norm(j0)) or 1.0))
-
-            cache[key] = all(self._for_every_parameter(affine))
-        return cache[key]
-
     def _mass_coefficient(self):
         """Per-node coefficient ``c`` on ``u.t`` (the diagonal mass ``M = diag(c)``), via the two-probe
         ``c = F(u.t=1) − F(u.t=0)`` (:func:`_set_temporal`) — the spatial residual cancels between the
@@ -1635,16 +1060,6 @@ class _TraceFDM:
         if len(coefs) == 1:
             return coefs[0]
         return lambda t=None: jnp.concatenate([c(t) for c in coefs])
-
-    @staticmethod
-    def _same(a, b):
-        """Are two evaluations of the same quantity equal to floating-point accuracy (:func:`_rtol`), relative
-        to their magnitude?"""
-        a, b = jnp.asarray(a), jnp.asarray(b)
-        # Compared inside JAX: the values can be tracers (a coefficient differentiated by jax.grad), whose
-        # comparison resolves but whose magnitude does not (`float()` of a tracer raises).
-        scale = jnp.maximum(jnp.maximum(jnp.max(jnp.abs(a)), jnp.max(jnp.abs(b))), jnp.finfo(a.dtype).tiny)
-        return bool(jnp.all(jnp.abs(a - b) <= _rtol(a.dtype) * scale))
 
     def _time_coefficient(self, t_val, tt_val, what, example, k=0):
         """Per-node coefficient of the time derivative selected by the probe ``(u.t, u.tt) = (t_val,
@@ -1690,95 +1105,6 @@ class _TraceFDM:
         # A function of TIME: `c(x, t)·u.t` and `m(t)·u.tt` are evaluated at each step's own time. They used
         # to be probed once at the start and then held (measured: (1 + t)·u.t stayed at 1·u.t).
         return lambda t=None: probe(0.0, t)
-
-    def _trainable_params(self):
-        """**Trainable** models in the constraints — a ``jno.np.parameter`` or a ``jno.nn`` network with an
-        attached optimizer (``.optimizer(...)``, i.e. ``model._opt_fn is not None``) that is not the unknown
-        (and, for a network, not ``.freeze()``d): the inverse parameters (a source amplitude, a diffusivity,
-        a network coefficient ``k(x)``, …). Their presence makes :meth:`solve` return a deferred
-        ``crux``-drivable node. A parameter **without** an optimizer is *data* — a known nodal field (e.g. a
-        neighbour's field in a coupled solve) — so it stays an eager solve and is gathered as a value by
-        :meth:`_eval_g`; a network without one is a known coefficient, evaluated at its stored weights.
-        Returns ``{layer_id: ModelCall}``.
-
-        A network used to be left out: with its optimizer attached, the solve still ran eagerly at the
-        stored weights and returned a constant array, so ``jno.core`` never trained it (no error)."""
-        from .trace import ModelCall
-
-        found = {}
-
-        def walk(n):
-            n = _unwrap(n)
-            if (
-                isinstance(n, ModelCall)
-                and all(n.model is not u for u in self.unknowns)
-                and getattr(n.model, "_opt_fn", None) is not None  # trainable ⇔ has an optimizer
-                and (getattr(n.model, "_is_parameter", False) or not getattr(n.model, "_frozen", False))
-            ):
-                found[n.model.layer_id] = n
-            for c in _iter(n):
-                walk(c)
-
-        for c in self._pde + self._dirichlet + self._neumann + self._ic:
-            walk(c)
-        return found
-
-    def _record_fixed_networks(self):
-        """Mark every network this solve bakes in at its stored weights (no optimizer yet, not frozen).
-
-        Trainability is decided here, at ``.solve()``: an optimizer attached to such a network AFTERWARDS does
-        not reach the array this solve returned, so training would silently leave the network alone. The mark
-        makes that late ``.optimizer(...)`` raise (see ``Model.optimizer``)."""
-        from .trace import ModelCall
-
-        def walk(n):
-            n = _unwrap(n)
-            m = getattr(n, "model", None) if isinstance(n, ModelCall) else None
-            if (
-                m is not None
-                and all(m is not u for u in self.unknowns)
-                and not getattr(m, "_is_parameter", False)
-                and not getattr(m, "_frozen", False)
-                and getattr(m, "_opt_fn", None) is None
-            ):
-                m._jno_fixed_by_eager_solve = True
-            for c in _iter(n):
-                walk(c)
-
-        for c in self._pde + self._dirichlet + self._neumann + self._ic:
-            walk(c)
-
-    @staticmethod
-    def _trainable_arg(node):
-        """What a trainable contributes to the deferred solve node's arguments: a parameter's own
-        ``ModelCall`` (it evaluates to the parameter's current value), a network's ``ModelWeights`` (it
-        evaluates to the network's live module -- a call would evaluate the network instead)."""
-        from .trace import ModelWeights
-
-        return node if getattr(node.model, "_is_parameter", False) else ModelWeights(node.model)
-
-    @staticmethod
-    def _trainable_module(node, value):
-        """The module a trainable resolves to inside the solve, from the value its :meth:`_trainable_arg`
-        evaluated to (possibly traced): the parameter's module holding ``value``, or the network's module
-        itself."""
-        if not getattr(node.model, "_is_parameter", False):
-            return value
-        import equinox as eqx
-
-        module = node.model.module
-        return eqx.tree_at(lambda m: m.value, module, jnp.asarray(value).astype(module.value.dtype))
-
-    def _require_real(self, value, what):
-        """``value``, unless it is complex while every unknown is real: a real solve would keep only its real
-        part (JAX casts complex to real with a warning), which is a wrong answer, not a supported one."""
-        if jnp.iscomplexobj(value) and not any(jnp.iscomplexobj(w.module.value) for w in self.unknowns):
-            raise NotImplementedError(
-                f"jno.fdm: {what} is complex, but the unknown is real, and a real solve would keep only the real "
-                "part. jno.fdm has no complex fields yet: write the real and imaginary parts as two real unknowns "
-                "(a coupled system)."
-            )
-        return value
 
     def _eval_g(self, g_node, idx, t=None):
         """Value ``g`` at the nodes ``idx`` — a constant, a coordinate expression, or a **known nodal
@@ -1916,15 +1242,6 @@ class _TraceFDM:
             return (div(left[0]), div(left[1]))
         return None
 
-    @staticmethod
-    def _uses_params(node, params):
-        from .trace import ModelCall
-
-        n = _unwrap(node)
-        if isinstance(n, ModelCall) and n.model.layer_id in params:
-            return True
-        return any(_TraceFDM._uses_params(c, params) for c in _iter(n))
-
     def _eval_value(self, g_node, idx, extra_params=None, t=None):
         """``g`` at the nodes ``idx``, evaluated by the trace evaluator with ``extra_params`` injected, so a
         trainable parameter in a Dirichlet value is differentiable. (It used to be read from the stored
@@ -1950,6 +1267,15 @@ class _TraceFDM:
         walk(g_node)
         params.update(extra_params or {})
         params.update(self._live_params())
+        # a nodal field (one value per mesh node, e.g. a neighbour's interface data injected as extra_params) is
+        # read at these nodes: evaluated whole it would be a field of the wrong length
+        import equinox as eqx
+
+        jidx = jnp.asarray(np.asarray(idx, dtype=int))
+        for lid, module in list(params.items()):
+            value = getattr(module, "value", None)
+            if value is not None and np.ndim(value) >= 1 and np.shape(value)[0] == self._N and self._N != len(idx):
+                params[lid] = eqx.tree_at(lambda m: m.value, module, jnp.asarray(value)[jidx])
         with self._fd_scope():
             out = jnp.asarray(TraceEvaluator(params=params).evaluate(_unwrap(g_node), context=ctx, var_bindings={}))
         self._require_real(out, "a condition's value")
@@ -2061,18 +1387,6 @@ class _TraceFDM:
         rfaces, rapex = bfaces[on_region], bapex[on_region]
         n, idx = MeshUtils._compute_normals_from_boundary_faces(pts, rfaces, apex_points=pts[rapex])
         return np.asarray(idx, dtype=int), jnp.asarray(n)
-
-    def _is_boundary_derivative_condition(self, c):
-        """A condition whose coordinates all live on boundary regions and which differentiates an unknown:
-        a boundary row (``nx*ub.x + ny*ub.y - g``, ``ub.d((nx, ny)) - g``, a tangential ``ub.x - g``). It
-        used to be read as a second PDE and summed into the first."""
-        tags = _spatial_tags(c)
-        boundary = set(getattr(self.domain, "_boundary_registry", {}) or {})
-        return (
-            bool(tags)
-            and all(t in boundary or str(t).startswith("n_") for t in tags)
-            and any(_has_unknown_derivative(c, u) for u in self.unknowns)
-        )
 
     def _flux_region(self, c):
         """The one boundary region a boundary row lives on (its coordinate tag, or its normal's)."""
@@ -2378,13 +1692,16 @@ class _TraceFDM:
                 v0 = v0.at[jnp.asarray(b * self._N + idx)].set(vb)
         return v0
 
-    def solve(self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None):
+    def solve(
+        self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None, span=None
+    ):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
         (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
         machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
         **Transient** problems (an ``u(initial) - u0`` condition is present) march by method-of-lines —
         ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
-        return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state).
+        return the trajectory (``(n_save, N)``). There ``x0=`` is the state the march starts from, in place of the
+        initial condition (a frame of an earlier march, flattened; a ``u.tt`` problem takes ``[u; v]``).
 
         ``linear=`` and ``precond=`` are the same solver slots as ``fem.solve``'s: any ``jno.solve``
         linear solver (``cg``, ``bicgstab``, ``gmres``, ``lu``, …) and any ``jno.precond`` spec (``jacobi``,
@@ -2402,21 +1719,34 @@ class _TraceFDM:
 
         ``save_ts=`` are the times a transient solve returns, exactly as ``fem.solve(save_ts=…)``: the march
         keeps its own step ``Δt`` from ``domain.time`` and the trajectory is sampled at ``save_ts`` (linear
-        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step."""
+        interpolation between steps). ``save_ts=ts[::k]`` keeps every k-th step.
+
+        ``span=(t0, t1)`` marches only that window of ``domain.time`` (a whole number of its steps); a window
+        that starts after the initial time needs ``x0=``. It returns the frames of the window's grid, both
+        ends included, so marching two windows, the second from the first's last frame, is one march."""
         if save_ts is not None and not self._transient:
             raise ValueError("jno.fdm([...]): save_ts= samples a transient march; this problem is steady.")
+        if span is not None and not self._transient:
+            raise ValueError("jno.fdm([...]): span= marches a window of a transient problem; this one is steady.")
 
         def _run():
             trainable = self._trainable_params()
             self._record_fixed_networks()
             if self._transient:
-                if x0 is not None:
-                    raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
                 if trainable:
                     return self._parametric_node(
-                        trainable, nonlinear=nonlinear, linear=linear, precond=precond, time=time, save_ts=save_ts
+                        trainable,
+                        nonlinear=nonlinear,
+                        x0=x0,
+                        linear=linear,
+                        precond=precond,
+                        time=time,
+                        save_ts=save_ts,
+                        span=span,
                     )
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
+                return self._march(
+                    nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts, x0=x0, span=span
+                )
             if trainable:
                 return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
             return self._steady_solve(nonlinear=nonlinear, x0=x0, linear=linear, precond=precond)
@@ -3102,7 +2432,9 @@ class _TraceFDM:
         Schwarz driver builds once and reuses)."""
         return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
-    def _parametric_node(self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None):
+    def _parametric_node(
+        self, trainable, *, nonlinear=None, x0=None, linear=None, precond=None, time=None, save_ts=None, span=None
+    ):
         """When the constraints carry a trainable ``jno.np.parameter`` or ``jno.nn`` network (an inverse
         parameter), return the solve as a **trace node** instead of an array — exactly as ``fem.solve()``
         does — so it composes into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with
@@ -3130,7 +2462,9 @@ class _TraceFDM:
             # consults (the PDE, boundary and flux values, time coefficients, initial values).
             self._override = extra
             try:
-                return self._march(nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts)
+                return self._march(
+                    nonlinear=nonlinear, time=time, linear=linear, precond=precond, save_ts=save_ts, x0=x0, span=span
+                )
             finally:
                 self._override = None
 
@@ -3138,7 +2472,7 @@ class _TraceFDM:
         node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
         return node
 
-    def _march(self, *, nonlinear=None, save_ts=None, time=None, linear=None, precond=None):
+    def _march(self, *, nonlinear=None, save_ts=None, time=None, linear=None, precond=None, x0=None, span=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
         :class:`SemidiscreteTimeBlock` integrator (``custom_root`` differentiable). ``M = I`` on interior
         nodes; **Dirichlet and Neumann/Robin flux nodes carry a zero mass row** — Dirichlet pins to ``g``,
@@ -3169,7 +2503,9 @@ class _TraceFDM:
 
         slots = dict(nonlinear=nonlinear, linear=linear, precond=precond)
         if self._time_order == 2:
-            traj = self._march_second_order(spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots)
+            traj = self._march_second_order(
+                spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots, start=(span, x0)
+            )
             # (steps, field, node) for a vector or coupled field, as the first-order march returns
             return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)
 
@@ -3183,10 +2519,10 @@ class _TraceFDM:
         def residual(wn, t, args):  # M u̇ + R = 0 → interior u̇ = -R_spatial; flux/Dirichlet rows algebraic
             return boundary_rows(wn, spatial_res(wn, t), t)
 
-        traj = self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots)
+        traj = self._run_block(M, residual, self._initial_state(), (t0, t1, dt), {}, save_ts, time, slots, start=(span, x0))
         return traj if self._nf == 1 else traj.reshape(traj.shape[0], self._nf, self._N)  # (steps, field, node)
 
-    def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots):
+    def _run_block(self, M, residual, state0, window, metadata, save_ts, time, slots, start=(None, None)):
         """Build the semidiscrete block ``M ẏ + R(y) = 0`` and march it.
 
         With no solver slots it is a residual block, stepped by the matrix-free Newton–Krylov (the
@@ -3247,6 +2583,9 @@ class _TraceFDM:
         steppers = (None, None)
         if linear is not None or precond is not None or nonlinear is not None:
             steppers = compose_transient_step_solvers(nonlinear, linear, precond, self, block, scheme=time, state=state0)
+        from .utils.solver.backend_blocks import window_block
+
+        block = window_block(block, *start, who="jno.fdm([...]).solve")  # x0= / span=: march from that state
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         return _integrate_transient(block, ts, time, *steppers)
 
@@ -3336,7 +2675,9 @@ class _TraceFDM:
             block = SemidiscreteTimeBlock(mass=lambda t, args: mass_of(t), residual=residual, **common)
         return block, nonlinear, linear
 
-    def _march_second_order(self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots):
+    def _march_second_order(
+        self, spatial_res, boundary_rows, algebraic, t0, t1, dt, save_ts, time, slots, start=(None, None)
+    ):
         """March ``m·u_tt + c·u_t + R_spatial(u) = 0`` as the first-order augmented system in
         ``y = [u; v]`` with ``v = u_t`` — the same reduction :func:`jno.fem` makes for ``u_tt``:
 
@@ -3371,7 +2712,7 @@ class _TraceFDM:
         # operator comes out rank-deficient (measured: rank 152 of 162 on a two-component wave) and CG
         # returns NaN, so such a system marches the augmented [u; v] block instead -- the same answer, twice
         # the unknowns per step. Making Newmark work for systems is open.
-        if time is None and self._nf == 1:
+        if time is None and self._nf == 1 and start[0] is None and start[1] is None:  # a window: the [u; v] block
             traj = self._newmark(spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, (t0, t1, dt), slots)
             if save_ts is None:
                 return traj
@@ -3381,7 +2722,7 @@ class _TraceFDM:
             return _resample_trajectory(traj, grid_ts, save_ts, traj.dtype)
         state0 = jnp.concatenate([self._initial_state(), v0])
         metadata = {"theta": 0.5, "second_order": True}
-        return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots)[:, :N]
+        return self._run_block(M, residual, state0, (t0, t1, dt), metadata, save_ts, time, slots, start=start)[:, :N]
 
     def _newmark(self, spatial_res, boundary_rows, algebraic, m_nodes, c_nodes, v0, window, slots):
         """The default ``u.tt`` march: Newmark average acceleration (Newmark 1959, J. Eng. Mech. Div. 85),

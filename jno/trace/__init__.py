@@ -61,6 +61,7 @@ __all__ = [
     "Diff",
     "DiffSlot",
     "Cellwise",
+    "InsideValue",
     "contains_cellwise",
     "BoundConstraint",
     "bound_constraints",
@@ -5325,6 +5326,32 @@ class Cellwise(Placeholder):
 
     def __repr__(self):
         return f"Cellwise({self.target})"
+
+
+class InsideValue(Placeholder):
+    """``target`` read from inside the domain at a boundary face: in the cell (or control volume) next to the face,
+    not at the face itself. Created by ``q.bind(x=xb, y=yb).inside``.
+
+    A ``jno.fvm`` boundary condition ``qb - G(qb.inside)`` gives the face its outer state as a function of the inside
+    one, the state on the other side of its Riemann problem: an open outflow (``G`` the identity), an outlet held at a
+    back pressure, an inflow from a plenum at the inside pressure, a valve that closes into a mirror (a wall). In a
+    cell it is the cell's own value. Only finite volumes have an inside of a face; ``jno.fdm`` and ``jno.fem`` refuse
+    it.
+
+    Args:
+        target: the expression to read inside (a bound unknown, or any expression of the unknowns).
+    """
+
+    def __init__(self, target: "Placeholder"):
+        target = target._expr if hasattr(target, "_expr") else target
+        if not isinstance(target, Placeholder):
+            raise TypeError(f".inside: expected a trace expression, got {type(target).__name__}.")
+        self.target = target
+        self.value_shape = tuple(getattr(target, "value_shape", ()))
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"InsideValue({self.target})"
 
 
 def contains_cellwise(expr) -> bool:

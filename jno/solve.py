@@ -73,6 +73,12 @@ __all__ = [
     "sdirk",
     "rosenbrock",
     "theta",
+    "coupling",
+    "erk",
+    "imex",
+    "ptc",
+    "piso",
+    "simple",
     "exponential",
     "adaptive",
     "arclength",
@@ -2077,6 +2083,209 @@ def theta(theta: float = 1.0):
     from .utils.solver.timeschemes import _ThetaScheme
 
     return _ThetaScheme(theta)
+
+
+def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
+    """IMEX Runge-Kutta (Ascher, Ruuth & Spiteri 1997): the transport explicit, the stiff cell-local terms implicit.
+
+    For a problem whose residual has terms that act on each cell alone -- a reaction, a drag, a relaxation, an
+    algebraic closure (the temperature of an energy) -- next to its fluxes: ``jno.fvm`` splits its volume terms
+    that differentiate no unknown in space from the rest. The local part is solved per cell by Newton on its
+    ``nf x nf`` block, so a stiff source costs no smaller step; the explicit part keeps its CFL limit.
+
+    Args:
+        method: ``"ars222"`` (second order, L-stable implicit part) or ``"ars443"`` (third order).
+        cfl: substeps per step from the transport's stable step, as ``jno.solve.erk(cfl=)``.
+        newton_tol: the per-cell Newton's step tolerance.
+        newton_steps: the per-cell Newton's most iterations.
+    """
+    from .utils.solver.imex import IMEXScheme
+
+    return IMEXScheme(method=method, cfl=cfl, newton_tol=newton_tol, newton_steps=newton_steps)
+
+
+def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, positive=None, keep=0.2, ramp=1.2):
+    """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
+    ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
+
+    Each step solves ``(J + D / Δτ) δ = -F(u)`` (a backward-Euler step in pseudo-time), ``D`` the row sums of
+    ``|J|``: on ``jno.fvm`` one value per cell, the largest of its unknowns', so a cell's unknowns advance together
+    as in a march. ``Δτ`` grows as the residual falls (switched evolution relaxation, Mulder & van Leer 1985), so it
+    follows the transient path where it must -- a shock or a front that has not formed in the start state -- and ends
+    as Newton. Every row is damped, a saddle point's constraint too (its row sum is not zero where its diagonal is).
+
+    Args:
+        dtau0: the first pseudo-time step, in units of ``D`` (smaller is more cautious).
+        dtau_max: the largest pseudo-time step.
+        max_steps: the most steps.
+        rtol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
+        atol: see ``rtol``.
+        positive: expressions of the unknowns that must stay positive in every cell, e.g. ``[rho, p]`` of a gas
+            (``jno.fvm``). A step is cut to the largest of ``1, 1/2, 1/4, ...`` that keeps each of them positive and
+            at least ``keep`` of its value; without it a step into a state where the residual is still finite (a
+            negative density) is taken, and the march does not come back.
+        keep: the share of a positive quantity a step must leave (0.2: a step takes at most 80 % of it away).
+        ramp: the least growth of ``Δτ`` after a full step (1: switched evolution relaxation alone, which creeps
+            while a shock forms and the residual hardly falls: the Mach 3 wedge stalled at 200 steps with it).
+    """
+    from .utils.solver.ptc import PseudoTransient
+
+    return PseudoTransient(
+        dtau0=dtau0,
+        dtau_max=dtau_max,
+        max_steps=max_steps,
+        rtol=rtol,
+        atol=atol,
+        positive=positive,
+        keep=keep,
+        ramp=ramp,
+    )
+
+
+def coupling(
+    scheme="gauss-seidel",
+    *,
+    tol=1e-8,
+    max_iter=50,
+    accel="aitken",
+    dirichlet=None,
+    alpha=None,
+    measure=None,
+    implicit=True,
+    window=None,
+    time=None,
+    reuse=0,
+    x0=None,
+    compile=True,
+):
+    """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
+    meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
+
+    Every interface condition goes to one problem as its own boundary condition, the other side's part read
+    from that problem's current solution and carried across the interface (values by interpolation, fluxes by
+    an L2 projection that keeps their total). A value and a flux condition between two problems are a
+    Dirichlet-Neumann pair, the value going to the side with the smaller interface stiffness (Giles 1997).
+    The problems are then solved in turn until the interface data stop changing.
+
+    Args:
+        scheme: ``"gauss-seidel"`` (each problem reads what the ones before it in the sweep just produced) or
+            ``"jacobi"`` (all read the last sweep's data).
+        tol: the relative change of the interface data at which the iteration stops.
+        max_iter: the most sweeps.
+        accel: ``"aitken"`` (dynamic relaxation, Küttler & Wall 2008), ``"iqn-ils"`` (interface quasi-Newton,
+            Degroote, Bathe & Vierendeels 2009), ``None`` (none), or a fixed relaxation factor.
+        dirichlet: the problem that takes the value condition of a pair, in place of the stiffness probe.
+        alpha: Robin-Robin in place of Dirichlet-Neumann: each side of a pair takes ``flux + alpha * value``
+            (Quarteroni & Valli 1999); ``"auto"`` sets ``alpha = sqrt(S_a S_b)`` from the two interface
+            stiffnesses. Robust when neither side is much stiffer than the other.
+        measure: the interface measure: ``None`` (length or area), ``"axisymmetric"`` (``2π r ds``, ``r`` the
+            second coordinate, an ``(x, r)`` meridian), ``"axisymmetric:0"`` (``r`` the first, ``(r, z)``) or a callable
+            of the points. It must match the measure the problems' own forms integrate with: a finite-element
+            side's interface load is written with it (``2π r``).
+        implicit: iterate every window to ``tol`` (``True``), or one sweep per window (``False``, loose coupling:
+            cheaper, first order in the window, not energy-conserving).
+        window: the coupling window of a transient coupling, a whole number of every problem's step; default the
+            largest step. Each problem marches its own steps inside it, the interface data held over it.
+        time: the time scheme of the transient problems: one for all, or ``{problem: scheme}``; default each
+            problem's own default (backward Euler).
+        reuse: IQN-ILS keeps the columns of this many earlier windows.
+        x0: where steady ``jno.fvm`` / ``jno.fdm`` problems start, ``{problem: state}`` (a state as their
+            ``solve(x0=)`` takes): their first sweep and the stiffness probe. A steady gas needs one, as it has no
+            state at zero. The interface data then start from the starting states too (each sender's value there, or
+            the value that holds its condition at the receiver's start), not from zero.
+        compile: run a transient coupling's windows as one compiled program, traced once (``core.coupled.compiles``),
+            after a first window run step by step: a window of one sweep (data flowing one way, or ``implicit=False``),
+            or its interface fixed point with ``accel="aitken"`` or a fixed relaxation, when the problems' windows do
+            not depend on their start time. ``False`` runs every window step by step.
+
+    The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
+    """
+    from ._coupling.driver import CouplingSpec
+
+    return CouplingSpec(
+        scheme=scheme,
+        tol=tol,
+        max_iter=max_iter,
+        accel=accel,
+        dirichlet=dirichlet,
+        alpha=alpha,
+        measure=measure,
+        implicit=implicit,
+        window=window,
+        time=time,
+        reuse=reuse,
+        x0=x0,
+        compile=compile,
+    )
+
+
+def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):
+    """**Explicit Runge-Kutta** time scheme for ``fem.solve(time=...)``, ``fdm(...).solve(time=...)`` and
+    ``fvm(...).solve(time=...)``: no linear solve per step, so it is the scheme for hyperbolic problems at a
+    CFL-limited step.
+
+    ``method`` is ``"ssprk3"`` (default; the third-order strong-stability-preserving scheme of Shu and Osher,
+    which keeps a total-variation-diminishing spatial scheme TVD), ``"ssprk2"`` (Heun), ``"ssprk54"`` (the
+    five-stage fourth-order SSP scheme of Spiteri and Ruuth), ``"rk4"`` or ``"euler"``; or give any explicit
+    Butcher tableau as ``tableau=(A, b, c, order)`` with ``A`` strictly lower triangular. The march takes
+    the domain's step (``domain.time``); with ``cfl=`` a finite-volume problem picks the number of substeps
+    of every step from its CFL limit, ``Δt = 2·cfl/ρ(M⁻¹ ∂R/∂u)`` of its first-order operator (for upwinded
+    convection the classical Courant number ``a Δt/Δx``), at the state where the step starts. Under a
+    gradient trace the count is fixed, from the initial state.
+
+    Rows with zero mass (Dirichlet and flux rows of ``jno.fdm``, a pinned cell) are constraints, solved at
+    every stage. The march is a fixed-length ``lax.scan``, so it is reverse-mode differentiable.
+
+    References: Gottlieb, Shu & Tadmor, *SIAM Review* **43** (2001) 89-112; Spiteri & Ruuth, *SIAM J. Numer.
+    Anal.* **40** (2002) 469-491."""
+    from .utils.solver.timeschemes import _ERK_TABLEAUS, _ERKScheme
+
+    if tableau is not None:
+        A, b, c, order = tableau
+        return _ERKScheme(A, b, c, order, "tableau", cfl)
+    if method not in _ERK_TABLEAUS:
+        raise ValueError(f"jno.solve.erk: method={method!r} is not one of {sorted(_ERK_TABLEAUS)}; or pass tableau=.")
+    A, b, c, order = _ERK_TABLEAUS[method]
+    return _ERKScheme(A, b, c, order, method, cfl)
+
+
+def simple(
+    *,
+    alpha_u: float = 0.7,
+    alpha_p: float = 0.3,
+    max_iters: int = 500,
+    rtol: float = 1e-8,
+    atol: float = 1e-10,
+    linear=None,
+):
+    """**SIMPLE** segregated solve of a saddle system (incompressible flow, Darcy, any constraint pair that
+    ``jno.fvm`` detects), for ``.solve(nonlinear=jno.solve.simple())``: a momentum predictor with the multiplier
+    held, under-relaxed by ``alpha_u``, then one correction of the multiplier on the Schur complement
+    ``D − C diag(A)⁻¹ B`` of the assembled tangent, relaxed by ``alpha_p``; repeated until the residual falls
+    by ``rtol``. A fallback where Newton from a poor start diverges (a high Reynolds number). The outer
+    iteration decides convergence on values, so it runs eagerly; inside ``jno.core`` keep the default Newton.
+
+    Reference: Patankar & Spalding, *Int. J. Heat Mass Transfer* **15** (1972) 1787-1806."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "simple", alpha_u=alpha_u, alpha_p=alpha_p, corrections=1, max_iters=max_iters, rtol=rtol, atol=atol, linear=linear
+    )
+
+
+def piso(*, n_corr: int = 2, n_outer: int = 20, rtol: float = 1e-8, atol: float = 1e-8, linear=None):
+    """**PISO** for a transient saddle system, ``.solve(time=..., nonlinear=jno.solve.piso())``: each implicit
+    step is a momentum predictor and ``n_corr`` multiplier corrections on the Schur complement of the step's
+    assembled tangent (Issa 1986). One such sweep leaves the splitting error, so the sweep is repeated until the
+    step's residual falls by ``rtol`` (at most ``n_outer`` times; the PIMPLE form), and the march checks every
+    step as it does for Newton. A fixed-length loop, so the march stays traceable and differentiable.
+
+    Reference: Issa, *J. Comput. Phys.* **62** (1986) 40-65."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "piso", alpha_u=1.0, alpha_p=1.0, corrections=n_corr, max_iters=n_outer, rtol=rtol, atol=atol, linear=linear
+    )
 
 
 def bdf(order: int | None = None, *, ndf: bool = True):

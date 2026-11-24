@@ -77,6 +77,14 @@ def _attach_coords(call, raw_operands):
     cv = _coord_vars_of(*raw_operands)
     if cv:
         call._coord_vars = cv
+    from .trace.views import _coord_sets_of
+
+    sets = _coord_sets_of(*raw_operands)
+    if sets:
+        try:
+            call._coord_sets = sets
+        except AttributeError:
+            pass
     return call
 
 
