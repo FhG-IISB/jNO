@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .._strong_form import _iter, _unwrap
-from .participant import has_derivative, mentions, participant
+from .participant import _tracing, has_derivative, mentions, participant
 from .transfer import conservative, consistent
 
 _NAMES = itertools.count()  # data-field names, unique across every coupled problem in the process
@@ -441,19 +441,22 @@ class Coupled:
             for i, part in enumerate(self.parts)
         ]
 
-    def _start_values(self, d, starts, peers):
+    def _start_values(self, d, starts, peers, params=None):
         """Where data field ``d`` starts, at its receiver's interface nodes. What its sender gives from the state it
         starts at (read on its own problem as built: the coupled ones may not exist yet); for a value whose sender has
         no state, the value that makes the received condition hold at the receiver's own start (the interface where
         the receiver already is: a gas starting at rest reads its wall at its own temperature, not at 0); else 0.
         ``peers`` are the data fields the receiver reads: a condition that also reads another one is left at 0."""
+        import jax.numpy as jnp
+
         r = self.parts[d.receiver]
         dst = r.interface(d.receiver_tag, self.spec.measure)
         s = self.parts[d.sender]
         if starts[d.sender] is not None:
             src = s.interface(d.sender_tag, self.spec.measure)
-            vals = s.sample(s.problem, starts[d.sender], d.expr, d.sender_tag, src)
-            return np.asarray(self._map(d, dst, src) @ np.asarray(vals), float)
+            mine = self._params_of(d.sender, params)
+            vals = s.sample(s.problem, starts[d.sender], d.expr, d.sender_tag, src, params=mine)
+            return self._map_jnp(d, dst, src) @ jnp.asarray(vals, float)
         zero = np.zeros(dst.points.shape[0])
         if d.flux or starts[d.receiver] is None or d.received is None:
             return zero
@@ -462,8 +465,11 @@ class Coupled:
             return zero
         if rest is not None and any(_unwrap(n) is _unwrap(o.node) for o in peers for n in _nodes(rest)):
             return zero
-        vals = 0.0 if rest is None else np.asarray(r.sample(r.problem, starts[d.receiver], rest, d.receiver_tag, dst))
-        return np.broadcast_to(-np.asarray(vals, float) / coef, zero.shape).copy()
+        if rest is None:
+            return zero
+        mine = self._params_of(d.receiver, params)
+        vals = r.sample(r.problem, starts[d.receiver], rest, d.receiver_tag, dst, params=mine)
+        return jnp.broadcast_to(-jnp.asarray(vals, float) / coef, zero.shape)
 
     def _solve_for(self, d):
         """``(c, rest)`` with the received condition ``= c * d.node + rest`` and ``rest`` free of ``d.node``; ``(None,
@@ -490,10 +496,20 @@ class Coupled:
             total = t if total is None else total + t
         return coef, total
 
-    def _start_data(self, states):
+    def _start_data(self, states, params=None):
         """Every data field's values at its start (:meth:`_start_values`) before the first sweep: one array per field,
         in the order of ``self.data``, at its receiver's interface nodes."""
-        return tuple(self._start_values(d, states, [o for o in self.data if o.receiver == d.receiver]) for d in self.data)
+        return tuple(
+            self._start_values(d, states, [o for o in self.data if o.receiver == d.receiver], params) for d in self.data
+        )
+
+    def _params_of(self, i, params):
+        """The trainable parameters among ``params`` (``{layer_id: value}``) that participant ``i`` reads."""
+        if not params:
+            return None
+        own = self.parts[i].trainables(self.problems[i])
+        mine = {lid: v for lid, v in params.items() if lid in own}
+        return mine or None
 
     def _unfloat(self):
         """A steady participant with no essential condition of its own that takes only fluxes is singular (a
@@ -674,7 +690,7 @@ class Coupled:
         return found[0].bind(**original.coords[i])
 
     # -- iteration ---------------------------------------------------------------------------------------
-    def _produce(self, d, states, values, frames=None):
+    def _produce(self, d, states, values, frames=None, params=None):
         """Data ``d`` from its sender's current state, carried to the receiver's interface nodes; ``values`` the data
         the sender read (its boundary conditions, which its own samples read too), ``frames`` the window's frames of
         the participants that marched one (:meth:`Participant.march`). Traceable.
@@ -688,13 +704,14 @@ class Coupled:
         src = s.interface(d.sender_tag, self.spec.measure)
         dst = r.interface(d.receiver_tag, self.spec.measure)
         prob, data = self.problems[d.sender], self._extra(d.sender, values)
+        mine = self._params_of(d.sender, params)
         fr = (frames or {}).get(d.sender) if d.flux else None
         if fr is None or fr.shape[0] < 2:
-            vals = jnp.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data))
+            vals = jnp.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data, params=mine))
         else:
             w = self._window_weights(d.sender, fr.shape[0] - 1)
             vals = sum(
-                wk * jnp.asarray(s.sample(prob, fr[k], d.expr, d.sender_tag, src, data))
+                wk * jnp.asarray(s.sample(prob, fr[k], d.expr, d.sender_tag, src, data, params=mine))
                 for k, wk in enumerate(w)
                 if wk != 0.0
             )
@@ -742,15 +759,15 @@ class Coupled:
                 extra.update(d.setter(part.nodal(iface, v), prob))
         return extra
 
-    def _advance(self, i, start, states, values, t, window):
+    def _advance(self, i, start, states, values, t, window, params=None):
         """Participant ``i`` with the data ``values``: a window's march from ``start`` for a transient problem, a
         (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady. Returns its
         state and the window's frames (``None`` for a solve)."""
         part, prob = self.parts[i], self.problems[i]
-        extra = self._extra(i, values)
+        extra, mine = self._extra(i, values), self._params_of(i, params)
         if window is not None and part.transient(prob):
-            return part.march(prob, start[i], t, window, extra, time=self._time_of(i))
-        return part.solve(prob, extra, x0=states[i]), None
+            return part.march(prob, start[i], t, window, extra, time=self._time_of(i), params=mine)
+        return part.solve(prob, extra, x0=states[i], params=mine), None
 
     def _time_of(self, i):
         tm = self.spec.time
@@ -766,7 +783,7 @@ class Coupled:
         pos = {i: k for k, i in enumerate(self.order)}
         return [k for k, d in enumerate(self.data) if pos[d.sender] >= pos[d.receiver]]
 
-    def _sweep(self, x, start, states, values, back, t=None, window=None):
+    def _sweep(self, x, start, states, values, back, t=None, window=None, params=None):
         """One sweep from the back data ``x``: every participant advanced once. Returns the states, the data values
         each participant read, and the back data its senders produce from them."""
         import jax.numpy as jnp
@@ -775,21 +792,22 @@ class Coupled:
         n = len(self.parts)
         states, frames = list(states), {}
         if self.spec.scheme == "jacobi":
-            for i, (state, fr) in enumerate([self._advance(i, start, states, values, t, window) for i in range(n)]):
+            advanced = [self._advance(i, start, states, values, t, window, params) for i in range(n)]
+            for i, (state, fr) in enumerate(advanced):
                 states[i], frames[i] = state, fr
         else:
             for i in self.order:
                 fresh = {  # forward data: fresh from senders already run in this sweep
-                    k: self._produce(d, states, values, frames)
+                    k: self._produce(d, states, values, frames, params)
                     for k, d in enumerate(self.data)
                     if d.receiver == i and k not in back
                 }
                 values = tuple(fresh.get(k, v) for k, v in enumerate(values))
-                states[i], frames[i] = self._advance(i, start, states, values, t, window)
-        produced = [self._produce(self.data[k], states, values, frames) for k in back]
+                states[i], frames[i] = self._advance(i, start, states, values, t, window, params)
+        produced = [self._produce(self.data[k], states, values, frames, params) for k in back]
         return states, values, jnp.concatenate(produced) if back else jnp.zeros(0)
 
-    def _iterate(self, start, states, values, t=None, window=None):
+    def _iterate(self, start, states, values, t=None, window=None, params=None):
         """One coupled solve -- the steady problem, or one window -- iterated until the interface data stop
         changing (or a single sweep, ``implicit=False``). Returns the participants' states and the data values."""
         states = list(states)
@@ -798,7 +816,7 @@ class Coupled:
         self._accel.start()
         history = []
         for it in range(1, self.spec.max_iter + 1):
-            states, values, x_new = self._sweep(x, start, states, values, back, t, window)
+            states, values, x_new = self._sweep(x, start, states, values, back, t, window, params)
             x_new = np.asarray(x_new)
             err = float(np.linalg.norm(x_new - x)) / max(float(np.linalg.norm(x_new)), 1e-300)
             history.append(err)
@@ -806,21 +824,128 @@ class Coupled:
             if err <= self.spec.tol or not back or not self.spec.implicit:
                 values = self._unpack(values, back, x_new)
                 break
-            if len(history) >= 4 and max(history[-3:]) <= 1.5 * min(history[-3:]) and history[-1] < 1e-4:
-                raise RuntimeError(
-                    f"jno.core([...]): the coupling stalled at an interface change of {err:.1e} (history "
-                    f"{self._brief()}), above tol = {self.spec.tol:.1e}: the participants' own solves are not that "
-                    "accurate. Set tol above it, or solve the participants more accurately (a direct solver)."
-                )
+            if _stalled(history):
+                raise self._stall_error(err)
             x = self._accel.next(x, x_new)
         else:
-            raise RuntimeError(
-                f"jno.core([...]): the coupling did not converge in {self.spec.max_iter} iterations"
-                f"{'' if t is None else f' in the window at t = {t:g}'} (interface change {history[-1]:.2e} > tol "
-                f"{self.spec.tol:.1e}; history {self._brief()}). Raise max_iter, accelerate (accel='iqn-ils' or "
-                "'aitken'), or swap the Dirichlet side (dirichlet=...)."
-            )
+            raise self._unconverged_error(t)
         return states, values
+
+    def _stall_error(self, err):
+        return RuntimeError(
+            f"jno.core([...]): the coupling stalled at an interface change of {err:.1e} (history "
+            f"{self._brief()}), above tol = {self.spec.tol:.1e}: the participants' own solves are not that "
+            "accurate. Set tol above it, or solve the participants more accurately (a direct solver)."
+        )
+
+    def _unconverged_error(self, t):
+        return RuntimeError(
+            f"jno.core([...]): the coupling did not converge in {self.spec.max_iter} iterations"
+            f"{'' if t is None else f' in the window at t = {t:g}'} (interface change {self.history[-1]:.2e} > tol "
+            f"{self.spec.tol:.1e}; history {self._brief()}). Raise max_iter, accelerate (accel='iqn-ils' or "
+            "'aitken'), or swap the Dirichlet side (dirichlet=...)."
+        )
+
+    def _verdict(self, aux, t=None):
+        """The step-by-step iteration's verdict on a traced fixed point, from what it returned: ``(iterations, last
+        change, history)``. Concrete, it raises here; traced, from a callback when the program runs."""
+        import jax
+
+        def judge(it, err, hist):
+            self.history = [float(e) for e in np.asarray(hist)[: int(it)]]
+            if self._one_sweep() or not self.history or self.history[-1] <= self.spec.tol:
+                return  # one sweep per window by design, or converged
+            if _stalled(self.history):
+                raise self._stall_error(self.history[-1])
+            raise self._unconverged_error(t)
+
+        if _tracing(*aux):
+            jax.debug.callback(judge, *aux)
+        else:
+            judge(*aux)
+
+    def _fixed_point(self, start, states, values, back, t, window, params, differentiable=True):
+        """The interface fixed point of one window (or of the steady problem) as one traceable computation: the sweeps
+        in a ``lax.while_loop`` with Aitken's relaxation (or a fixed one) carried in jnp, until the change of the back
+        data is below ``tol`` (or it stalls, or ``max_iter``). Its derivative is the implicit one at the root
+        (``custom_root``): the unknown is the back data with every participant's state, ``z = (x, s)``, the root of
+        ``z - (G(x), S(x))``, and a tangent is one GMRES solve with that map's Jacobian (in a ``custom_linear_solve``,
+        so reverse mode solves the transposed system). ``differentiable=False`` (a compiled window called with concrete
+        inputs, which nothing differentiates) runs the loop alone. Returns the states, the data values and
+        ``(iterations, last change, history)`` for :meth:`_verdict`."""
+        import jax
+        import jax.numpy as jnp
+        from jax.flatten_util import ravel_pytree
+        from jax.scipy.sparse.linalg import gmres
+
+        if not isinstance(self._accel, _Aitken):
+            raise NotImplementedError(
+                "jno.solve.coupling(accel='iqn-ils'): a compiled or differentiated coupling iterates with accel='aitken' "
+                "or a fixed relaxation; IQN-ILS runs step by step only (git-bug 1c39855)."
+            )
+        omega0, fixed = float(self._accel.omega0), self._accel.fixed
+        tol, max_iter = float(self.spec.tol), int(self.spec.max_iter)
+        x0 = jnp.concatenate([jnp.asarray(values[k], float) for k in back]) if back else jnp.zeros(0)
+
+        def sweep(x, warm):
+            return self._sweep(x, start, warm, values, back, t, window, params)
+
+        if any(w is None for w in states):  # no warm start: zeros shaped like what the participant returns
+            shapes = jax.eval_shape(lambda x: sweep(x, states)[0], x0)
+            states = [jnp.zeros(sh.shape, sh.dtype) if w is None else w for w, sh in zip(states, shapes)]
+        states = [jnp.asarray(w) for w in states]
+
+        def relax(x, x_new, r_prev, omega, first):
+            r = x_new - x
+            if fixed is not None:
+                return x + fixed * r, r, omega
+            dr = r - r_prev
+            denom = dr @ dr
+            new = jnp.where(denom > 0.0, -omega * (r_prev @ dr) / jnp.where(denom > 0.0, denom, 1.0), omega)
+            omega = jnp.where(first, omega0, new)
+            return x + omega * r, r, omega
+
+        def forward(_f, z0):
+            def body(c):
+                it, x, warm, r_prev, omega, err, hist = c
+                warm, _, x_new = sweep(x, warm)
+                err = jnp.linalg.norm(x_new - x) / jnp.maximum(jnp.linalg.norm(x_new), 1e-300)
+                hist = hist.at[it].set(err)
+                x_relaxed, r_prev, omega = relax(x, x_new, r_prev, omega, it == 0)
+                return it + 1, jnp.where(err <= tol, x_new, x_relaxed), warm, r_prev, omega, err, hist
+
+            def cond(c):
+                it, err, hist = c[0], c[5], c[6]
+                recent = jax.lax.dynamic_slice(hist, (jnp.maximum(it - 3, 0),), (3,))
+                stalled = (it >= 4) & (jnp.max(recent) <= 1.5 * jnp.min(recent)) & (err < 1e-4)
+                return (it < max_iter) & (err > tol) & ~stalled
+
+            x, warm = z0
+            init = (jnp.int32(0), x, warm, jnp.zeros_like(x), jnp.asarray(omega0), jnp.asarray(jnp.inf), jnp.zeros(max(max_iter, 3)))
+            it, x, warm, _, _, err, hist = jax.lax.while_loop(cond, body, init)
+            return (x, warm), (it.astype(err.dtype), err, hist)  # all floating: custom_root's jvp rejects an int aux
+
+        def residual(z):
+            x, warm = z
+            new, _, x_new = sweep(x, [jax.lax.stop_gradient(w) for w in warm])  # a warm start changes no root
+            return x - x_new, [w - wn for w, wn in zip(warm, new)]
+
+        def tangent(g, y):
+            # on one flat vector: custom_linear_solve's transpose wants every right-hand-side leaf linear in the input,
+            # and a block whose tangent is a constant zero (a state no parameter reaches) is not
+            flat, unravel = ravel_pytree(y)
+
+            def krylov(mv, b):
+                return gmres(mv, b, tol=1e-12, atol=0.0, restart=30, maxiter=20)[0]
+
+            matvec = lambda v: ravel_pytree(g(unravel(v)))[0]  # noqa: E731
+            return unravel(jax.lax.custom_linear_solve(matvec, flat, krylov, transpose_solve=krylov))
+
+        if differentiable:
+            (x, warm), aux = jax.lax.custom_root(residual, (x0, states), forward, tangent, has_aux=True)
+        else:
+            (x, warm), aux = forward(None, (x0, states))
+        return warm, self._unpack(values, back, x), aux
 
     def _windows(self, transient):
         """``(window, t0, t1)`` of a transient coupling: the transient problems' common time span, the window the
@@ -847,72 +972,104 @@ class Coupled:
             raise ValueError(f"jno.core([...]): the time span {t1 - t0:g} is not a whole number of windows {window:g}.")
         return float(window), float(t0), float(t1)
 
-    def solve(self):
+    def solve(self, params=None):
         """Iterate to the coupled solution: a list with each problem's solution, in the order given -- for a
-        transient coupling, each problem's states at the window ends (the initial state first)."""
+        transient coupling, each problem's states at the window ends (the initial state first).
+
+        ``params`` (``{layer_id: value}``) gives the participants' trainable parameters their values. Traced (under
+        ``jax.grad``, ``jax.jit``), every window's fixed point is one traced computation, differentiated implicitly
+        at its root (:meth:`_fixed_point`), and the windows chain through their states."""
+        import jax
+        import jax.numpy as jnp
+
         n = len(self.parts)
         self._accel = _accelerator(self.spec)
+        if params:
+            known = set().union(*(p.trainables(q) for p, q in zip(self.parts, self.problems)))
+            unknown = sorted(set(params) - known)
+            if unknown:
+                raise ValueError(f"coupling: params= names layer ids {unknown}, which no coupled problem trains.")
+        traced = _tracing(params)
         transient = [i for i in range(n) if self.parts[i].transient(self.problems[i])]
+        stack = jnp.stack if traced else np.stack
         if not transient:
             states = [self._guess.get(i) for i in range(n)]
-            states, _ = self._iterate([None] * n, states, self._start_data(states))
-            self.iterations = len(self.history)
+            values = self._start_data(states, params)
+            if traced:
+                states, _, aux = self._fixed_point([None] * n, states, values, self._back(), None, None, params)
+                self._verdict(aux)
+            else:
+                states, _ = self._iterate([None] * n, states, values, params=params)
+                self.iterations = len(self.history)
             self.states = states
             return [self._shape(i, st) for i, st in enumerate(states)]
         window, t0, t1 = self._window
         start = [self.parts[i].initial(self.problems[i]) if i in transient else None for i in range(n)]
         states = [start[i] if i in transient else self._guess.get(i) for i in range(n)]
-        values = self._start_data(states)
+        values = self._start_data(states, params)
         frames = [[] for _ in range(n)]
         self.window_iterations, self.times = [], [t0]
-        program = self._window_program(transient) if self._one_sweep(transient) else None
+        run = self._window_run(transient)
+        program = None
+        if not traced and self._compilable(transient):  # concrete: nothing differentiates it, the loop alone
+            eager_run = self._window_run(transient, differentiable=False)
+            program = jax.jit(lambda s, v, p: eager_run(s, v, p, t0))  # autonomous: every window from t0's program
         t = t0
         for w in range(int(round((t1 - t0) / window))):
-            if program is not None and w > 0:  # the first window eagerly: it makes the structural decisions
-                states, values, err = program(states, values)
-                self.history = [float(err)]
+            if traced:  # every window traced, its fixed point differentiated at its root
+                states, values, aux = run(states, values, params, t)
+                self._verdict(aux, t)
+            elif program is not None and w > 0:  # the first window step by step: it makes the structural decisions
+                states, values, aux = program(states, values, params)
+                self._verdict(aux, t)
             else:
-                states, values = self._iterate(start, states, values, t, window)
+                states, values = self._iterate(start, states, values, t, window, params)
             if w == 0:  # a quasi-steady problem's first frame is its state in the first window
                 for i in range(n):
                     frames[i].append(start[i] if i in transient else states[i])
             for i in range(n):
                 frames[i].append(states[i])
-            self.window_iterations.append(len(self.history))
+            if not traced:
+                self.window_iterations.append(len(self.history))
             start = [states[i] if i in transient else None for i in range(n)]
             t += window
             self.times.append(t)
         self.iterations = int(sum(self.window_iterations))
         self.states = states
-        return [np.stack([self._shape(i, f) for f in frames[i]]) for i in range(n)]
+        return [stack([self._shape(i, f) for f in frames[i]]) for i in range(n)]
 
-    def _one_sweep(self, transient):
-        """Is every window one sweep that one compiled program can run: data flowing one way (no back data) or a
-        loose coupling, and transient participants whose windows do not depend on their start time?"""
-        if not self.spec.compile:
-            return False
-        if self._back() and self.spec.implicit:
-            return False
-        return all(self.parts[i].autonomous() for i in transient)
+    def _one_sweep(self):
+        """Is every window one sweep: data flowing one way (no back data), or a loose coupling?"""
+        return not self._back() or not self.spec.implicit
 
-    def _window_program(self, transient):
-        """One window of one sweep as a single compiled program: every participant's march or solve, its samples
-        and the transfers between them, traced once for every window (``self.compiles`` counts the traces)."""
-        import jax
+    def _window_run(self, transient, differentiable=True):
+        """One window as one traceable function ``(states, values, params, t) -> (states, values, aux)``: one sweep
+        (:meth:`_one_sweep`), or the interface fixed point (:meth:`_fixed_point`). ``self.compiles`` counts its
+        traces."""
         import jax.numpy as jnp
 
-        window, t0, _ = self._window
+        window = self._window[0]
         back = self._back()
+        one = self._one_sweep()
 
-        def run(states, values):
+        def run(states, values, params, t):
             self.compiles += 1
             start = [states[i] if i in transient else None for i in range(len(self.parts))]
+            if not one:
+                return self._fixed_point(start, states, values, back, t, window, params, differentiable)
             x = jnp.concatenate([jnp.asarray(values[k]) for k in back]) if back else jnp.zeros(0)
-            states, values, x_new = self._sweep(x, start, states, values, back, t0, window)
+            states, values, x_new = self._sweep(x, start, states, values, back, t, window, params)
             err = jnp.linalg.norm(x_new - x) / jnp.maximum(jnp.linalg.norm(x_new), 1e-300)
-            return states, self._unpack(values, back, x_new), err
+            return states, self._unpack(values, back, x_new), (jnp.ones((), err.dtype), err, jnp.reshape(err, (1,)))
 
-        return jax.jit(run)
+        return run
+
+    def _compilable(self, transient):
+        """Can every window after the first run as one compiled program: asked for (``compile=``), windows that do
+        not depend on their start time, and an iteration that runs in jnp (one sweep, or Aitken)?"""
+        if not self.spec.compile or not all(self.parts[i].autonomous() for i in transient):
+            return False
+        return self._one_sweep() or isinstance(self._accel, _Aitken)
 
     def _brief(self):
         h = self.history
@@ -929,12 +1086,20 @@ class Coupled:
         return tuple(out)
 
     def _shape(self, i, state):
+        import jax
+
         p = self.problems[i]
         part = self.parts[i]
+        state = state if isinstance(state, jax.core.Tracer) else np.asarray(state)
         if part.kind == "fem":
-            return np.asarray(state)
+            return state
         nf, N = getattr(p, "_nf", 1), getattr(p, "_N", None)
-        return np.asarray(state).reshape(N) if nf == 1 else np.asarray(state).reshape(nf, N)
+        return state.reshape(N) if nf == 1 else state.reshape(nf, N)
+
+
+def _stalled(history):
+    """Have the last three changes stopped falling (within a factor 1.5) below 1e-4: the participants' own accuracy?"""
+    return len(history) >= 4 and max(history[-3:]) <= 1.5 * min(history[-3:]) and history[-1] < 1e-4
 
 
 def _componentwise(rest, test, dim):

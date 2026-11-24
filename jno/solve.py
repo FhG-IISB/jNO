@@ -2193,10 +2193,10 @@ def coupling(
             ``solve(x0=)`` takes): their first sweep and the stiffness probe. A steady gas needs one, as it has no
             state at zero. The interface data then start from the starting states too (each sender's value there, or
             the value that holds its condition at the receiver's start), not from zero.
-        compile: run a transient coupling's window as one compiled program where every window is one sweep (data
-            flowing one way, or ``implicit=False``) and the problems' windows do not depend on their start time:
-            traced once (``core.coupled.compiles``), after a first window run step by step. ``False`` runs every
-            window step by step.
+        compile: run a transient coupling's windows as one compiled program, traced once (``core.coupled.compiles``),
+            after a first window run step by step: a window of one sweep (data flowing one way, or ``implicit=False``),
+            or its interface fixed point with ``accel="aitken"`` or a fixed relaxation, when the problems' windows do
+            not depend on their start time. ``False`` runs every window step by step.
 
     The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
     """

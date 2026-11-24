@@ -104,7 +104,7 @@ window as the same compiled program.
 | `measure=` | `None`, `"axisymmetric"`, `"axisymmetric:0"` |
 | `implicit=`, `window=`, `time=` | see above |
 | `x0=` | `{problem: state}`: where steady `jno.fvm` / `jno.fdm` problems start (first sweep, stiffness probe) |
-| `compile=` | a window of one sweep (one-way data, or `implicit=False`) as one compiled program, traced once (`core.coupled.compiles`); default `True` |
+| `compile=` | every window after the first as one compiled program, traced once (`core.coupled.compiles`): one sweep (one-way data, `implicit=False`) or the fixed point with Aitken or a fixed relaxation; default `True` |
 
 A stall below `tol` (the participants' own solves are not that accurate) is named as such.
 

@@ -209,6 +209,10 @@ class Participant:
         return (0.0, float(window)) if self.autonomous() else (float(t0), float(t0) + float(window))
 
     # -- solving and reading back -----------------------------------------------------------------------
+    def trainables(self, problem) -> set:
+        """The layer ids of the trainable parameters ``problem`` reads (what ``params=`` may name)."""
+        raise NotImplementedError
+
     def solve(self, problem, data, x0=None, params=None):
         """The steady state with the interface ``data`` (what :meth:`data`'s setters return). ``params``
         (``{layer_id: value}``) gives the problem's trainable parameters their values; data and parameters are
@@ -252,6 +256,9 @@ class _StrongForm(Participant):
             return {node.model.layer_id: jnp.asarray(values)}
 
         return node, setter
+
+    def trainables(self, problem) -> set:
+        return set(problem._trainable_params())
 
     def _scope(self, problem, data, params=None):
         """``extra_params`` for ``data`` (``{layer_id: values}``) and ``params`` (``{layer_id: value}`` of trainable
@@ -517,13 +524,20 @@ class FEMParticipant(Participant):
 
         return node, setter
 
+    def _names(self, problem):
+        """``{layer_id: name}`` of the runtime parameters the problem's forms read (trainable ones and data)."""
+        exprs = getattr(problem._op, "runtime_parameter_exprs", None) or getattr(problem._op, "param_exprs", {})
+        return {getattr(getattr(_unwrap(e), "model", None), "layer_id", None): n for n, e in exprs.items()}
+
+    def trainables(self, problem) -> set:
+        return set(self._names(problem)) - {None}
+
     def _args(self, problem, data, params=None):
         """The runtime arguments of the problem's forms: the data by their field names, the trainable parameters
         (``{layer_id: value}``) by the names the forms know them by."""
         args = dict(data)
         if params:
-            exprs = getattr(problem._op, "runtime_parameter_exprs", None) or getattr(problem._op, "param_exprs", {})
-            names = {getattr(getattr(_unwrap(e), "model", None), "layer_id", None): n for n, e in exprs.items()}
+            names = self._names(problem)
             missing = sorted(set(params) - set(names))
             if missing:
                 raise ValueError(f"coupling: params= names layer ids {missing}, which this jno.fem problem does not read.")
