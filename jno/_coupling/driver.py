@@ -75,7 +75,8 @@ class CouplingSpec:
 
 @dataclass
 class _Data:
-    """One data field: what ``sender`` evaluates (``expr`` at its ``sender_tag``) and ``receiver`` reads."""
+    """One data field: what ``sender`` evaluates (``expr`` at its ``sender_tag``) and ``receiver`` reads. Its values
+    are not kept here: the iteration passes them along, one array per field in the order of ``Coupled.data``."""
 
     receiver: int
     sender: int
@@ -85,7 +86,6 @@ class _Data:
     sender_tag: str
     node: object = None
     setter: object = None
-    values: np.ndarray = None  # at the receiver's interface nodes
     cond: int = None  # the index of the condition it was made for
     received: object = None  # that condition as its receiver imposes it (this field's node in it)
 
@@ -143,7 +143,6 @@ class Coupled:
         self.order = self._order()
         self.data, self.problems = self._build()
         self.history = []
-        self._last = {}
 
     # -- structure ------------------------------------------------------------------------------------
     def _who(self, node):
@@ -490,9 +489,9 @@ class Coupled:
         return coef, total
 
     def _start_data(self, states):
-        """Every data field at its start (:meth:`_start_values`) before the first sweep, in place of zeros."""
-        for d in self.data:
-            d.values = self._start_values(d, states, [o for o in self.data if o.receiver == d.receiver])
+        """Every data field's values at its start (:meth:`_start_values`) before the first sweep: one array per field,
+        in the order of ``self.data``, at its receiver's interface nodes."""
+        return tuple(self._start_values(d, states, [o for o in self.data if o.receiver == d.receiver]) for d in self.data)
 
     def _unfloat(self):
         """A steady participant with no essential condition of its own that takes only fluxes is singular (a
@@ -610,9 +609,6 @@ class Coupled:
             self._all_data.extend(data)
             extra[r].append(self._as_condition(r, cond, c))
         problems = [p.rebuild(extra[i]) if extra[i] else p.problem for i, p in enumerate(self.parts)]
-        for d in self._all_data:
-            iface = self.parts[d.receiver].interface(d.receiver_tag, self.spec.measure)
-            d.values = np.zeros(iface.points.shape[0])
         return self._all_data, problems
 
     def _as_condition(self, i, cond, original):
@@ -676,8 +672,9 @@ class Coupled:
         return found[0].bind(**original.coords[i])
 
     # -- iteration ---------------------------------------------------------------------------------------
-    def _produce(self, d, states):
-        """Data ``d`` from its sender's current state, carried to the receiver's interface nodes.
+    def _produce(self, d, states, values):
+        """Data ``d`` from its sender's current state, carried to the receiver's interface nodes; ``values`` the data
+        the sender read (its boundary conditions, which its own samples read too).
 
         A flux from a sender that just marched a window is its mean over the window, from the sender's own
         steps: what the receiver takes in over the window is then what the sender gave out. Its end value is
@@ -685,7 +682,7 @@ class Coupled:
         s, r = self.parts[d.sender], self.parts[d.receiver]
         src = s.interface(d.sender_tag, self.spec.measure)
         dst = r.interface(d.receiver_tag, self.spec.measure)
-        prob, data = self.problems[d.sender], self._last.get(d.sender)
+        prob, data = self.problems[d.sender], self._extra(d.sender, values)
         frames = s.frames(prob, states[d.sender]) if d.flux else None
         if frames is None or frames.shape[0] < 2:
             vals = np.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data))
@@ -720,16 +717,21 @@ class Coupled:
             cache[key] = (conservative if d.flux else consistent)(dst, src)
         return cache[key]
 
-    def _advance(self, i, start, states, t, window):
-        """Participant ``i`` with its current data: a window's march from ``start`` for a transient problem, a
-        (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady."""
+    def _extra(self, i, values):
+        """What participant ``i``'s solve takes for the data fields it reads, from their ``values``."""
         part, prob = self.parts[i], self.problems[i]
         extra = {}
-        for d in self.data:
+        for d, v in zip(self.data, values):
             if d.receiver == i:
                 iface = part.interface(d.receiver_tag, self.spec.measure)
-                extra.update(d.setter(part.nodal(iface, d.values), prob))
-        self._last[i] = extra  # what its boundary conditions read: its own samples need them too
+                extra.update(d.setter(part.nodal(iface, v), prob))
+        return extra
+
+    def _advance(self, i, start, states, values, t, window):
+        """Participant ``i`` with the data ``values``: a window's march from ``start`` for a transient problem, a
+        (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady."""
+        part, prob = self.parts[i], self.problems[i]
+        extra = self._extra(i, values)
         if window is not None and part.transient(prob):
             return part.march(prob, start[i], t, window, extra, time=self._time_of(i))
         return part.solve(prob, extra, x0=states[i])
@@ -740,34 +742,49 @@ class Coupled:
             return next((s for p, s in tm.items() if p is self.parts[i].problem), None)
         return tm
 
-    def _iterate(self, start, states, t=None, window=None):
-        """One coupled solve -- the steady problem, or one window -- iterated until the interface data stop
-        changing (or a single sweep, ``implicit=False``). Returns the participants' states."""
-        n = len(self.parts)
-        states = list(states)
-        pos = {i: k for k, i in enumerate(self.order)}
-        back = [d for d in self.data if pos[d.sender] >= pos[d.receiver]]  # read before their sender runs
+    def _back(self):
+        """Indices of the data fields read before their sender runs in a sweep (every one, for Jacobi): the
+        iteration's unknowns."""
         if self.spec.scheme == "jacobi":
-            back = list(self.data)
-        x = np.concatenate([d.values for d in back]) if back else np.zeros(0)
+            return list(range(len(self.data)))
+        pos = {i: k for k, i in enumerate(self.order)}
+        return [k for k, d in enumerate(self.data) if pos[d.sender] >= pos[d.receiver]]
+
+    def _sweep(self, x, start, states, values, back, t=None, window=None):
+        """One sweep from the back data ``x``: every participant advanced once. Returns the states, the data values
+        each participant read, and the back data its senders produce from them."""
+        values = self._unpack(values, back, x)
+        n = len(self.parts)
+        if self.spec.scheme == "jacobi":
+            states = [self._advance(i, start, states, values, t, window) for i in range(n)]
+        else:
+            states = list(states)
+            for i in self.order:
+                fresh = {  # forward data: fresh from senders already run in this sweep
+                    k: self._produce(d, states, values)
+                    for k, d in enumerate(self.data)
+                    if d.receiver == i and k not in back
+                }
+                values = tuple(fresh.get(k, v) for k, v in enumerate(values))
+                states[i] = self._advance(i, start, states, values, t, window)
+        x_new = np.concatenate([self._produce(self.data[k], states, values) for k in back]) if back else np.zeros(0)
+        return states, values, x_new
+
+    def _iterate(self, start, states, values, t=None, window=None):
+        """One coupled solve -- the steady problem, or one window -- iterated until the interface data stop
+        changing (or a single sweep, ``implicit=False``). Returns the participants' states and the data values."""
+        states = list(states)
+        back = self._back()
+        x = np.concatenate([values[k] for k in back]) if back else np.zeros(0)
         self._accel.start()
         history = []
         for it in range(1, self.spec.max_iter + 1):
-            self._set(back, x)
-            if self.spec.scheme == "jacobi":
-                states = [self._advance(i, start, states, t, window) for i in range(n)]
-            else:
-                for i in self.order:
-                    for d in self.data:  # forward data: fresh from senders already run in this sweep
-                        if d.receiver == i and d not in back:
-                            d.values = self._produce(d, states)
-                    states[i] = self._advance(i, start, states, t, window)
-            x_new = np.concatenate([self._produce(d, states) for d in back]) if back else np.zeros(0)
+            states, values, x_new = self._sweep(x, start, states, values, back, t, window)
             err = float(np.linalg.norm(x_new - x)) / max(float(np.linalg.norm(x_new)), 1e-300)
             history.append(err)
             self.history = history
             if err <= self.spec.tol or not back or not self.spec.implicit:
-                self._set(back, x_new)
+                values = self._unpack(values, back, x_new)
                 break
             if len(history) >= 4 and max(history[-3:]) <= 1.5 * min(history[-3:]) and history[-1] < 1e-4:
                 raise RuntimeError(
@@ -783,7 +800,7 @@ class Coupled:
                 f"{self.spec.tol:.1e}; history {self._brief()}). Raise max_iter, accelerate (accel='iqn-ils' or "
                 "'aitken'), or swap the Dirichlet side (dirichlet=...)."
             )
-        return states
+        return states, values
 
     def _windows(self, transient):
         """``(window, t0, t1)`` of a transient coupling: the transient problems' common time span, the window the
@@ -818,20 +835,19 @@ class Coupled:
         transient = [i for i in range(n) if self.parts[i].transient(self.problems[i])]
         if not transient:
             states = [self._guess.get(i) for i in range(n)]
-            self._start_data(states)
-            states = self._iterate([None] * n, states)
+            states, _ = self._iterate([None] * n, states, self._start_data(states))
             self.iterations = len(self.history)
             self.states = states
             return [self._shape(i, st) for i, st in enumerate(states)]
         window, t0, t1 = self._window
         start = [self.parts[i].initial(self.problems[i]) if i in transient else None for i in range(n)]
         states = [start[i] if i in transient else self._guess.get(i) for i in range(n)]
-        self._start_data(states)
+        values = self._start_data(states)
         frames = [[] for _ in range(n)]
         self.window_iterations, self.times = [], [t0]
         t = t0
         for w in range(int(round((t1 - t0) / window))):
-            states = self._iterate(start, states, t, window)
+            states, values = self._iterate(start, states, values, t, window)
             if w == 0:  # a quasi-steady problem's first frame is its state in the first window
                 for i in range(n):
                     frames[i].append(start[i] if i in transient else states[i])
@@ -849,12 +865,15 @@ class Coupled:
         h = self.history
         return ", ".join(f"{e:.1e}" for e in (h[:3] + ["…"] + h[-2:] if len(h) > 6 else h) if not isinstance(e, str))
 
-    def _set(self, back, x):
-        k = 0
-        for d in back:
-            m = d.values.size
-            d.values = np.asarray(x[k : k + m])
+    @staticmethod
+    def _unpack(values, back, x):
+        """``values`` with the back data fields (indices ``back``) replaced by their slices of ``x``."""
+        out, k = list(values), 0
+        for j in back:
+            m = np.size(values[j])
+            out[j] = x[k : k + m]
             k += m
+        return tuple(out)
 
     def _shape(self, i, state):
         p = self.problems[i]
