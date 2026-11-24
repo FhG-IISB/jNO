@@ -134,6 +134,7 @@ class Coupled:
         if not self.conditions:
             raise ValueError("jno.core([...]): problems on their own meshes need interface conditions between them.")
         self.stiffness = {}
+        self._probe_params = self._initial_params()  # what the structural probes give the trainable parameters
         self._guess = self._guesses()  # participant -> the state a steady one starts from (x0=)
         transient = [i for i, part in enumerate(self.parts) if part.transient()]
         self._window = self._windows(transient) if transient else None  # (window, t0, t1)
@@ -380,12 +381,15 @@ class Coupled:
         windowed = part.transient(prob) and self._window is not None
         about = windowed or i in self._guess  # probed about where it starts, not from zero
         starts = self._starts(windowed)
+        mine = {lid: v for lid, v in self._probe_params.items() if lid in part.trainables(prob)} or None
         base = {}  # the data the probe starts from, per (condition, data index)
         for k, ds in data.items():
             face = part.interface(self.conditions[k].tags[i], self.spec.measure)
             for j, d in enumerate(ds):
                 peers = [o for os in data.values() for o in os]
-                base[k, j] = self._start_values(d, starts, peers) if about else np.zeros(face.points.shape[0])
+                base[k, j] = (
+                    self._start_values(d, starts, peers, self._probe_params) if about else np.zeros(face.points.shape[0])
+                )
         step = 1.0
         if about:  # a small step about the start for a nonlinear problem; exact either way for a linear one
             step = 1e-3 * max(1.0, max(float(np.abs(base[kv, j]).max(initial=0.0)) for j in range(len(data[kv]))))
@@ -399,12 +403,39 @@ class Coupled:
                     extra.update(d.setter(part.nodal(face, lv), prob))
             if windowed:
                 window, t0, _ = self._window
-                state, _ = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i))
+                state, _ = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i), params=mine)
             else:
-                state = part.solve(prob, extra, x0=self._guess.get(i))
-            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra)))
+                state = part.solve(prob, extra, x0=self._guess.get(i), params=mine)
+            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra, params=mine)))
         self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / (step * iface.total)
         return self.stiffness[key]
+
+    def _initial_params(self):
+        """``{layer_id: value}`` for the structural probes (the interface stiffness): a trainable parameter that still
+        holds its placeholder, 0 until a jno.core setup applies its ``.initialize(...)``, is probed at its
+        initializer's value instead. At 0 a trainable conductivity made the probed slab singular and put the value
+        condition on the wrong side. Parameters set or trained already are probed where they are."""
+        import jax
+        import jax.numpy as jnp
+
+        from ..trace import ModelCall
+
+        found = {}
+        for expr in [c for part in self.parts for c in part.constraints()] + [c.expr for c in self.conditions]:
+            for n in _nodes(expr):
+                model = getattr(n, "model", None) if isinstance(n, ModelCall) else None
+                if model is None or not getattr(model, "_is_parameter", False) or model.layer_id in found:
+                    continue
+                init, value = getattr(model, "_initializer_fn", None), getattr(model.module, "value", None)
+                if getattr(model, "_opt_fn", None) is None or init is None or value is None or np.any(np.asarray(value)):
+                    continue
+                key = getattr(model, "_initializer_key", None)
+                key = jax.random.PRNGKey(0) if key is None else key
+                try:
+                    found[model.layer_id] = jnp.asarray(init(key, value.shape, value.dtype), value.dtype)
+                except TypeError:  # an initializer without a dtype argument, as jno.core calls it too
+                    found[model.layer_id] = jnp.asarray(init(key, value.shape), value.dtype)
+        return found
 
     def _guesses(self):
         """``{participant: state}`` from ``coupling(x0={problem: state})``: where a steady participant starts (its first
@@ -507,7 +538,8 @@ class Coupled:
         """The trainable parameters among ``params`` (``{layer_id: value}``) that participant ``i`` reads."""
         if not params:
             return None
-        own = self.parts[i].trainables(self.problems[i])
+        problems = self.__dict__.get("problems")  # built after the structural probes, which read the originals
+        own = self.parts[i].trainables(problems[i] if problems is not None else self.parts[i].problem)
         mine = {lid: v for lid, v in params.items() if lid in own}
         return mine or None
 

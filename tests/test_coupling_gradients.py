@@ -25,13 +25,15 @@ def _x64():
     jax.config.update("jax_enable_x64", prev)
 
 
-def _trainable(name, value):
-    """A trainable scalar with its stored value set (``initialize`` acts only inside jno.core)."""
+def _trainable(name, value, stored=True):
+    """A trainable scalar initialised to ``value``; ``stored``: its stored value set too (``initialize`` acts only in
+    a jno.core setup, until then the parameter holds 0)."""
     k = jno.np.parameter((1,), name=name)
     k.dtype(jnp.float64)
     k.initialize(jax.nn.initializers.constant(value))
     k.optimizer(optax.adam(1e-2))
-    k.model.module = eqx.tree_at(lambda m: m.value, k.model.module, jnp.asarray([value]))
+    if stored:
+        k.model.module = eqx.tree_at(lambda m: m.value, k.model.module, jnp.asarray([value]))
     return k
 
 
@@ -127,7 +129,7 @@ def test_jno_core_trains_a_conductivity_through_a_coupling():
     from jno.trace import FunctionCall
 
     ka_true, kb = 2.0, 10.0
-    k = _trainable("ka", 1.0)
+    k = _trainable("ka", 1.0, stored=False)  # as a user writes it: jno.core applies the initializer
     k.optimizer(optax.adam(1e-1))
     pa, ua, fa, _ = _fvm_slab(k, 0.0, 0.1, "left", 0.0, "right")
     pb, ub, fb, db = _fem_slab(kb, 1.0, 0.07, "right", 1.0, "left")
@@ -173,3 +175,20 @@ def test_three_kinds_in_series_differentiate_by_the_middle_conductivity():
     k2 = jnp.asarray([k20])
     np.testing.assert_allclose(float(t2(k2)), (1.0 / k1 + 1.0 / k20) / S, atol=1e-9)
     np.testing.assert_allclose(float(jax.grad(t2)(k2)[0]), -(1.0 / k20**2) * (1.0 / k3) / S**2, rtol=1e-7)
+
+
+def test_a_coupling_probes_a_parameter_at_its_initial_value_before_jno_core_sets_it():
+    # Name the break: a parameter given only .initialize(...) holds 0 until a jno.core setup, and the coupling's
+    # structural probes (the interface stiffness) solved at 0: a singular slab (-0 Δu), no stiffness, the value
+    # condition on the wrong side. They read the parameter's initializer now. With k_a = 1 against k_b = 10 the
+    # softer fvm slab takes the value (Giles 1997), as with a literal k_a = 1.
+    ka0, kb = 1.0, 10.0
+    k = _trainable("ka", ka0, stored=False)
+    pa, ua, fa, _ = _fvm_slab(k, 0.0, 0.1, "left", 0.0, "right")
+    pb, ub, fb, db = _fem_slab(kb, 1.0, 0.07, "right", 1.0, "left")
+    c = couple([pa, pb], [ua - ub, k * fa + kb * fb], CouplingSpec(tol=1e-12, max_iter=60))
+    assert c.parts[c.assign[0]].problem is pa
+    np.testing.assert_allclose(sorted(c.stiffness.values()), [ka0, kb], rtol=1e-6)  # k/L of each unit slab
+    _, sb = c.solve(params={k.model.layer_id: jnp.asarray([ka0])})
+    iface = np.isclose(np.asarray(db.mesh_connectivity["points"])[:, 0], 1.0)
+    np.testing.assert_allclose(np.asarray(sb)[iface], kb / (ka0 + kb), atol=1e-10)
