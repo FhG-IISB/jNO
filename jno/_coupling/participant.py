@@ -95,6 +95,30 @@ def evaluate_at(expr, points, leaf, normals=None, t=None, domain=None):
     return TraceEvaluator(params={}).evaluate(expr, context=context, var_bindings={})
 
 
+def _tracing(*args):
+    """Is this call inside a trace (a compiled program, a gradient), or are any of ``args`` traced?"""
+    import jax
+    import jax.numpy as jnp
+
+    leaves = jax.tree_util.tree_leaves(args)
+    return isinstance(jnp.zeros(()) + 0, jax.core.Tracer) or any(isinstance(x, jax.core.Tracer) for x in leaves)
+
+
+def _compiled(cache, key, run, *args):
+    """``run(*args)``: compiled once per ``key`` and reused when called eagerly; inside a trace (a coupling window
+    compiled whole, a gradient) called directly, since the enclosing program compiles it anyway. A cached jitted
+    closure traced first inside another program and then called eagerly ran one input buffer short under JAX 0.10.1
+    ("Execution supplied 822 buffers but compiled program expected 823"; git-bug 2eb8fac)."""
+    import jax
+
+    if _tracing(*args):
+        return run(*args)
+    fn = cache.get(key)
+    if fn is None:
+        fn = cache[key] = jax.jit(run)
+    return fn(*args)
+
+
 class Participant:
     """What the driver needs of one problem; subclasses implement it per discretisation."""
 
@@ -135,10 +159,11 @@ class Participant:
         raise NotImplementedError
 
     def nodal(self, iface, values):
-        """Interface-node values ``(m,)`` spread to a full nodal field (zero off the interface)."""
-        out = np.zeros(self.points.shape[0])
-        out[iface.nodes] = np.asarray(values).reshape(-1)
-        return out
+        """Interface-node values ``(m,)`` spread to a full nodal field (zero off the interface); traceable."""
+        import jax.numpy as jnp
+
+        values = jnp.asarray(values).reshape(-1)
+        return jnp.zeros(self.points.shape[0], values.dtype).at[jnp.asarray(iface.nodes)].set(values)
 
     def essential(self, problem=None) -> bool:
         """Does the problem hold an essential (value) condition of its own? A steady problem without one, given
@@ -164,8 +189,9 @@ class Participant:
 
         return not any(walk(c) for c in self.constraints())
 
-    def march(self, problem, state, t0, window, data, time=None):
-        """The state after the window ``[t0, t0 + window]`` from ``state``, the data held over it."""
+    def march(self, problem, state, t0, window, data, time=None, params=None):
+        """The state after the window ``[t0, t0 + window]`` from ``state``, the data held over it. ``params``
+        (``{layer_id: value}``) gives trainable parameters their (possibly traced) values, as in :meth:`solve`."""
         raise NotImplementedError
 
     def frames(self, problem, end):
@@ -188,12 +214,15 @@ class Participant:
         return (0.0, float(window)) if self.autonomous() else (float(t0), float(t0) + float(window))
 
     # -- solving and reading back -----------------------------------------------------------------------
-    def solve(self, problem, data, x0=None):
+    def solve(self, problem, data, x0=None, params=None):
+        """The steady state with the interface ``data`` (what :meth:`data`'s setters return). ``params``
+        (``{layer_id: value}``) gives the problem's trainable parameters their values; data and parameters are
+        traced inputs, so the solve runs under ``jax.jit`` and differentiates by both."""
         raise NotImplementedError
 
-    def sample(self, problem, state, expr, tag, iface, data=None):
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
         """``expr`` (one of this participant's own expressions) at the interface nodes, ``(m,)``; ``data`` the
-        participant's current interface data (its boundary conditions read them)."""
+        participant's current interface data (its boundary conditions read them), ``params`` as in :meth:`solve`."""
         raise NotImplementedError
 
 
@@ -229,71 +258,72 @@ class _StrongForm(Participant):
 
         return node, setter
 
-    def _scope(self, problem, data):
-        """``extra_params`` for ``data`` (``{layer_id: values}``): each data field's module holding its values."""
+    def _scope(self, problem, data, params=None):
+        """``extra_params`` for ``data`` (``{layer_id: values}``) and ``params`` (``{layer_id: value}`` of trainable
+        parameters): each one's module holding its (possibly traced) value."""
         nodes = self.__dict__.get("_data_nodes", {})
-        return {lid: problem._trainable_module(nodes[lid], v) for lid, v in data.items()}
+        scope = {lid: problem._trainable_module(nodes[lid], v) for lid, v in data.items()}
+        if params:
+            trainable = problem._trainable_params()
+            missing = sorted(set(params) - set(trainable))
+            if missing:
+                raise ValueError(f"coupling: params= names layer ids {missing}, which are not trainable in this problem.")
+            scope.update({lid: problem._trainable_module(trainable[lid], v) for lid, v in params.items()})
+        return scope
 
-    def solve(self, problem, data, x0=None):
+    def solve(self, problem, data, x0=None, params=None):
         """One steady solve with the data as traced inputs of a solve compiled once per problem: a new value of the
         interface data is a new argument, not a new program (a module swap would change the problem's fingerprint
         and recompile: measured 1.4 s per coupling iteration on a 246-cell slab, against milliseconds)."""
         import jax
         import jax.numpy as jnp
 
-        keys = tuple(sorted(data))
-        cache = problem.__dict__.setdefault("_cpl_solve", {})
-        fn = cache.get(keys)
-        if fn is None:
-            from .. import solve as _solve
+        from .. import solve as _solve
 
-            def run(values, x0):
-                # a direct solve: exact to round-off, so the coupling can converge below an iterative solver's
-                # tolerance, and robust on the traced path (matrix-free BiCGStab diverged on fdm flux rows there)
-                scope = self._scope(problem, dict(zip(keys, values)))
-                return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=_solve.lu()))
+        params = params or {}
+        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
 
-            fn = cache[keys] = jax.jit(run)
-        if x0 is not None and "_probe_state" not in problem.__dict__:
+        def run(values, pvalues, x0):
+            # a direct solve: exact to round-off, so the coupling can converge below an iterative solver's
+            # tolerance, and robust on the traced path (matrix-free BiCGStab diverged on fdm flux rows there)
+            scope = self._scope(problem, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
+            return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=_solve.lu()))
+        if x0 is not None and "_probe_state" not in problem.__dict__ and not isinstance(x0, jax.core.Tracer):
             # traced inside the compiled solve, the start cannot decide the Jacobian's stencil: record it concretely
             problem._probe_state = np.asarray(x0, dtype=float).reshape(-1)
         x0 = jnp.zeros(problem._Ntot) if x0 is None else jnp.asarray(x0).reshape(-1)  # one signature: no retrace
-        return fn([data[k] for k in keys], x0).reshape(-1)
+        cache = problem.__dict__.setdefault("_cpl_solve", {})
+        return _compiled(cache, (keys, pkeys), run, [data[k] for k in keys], [params[k] for k in pkeys], x0).reshape(-1)
 
 
 class FDMParticipant(_StrongForm):
-    """A ``jno.fdm`` problem. Its data fields hold their values (the setter swaps the module): jno.fdm reads its
-    data fields live at every call of its compiled solve, and its traced ``extra_params`` route assembles flux
-    rows that read data wrongly (NaN on a Neumann condition with injected data)."""
+    """A ``jno.fdm`` problem: data and parameters are traced inputs of its solve, as for jno.fvm."""
 
     kind = "fdm"
 
-    def data(self, name):
-        import equinox as eqx
-        import jax.numpy as jnp
-
-        import jno
-
-        node = jno.np.parameter((self.points.shape[0],), name=name)  # no optimizer: data, the solve stays eager
-
-        def setter(values, problem=None):
-            node.model.module = eqx.tree_at(lambda m: m.value, node.model.module, jnp.asarray(values))
-            return {}
-
-        return node, setter
-
-    def solve(self, problem, data, x0=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None):
+        """One window, with the data held over it (read through ``_override``, as jno.fvm's march reads them). Its
+        steps are direct solves, as :meth:`solve` is: exact to round-off, so the coupling and its gradient are not
+        limited by a Krylov tolerance."""
+        import jax
         import jax.numpy as jnp
 
         from .. import solve as _solve
 
-        x0 = None if x0 is None else jnp.asarray(x0).reshape(-1)
-        return jnp.asarray(problem._steady_solve(x0=x0, linear=_solve.lu())).reshape(-1)
-
-    def march(self, problem, state, t0, window, data, time=None):
-        import jax.numpy as jnp
-
-        traj = problem._march(time=time, x0=jnp.asarray(state).reshape(-1), span=self._span(t0, window))
+        span = self._span(t0, window)
+        warmed = problem.__dict__.setdefault("_cpl_warmed", set())
+        if (span, repr(time)) not in warmed and _tracing(state, data, params):
+            # every structural decision of the march (linearity, sparsity, time variance, the time coefficients) made
+            # on concrete values and cached, so the traced march reuses them: jno.fdm's own traced solve does the same
+            with jax.ensure_compile_time_eval():
+                problem._march(time=time, x0=jnp.asarray(self.initial(problem)), span=span, linear=_solve.lu())
+        warmed.add((span, repr(time)))
+        problem._override = self._scope(problem, data, params)
+        try:
+            x0 = jnp.asarray(state).reshape(-1)
+            traj = problem._march(time=time, x0=x0, span=span, linear=_solve.lu())
+        finally:
+            problem._override = None
         traj = jnp.asarray(traj)
         return self._keep(problem, traj.reshape(traj.shape[0], -1))
 
@@ -309,7 +339,7 @@ class FDMParticipant(_StrongForm):
 
         return jno.fdm(self.constraints() + list(extra))
 
-    def sample(self, problem, state, expr, tag, iface, data=None):
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
         import jax.numpy as jnp
 
         u = jnp.asarray(state).reshape(-1)
@@ -319,7 +349,8 @@ class FDMParticipant(_StrongForm):
             nodes = np.asarray(nodes, dtype=int)
             skeleton = problem._flux_skeleton(expr, nodes)
             k = problem._flux_owner(expr, nodes)
-            out = problem._flux_row_fn(skeleton, None, problem._ncomp[k])(u, None)  # data: the stored values
+            scope = self._scope(problem, data or {}, params)
+            out = problem._flux_row_fn(skeleton, scope, problem._ncomp[k])(u, None)
             out = jnp.asarray(out)
             return out[idx] if out.ndim == 1 else out[idx, 0]
         fields = u.reshape(problem._nf, problem._N).T  # (N, nf)
@@ -341,44 +372,43 @@ class FVMParticipant(_StrongForm):
 
         return jno.fvm(self.constraints() + list(extra), centering=self.problem.graph.centering)
 
-    def sample(self, problem, state, expr, tag, iface, data=None):
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
         """Evaluated on the tag's boundary faces with the problem's own boundary rule (face values and normal
         derivatives as its fluxes see them), then lumped to the nodes: ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with
         ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly. Compiled once per expression."""
         import jax
         import jax.numpy as jnp
 
-        data = data or {}
-        keys = tuple(sorted(data))
+        data, params = data or {}, params or {}
+        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         faces = np.asarray(problem._region_faces(tag))
         A = jnp.asarray(self._attachment(problem, faces, iface))
         # how its boundary rule treats each condition is decided on concrete values, once; a problem sampled
         # before it was ever solved (a coupling's probe reads its initial state) has not decided it yet
         problem._decide_condition_affinity(problem._concrete_scope())
         cache = problem.__dict__.setdefault("_cpl_sample", {})
-        fn = cache.get((id(expr), tag, keys))
-        if fn is None:
 
-            def run(state, values):
-                F = self._face_values(problem, state, expr, faces, dict(zip(keys, values)))
-                return (A @ F) / A.sum(axis=1)
+        def run(state, values, pvalues):
+            F = self._face_values(problem, state, expr, faces, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
+            return (A @ F) / A.sum(axis=1)
 
-            fn = cache[(id(expr), tag, keys)] = jax.jit(run)
-        return fn(jnp.asarray(state), [data[k] for k in keys])
+        args = (jnp.asarray(state), [data[k] for k in keys], [params[k] for k in pkeys])
+        return _compiled(cache, (id(expr), tag, keys, pkeys), run, *args)
 
-    def march(self, problem, state, t0, window, data, time=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None):
         """One window, compiled once per window length for an autonomous problem: the data are traced inputs
         (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
         substeps inside the program, from the state at the window's start, so every window runs the same one."""
         import jax
         import jax.numpy as jnp
 
-        keys = tuple(sorted(data))
+        params = params or {}
+        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         span = self._span(t0, window)
         state = jnp.asarray(state).reshape(-1)
 
-        def run(values, x0):
-            problem._override = self._scope(problem, dict(zip(keys, values)))
+        def run(values, pvalues, x0):
+            problem._override = self._scope(problem, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
             try:
                 traj = problem._march(time=time, x0=x0, span=span)
             finally:
@@ -386,13 +416,11 @@ class FVMParticipant(_StrongForm):
             traj = jnp.asarray(traj)
             return traj.reshape(traj.shape[0], -1)
 
+        args = ([data[k] for k in keys], [params[k] for k in pkeys], state)
         if not self.autonomous():  # its own times: compiled per window
-            return self._keep(problem, jax.jit(run)([data[k] for k in keys], state))
+            return self._keep(problem, _compiled({}, None, run, *args))
         cache = problem.__dict__.setdefault("_cpl_march", {})
-        key = (keys, span, repr(time))
-        if key not in cache:
-            cache[key] = jax.jit(run)
-        return self._keep(problem, cache[key]([data[k] for k in keys], state))
+        return self._keep(problem, _compiled(cache, (keys, pkeys, span, repr(time)), run, *args))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -401,13 +429,13 @@ class FVMParticipant(_StrongForm):
             raise NotImplementedError("coupling: a u.tt problem marches [u; v]; its windows are not coupled yet.")
         return jnp.asarray(problem._initial_values(problem._params_scope())).reshape(-1)
 
-    def _face_values(self, problem, state, expr, faces, data):
+    def _face_values(self, problem, state, expr, faces, data, params=None):
         import jax.numpy as jnp
 
         g = problem.graph
         q = problem._split_dofs(state)
         qb = [qk[problem.ops.b_owner] for qk in q]
-        ev = problem._evaluator(q, qb, None, problem._params_scope(self._scope(problem, data)))
+        ev = problem._evaluator(q, qb, None, problem._params_scope(self._scope(problem, data, params)))
         for i in range(problem.ops.boundary_passes):
             ev.solve_boundary(first=i == 0)
         if g.centering == "vertex":
@@ -488,18 +516,33 @@ class FEMParticipant(Participant):
         node.model._runtime_field = True  # an essential value reads it per solve too, not frozen at build
 
         def setter(values, problem=None):
-            return {name: np.asarray(values)}
+            import jax.numpy as jnp
+
+            return {name: jnp.asarray(values)}
 
         return node, setter
 
-    def solve(self, problem, data, x0=None):
+    def _args(self, problem, data, params=None):
+        """The runtime arguments of the problem's forms: the data by their field names, the trainable parameters
+        (``{layer_id: value}``) by the names the forms know them by."""
+        args = dict(data)
+        if params:
+            exprs = getattr(problem._op, "runtime_parameter_exprs", None) or getattr(problem._op, "param_exprs", {})
+            names = {getattr(getattr(_unwrap(e), "model", None), "layer_id", None): n for n, e in exprs.items()}
+            missing = sorted(set(params) - set(names))
+            if missing:
+                raise ValueError(f"coupling: params= names layer ids {missing}, which this jno.fem problem does not read.")
+            args.update({names[lid]: v for lid, v in params.items()})
+        return args
+
+    def solve(self, problem, data, x0=None, params=None):
         import jax.numpy as jnp
 
-        out = problem.solve(**data)
+        out = problem.solve(**self._args(problem, data, params))
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
-    def march(self, problem, state, t0, window, data, time=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None):
         """One window of the FEM's own time block: its step solvers (a direct step, composed once per scheme), a
         window copy of the block from ``state``, and the data as the runtime arguments. Going through
         ``fem.solve`` composed new step solvers on every call, a new compiled-march key each time (0.5 s a window,
@@ -517,7 +560,7 @@ class FEMParticipant(Participant):
             cache[key] = compose_transient_step_solvers(None, _solve.lu(), None, problem, block, time)
         lin_s, nonlin_s = cache[key]
         win = window_block(block, self._span(t0, window), jnp.asarray(state).reshape(-1), who="coupling")
-        args = {k: jnp.asarray(v) for k, v in data.items()}
+        args = {k: jnp.asarray(v) for k, v in self._args(problem, data, params).items()}
         grid = _block_time_grid(win)
         if time is not None:
             ys = time.integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
@@ -532,8 +575,10 @@ class FEMParticipant(Participant):
 
     def _field_nodal(self, problem, state, field):
         """A scalar P1 field's nodal values from the DOF vector."""
+        import jax.numpy as jnp
+
         sl = problem.blocks[problem.block_index(field)]
-        vals = np.asarray(state).reshape(-1)[sl.start : sl.stop]
+        vals = jnp.asarray(state).reshape(-1)[sl.start : sl.stop]
         if vals.size != self.points.shape[0]:
             raise NotImplementedError(
                 "coupling: an interface reads a jno.fem field as P1 nodal values; this field has "
@@ -552,7 +597,7 @@ class FEMParticipant(Participant):
 
         return [c for c in self.constraints() if has_test(c)]
 
-    def sample(self, problem, state, expr, tag, iface, data=None):
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
         import jax.numpy as jnp
 
         if has_derivative(expr, self.owns):
@@ -561,7 +606,10 @@ class FEMParticipant(Participant):
             total = terms[0]
             for c in terms[1:]:
                 total = total + c
-            r = np.asarray(problem.eval(total, jnp.asarray(state)))
+            # the problem's own weak terms never read the interface data (those are in the received conditions):
+            # only the trainable parameters are arguments
+            args = self._args(problem, {}, params)
+            r = jnp.asarray(problem.eval(total, jnp.asarray(state), args=args or None))
             field = self._flux_field(expr)
             sl = problem.blocks[problem.block_index(field)]
             # loads ∫ N φ_i -> the density whose loads they are (the interface mass, not the lumped weights,

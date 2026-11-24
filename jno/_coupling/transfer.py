@@ -6,6 +6,8 @@ Based on:
     Farhat, C., Lesoinne, M. & Le Tallec, P. (1998). Load and motion transfer algorithms for fluid/structure
     interaction problems with non-matching discrete interfaces. Computer Methods in Applied Mechanics and
     Engineering 157, 95-114.
+    Wathen, A. J. (1987). Realistic eigenvalue bounds for the Galerkin mass matrix. IMA Journal of Numerical
+    Analysis 7, 449-457 (the Jacobi-scaled mass is well conditioned: CG for the projection).
 
 Each side of an interface is a set of mesh nodes on its own boundary facets (:class:`Interface`). Data move as
 nodal fields:
@@ -194,14 +196,32 @@ class Interface:
         return M
 
     def project(self, loads):
-        """Nodal densities whose loads ``∫ q φ_i dμ`` are ``loads``: ``M^-1 loads``."""
-        lu = self.__dict__.get("_mass_lu")
-        if lu is None:
-            from scipy.sparse.linalg import splu
+        """Nodal densities whose loads ``∫ q φ_i dμ`` are ``loads``: ``M^-1 loads``, by conjugate gradients on the
+        sparse interface mass with a Jacobi preconditioner, so it runs inside a compiled program and differentiates
+        in ``loads`` (a host LU did neither), in O(nnz) memory. Jacobi-scaled, a linear-element mass has its
+        eigenvalues in [1/2, 3/2] on segments, [1/2, 2] on triangles, [1/4, 9/4] on bilinear quads (Wathen 1987):
+        CG halves the error at least every iteration and reaches round-off in a few tens of them."""
+        import jax.numpy as jnp
+        from jax.experimental import sparse as jsparse
+        from jax.scipy.sparse.linalg import cg
 
-            lu = splu(sp.csc_matrix(self.mass))
-            object.__setattr__(self, "_mass_lu", lu)
-        return lu.solve(np.asarray(loads, dtype=float))
+        from .participant import _compiled
+
+        ops = self.__dict__.get("_mass_ops")
+        if ops is None:
+            coo = sp.coo_matrix(self.mass)
+            index = jnp.asarray(np.stack([coo.row, coo.col], axis=1))
+            A = jsparse.BCOO((jnp.asarray(coo.data), index), shape=coo.shape)
+            dinv = jnp.asarray(1.0 / self.mass.diagonal())
+
+            def solve(loads):
+                maxiter = 4 * loads.shape[0] + 50
+                return cg(lambda v: A @ v, loads, M=lambda r: dinv * r, tol=1e-14, atol=0.0, maxiter=maxiter)[0]
+
+            ops = (solve, dinv.dtype, {})
+            object.__setattr__(self, "_mass_ops", ops)
+        solve, dtype, cache = ops
+        return _compiled(cache, None, solve, jnp.asarray(loads, dtype=dtype))  # compiled once, eagerly
 
 
 def _closest_on_segments(p, a, b):

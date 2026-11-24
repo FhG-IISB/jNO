@@ -407,8 +407,11 @@ class StrongFormProblem:
         if value is None or np.ndim(value) != 1 or np.shape(value)[0] != self._N:
             return module
         import equinox as eqx
+        import jax
 
-        return eqx.tree_at(lambda m: m.value, module, jnp.reshape(value, (self._N, 1)))
+        with jax.ensure_compile_time_eval():  # a stored value stays concrete inside a trace: structural probes read it
+            value = jnp.reshape(value, (self._N, 1))
+        return eqx.tree_at(lambda m: m.value, module, value)
 
     def _params_scope(self, extra_params=None):
         """The module every trainable parameter resolves to in an evaluation: its current value, then the
