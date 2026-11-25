@@ -596,6 +596,23 @@ def _extract_user_name(orig_expr) -> str | None:
     return None
 
 
+def _one_value(residual, sense: str) -> FunctionCall:
+    """``residual`` as a constraint row, refused when traced if it holds more than one value: a row is reduced by
+    its mean, so an array-valued ``jno.le(v, b)`` would bound the average of ``v``, not every entry."""
+
+    def check(v):
+        if jnp.size(v) != 1:
+            raise ValueError(
+                f"jno.core: the constraint jno.{sense}(...) evaluates to {tuple(jnp.shape(v))} values, and a row "
+                "bounds ONE value (it would otherwise bound their mean). For a bound on every entry give "
+                f"jno.{sense}(expr, bound, margin=...): a smooth maximum that lies at most `margin` above the "
+                "largest entry. For a bound on a total or an average, reduce it yourself (`.sum`, `.mean`)."
+            )
+        return v
+
+    return FunctionCall(check, [residual], name="row")
+
+
 class _RebuildWatch(_CallbackBase):
     """Stops a training stretch at the first epoch where a watched domain's ``when`` holds, and keeps
     the parameter values it held at -- what the rebuild builds the shape at."""
@@ -2469,10 +2486,10 @@ class core:
                 inner = expr.expr
             elif isinstance(expr, OperationDef) and isinstance(expr.expr, Constraint):
                 inequality_sense = expr.expr.sense
-                inner = OperationDef(expr.expr.residual)
+                inner = OperationDef(_one_value(expr.expr.residual, expr.expr.sense))
             elif isinstance(expr, Constraint):
                 inequality_sense = expr.sense
-                inner = expr.residual
+                inner = _one_value(expr.residual, expr.sense)
 
             if inequality_sense is not None:
                 if isinstance(_bare, AugLagConstraint):

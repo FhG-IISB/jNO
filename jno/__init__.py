@@ -139,7 +139,23 @@ class ScheduleWrapper:
 schedule = ScheduleWrapper()
 
 
-def le(expr, bound=0.0):
+def _every(expr, margin, sense):
+    """``expr`` reduced for a bound on every entry: its smooth maximum (``"le"``) or minimum (``"ge"``) within
+    ``margin`` (see :func:`le`); ``expr`` itself without a margin."""
+    if margin is None:
+        return expr
+    margin = float(margin)
+    if not margin > 0.0:
+        raise ValueError(
+            f"jno.le/jno.ge: margin={margin!r}; it is how far the smooth maximum may lie above the largest entry, in "
+            "the units of the expression, and must be > 0 (e.g. 1 % of the bound)."
+        )
+    from .jnp_ops import _smooth_max
+
+    return _smooth_max(expr, margin) if sense == "le" else -_smooth_max(-expr, margin)
+
+
+def le(expr, bound=0.0, *, margin=None):
     """An inequality constraint ``expr <= bound``, as an entry in the ``jno.core`` list.
 
     It is evaluated and differentiated exactly like any other entry -- so its value and gradient
@@ -154,23 +170,37 @@ def le(expr, bound=0.0):
     With no constrained optimiser attached this raises at ``solve()`` rather than silently
     ignoring the constraint. ``jno.le(g, b).auglag(mu=..., every=...)`` (or ``(g <= b).auglag()``)
     enforces it with ANY optimiser through an augmented Lagrangian instead.
+
+    **A bound on every entry** of an array-valued ``expr`` (per cell, per vertex, per pair) takes ``margin``: the
+    entries go to the optimiser as one row, their Kreisselmeier-Steinhauser smooth maximum
+    ``KS(v) = log(sum_i exp(rho v_i)) / rho`` with ``rho = log(n) / margin`` [Kreisselmeier & Steinhauser 1979].
+    It lies in ``[max v, max v + margin]``, so a design that satisfies the row satisfies every entry (never an
+    approximation from below), and every design whose largest entry is ``margin`` below the bound satisfies it.
+    ``margin`` is in the units of ``expr``; smaller is tighter and more curved (a few % of the bound is usual)::
+
+        jno.le(stress / s_max, 1.0, margin=0.01)    # the stress at every point below s_max
+
+    An array-valued row without ``margin`` is refused when the core is traced: it would otherwise be reduced by its
+    mean, a bound on the average rather than on every entry.
     """
-    return Constraint(expr, bound, "le")
+    return Constraint(_every(expr, margin, "le"), bound, "le")
 
 
-def ge(expr, bound=0.0):
+def ge(expr, bound=0.0, *, margin=None):
     """An inequality constraint ``expr >= bound``, for a constrained optimiser (MMA, GCMMA) or ``.auglag()``.
 
-    The mirror of :func:`le`; see there for how constraints enter ``jno.core``.
+    The mirror of :func:`le`; see there for how constraints enter ``jno.core``. With ``margin``, a bound on every
+    entry through the smooth minimum ``-KS(-v)``, in ``[min v - margin, min v]``.
 
     Args:
-        expr: the constrained scalar expression.
+        expr: the constrained expression (one value, or an array with ``margin``).
         bound: the lower bound.
+        margin: for an array-valued ``expr``, how far the smooth minimum may lie below the smallest entry.
 
     Returns:
         Constraint: the constraint row.
     """
-    return Constraint(expr, bound, "ge")
+    return Constraint(_every(expr, margin, "ge"), bound, "ge")
 
 
 def eq(expr, bound=0.0):
