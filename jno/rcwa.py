@@ -24,14 +24,13 @@ Two entry points, both on `jno.rcwa`:
 * **Explicit layers (the backend).** :class:`Rcwa` takes a hand-built ``[(thickness, eps), ...]`` stack;
   this is what the front door constructs internally.
 
-Built on `fmmax` (a differentiable JAX Fourier Modal Method), imported lazily so the core install stays
-lean. Enable with the ``rcwa`` extra::
-
-    pip install jax-numerical-operators[rcwa]      # or: pixi run -e rcwa ...
-
+Built on the eig-free, state-space RCWA backend in :mod:`jno._rcwa` (self-owned, no fmmax import at
+runtime): each layer is solved by a first-order state transfer ``d/dz ψ = i M_L ψ`` (``expm``, never a
+dense eigendecomposition) and stacked with a chunked R-matrix/impedance recursion. The previous fmmax
+backend remains only as a *test-only oracle* (the cross-check suite and committed golden references).
 It **never fails silently**: every inference (periodicity, layer invariance, order/grid Nyquist,
 wavelength, energy balance, a recognisable source) is validated and raises :class:`RcwaError` with a
-concrete fix. Two `fmmax` conventions are baked in: the Poynting flux is summed *with sign* (an
+concrete fix. Two flux conventions are baked in: the Poynting flux is summed *with sign* (an
 ``abs()`` sum over-counts and yields ``T+R>1``), and ``JONES_DIRECT_FOURIER`` is the default
 factorization (the naive rule converges poorly for high-contrast dielectrics such as a-Si).
 
@@ -39,15 +38,17 @@ Beyond a scalar ε, the front door also infers a **tensor permittivity** ``ε̂`
 and an **in-plane PML** (a complex coordinate stretch ``S = 1 + iσ/k`` written into the stiffness
 coefficients of the scalar Helmholtz term). A uniaxial PML is exactly a diagonal Maxwell ``ε̂`` and ``μ̂``
 (``ε̂ = ε·Λ``, ``μ̂ = Λ``, ``Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)``), so the traced stretch is honoured
-exactly and solved via `fmmax`'s general anisotropic eigensolve — turning a periodic supercell into an
-isolated scatterer (the absorbing frame decouples the walls).
+exactly and solved via the backend's anisotropic layer kind — turning a periodic supercell into an
+isolated scatterer (the absorbing frame decouples the walls). Stage 2 wires the anisotropic and
+internal-source layers into the backend (tasks T28/T29); until then a 5/10-component layer or an
+emitter raises a loud :class:`RcwaError` naming the stage-2 task.
 
 An **internal source** — a dipole / Gaussian emitter — is authored the same way you would drive `jno.fem`
 or a PINN: a forcing term in the residual, ``- f·v`` (scalar) or ``- inner(J, v)`` (vector current). The
 front door detects the trial-free/test-present volume summand, localizes it (centroid → point vs Gaussian
-width; which z-layer), splits the stack at the source plane, and drives `fmmax`'s ``amplitudes_for_source``.
-Then ``sol.power("up"|"down")`` and ``sol.extraction(...)`` give the emitted power and directionality (LED /
-Purcell physics) instead of plane-wave ``T``/``R``.
+width; which z-layer), splits the stack at the source plane, and drives the backend's Maxwell-jump
+source solve. Then ``sol.power("up"|"down")`` and ``sol.extraction(...)`` give the emitted power and
+directionality (LED / Purcell physics) instead of plane-wave ``T``/``R``.
 
 References:
  * M. G. Moharam & T. K. Gaylord, "Rigorous coupled-wave analysis of planar-grating diffraction",
@@ -69,6 +70,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jno._rcwa import (
+    Formulation,
+    LatticeVectors,
+    StateStack,
+    generate_expansion,
+)
+from jno._rcwa.stack import _Result  # the backend's request/result container for the seam readouts
 from jno.litho import Threshold  # default resist for the .develop() / .printed() lithography readout
 from jno.utils.profiling import annotate as _annot  # stage annotator for rc.solve(profile=True)
 
@@ -79,24 +87,15 @@ def _concrete(x):
     return not isinstance(x, jax.core.Tracer)
 
 
-# Relative spread below which a permittivity grid counts as uniform (see ``_eigensolve_stack._grid``).
+# Relative spread below which a permittivity grid counts as uniform (see ``Rcwa._prepare_stack``).
 # Tight on purpose: the collapse is exact only for a genuinely constant layer, never a "nearly flat" one.
 _UNIFORM_RTOL = 1e-12
 
-
-_FMMAX_HINT = (
-    "jno.rcwa needs the optional fmmax backend: pip install jax-numerical-operators[rcwa] "
-    "(or `pixi run -e rcwa ...`, or `pip install fmmax`)."
-)
-
-
-def _fmmax():
-    try:
-        import fmmax
-
-        return fmmax
-    except ImportError as e:  # never a silent no-op
-        raise ImportError(_FMMAX_HINT) from e
+# The stage-2 tasks that own the not-yet-wired backend kinds (named in every loud raise so nobody
+# mistakes a missing feature for a bug).
+_STAGE2_ANISO = "the anisotropic 5/10-component layers (task T28)"
+_STAGE2_SOURCE = "internal sources via Maxwell jump conditions (task T29)"
+_STAGE2_FIELDS = "interior field3d reconstruction (task T40)"
 
 
 class RcwaError(ValueError):
@@ -184,7 +183,7 @@ def detect_layers(E, z, tol=1e-3, slices=None, locate=None):
 
 
 # =====================================================================================
-# The forward engine (explicit layers) — the fmmax backend the front door constructs.
+# The forward engine (explicit layers) — the state-space backend the front door constructs.
 # =====================================================================================
 def _as_jones(pol):
     """A transverse Jones vector ``(p_x, p_y)`` of unit norm from ``"x"``, ``"y"`` or a 2-sequence (complex
@@ -205,42 +204,37 @@ def _as_jones(pol):
     return (px / n, py / n)
 
 
-def _incident(fm, ex, layer0, nt, pol):
-    """Forward 0th-order incident amplitude for the transverse Jones vector ``pol``, built as a UNIFORM
-    real-space plane wave and decomposed at k_in (x-pol E=x̂, H=ŷ; y-pol E=ŷ, H=-x̂). Each basis field is a
-    pure polarization: at oblique incidence (E_y, H_x) decomposes into s-waves only and (E_x, H_y) into
-    p-waves only, so their combination is exactly the requested polarization. jax-native (traces)."""
-    px, py = pol
-    gs = fm.min_array_shape_for_expansion(ex)
-    _u = jnp.ones((*gs, 1), complex)
-    _z = jnp.zeros((*gs, 1), complex)
-    fx = fm.amplitudes_for_fields(_u, _z, _z, _u, layer0)[0]
-    fy = fm.amplitudes_for_fields(_z, _u, -_u, _z, layer0)[0]
-    return jnp.reshape(px * fx + py * fy, (2 * nt, 1))
+def _incident_pol(pol):
+    """The backend's incident plane-wave state for the Jones pair ``pol`` is built *inside* the
+    jitted core (``u_inc = (-E_y, E_x)`` at order (0,0), ``v_inc = Y_sup u_inc``) -- the same uniform
+    real-space wave the older engine decomposed via ``amplitudes_for_fields``. What the readouts need
+    from ``pol`` is only the pair itself, re-solved through the compiled core when a readout asks for a
+    different input polarization (``jones`` / the vector-aerial pupil)."""
+    return _as_jones(pol)
 
 
 class _Sol:
-    def __init__(self, fm, s, layers, expansion, nt, Pin, wavelength, thick=None, period=None, pol=(1.0, 0.0)):
-        self._fm, self._s, self._layers, self._ex = fm, s, layers, expansion
+    def __init__(self, eng, res, expansion, nt, Pin, wavelength, thick=None, period=None, pol=(1.0, 0.0)):
+        self._eng = eng  # the Rcwa engine: re-solve through its compiled core for an alternate input pol
+        self._s = res  # the backend _Result (T/R/pin/state vectors) of THIS solve
+        self._ex = expansion
         self._nt, self._Pin, self._wl = nt, Pin, wavelength
         self._thick, self._period = thick, period
         self._pol = pol  # the incident Jones vector every readout refers to
-        self._fwd = np.zeros((2 * nt, 1), complex)
 
-    def _flux(self, amps, layer, backward=False):
-        zero = jnp.zeros_like(amps)
-        f, b = self._fm.directional_poynting_flux(zero if backward else amps, amps if backward else zero, layer)
-        return jnp.reshape(b if backward else f, (-1,))  # SIGNED — energy-correct; jax-native (differentiable)
+    def _e_of(self, state):
+        """Per-order transverse E-field amplitudes ``(ex, ey)`` of a tangential state ``u = (-E_y, E_x)``."""
+        return jnp.reshape(state[self._nt :], (-1,)), jnp.reshape(-state[: self._nt], (-1,))
 
     def efficiency(self, kind):
         """Total transmitted (``"T"``) or reflected (``"R"``) power fraction over propagating orders.
 
         Returns a JAX scalar -- differentiable in the design (permittivity) so ``jax.grad`` of a
-        transmission/reflection objective flows through the modal solve."""
+        transmission/reflection objective flows through the state-space solve."""
         if kind == "T":
-            return jnp.sum(self._flux(self._s.s11 @ self._fwd, self._layers[-1])) / self._Pin
+            return self._s.T
         if kind == "R":
-            return -jnp.sum(self._flux(self._s.s21 @ self._fwd, self._layers[0], backward=True)) / self._Pin
+            return self._s.R
         raise RcwaError(f"efficiency(kind): kind must be 'T' or 'R', got {kind!r}")
 
     def order(self, m, n):
@@ -251,22 +245,20 @@ class _Sol:
         if len(hit) == 0:
             raise RcwaError(f"order ({m},{n}) is outside the truncation ({self._nt} terms); raise orders=.")
         i = int(hit[0])
-        tf = jnp.abs(
-            jnp.reshape(
-                self._fm.directional_poynting_flux(
-                    self._s.s11 @ self._fwd, jnp.zeros((2 * self._nt, 1), complex), self._layers[-1]
-                )[0],
-                (-1,),
-            )
-        )
-        return (tf[i] + tf[i + self._nt]) / self._Pin
+        # Signed per-order z-Poynting of the transmitted state, summed over the two tangential
+        # components (jNO's flux convention), normalized by the incident power. For a propagating
+        # order both tangential components carry +z energy, so |sum over components| == sum of
+        # |component| -- equal to the old per-component-abs form; only pathological (evanescent /
+        # counter-propagating) orders differ, where the signed-sum form is the physical one.
+        return jnp.abs(self._s.flux_trn[i]) / self._Pin
 
     def _input_pol(self, pol):
-        """0th-order forward incident amplitude for an input polarization (``"x"`` or ``"y"``), built as a
-        UNIFORM real-space plane wave (x-pol E=x̂,H=ŷ; y-pol E=ŷ,H=-x̂, both forward) and decomposed at k_in.
-        Working in the field basis (not the eigenvalue-sorted eigenmode basis) avoids an argmax(flux) pick
-        grabbing the wrong oblique mode for an asymmetric structure. jax-native (traces under grad/jit)."""
-        return _incident(self._fm, self._ex, self._layers[0], self._nt, _as_jones(pol))
+        """The normalized Jones pair for an alternate input polarization (``"x"`` or ``"y"``) -- re-solved
+        through the compiled core when a readout needs the response to a different input (``jones`` /
+        vector-aerial pupil). The backend builds the incident state itself: the 0th-order ``(-E_y, E_x)``
+        of the requested polarization at ``k_in``, i.e. the field-space decomposition of the uniform
+        plane wave (jax-native, traces under grad/jit)."""
+        return _as_jones(pol)
 
     def jones(self, kind="T"):
         """The 2×2 complex **Jones matrix** at the 0th diffraction order — how the structure maps incident
@@ -311,22 +303,16 @@ class _Sol:
         )
 
     def _field_volume(self, nx=80, density=40.0):
-        """``(|E|², x, y, z)`` on the full 3-D reconstruction grid — the shared core of :meth:`field`
-        and :meth:`field3d`. ``|E|²`` has shape ``(nx, ny, nz)``; the coordinate arrays come straight
-        from ``fmmax.stack_fields_3d``."""
-        fm = self._fm
-        if self._thick is None:
-            raise RcwaError("field() needs the layer thicknesses; call .solve() (which records them).")
-        znum = [max(4, int(round(float(t) * density))) for t in self._thick]
-        smi = fm.stack_s_matrices_interior(self._layers, self._thick)
-        amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
-        leaves = jax.tree_util.tree_leaves(amps)  # an fmmax result is a pytree; a trace steps aside, as the T/R guard
-        if all(_concrete(a) for a in leaves) and not all(np.all(np.isfinite(np.asarray(a))) for a in leaves):
-            raise RcwaError(self._nonfinite_field_message())
-        efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
-        # JAX all the way: |E|^2 stays differentiable in the design (permittivity grids), so it can feed a
-        # coupled objective (absorbed power -> heat). NumPy callers (plotting) accept the JAX array as is.
-        return jnp.sum(jnp.abs(efield) ** 2, axis=0)[..., 0], x, y, z  # efield: (3, nx, ny, nz, 1)
+        """Interior field reconstruction is stage-2 work (backend ``fields.py``, task T40).
+
+        Loud and never silent: the backend owns interior state propagation + iFFT; until it lands,
+        calling any of ``field``/``field3d``/``_bulk`` names the stage-2 task instead of returning a
+        wrong answer."""
+        raise RcwaError(
+            "field()/field3d() need interior field reconstruction, which the state-space backend "
+            f"implements in stage 2 ({_STAGE2_FIELDS}). Plane-wave readouts (efficiency/order/jones/"
+            "aerial) are available now."
+        )
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
@@ -336,47 +322,31 @@ class _Sol:
         z-interfaces between layers (to annotate the patterned slab). Needs the finite ambient
         thickness recorded at solve time (semi-infinite ambients are shown as unit-thick slabs).
 
-        See :meth:`field3d` for the whole volume rather than one slice."""
-        inten, _x, y, z = self._field_volume(nx=nx, density=density)
-        j = int(jnp.argmin(jnp.abs(y[0, :] - y_frac * self._period[1])))
-        slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
-        zc = z.reshape(-1)
-        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
-        return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
+        Stage 2 (task T40) restores this via the backend's interior field reconstruction; today it
+        raises a loud :class:`RcwaError` naming the task."""
+        return self._field_volume(nx=nx, density=density)
 
     def field3d(self, nx=80, density=40.0):
         """``|E|²`` on the full 3-D grid, for volume rendering / isosurfaces — the whole reconstruction
         rather than the single ``y``-slice :meth:`field` returns.
 
-        Returns ``(intensity, (x, y, z), layer_z)`` with ``intensity`` of shape ``(nx, ny, nz)`` and
-        ``x``/``y``/``z`` the 1-D coordinates of each axis. The semi-infinite ambients are rendered as
-        unit-thick slabs (see :meth:`field`), so ``z`` starts at 0 at the top of the superstrate, not at
-        any coordinate of the authored geometry — ``layer_z`` gives the interfaces in the same frame.
-
-        A JAX array, differentiable in the design (the layers' permittivity grids): ``jax.grad`` of a
-        functional of it (e.g. the absorbed power ``½ ω ε₀ Im ε |E|²`` heating a coupled thermal solve) flows
-        back through the interior-field reconstruction and the modal solve. The grid sizes (``nx``, the
-        per-layer ``nz`` from ``density``) and the layer thicknesses are static."""
-        inten, x, y, z = self._field_volume(nx=nx, density=density)
-        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
-        return inten, (x[:, 0], y[0, :], z.reshape(-1)), layer_z
+        Stage 2 (task T40) restores this via the backend's interior field reconstruction; today it
+        raises a loud :class:`RcwaError` naming the task."""
+        return self._field_volume(nx=nx, density=density)
 
     def _spectrum(self, kind="T", fwd=None):
         """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
         ``(ex, ey)`` per diffraction order (transmitted ``"T"`` or reflected ``"R"``), for the corrected
-        0th-order incidence (or a supplied input amplitude ``fwd``). ``(0,0)`` is expansion index 0."""
-        fm = self._fm
-        if kind == "T":
-            smat, layer = self._s.s11, self._layers[-1]
-        elif kind == "R":
-            smat, layer = self._s.s21, self._layers[0]
-        else:
+        0th-order incidence (or, when ``fwd`` is an input polarization pair, re-solved for that input).
+        ``(0,0)`` is expansion index 0."""
+        if kind not in ("T", "R"):
             raise RcwaError(f"kind must be 'T' or 'R', got {kind!r}")
-        amp = smat @ (self._fwd if fwd is None else fwd)
-        zero = jnp.zeros_like(amp)
-        fa, ba = (amp, zero) if kind == "T" else (zero, amp)  # T -> forward in substrate; R -> backward in super
-        (ex, ey, _ez), _ = fm.fields_from_wave_amplitudes(fa, ba, layer)
-        return jnp.reshape(ex, (-1,)), jnp.reshape(ey, (-1,))
+        if fwd is not None:  # an alternate input polarization: re-solve through the compiled core
+            res = self._eng._resolve_pol(fwd)
+        else:
+            res = self._s
+        state = res.u_sub if kind == "T" else res.u_ref
+        return self._e_of(state)
 
     def aerial(self, NA, source=0.7, defocus=0.0, grid=128, kind="T", polarization=None):
         """Partially-coherent **aerial image** (wafer-plane intensity) of this mask, by **Abbe** source
@@ -656,13 +626,15 @@ class Rcwa:
 
     Args:
         layers: the stack, ``[(thickness, eps), ...]`` from top to bottom; ``eps`` is a scalar or a
-            permittivity grid (2-D array, or a ``(…, 3, 3)`` tensor grid).
+            permittivity grid (2-D array; a ``(…, 3, 3)`` tensor grid is stage-2, task T28).
         period: the lattice periods ``(Lx, Ly)``.
         orders: Fourier truncation (approximate number of retained orders).
         wavelength: free-space wavelength; may instead be given to :meth:`solve`.
         k_in: transverse incident wavevector ``(kx, ky)``.
-        formulation: the ``fmmax`` Fourier factorization; ``"JONES_DIRECT_FOURIER"`` (default) converges
-            well for high-contrast dielectrics, where the naive rule converges poorly.
+        formulation: the Fourier-factorization name, e.g. ``"JONES_DIRECT_FOURIER"`` (default; converges
+            well for high-contrast dielectrics, where the naive ``"FFT"`` rule converges poorly). The
+            state-space backend now implements ``FFT`` and ``JONES_DIRECT_FOURIER``; the other vector
+            schemes land in stage 2 (task T30).
         assume_periodic: skip the check that each layer's grid is periodic.
         polarization: ``"x"``, ``"y"``, or a Jones vector ``(p_x, p_y)``.
     """
@@ -679,7 +651,6 @@ class Rcwa:
         assume_periodic=False,
         polarization="x",
     ):
-        fm = _fmmax()
         self.polarization = _as_jones(polarization)
         if period is None or len(period) != 2 or period[0] <= 0 or period[1] <= 0:
             raise RcwaError(f"period must be (Px,Py) > 0, got {period!r}.")
@@ -706,112 +677,244 @@ class Rcwa:
                     f"eps grid {ng}x{ng} under-resolves orders={orders} (~{per_axis}/axis); "
                     f"need >= {2 * per_axis} grid points/axis or fewer orders."
                 )
-        self.fm, self.layers_spec, self.period = fm, layers, period
+        self.layers_spec, self.period = layers, period
         self.orders, self.wavelength, self.k_in = orders, wavelength, tuple(k_in)
-        self.formulation = fm.Formulation[formulation]
+        # The 3 layer kinds get dispatched at the seam: the owned backend ships scalar-isotropic layers
+        # in stage 1; the anisotropic 5/10-component kinds are stage-2 work and raise loudly, never
+        # silently wrong (the PML / tensor front door routes to them).
+        for k, (_t, e) in enumerate(layers):
+            if isinstance(e, tuple) and len(e) in (5, 10):
+                n = len(e)
+                raise RcwaError(
+                    f"layer {k}: a {n}-component anisotropic layer is {_STAGE2_ANISO} -- the state-space "
+                    "backend solves scalar-isotropic stacks now. (Never silent, never wrong.)"
+                )
+            if not isinstance(e, tuple) and jnp.ndim(e) >= 3:
+                raise RcwaError(
+                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer is "
+                    f"{_STAGE2_ANISO} -- the state-space backend solves scalar-isotropic stacks now. "
+                    "(Never silent, never wrong.)"
+                )
+        if not isinstance(formulation, Formulation):
+            try:
+                formulation = Formulation[formulation]
+            except (KeyError, TypeError):
+                raise RcwaError(
+                    f"unknown formulation {formulation!r}; valid names: {', '.join(m for m in Formulation.__members__)}"
+                ) from None
+        self.formulation = formulation
         self.assume_periodic = True
-        # Precompute the (design-INDEPENDENT) Fourier expansion ONCE, eagerly. fmmax's generate_expansion
-        # mixes jnp with np.linalg.norm — fine eagerly, but under jax.jit jnp ops are tracers, so recomputing
-        # it inside the traced solve raised TracerArrayConversionError. Cached here, the design solve is jit-safe.
-        self._lv = fm.LatticeVectors(u=np.array([period[0], 0.0]), v=np.array([0.0, period[1]]))
-        self._ex = fm.generate_expansion(self._lv, approximate_num_terms=orders)
+        # Precompute the (design-INDEPENDENT) Fourier expansion ONCE, eagerly, host-side (the backend's
+        # generate_expansion is pure numpy, cached here so the design solve is jit-safe).
+        self._lv = LatticeVectors(u=np.array([period[0], 0.0]), v=np.array([0.0, period[1]]))
+        self._ex = generate_expansion(self._lv, approximate_num_terms=orders)
         self._nt = self._ex.num_terms
+        # The backend StateStack (expansion + chunking + guards fixed EAGERLY) is built as soon as a
+        # concrete wavelength is known -- at construction when given, else on the first solve. The
+        # stack's structural decisions never depend on the design, only the structure.
+        self._stack = None
+        self._prepared_grids = self._prepared_thick = self._prepared_wl = self._prepared_kin = None
+        if wavelength is not None:
+            self._build_stack(wavelength)
+
+    @staticmethod
+    def _ambient_scalar(e):
+        """The scalar permittivity of a CONCRETE uniform ambient, or ``None`` when it is traced or
+        in-plane patterned (the stage-2 ambient corner -- the analytic plane-wave split needs a
+        structurally uniform medium; a patterned/traced ambient is loud, not silently wrong)."""
+        g = np.asarray(e)
+        if g.ndim == 0:
+            return complex(g)
+        if g.size <= 1:
+            return complex(g.reshape(-1)[0])
+        scale = max(float(np.abs(g).max()), 1.0)
+        if np.ptp(g.real) <= _UNIFORM_RTOL * scale and np.ptp(g.imag) <= _UNIFORM_RTOL * scale:
+            return complex(g.reshape(-1)[0])
+        return None
+
+    def _build_stack(self, wavelength):
+        """Build the backend :class:`StateStack` from the CONSTRUCTION stack: the expansion, per-layer
+        chunk counts, uniform/patterned flags and expm squaring guards are all decided here, eagerly,
+        before any trace. Ambients (layers 0 and -1) must be uniform and concrete."""
+        if not _concrete(wavelength):
+            raise RcwaError(
+                "the state-space backend needs a CONCRETE wavelength to fix its standing structure "
+                "(chunking/squaring guards); solve with a concrete wavelength or pass wavelength= at "
+                "construction."
+            )
+        sup, sub = self._ambient_scalar(self.layers_spec[0][1]), self._ambient_scalar(self.layers_spec[-1][1])
+        if sup is None or sub is None:
+            raise RcwaError(
+                "the ambients (layers 0 and -1) must be uniform, concrete permittivities for the "
+                "analytic plane-wave split; a traced or in-plane-patterned ambient is the stage-2 "
+                "corner (task T30) and raises here instead of returning a wrong answer."
+            )
+        films = []
+        for k, (_t, e) in enumerate(self.layers_spec[1:-1]):
+            t = _t
+            if t is None or t == np.inf:  # jNO's historical mapping for a missing/ambient thickness
+                t = 1.0
+            if not (np.isreal(t) and t > 0):
+                raise RcwaError(f"layer {k + 1} thickness must be > 0 (or None/inf for a ~unit ambient), got {t!r}.")
+            films.append((float(t), e))
+        dtype = jnp.dtype(jnp.complex128) if jax.config.jax_enable_x64 else jnp.dtype(jnp.complex64)
+        try:
+            self._stack = StateStack(
+                wavelength=float(wavelength),
+                period=self.period,
+                amb_sup=sup,
+                amb_sub=sub,
+                layers=films,
+                orders=self.orders,
+                k_in=self.k_in,
+                formulation=self.formulation,
+                dtype=dtype,
+            )
+        except NotImplementedError as e:  # an unimplemented vector formulation on a patterned layer
+            raise RcwaError(
+                f"{e} -- that formulation is not wired in the state-space backend yet (stage 2, task T30)."
+            ) from e
+        except ValueError as e:
+            raise RcwaError(f"cannot build the state-space backend for this stack: {e}") from e
 
     def _prepare_stack(self, layers_spec, kin):
-        """Each layer's permittivity as the eigensolve takes it, and the thickness list. EAGER on purpose:
-        collapsing a uniform layer reads its values, which a trace cannot do -- so this runs before the
-        compiled solve (:meth:`_solve_core`) and hands it the result as arguments."""
-        kin = jnp.asarray(kin)
-        cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the eigensolve (robust to a
+        """Each layer's permittivity grid and the thickness list. EAGER on purpose: collapsing a uniform
+        layer reads its values, which a trace cannot do -- so this runs before the compiled solve and
+        hands it ``(1, 1)`` (the backend's uniform-isotropic shortcut) or patterned grids as arguments.
 
-        def _grid(g):  # float32 design parameter, e.g. when trained through jno.core, vs float64 wavevectors)
-            g = jnp.asarray(g).astype(cdt)  # jax-native so a permittivity grid flows -> differentiable in ε
+        The 3 layer kinds are dispatched here: scalar-isotropic solves now; a 5/10-component
+        anisotropic layer is stage-2 work and raises loudly (never silently wrong)."""
+        kin = jnp.asarray(kin)
+        cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the solve (robust to a
+        for k, (_t, e) in enumerate(layers_spec):  # float32 design parameter vs float64 wavevectors)
+            if isinstance(e, tuple) and len(e) in (5, 10):
+                n = len(e)
+                raise RcwaError(
+                    f"layer {k}: a {n}-component anisotropic layer is {_STAGE2_ANISO} -- the state-space "
+                    "backend solves scalar-isotropic stacks now. (Never silent, never wrong.)"
+                )
+            if not isinstance(e, tuple) and jnp.ndim(e) >= 3:
+                raise RcwaError(
+                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer is "
+                    f"{_STAGE2_ANISO} -- the state-space backend solves scalar-isotropic stacks now. "
+                    "(Never silent, never wrong.)"
+                )
+
+        def _grid(g):  # scalar -> (1, 1) grid; jax-native so a permittivity grid flows -> differentiable in ε
+            g = jnp.asarray(g).astype(cdt)
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
-        def _uniform_value(g):
-            """The single value of a CONCRETE, constant grid; ``None`` if it is patterned or traced.
-
-            Traced grids never collapse: under trace a "uniform" grid may be a design parameter that merely
-            starts flat (a topology-optimisation ρ initialised to a constant), and collapsing that would
-            freeze the design's structure out of the solve."""
-            if not _concrete(g) or g.size <= 1:
-                return None
-            a = np.asarray(g)
-            scale = max(float(np.abs(a).max()), 1.0)
-            if np.ptp(a.real) <= _UNIFORM_RTOL * scale and np.ptp(a.imag) <= _UNIFORM_RTOL * scale:
-                return a.reshape(-1)[0]
-            return None
-
-        def _collapse(gs):
-            """Collapse a layer's component grids to ``(1, 1)`` so fmmax takes its ANALYTIC uniform
-            eigensolve (in uniform media the eigenmodes are exactly the plane waves) instead of a dense
-            O((2·n_terms)³) eigendecomposition. ``detect_layers`` hands back a full ``(Ng, Ng)`` grid for
-            EVERY slab, so constant cladding / substrate / mirror films would otherwise each pay for one --
-            ruinous for a stack that is mostly uniform (a Bragg or Mo/Si multilayer). Exact, not an
-            approximation.
-
-            ALL-OR-NOTHING across the layer's components: fmmax requires every component of an anisotropic
-            layer to share one shape, so a partly-uniform tensor layer must stay fully patterned."""
-            vals = [_uniform_value(g) for g in gs]
-            if any(v is None for v in vals):
-                return gs
-            return [jnp.full((1, 1), v, dtype=cdt) for v in vals]
-
         def prepare(e):
-            if isinstance(e, tuple) and len(e) in (5, 10):
-                return tuple(_collapse([_grid(c) for c in e]))
-            return _collapse([_grid(e)])[0]
+            """Collapse a CONCRETE constant grid to ``(1, 1)`` so the backend takes its ANALYTIC uniform
+            path (exact plane waves, no expm) instead of the patterned (4n) transfer. ``detect_layers``
+            hands back a full ``(Ng, Ng)`` grid for EVERY slab, so constant cladding / substrate / mirror
+            films must collapse -- ruinous otherwise for a mostly-uniform stack (a Bragg / Mo/Si
+            multilayer). Exact, not an approximation. A TRACED grid never collapses: under trace a
+            "uniform" grid may be a design parameter that merely starts flat, and collapsing it would
+            freeze the design's structure out of the solve."""
+            g = _grid(e)
+            if _concrete(g) and g.size > 1:
+                a = np.asarray(g)
+                scale = max(float(np.abs(a).max()), 1.0)
+                if np.ptp(a.real) <= _UNIFORM_RTOL * scale and np.ptp(a.imag) <= _UNIFORM_RTOL * scale:
+                    return jnp.full((1, 1), a.reshape(-1)[0], dtype=cdt)
+            return g
 
         grids = [prepare(e) for _, e in layers_spec]
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
         return grids, thick
 
-    def _eigensolve_grids(self, grids, wl, kin):
-        """Eigensolve every prepared layer (isotropic / anisotropic-ε / general ε&μ, by tuple length).
-        Pure in its arguments, so it compiles (:meth:`_solve_core`)."""
-        fm, lv, ex = self.fm, self._lv, self._ex
-        kin = jnp.asarray(kin)
-        wl = jnp.asarray(wl).astype(kin.dtype)  # wl at the incidence real precision
-
-        def solve_layer(e):
-            # general anisotropic layer: e = (ε_xx..ε_zz, μ_xx..μ_zz) -> ε AND μ tensors. Used for a uniaxial
-            # PML (an in-plane coordinate stretch is a diagonal ε̂ and μ̂), and for magnetic / magneto-optic media.
-            if isinstance(e, tuple) and len(e) == 10:
-                return fm.eigensolve_general_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
-            # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
-            if isinstance(e, tuple) and len(e) == 5:
-                return fm.eigensolve_anisotropic_media(wl, kin, lv, *e, ex, formulation=self.formulation)
-            return fm.eigensolve_isotropic_media(wl, kin, lv, e, ex, formulation=self.formulation)
-
-        return [solve_layer(e) for e in grids]
-
-    def _eigensolve_stack(self, layers_spec, wl, kin):
-        """Eigensolve every layer and return the ``LayerSolveResult`` list plus the thickness list. Used by
-        the internal-source path; the plane-wave path compiles the same steps (:meth:`_solve_core`)."""
-        grids, thick = self._prepare_stack(layers_spec, kin)
-        return self._eigensolve_grids(grids, wl, kin), thick
+    def _ensure_stack(self, grids, thick, wl):
+        """Lazy engine build + per-solve structure validation (count/shapes/thicknesses are fixed at
+        build; a mismatch raises loudly instead of silently solving a different structure)."""
+        if self._stack is None:
+            self._build_stack(wl)
+        st = self._stack
+        # Degenerate ambient-only stacks (0 finite films: a single homogenized medium, or a bare
+        # super|sub pair) are legal -- the grids are the ambients, exactly as the fmmax-era engine
+        # treated them (T = 1 trivially when the two sides share one medium).
+        n_film = max(0, len(grids) - 2)
+        if n_film != len(st.layers):
+            raise RcwaError(
+                f"per-solve layer stack has {n_film} finite layers but the engine was built with "
+                f"{len(st.layers)} -- the state-space backend fixes the structure at build; create a "
+                "fresh Rcwa for a different structure."
+            )
+        # The analytic plane-wave split needs UNIFORM ambients. `_prepare_stack` collapses a concrete
+        # constant ambient grid to (1, 1), so a remaining CONCRETE non-(1, 1) ambient grid here is a
+        # genuinely patterned grid -- and the compiled seam's `_amb` would slice its corner value
+        # g[0, 0] and silently solve that scalar as the whole ambient (the stage-2 ambient corner,
+        # task T30). A TRACED ambient grid is allowed: it arises only from the parametric engine's
+        # resample, whose ambients are scalar-derived and therefore uniform at every trace point
+        # (corner-slice exact); a traced-*patterned* ambient cannot be checked eagerly (values are
+        # invisible under trace) and is a documented stage-2 limitation.
+        for gi in (0, len(grids) - 1):
+            gshape = tuple(jnp.shape(grids[gi]))
+            if _concrete(grids[gi]) and gshape not in ((), (1, 1)):
+                raise RcwaError(
+                    f"ambient layer {gi}'s per-solve grid shape {gshape} is not a uniform (1,1) "
+                    "permittivity -- the analytic plane-wave split needs a structurally uniform "
+                    "ambient; a patterned ambient is the stage-2 corner (task T30) and raises here "
+                    "instead of returning a wrong answer."
+                )
+        for li, g in enumerate(grids[1:-1]):
+            gshape = tuple(jnp.shape(g))
+            # A per-solve constant grid is collapsed to (1, 1) eagerly (exact): accept it for a
+            # genuinely patterned build shape too -- the uniform shortcut is a per-solve property.
+            if gshape != st._shapes[li] and gshape != (1, 1):
+                raise RcwaError(
+                    f"layer {li + 1} grid shape {gshape} differs from the engine's "
+                    f"{st._shapes[li]} (structure fixed at build) -- create a fresh Rcwa."
+                )
+        for li, t in enumerate(thick[1:-1]):
+            # The built thickness may live in float32/complex64 storage (e.g. stored as a complex64
+            # scalar) or be reached through a float32 per-solve JAX array: 0.35 -> 0.35000002 in
+            # float32, so a 1e-9 comparison against the exact float64 value fails spuriously. Compare
+            # with a float32-safe relative tolerance (float32 eps ~1.2e-7, so 1e-6 rel. gives ~10x
+            # margin) while keeping the guard's spirit: a genuinely different thickness still raises.
+            tb = float(np.real(st.layers[li][0]))
+            if _concrete(t) and abs(float(t) - tb) > 1e-6 * max(1.0, abs(tb)):
+                raise RcwaError(
+                    f"per-solve thickness {float(t):.6g} for layer {li + 1} differs from the engine's "
+                    f"built {tb:.6g}; chunking is fixed at build -- create a fresh Rcwa for a new "
+                    "thickness."
+                )
+        return st
 
     def _solve_core(self, grids, thick, wl, kin, pol):
-        """Eigensolves, S-matrix, incident amplitude and incident flux -- the numerical core of a plane-wave
-        solve, COMPILED once per stack structure.
-
-        Run eagerly, fmmax dispatches each primitive on its own: measured ~1,340 dispatches per solve of a
-        25-order crossed grating, a 0.7 s floor on the GPU that no truncation got below, while the dense
-        eigendecomposition it wraps takes milliseconds there. fmmax registers every type it returns as a
-        pytree for exactly this. Structural decisions that read VALUES (collapsing a uniform layer, the
-        guards) stay outside, eager."""
+        """Backend layer solves + chunked R-matrix stack assembly + incident state/flux at k_in -- the
+        numerical core of a plane-wave solve, COMPILED once per stack structure (the ``_core_jit``
+        cache, exactly as before, so re-solves across wavelength/design/k_in/pol reuse the executable).
+        Structural decisions (collapse, chunking, squaring guards) stay outside, eager."""
         fn = self.__dict__.get("_core_jit")
         if fn is None:
+            stack = self._stack
+
+            def _amb(g):  # the ambient's scalar permittivity (jax-native: (1,1) or (g,g) -> [0, 0])
+                g = jnp.asarray(g)
+                return g if g.ndim == 0 else g[0, 0]
 
             def core(grids, thick, wl, kin, pol):
-                layers = self._eigensolve_grids(grids, wl, kin)
-                s = self.fm.stack_s_matrix(layers, thick)
-                fwd = _incident(self.fm, self._ex, layers[0], self._nt, pol)
-                flux = self.fm.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0]
-                return layers, s, fwd, jnp.sum(jnp.real(flux))
+                return stack._solve_core(
+                    tuple(grids[1:-1]),
+                    wl,
+                    kin,
+                    pol,
+                    _amb(grids[0]),
+                    _amb(grids[-1]),
+                )
 
             fn = self._core_jit = jax.jit(core)
-        return fn(grids, thick, jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
+        return _Result.from_tuple(
+            fn(tuple(grids), tuple(thick), jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
+        )
+
+    def _resolve_pol(self, pol):
+        """Re-solve the last solve's stack at an alternate input polarization (``jones`` / the
+        vector-aerial pupil) -- through the SAME compiled core, so it is a cheap reuse."""
+        return self._solve_core(
+            self._prepared_grids, self._prepared_thick, self._prepared_wl, self._prepared_kin, _as_jones(pol)
+        )
 
     def solve(self, *, wavelength=None, k_in=None, layers=None, source=None, polarization=None):
         """Solve the stack and return a :class:`_Sol`. Raises if the wavelength is unknown or energy is
@@ -838,32 +941,27 @@ class Rcwa:
         Raises:
             RcwaError: if the wavelength is unknown or energy is not conserved.
         """
-        fm = self.fm
         wl = wavelength if wavelength is not None else self.wavelength
         if wl is None:
             raise RcwaError(
                 "wavelength is unknown: pass wavelength= to solve() or at construction; it sets every "
-                "layer's eigenmodes and is never defaulted."
+                "layer's state transfer and is never defaulted."
             )
         layers_spec = self.layers_spec if layers is None else layers
         kin = jnp.asarray(self.k_in if k_in is None else k_in, float)  # jax -> incidence angle is differentiable
         nt = self._nt  # precomputed eagerly in __init__ (jit-safe)
         if source is not None:
             return self._solve_source(source, layers_spec, wl, kin)
-        # Incidence: the 0th diffraction order (at k_in) -- a plane wave of the requested polarization whose
-        # REAL-SPACE field is uniform. `argmax(eigenmode flux)` is wrong here: the (0,0) order does NOT carry
-        # the max eigenmode flux (the oblique first-ring orders can tie higher), so argmax would excite an
-        # oblique mode and tilt the incidence -- invisible in symmetric problems but wrong for anything
-        # direction-sensitive. `amplitudes_for_fields` divides out the Bloch phase, so a uniform field
-        # decomposes to the forward 0th-order amplitude at k_in (jax-native, so the solve still traces).
         pol = self.polarization if polarization is None else _as_jones(polarization)
         grids, thick = self._prepare_stack(layers_spec, kin)
-        with _annot("rcwa:eigensolve+s_matrix"):
-            layers, s, fwd, Pin = self._solve_core(grids, thick, wl, kin, pol)
-        if _concrete(Pin) and float(Pin) <= 0:
+        self._ensure_stack(grids, thick, wl)  # lazy engine build + structure validation
+        self._prepared_grids, self._prepared_thick = tuple(grids), tuple(thick)
+        self._prepared_wl, self._prepared_kin = jnp.asarray(wl), jnp.asarray(kin)
+        with _annot("rcwa:layer_solves+stack"):
+            res = self._solve_core(grids, thick, wl, kin, pol)
+        if _concrete(res.pin) and float(res.pin) <= 0:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
-        sol = _Sol(fm, s, layers, self._ex, nt, Pin, wl, thick=thick, period=self.period, pol=pol)
-        sol._fwd = fwd
+        sol = _Sol(self, res, self._ex, nt, res.pin, wl, thick=thick, period=self.period, pol=pol)
         T, R = sol.efficiency("T"), sol.efficiency("R")
         if _concrete(T):  # never-silent runtime guards run on the eager forward pass; they step aside under trace
             if not (np.isfinite(float(T)) and np.isfinite(float(R))):
@@ -874,51 +972,22 @@ class Rcwa:
                 )
             if float(T) + float(R) > 1.0 + 5e-3:
                 raise RcwaError(
-                    f"energy not conserved: T+R={float(T) + float(R):.4f} > 1 at orders={self.orders}. The modal "
-                    f"solve is not converged (raise orders) or the structure is unphysical."
+                    f"energy not conserved: T+R={float(T) + float(R):.4f} > 1 at orders={self.orders}. "
+                    "The state-space solve is not converged: raise orders= for more Fourier orders, or "
+                    "-- for a thick high-contrast layer -- thin the sub-slab chunking (the T+R>1 cliff "
+                    "is the un-chunked impedance recursion; auto chunking is fixed at build, so rebuild "
+                    "the Rcwa if chunking is the culprit), or the structure is unphysical."
                 )
         return sol
 
     def _solve_source(self, source, layers_spec, wl, kin):
-        """Internal-source (dipole / Gaussian) emission solve. ``source`` is a dict from the front door::
-
-            {x0, y0, layer, t_upper, t_lower, kind ('delta'|'gaussian'), fwhm, orient (ox,oy,oz), amp}
-
-        The stack is split at the source plane (layer ``layer`` divided into ``t_upper`` above / ``t_lower``
-        below the source), fmmax builds the dipole current ``(jx,jy,jz) = amp·orient·source_coeffs`` and
-        ``amplitudes_for_source`` propagates it to the ambients. Returns an :class:`_EmitterSol` with the
-        power radiated up / down (differentiable in ``amp``, ``orient`` and the design ε)."""
-        fm, lv, ex = self.fm, self._lv, self._ex
-        with _annot("rcwa:eigensolve"):
-            layers, thick = self._eigensolve_stack(layers_spec, wl, kin)
-        si = source["layer"]
-        tu, tl = jnp.asarray(source["t_upper"]), jnp.asarray(source["t_lower"])  # z-split thicknesses (differentiable)
-        before = layers[: si + 1]
-        after = layers[si:]
-        before_t = [*thick[:si], tu]
-        after_t = [tl, *thick[si + 1 :]]
-        s_before = fm.stack_s_matrix(before, before_t)
-        s_after = fm.stack_s_matrix(after, after_t)
-        loc = jnp.asarray(source["loc"])  # (1, 2) lateral location -- JAX, so an emitter-placement param flows
-        if source["kind"] == "gaussian":
-            base = fm.gaussian_source(jnp.asarray(source["fwhm"]), loc, kin, lv, ex)
-        else:
-            base = fm.dirac_delta_source(loc, kin, lv, ex)
-        ox, oy, oz = source["orient"]
-        amp = jnp.asarray(source["amp"]) + 0j
-        jx, jy, jz = amp * ox * base, amp * oy * base, amp * oz * base
-        bwd0, _, _, _, _, fN = fm.amplitudes_for_source(jx, jy, jz, s_before, s_after)
-        # power emitted up = backward-going flux in the superstrate; down = forward-going flux in the substrate
-        _, ub = fm.directional_poynting_flux(jnp.zeros_like(bwd0), bwd0, layers[0])
-        df, _ = fm.directional_poynting_flux(fN, jnp.zeros_like(fN), layers[-1])
-        up = jnp.abs(jnp.sum(jnp.real(ub)))
-        down = jnp.abs(jnp.sum(jnp.real(df)))
-        if _concrete(up) and not (np.isfinite(float(up)) and np.isfinite(float(down))):
-            raise RcwaError(
-                "non-finite emission (NaN/inf): the internal-source solve hit a Γ-point / Rayleigh degeneracy "
-                f"(k_in={tuple(float(k) for k in kin)}). Nudge k_in off exact normal, e.g. k_in=(1e-3, 1e-3)."
-            )
-        return _EmitterSol(up, down)
+        """Internal-source (dipole / Gaussian) emission solve: the backend wires the Maxwell jump
+        conditions in stage 2 (``jno/_rcwa/fields.py`` + the source task); until then this raises
+        loudly instead of returning a wrong answer."""
+        raise RcwaError(
+            "internal-source (emitter) solves need the backend's Maxwell-jump source terms "
+            f"(stage 2, {_STAGE2_SOURCE}); plane-wave solves work now."
+        )
 
 
 # =====================================================================================
@@ -1835,13 +1904,13 @@ def _profile_solve(run, eng):
     from jno.utils.profiling import profile_solve
 
     nt = eng._nt
-    label = f"rcwa profile · {len(eng.layers_spec)} layers · n_t={nt} · {2 * nt}×{2 * nt} eigenproblem/layer"
+    label = f"rcwa profile · {len(eng.layers_spec)} layers · n_t={nt} · {2 * nt}×{2 * nt} state transfer/layer"
     return profile_solve(run, label=label)
 
 
 class _RcwaProblem:
     """An RCWA problem inferred from a jNO constraint list / FEM problem. Holds the inferred
-    :class:`RcwaSpec` and builds the fmmax engine on :meth:`solve`."""
+    :class:`RcwaSpec` and builds the state-space engine on :meth:`solve`."""
 
     def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None, rpe=None):
         self.spec = spec
@@ -1896,7 +1965,7 @@ class _RcwaProblem:
         scale. ``profile=True`` runs the solve eagerly (at the current parameter values) inside a JAX
         Perfetto trace with per-stage annotations, like ``jno.core.solve(profile=True)`` -- it prints the
         problem size and wall time and writes the trace to ``./rcwa_traces`` (RCWA time is dominated by the
-        O((2·n_t)³) per-layer eigensolves, which the trace makes explicit)."""
+        per-layer eigensolves, which the trace makes explicit)."""
         forward = params is not None or wavelength is not None or k_in is not None or orders is not None or profile
         if not forward:
             if self._rpe and self._resample is not None:
@@ -2174,14 +2243,16 @@ def rcwa(
         slices: Staircase a continuously-varying permittivity into this many layers instead of raising.
         params: values of the problem's ``jno.np.parameter`` nodes, by name, used for the eager
             inference (structure, source, wavelength) instead of their initial values.
-        formulation: the ``fmmax`` Fourier factorization; ``"JONES_DIRECT_FOURIER"`` (default) converges
-            well for high-contrast dielectrics, where the naive rule converges poorly.
+        formulation: the Fourier-factorization name, e.g. ``"JONES_DIRECT_FOURIER"`` (default; converges
+            well for high-contrast dielectrics, where the naive ``"FFT"`` rule converges poorly). The
+            state-space backend now implements ``FFT`` and ``JONES_DIRECT_FOURIER``; the other vector
+            schemes land in stage 2 (task T30).
         smoothing: Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each
             RCWA pixel ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries.
             Recommended (``2``–``4``) for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer
             ``orders`` converge, and makes the gradient w.r.t. a boundary-moving design parameter smooth
-            rather than staircased. Costs ``k²``× more coefficient evaluations (cheap) — the fmmax
-            eigensolve size is unchanged.
+            rather than staircased. Costs ``k²``× more coefficient evaluations (cheap) — the
+            state-space solve size is unchanged.
         polarization: The incident polarization: ``"x"``, ``"y"``, or a transverse Jones vector ``(p_x,
             p_y)`` (complex entries give elliptical light). Usually inferred, and the choice is logged
             and kept on ``spec.polarization`` / ``spec.polarization_from``. A **vector** (curl-curl)
