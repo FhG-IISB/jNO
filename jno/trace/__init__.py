@@ -32,6 +32,27 @@ def _matmul(a, b):
     return small_matmul(a, b)
 
 
+def _start_node(expr):
+    """The node of ``expr.start`` (see :attr:`Placeholder.start`): a call without arguments that returns the value
+    ``jno.core`` stored in ``_start_holder``; ``expr`` hangs on it as ``_start_of``, not as an argument, so the
+    graph it sits in neither evaluates nor differentiates ``expr`` through it."""
+    holder: dict = {}
+
+    def value():
+        if "value" not in holder:
+            raise ValueError(
+                "`.start` is the value an expression has at the start of a jno.core optimisation; jno.core sets it "
+                "at its first solve() or eval(). This one was evaluated outside a jno.core (or before it started): "
+                "use it among a jno.core's entries, or evaluate the expression yourself for a constant."
+            )
+        return holder["value"]
+
+    node = FunctionCall(value, [], name="start")
+    node._start_of = expr
+    node._start_holder = holder
+    return node
+
+
 __all__ = [
     "Placeholder",
     "FunctionCall",
@@ -732,6 +753,22 @@ class Placeholder:
             FunctionCall: the scalar node.
         """
         return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
+
+    @property
+    def start(self) -> FunctionCall:
+        """This expression's value at the start of the optimisation: a constant, the reference of a relative target::
+
+            jno.core([loss / loss.start,                       # starts at 1
+                      jno.le(jno.np.abs(L / L.start - 1), 0.01)])   # L within 1 % of where it started
+
+        ``jno.core`` evaluates every ``.start`` among its entries, all in one evaluation, at its first ``solve`` or
+        ``eval`` (before any step), and the value then stays, whatever the design does, also across a remesh. No
+        gradient flows through it. One node per expression (``e.start is e.start``). A scalar is stored as one;
+        an array keeps the shape ``crux.eval`` gives it. Outside a ``jno.core`` it has no value and says so."""
+        node = self.__dict__.get("_start_node")
+        if node is None:
+            node = self.__dict__["_start_node"] = _start_node(self)
+        return node
 
     @property
     def std(self) -> FunctionCall:

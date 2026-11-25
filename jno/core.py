@@ -53,6 +53,7 @@ from .trace import (
     TunableModule,
     TunableModuleCall,
     Variable,
+    _iter_placeholder_children,
     collect_operations,
     collect_tags,
     cse,
@@ -2685,6 +2686,7 @@ class core:
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        self._resolve_starts()  # every `expr.start` of the entries: their values now, before the first step
         watched = self._rebuild_watch()
         if watched and not self.__dict__.get("_in_rebuild_segment", False):
             return self._solve_rebuilding(
@@ -5982,6 +5984,52 @@ class core:
                 self._opt_states = None
         return out
 
+    def _resolve_starts(self, extra=()):
+        """Set the value of every unset ``expr.start`` in the entries (and in ``extra``): ``expr`` evaluated now, all
+        of them in one :meth:`eval`. Called at the first ``solve`` / ``eval``, so "the start" is the design the
+        optimisation starts from; a value once set stays (also across a remesh: the start does not move). A
+        ``.start`` inside another's expression is set first."""
+        if getattr(self, "_resolving_starts", False):
+            return
+        found, seen = [], set()
+
+        def walk(n):
+            if id(n) in seen:
+                return
+            seen.add(id(n))
+            if getattr(n, "_start_holder", None) is not None:
+                if "value" not in n._start_holder:
+                    found.append(n)
+                return
+            for kind, _attr, val in _iter_placeholder_children(n):
+                for c in val if kind == "list" else (val,):
+                    if isinstance(c, Placeholder) or hasattr(c, "_start_holder"):
+                        walk(c)
+
+        for e in list(self.constraints) + list(extra):
+            walk(e)
+        pending = list(found)
+        while pending:
+            inner = []
+            for n in pending:  # the starts inside a pending start's expression
+                found.clear()
+                seen.clear()
+                walk(n._start_of)
+                inner.append(bool(found))
+            ready = [n for n, nested in zip(pending, inner) if not nested]
+            if not ready:
+                raise ValueError("jno.core: the `.start` values refer to each other in a cycle; none can be evaluated.")
+            self._resolving_starts = True
+            try:
+                vals = self.eval([n._start_of for n in ready])
+            finally:
+                self._resolving_starts = False
+            vals = vals if isinstance(vals, (list, tuple)) else [vals]
+            for n, v in zip(ready, vals):
+                v = jnp.asarray(v)
+                n._start_holder["value"] = v.reshape(()) if v.size == 1 else v
+            pending = [n for n in pending if "value" not in n._start_holder]
+
     def eval(
         self,
         operation: Union[List[BinaryOp], BinaryOp],
@@ -6029,6 +6077,7 @@ class core:
             operation = [_unwrap_view(operation)]
         else:
             operation = [_unwrap_view(op) for op in operation]
+        self._resolve_starts(operation)  # an `expr.start` in what is evaluated, or in the entries
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
