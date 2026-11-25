@@ -84,3 +84,14 @@ def test_start_outside_a_core_says_where_it_is_set():
     node = jno.np.sum(p).start
     with pytest.raises(ValueError, match="jno.core"):
         node.fn()
+
+
+def test_a_start_in_a_constraint_s_bound_is_set_before_the_first_step():
+    """``jno.ge(v, v.start - 0.5)``: the bound is no child of the constraint's expression, and was never set"""
+    p = jno.np.parameter((1,), name="p").initialize(lambda *_a, **_k: jnp.array([2.0]))
+    p.dtype(jnp.float64)
+    p.optimizer(jno.optimizers.mma(move=0.2, lower=-5.0, upper=5.0))
+    v = p[0]
+    crux = jno.core([v, jno.ge(v, v.start - 0.5)], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    crux.solve(20)
+    np.testing.assert_allclose(np.asarray(crux.eval([p])).reshape(-1), [1.5], atol=1e-3)

@@ -6001,6 +6001,9 @@ class core:
                 if "value" not in n._start_holder:
                     found.append(n)
                 return
+            bound = getattr(n, "bound", None) if isinstance(n, Constraint) else None
+            if isinstance(bound, Placeholder):  # a constraint's bound is no child: `jno.ge(fx, fx.min.start - tol)`
+                walk(bound)
             for kind, _attr, val in _iter_placeholder_children(n):
                 for c in val if kind == "list" else (val,):
                     if isinstance(c, Placeholder) or hasattr(c, "_start_holder"):
