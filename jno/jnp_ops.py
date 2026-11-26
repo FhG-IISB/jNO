@@ -1753,6 +1753,22 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
         FunctionCall: the contraction.
     """
 
+    from .trace import _component_keeps_axis
+    from .trace.views import ScalarView
+
+    if (
+        n_contract == 1
+        and not keepdims
+        and isinstance(x, ScalarView)
+        and isinstance(y, ScalarView)
+        and not (_component_keeps_axis(_u(x)) and _component_keeps_axis(_u(y)))
+    ):
+        # Two scalar FE quantities, as the curl of a 2-D N1E field is: there is no value axis to contract, and
+        # the last axis of ``(n_q,)`` / ``(n_q, n_dof)`` would be summed away. Their inner product is the
+        # product, exactly as written ``cu * cv`` (a per-point scalar field, ``(N, 1)``, still contracts its
+        # one column below).
+        return _attach_coords(_u(x) * _u(y), [x, y])
+
     def _fn(a, b, _n=n_contract, _keep=keepdims):
         a = jnp.asarray(a)
         b = jnp.asarray(b)
