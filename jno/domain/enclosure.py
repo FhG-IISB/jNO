@@ -152,8 +152,8 @@ class _SolidSDF:
     solid or the chord steps straight over it, and in a real furnace that ratio is brutal (a 0.5 mm seed
     disc against ~500 mm chords needs ~3000 samples per chord, over ~650k pairs x n_phi azimuths). And a
     missed wall is not a benign inaccuracy -- it is occlusion that silently does not happen, so the ray
-    passes THROUGH a solid, inflating F and pushing row sums past the physical bound of 1. Measured on the
-    cg furnace, a 16-sample chord test wrongly called 12% of all *visible* pairs visible.
+    passes THROUGH a solid, inflating F and pushing row sums past the physical bound of 1. Measured on a
+    furnace geometry, a 16-sample chord test wrongly called 12% of all *visible* pairs visible.
 
     A distance field fixes both at once: you may safely advance by the distance to the nearest solid,
     because nothing can be hit within it. Steps are therefore LARGE in open space and shrink automatically
@@ -278,7 +278,7 @@ def _chord_blocked(sdf, ri, zi, rj, zj, cphi, sphi, depth, max_iter=160):
 
     **The grazing trap.** Sphere tracing converges only geometrically when a ray runs nearly PARALLEL to a
     surface: if the clearance shrinks by a fraction ``k`` of the distance travelled, the march needs
-    ``~log(eps)/log(1-k)`` steps. On the cg furnace a chord skimming the 0.5 mm seed disc has ``k ~ 0.016``
+    ``~log(eps)/log(1-k)`` steps. On a furnace geometry a chord skimming the 0.5 mm seed disc has ``k ~ 0.016``
     -- over 400 steps. Capping the iteration count and then treating the survivors as VISIBLE silently
     un-blocks every such ray, which is a hot-to-cold short circuit between surfaces that cannot see each
     other at all (it connected the crucible's inner cavity to the outer walls THROUGH 30 mm of solid seed).
@@ -355,7 +355,7 @@ def _chord_test_setup(geoms, union, r, z):
 
     ``cell`` must resolve the THINNEST solid (``w/8``) -- never the mesh. Scaling the chord test to the
     element size (as the legacy straight-line test's ``tol`` does) is a trap: a solid thinner than the
-    tolerance can then NEVER register as a block, at any sampling density. The cg furnace hits exactly
+    tolerance can then NEVER register as a block, at any sampling density. A furnace geometry hits exactly
     that, with a 0.5 mm seed disc against ~1.2 mm elements. It is also capped against the domain span, so a
     geometry whose only solid is thick does not end up with an absurdly coarse field.
 
@@ -420,8 +420,8 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, occluders=Non
     The fallback is the dangerous case, and it is why this argument exists. It makes a solid an
     occluder only if some radiating element happens to be *tagged* with it, so a solid that owns no
     radiating element -- or one whose elements were tagged under a different name -- is silently
-    transparent. Measured on the cg furnace, tagging every insulation element ``WallS`` left ``WallU``,
-    ``WallO`` and three quartz ports out of the occluder set, and **46% of the pairs this function
+    transparent. Measured on a furnace geometry, tagging every insulation element with one name left three
+    other walls and three ports out of the occluder set, and **46% of the pairs this function
     called visible had chords passing through solid material** (worst case: 99% of the chord buried in
     insulation). There is no error and the resulting ``F`` looks perfectly plausible. Callers that know
     their opaque geometry should pass it rather than let it be inferred from tags.
@@ -1037,7 +1037,7 @@ def build_enclosure(
             # enclosure would be built with an empty occluder model -- every pair mutually visible,
             # through solid metal and insulation alike. It fails silently: closure and reciprocity stay
             # perfect (they are enforced), so the F that comes out looks entirely plausible. Measured on
-            # the cg furnace, one Quartz.1->WallO pair read 0.024 unoccluded against 0.363 occluded, and
+            # a furnace geometry, one port-to-wall pair read 0.024 unoccluded against 0.363 occluded, and
             # the coupled solve landed 620 K cold.
             #
             # The mesh already carries the answer: `cell_region` labels every cell, so each opaque

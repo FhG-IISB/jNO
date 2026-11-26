@@ -352,7 +352,7 @@ def test_axisymmetric_occlusion_catches_a_wall_far_thinner_than_the_mesh():
 
     This is the case a fixed-stride chord test cannot do at any affordable density -- sample every
     ``L/n`` and you step clean over any wall thinner than that, and the ray passes THROUGH a solid. That
-    is occlusion which silently does not happen, so it INFLATES the view factors: on the cg furnace a
+    is occlusion which silently does not happen, so it INFLATES the view factors: on a furnace geometry a
     16-sample test wrongly called 12% of all visible pairs visible. It is equally fatal to scale the
     blocking tolerance to the element size (as the legacy straight-line test does): a wall thinner than
     the tolerance can then never register as a block no matter how finely it is sampled.

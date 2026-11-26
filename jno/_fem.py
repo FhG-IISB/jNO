@@ -4852,6 +4852,7 @@ class FEM:
         eigenvalues and the solve returns the first ``k`` elastic modes::
 
             lam, X = K.eigs(mass=[rho * ui @ vi], k=6, precond=jno.precond.amg(), deflate=[(1, 0), (0, 1), (-y, x)])
+
         ``log=True`` prints each iteration of LOBPCG (``precond=``) or of the shift-invert iteration (``sigma=``)
         while it runs (``log=N``: every N-th and the last); the dense reduction and ARPACK have no loop to report.
         """
@@ -4869,6 +4870,7 @@ class FEM:
                 maxiter=maxiter,
                 X0=X0,
                 contour=contour,
+                deflate=deflate,
             )
 
     def _eigs_inner(
@@ -4884,6 +4886,7 @@ class FEM:
         maxiter=None,
         X0=None,
         contour=None,
+        deflate=None,
     ):
         """The body of :meth:`eigs` (which documents it), run inside its ``log=`` session."""
         self._refresh_attachments()

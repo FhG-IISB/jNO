@@ -1734,7 +1734,16 @@ class _TraceFDM(StrongFormProblem):
         return v0
 
     def solve(
-        self, nonlinear=None, x0=None, profile=False, time=None, *, linear=None, precond=None, save_ts=None, span=None,
+        self,
+        nonlinear=None,
+        x0=None,
+        profile=False,
+        time=None,
+        *,
+        linear=None,
+        precond=None,
+        save_ts=None,
+        span=None,
         log=False,
     ):
         """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
