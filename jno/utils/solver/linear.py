@@ -233,6 +233,13 @@ def jacobi(A):
     return lambda x: inv * x
 
 
+#: ``spsolve``'s singularity threshold, RELATIVE to the largest entry (the operator is divided by it first). The
+#: default ``1e-6`` is an absolute pivot threshold of cuSolver's sparse QR: a stiff but nonsingular block (unit
+#: Dirichlet rows beside stiffness entries scaled by a 1e-4 floor) was called "Singular matrix" on a GPU while the
+#: CPU's LU factored it, and ``1e-12`` solved it. A truly singular block still yields a zero pivot, far below this.
+_SPSOLVE_TOL = 1e-12
+
+
 @jax.jit
 def _sparse_lu_solve(A, b):
     """The triplets-to-CSR conversion and the ``spsolve`` itself, as ONE compiled program.
@@ -272,7 +279,13 @@ def _sparse_lu_solve(A, b):
         order = jnp.lexsort((second, first))  # CSR ordering: by row, then column
         rows = first[order]
         indptr = jnp.searchsorted(rows, jnp.arange(n + 1, dtype=rows.dtype)).astype(jnp.int32)
-        return spsolve(data0[order] / scale, second[order].astype(jnp.int32), indptr, rhs / scale.astype(rhs.dtype))
+        return spsolve(
+            data0[order] / scale,
+            second[order].astype(jnp.int32),
+            indptr,
+            rhs / scale.astype(rhs.dtype),
+            tol=_SPSOLVE_TOL,
+        )
 
     return jax.lax.custom_linear_solve(
         lambda x: A @ x,
@@ -297,7 +310,22 @@ def sparse_lu_solve(A, b):
 
     if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
         A = jsp.BCOO.fromdense(jnp.asarray(A))
-    return _sparse_lu_solve(A, b)
+    try:
+        x = _sparse_lu_solve(A, b)
+        if not isinstance(x, jax.core.Tracer):
+            jax.block_until_ready(x)  # dispatch is asynchronous: the device's refusal surfaces here, not at the caller
+        return x
+    except jax.errors.JaxRuntimeError as e:
+        if "Singular matrix" not in str(e):
+            raise
+        raise RuntimeError(
+            f"jno: the sparse direct solve (backend 'device': JAX spsolve, a sparse QR on a GPU) reports a singular "
+            f"{A.shape[0]} x {A.shape[0]} matrix. After scaling to its largest entry no pivot is above "
+            f"{_SPSOLVE_TOL:g}, so the operator is singular or numerically so (a missing boundary condition or "
+            "gauge, a zero row, a mesh with an unconnected node). If it should be nonsingular, factor it elsewhere: "
+            "linear=jno.solve.lu(backend='host') (CPU SuperLU), 'pardiso' (CPU) or, in float64 on a GPU, 'cudss'. "
+            f"Original error: {e}"
+        ) from e
 
 
 _CUDSS_PIN = "nvidia-cudss-cu12>=0.8,<0.9"  # what nvmath-python 1.0.x asks for (`nvidia-cudss-cu12==0.8.*`)
