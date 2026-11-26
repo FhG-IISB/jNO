@@ -207,3 +207,37 @@ def test_periodic_remesh_pairs_each_face_piece_with_its_own_partner():
     fem = jno.fem([vol, face("left") - face("right"), face("front") - face("back")])
     per = fem._periodic
     assert per is not None and per["n_red"] < per["n_full"]
+
+
+def test_periodic_n1e_on_new_tag_names_over_built_in_faces_matches_the_built_in_names():
+    """`d.tag("xr", x > P - e)` selects the nodes of the box's own `right` face. The node partition is
+    exclusive, so `xr` held none and the tie failed with "boundary tag xr has no mesh vertices"; the
+    tie's face is now the predicate evaluated inclusively over the vertices."""
+
+    def reduced(names):
+        d = jno.domain(jno.shape.box(0, 0, 0, 0.6, 0.6, 1.0, size=0.3))
+        e = 1e-6
+        left, right = names
+        d.tag(left, lambda x, y, z: x < e)
+        d.tag(right, lambda x, y, z: x > 0.6 - e)
+        d.tag("front", lambda x, y, z: y < e)
+        d.tag("back", lambda x, y, z: y > 0.6 - e)
+        u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+        c = d.variable("interior", split=True)
+        xi, yi, zi = c[0], c[1], c[2]
+        ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+        cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+
+        def face(nm):
+            cc = d.variable(nm, split=True)
+            return u.bind(x=cc[0], y=cc[1], z=cc[2])
+
+        per = jno.fem([inner(cu, cv) + inner(ui, vi), face(left) - face(right), face("front") - face("back")])._periodic
+        return per["n_red"], per["n_full"]
+
+    n_red, n_full = reduced(("xl", "xr"))
+    assert n_red < n_full  # the secondary face's edge DOFs are eliminated
+    ref_red, ref_full = reduced(("left", "right"))
+    # the built-in names hold the exclusive node partition, the new ones the inclusive predicate (a shared
+    # edge of two faces belongs to both): the same reduction up to those few edges
+    assert abs(n_red - ref_red) <= 0.02 * ref_red and abs(n_full - ref_full) <= 0.02 * ref_full

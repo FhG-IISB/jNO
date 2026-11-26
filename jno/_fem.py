@@ -6272,6 +6272,30 @@ def _edges_on_tag(edge_vertices: np.ndarray, tag_vertex_ids: np.ndarray) -> np.n
     return np.flatnonzero(on_tag[ev[:, 0]] & on_tag[ev[:, 1]]).astype(int)
 
 
+def _tie_face_nodes(domain: Any, vpts: Any, tag: str) -> Optional[np.ndarray]:
+    """Vertex ids of a periodic tie's face: :func:`_face_nodes`, and when the exclusive partition left the tag
+    empty, the tag's predicate evaluated INCLUSIVELY over the vertices.
+
+    ``domain.tag`` hands each boundary node to one tag only. A new name whose predicate selects the nodes of a
+    built-in face (``d.tag("xr", lambda x, y, z: x > P - e)`` over a box's ``right``) therefore owns none of
+    them, although the predicate says exactly where the face is."""
+    f = _face_nodes(domain, vpts, None, tag)
+    if f is not None and np.asarray(f).size:
+        return f
+    m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+    if m is None:
+        return f
+    return np.flatnonzero(np.asarray(m, dtype=bool).reshape(-1)[: np.asarray(vpts).shape[0]])
+
+
+def _no_vertices_error(domain: Any, tag: str, where: str) -> ValueError:
+    """The error for a periodic tie face that selects no vertex, naming the tag that holds its nodes if any."""
+    msg = f"jno.fem periodic ({where}): boundary tag {tag!r} has no mesh vertices."
+    if tag not in (getattr(domain, "tag_indices", {}) or {}):
+        msg += f" {tag!r} is not a tag of this domain (known: {sorted(getattr(domain, 'tag_indices', {}) or {})})."
+    return ValueError(msg)
+
+
 def _face_nodes(
     domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str, cells: Any = None
 ) -> Optional[np.ndarray]:
@@ -6457,9 +6481,9 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
     phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]  # Bloch phase (e^{iφ}) per tie
     etags: dict = {}
     for tag in {t for tie in ties for t in tie[:2]}:
-        f = _face_nodes(domain, vpts, None, tag)
+        f = _tie_face_nodes(domain, vpts, tag)
         if f is None or np.asarray(f).size == 0:
-            raise ValueError(f"jno.fem periodic (N1E): boundary tag {tag!r} has no mesh vertices.")
+            raise _no_vertices_error(domain, tag, "N1E")
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
         etags[tag] = _edges_on_tag(ev, np.asarray(f, dtype=int).reshape(-1))
 
@@ -6568,9 +6592,9 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
     vtags: dict = {}
     etags: dict = {}
     for tag in {t for (m, s, *_rest) in ties for t in (m, s)}:
-        f = _face_nodes(domain, vpts, None, tag)
+        f = _tie_face_nodes(domain, vpts, tag)
         if f is None or np.asarray(f).size == 0:
-            raise ValueError(f"jno.fem periodic (non-nodal C¹): boundary tag {tag!r} has no mesh vertices.")
+            raise _no_vertices_error(domain, tag, "non-nodal C¹")
         vids = np.asarray(f, dtype=int).reshape(-1)
         vtags[tag] = vids
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
