@@ -3588,6 +3588,16 @@ class FEM:
             linear = _default_direct(self)
         if linear is None and precond is None and solve_fn is None:
             linear = _default_saddle_step_solve(self)
+        if (
+            linear is None
+            and getattr(nonlinear, "name", None) == "staggered"
+            and getattr(nonlinear, "direct", None) is True
+        ):
+            # staggered(direct=True) factorizes each field's block: with no linear slot that is what lu() resolves to
+            # (cuDSS where it runs, else JAX's spsolve), not an unconditional spsolve -- on a GPU, cuSolver's sparse QR.
+            from .solve import lu
+
+            linear = lu()
         linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 
