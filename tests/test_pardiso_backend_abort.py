@@ -44,6 +44,7 @@ REPRO = textwrap.dedent(
     E0, EMIN, NU, PENAL, VOLFRAC = 1.0, 1e-4, 0.3, 3.0, 0.3
     LAM, MU = E0*NU/((1+NU)*(1-2*NU)), E0/(2*(1+NU))
     USE_FILTER = __import__("os").environ["FILTER"] == "1"
+    NAN_START = __import__("os").environ["NAN_START"] == "1"
 
     d = jno.shape.box(0, 0, 0, 2, 1, 1, size=0.25).domain()
     u, phi = d.fem_symbols(value_shape=(3,))
@@ -52,7 +53,7 @@ REPRO = textwrap.dedent(
     left = d.variable("left", where=lambda x, y, z: x < 1e-9, split=True)[:3]
     right = d.variable("right", where=lambda x, y, z: x > 2 - 1e-9, split=True)[:3]
     rho = jno.np.parameter(s, name="rho"); rho.dtype(jnp.float64)
-    rho.initialize(jax.nn.initializers.constant(VOLFRAC))
+    rho.initialize(jax.nn.initializers.constant(float('nan') if NAN_START else VOLFRAC))
     rho.optimizer(jno.optimizers.mma(move=0.2, lower=1e-3, upper=1.0))
     if USE_FILTER:
         rho.constrain(d.patch_filter())
@@ -73,8 +74,14 @@ REPRO = textwrap.dedent(
 )
 
 
-def _run(filter_on: bool):
-    env = dict(os.environ, FILTER="1" if filter_on else "0", CUDA_VISIBLE_DEVICES="", JAX_PLATFORMS="cpu")
+def _run(filter_on: bool, nan_start: bool = False):
+    env = dict(
+        os.environ,
+        FILTER="1" if filter_on else "0",
+        NAN_START="1" if nan_start else "0",
+        CUDA_VISIBLE_DEVICES="",
+        JAX_PLATFORMS="cpu",
+    )
     return subprocess.run([sys.executable, "-c", REPRO], env=env, capture_output=True, text=True, timeout=900)
 
 
@@ -87,9 +94,15 @@ def _skip_unless_available():
 
 class TestTheBackendDoesNotKillTheProcess:
     def test_a_non_finite_operator_raises_instead_of_aborting(self):
-        """The headline. Exit 134/-6 is SIGABRT and means the guard is gone."""
+        """The headline. Exit 134/-6 is SIGABRT and means the guard is gone.
+
+        The density STARTS at NaN, so the operator is non-finite at the first solve. (The first version let
+        a filtered optimisation drive the density to NaN by itself; that no longer happens, and the test then
+        passed vacuously or failed on a run that never reached the guard.) The guard's own unit test, with
+        a NaN BCOO, is in test_pardiso_guard.py.
+        """
         _skip_unless_available()
-        r = _run(filter_on=True)
+        r = _run(filter_on=True, nan_start=True)
         assert r.returncode not in (134, -6), (
             f"the process was ABORTED (exit {r.returncode}) rather than raising; MKL PARDISO was "
             f"handed a non-finite system again:\n{r.stderr[-600:]}"
