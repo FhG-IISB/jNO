@@ -223,3 +223,26 @@ def test_the_step_solve_starts_from_the_predictor():
     out = np.asarray(scheme.integrate(fem.operator, {}, SAVE[-1:], linear_solve=counting, nonlinear_solve=None))
     assert not np.any(np.isnan(out)) and len(seen) > 20
     assert np.median(seen) < 1e-4, f"median warm-start residual {np.median(seen):.1e}"
+
+
+@pytest.mark.parametrize("rtol, want", [(1e-4, 1e-6), (1e-6, 1e-8), (1e-9, 1e-10)])
+@pytest.mark.parametrize("make", [lambda: jno.solve.bdf(), lambda: jno.solve.sdirk(3)], ids=["bdf", "sdirk3"])
+def test_step_solve_tolerance_follows_the_march_tolerance(monkeypatch, make, rtol, want):
+    """The default step solve of an error-controlled march stops at a fraction of the march's rtol (floor 1e-10),
+    not at a fixed 1e-10: a loose march must not pay for tight inner solves. The fixed grid keeps 1e-10."""
+    import jax.scipy.sparse.linalg as jsl
+
+    seen = []
+    real = jsl.bicgstab
+
+    def spy(A, b, **kw):
+        seen.append(kw["tol"])
+        return real(A, b, **kw)
+
+    monkeypatch.setattr(jsl, "bicgstab", spy)
+    fem = _form(6)
+    _run(make().adaptive(rtol=rtol, atol=1e-3 * rtol, max_steps=40), fem, SAVE[-1:])
+    assert seen and all(np.isclose(v, want, rtol=1e-6) for v in seen), seen
+    seen.clear()
+    _run(jno.solve.sdirk(3), fem, SAVE)
+    assert seen and all(v == 1e-10 for v in seen), seen

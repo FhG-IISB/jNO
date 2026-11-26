@@ -133,6 +133,32 @@ def _theta_row_weights(M, theta, n, dtype):
     return jnp.where(_algebraic_rows(M, n, dtype), jnp.asarray(1.0, dtype), jnp.asarray(theta, dtype))
 
 
+# Relative-residual target of the default step solve while an error-controlled march is being traced (set by
+# _step_solve_tolerance); None outside one, which keeps the fixed 1e-10 target.
+_STEP_SOLVE_TOL: list = [None]
+# A step solves own error is kept this fraction below the marchs tolerance, and never asked tighter than the
+# fixed default below (a looser solve than that pollutes the error estimate: rtol 1e-6 with a 1e-6 solve
+# rejected steps until the budget ran out, measured on a 2-D heat march).
+_STEP_SOLVE_FRACTION = 1e-2
+_STEP_SOLVE_FLOOR = 1e-10
+
+
+class _step_solve_tolerance:
+    """Trace-time context: the default step solve of an error-controlled march with relative tolerance
+    rtol stops at max(1e-10, 1e-2 * rtol) instead of the fixed 1e-10, so a loose march does not pay
+    for tight inner solves. Read when the step is TRACED, so it must wrap the lax.scan that traces it."""
+
+    def __init__(self, rtol):
+        self.tol = max(_STEP_SOLVE_FLOOR, _STEP_SOLVE_FRACTION * float(rtol))
+
+    def __enter__(self):
+        self._prev = _STEP_SOLVE_TOL[0]
+        _STEP_SOLVE_TOL[0] = self.tol
+
+    def __exit__(self, *exc):
+        _STEP_SOLVE_TOL[0] = self._prev
+
+
 def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     """jNO's default solve of one implicit step ``step_op(w) = rhs`` -- Jacobi-preconditioned BiCGStab with a
     verified GMRES rescue (GMRES outright when the assembly asks for it via ``metadata["krylov"]``).
@@ -196,7 +222,7 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
         # it converges and a hard one keeps working, where a fixed cap would silently under-solve the
         # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
         # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
-        ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
+        ktol = max(_STEP_SOLVE_TOL[0] or 1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
         wn, _ = _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
         return wn
     # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
@@ -206,7 +232,8 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
     # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
     # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
     # becomes the GMRES bug and wants the same `ktol`.
-    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
+    tol = _STEP_SOLVE_TOL[0] or 1e-10
+    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=tol, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
     # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
     # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
     # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
@@ -222,8 +249,9 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
     eps = float(jnp.finfo(rhs.dtype).eps)
     r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
     ktol = max(1e-10, 100.0 * eps)
+    # the stall the rescue is for sits near 1e-2; a converged solve to a loosened target must not trip it
     return jax.lax.cond(
-        r_rel < max(1e-9, 1e4 * eps),
+        r_rel < max(1e-9, 1e4 * eps, 10.0 * tol),
         lambda: wn,
         lambda: _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
     )

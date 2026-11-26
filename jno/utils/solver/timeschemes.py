@@ -1200,7 +1200,11 @@ def bdf_march(
     hist_u0 = jnp.broadcast_to(u0, (H, u0.shape[0]))
     init = (t0, hist_t0, hist_u0, jnp.asarray(1, jnp.int32), jnp.asarray(1, jnp.int32), jnp.asarray(0, jnp.int32),
             dt_start, jnp.asarray(True))  # fmt: skip
-    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+    from .backend_blocks import _step_solve_tolerance
+
+    # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
+    with _step_solve_tolerance(rtol):
+        (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))
     us = jnp.concatenate([u0[None, :], us], axis=0)
     out = _dense_sample(jnp.asarray(save_ts, rt), ts, us, K)
@@ -1381,7 +1385,11 @@ def adaptive_march(
         return (t_new, u_new, dt_next, accept), (t_new, u_new)
 
     init = (t0, u0, dt_start, jnp.asarray(True))
-    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+    from .backend_blocks import _step_solve_tolerance
+
+    # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
+    with _step_solve_tolerance(rtol):
+        (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)
