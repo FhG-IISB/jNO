@@ -2849,12 +2849,13 @@ class core:
         from .optimizers import MMACallback as _MMACallback
         from .optimizers import MMAOptimizer as _MMAOptimizer
 
+        _prev_mma = getattr(self, "_mma_cb", None)  # its history carries on (`MMACallback.continue_from`)
         self._mma_cb = None
         _mma_blocks = [
             (_lid, _fm._opt_fn)
             for _lid, _fm in sorted(self._collect_flax_modules().items())
-            if isinstance(_fm._opt_fn, _MMAOptimizer)
-        ]
+            if isinstance(_fm._opt_fn, _MMAOptimizer) and not getattr(_fm, "_frozen", False)
+        ]  # a frozen block is no design variable of this solve; its history waits for the solve that trains it
         _plain_ineq = [i for i in getattr(self, "_inequality_idx", []) if i not in getattr(self, "_auglag_idx", [])]
         if _mma_blocks and getattr(self, "_auglag_idx", None):
             raise ValueError(
@@ -2872,6 +2873,9 @@ class core:
             import optax as _optax_mma
 
             _cb_mma = _MMACallback(_mma_blocks, list(self._inequality_idx))
+            # A second solve() continues the first, as the optax states do: MMA's asymptotes and iterates carry over
+            # instead of restarting at every call
+            _cb_mma.continue_from(_prev_mma)
             self._mma_cb = _cb_mma
             callbacks = [_cb_mma] + list(callbacks or [])
             for _lid, _ in _mma_blocks:
