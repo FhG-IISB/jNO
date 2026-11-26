@@ -73,6 +73,26 @@ from .utils import beacon as _beacon
 from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
+# A solve that reuses its compiled step should compile nothing: every other program it runs belongs to the program set
+# kept with the step. JAX reports each trace and backend compile; their seconds are summed here (process-wide, cheap)
+# and a reusing solve that spent more than this on them says so -- a program made anew per solve, by construction a
+# bug, shows up the first time it costs anything rather than as a slow run nobody explains.
+RECOMPILE_REPORT_SECONDS = 1.0
+# How many problem structures (a stage's frozen/trained split, its settings) a core keeps compiled: see `_program_set`.
+PROGRAM_SETS = 4
+_COMPILE_SECONDS = [0.0]
+# The key of a step's info dict under which it returns what it evaluated beside its rows (`make_step_fn` extra_exprs).
+_STEP_EXTRAS = "__step_extras__"
+_COMPILE_EVENTS = ("/jax/core/compile/jaxpr_trace_duration", "/jax/core/compile/backend_compile_duration")
+
+
+def _count_compile_seconds(event, seconds, **_kw):
+    if event in _COMPILE_EVENTS:
+        _COMPILE_SECONDS[0] += float(seconds)
+
+
+jax.monitoring.register_event_duration_secs_listener(_count_compile_seconds)
+
 
 def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
     """Return True if any ModelCall in the expression tree has layer_id == lid."""
@@ -1511,8 +1531,13 @@ class core:
         static,
         checkpoint_gradients=False,
         min_consecutive=1,
+        n_extra=0,
     ):
-        """Create loss function — evaluates ALL constraints in one combined call."""
+        """Create loss function — evaluates ALL constraints in one combined call.
+
+        ``n_extra``: the last ``n_extra`` outputs of ``compiled_constraints_fn`` are no rows but expressions evaluated
+        beside them (sharing their solves), not differentiated: ``loss_fn`` then returns ``(total, (losses, extras))``.
+        """
         # Only build a mask when `jno.le`/`jno.ge` is actually in use. With no inequality
         # constraints the aggregate stays the plain `jnp.mean(losses)` it has always been --
         # identical code, not merely an equivalent formula -- so nothing downstream shifts by an
@@ -1557,9 +1582,13 @@ class core:
                 )
 
             # all_residuals is a list of (B, T, ...) arrays — one per constraint
+            if n_extra:
+                extras = [jax.lax.stop_gradient(r) for r in all_residuals[-n_extra:]]
+                all_residuals = all_residuals[:-n_extra]
             losses = jnp.stack([jnp.mean(r) for r in all_residuals])
+            aux = (losses, extras) if n_extra else losses
             if objective_mask is None:
-                return jnp.mean(losses), losses
+                return jnp.mean(losses), aux
             # `jno.le`/`jno.ge` entries are evaluated and differentiated with everything else --
             # they stay in `losses`, which is what reaches the optimiser hook -- but they are held
             # out of the scalar being descended. Summing a constraint into the objective would make
@@ -1570,9 +1599,49 @@ class core:
                 # Augmented-Lagrangian penalties: summed, not averaged with the objective rows, so
                 # d(total)/d(lambda) is the violation itself and the multiplier update reads it exactly.
                 total = total + jnp.sum(jnp.where(penalty_mask, losses, 0.0))
-            return total, losses
+            return total, aux
 
         return loss_fn
+
+    @staticmethod
+    def _sample_batch_sizes(op, ctx) -> frozenset:
+        """the sample-batch sizes the compiled function sees for ``op`` alone in context ``ctx`` (its tags' leading
+        axes). Expressions with equal sizes evaluated in one program have the shapes each has alone."""
+        from .trace import collect_tags
+        from .trace_compiler import CONTEXT_METADATA_TAGS
+
+        tags = collect_tags(op)
+        return frozenset(
+            int(arr.shape[0])
+            for tag, arr in ctx.items()
+            if tag in tags and tag != "__time__" and tag not in CONTEXT_METADATA_TAGS and getattr(arr, "ndim", 0) >= 1
+        )
+
+    def _program_set(self, key):
+        """The program set of a solve whose step program is described by ``key`` (`_step_program_key`): the step and
+        every program made with it (`_cache` in `solve`). A core keeps the sets of its last ``PROGRAM_SETS`` problem
+        structures, so a run that switches between stages (freeze one block, train another, and back) compiles each
+        stage once; sets of an earlier compiled problem (a rebuild recompiled its rows) are dropped at once, since
+        they can never run again and hold that discretisation's constants."""
+        sets = self.__dict__.setdefault("_program_sets", [])
+        rows = self.compiled_constraints_fn
+        sets[:] = [s for s in sets if s.get("__rows__") is rows]
+        found = None if key is None else next((s for s in sets if s["__key__"] == key), None)
+        if found is None:
+            found = {"__key__": key, "__rows__": rows}
+            if key is not None:  # an undescribable step is never reused, so not kept
+                sets.append(found)
+                while len(sets) > PROGRAM_SETS:
+                    sets.pop(0)
+                    self.log.info(
+                        f"jno.core: more than {PROGRAM_SETS} problem structures in one run; the least recently used "
+                        "one's programs are dropped (a return to it compiles again)."
+                    )
+        else:
+            sets.remove(found)
+            sets.append(found)  # most recently used last
+        self._jit_program_cache = found
+        return found
 
     def _make_track_fn(self, compiled_trackers, batchsize, frozen, static):
         """Create tracking function that evaluates monitored expressions.
@@ -1633,6 +1702,8 @@ class core:
         min_consecutive=1,
         compiled_constraints_fn=None,
         bayesian_handles=None,
+        extra_exprs=(),
+        extra_reduce=None,
     ):
         """Build a single JIT-compiled training step.
 
@@ -1661,8 +1732,17 @@ class core:
             bayesian_handles: Optional ``{layer_id_str: _KernelHandle}`` for
                 models configured with ``.bayesian()``.  Their per-step update
                 runs a blackjax MCMC kernel instead of the optax chain.
+            extra_exprs: evaluated in the step's forward pass with the constraints (sharing its solves), not
+                differentiated; returned in the info dict under ``_STEP_EXTRAS``, through ``extra_reduce`` if given.
+                The trackers ride here, instead of a program of their own that runs the forward pass again.
         """
+        extra_exprs = list(extra_exprs)
+        if extra_exprs and compiled_constraints_fn is not None:
+            raise ValueError("make_step_fn: extra_exprs are compiled with the core's own constraints only.")
         _compiled_fn = compiled_constraints_fn if compiled_constraints_fn is not None else self.compiled_constraints_fn
+        if extra_exprs:
+            _compiled_fn = TraceCompiler.compile_multi_expression(list(self._constraint_exprs) + extra_exprs, self.all_ops)
+        n_extra = len(extra_exprs)
         loss_fn = self._make_loss_fn(
             _compiled_fn,
             batchsize,
@@ -1670,6 +1750,7 @@ class core:
             static,
             checkpoint_gradients=checkpoint_gradients,
             min_consecutive=min_consecutive,
+            n_extra=n_extra,
         )
 
         bayesian_handles = bayesian_handles or {}
@@ -1692,7 +1773,8 @@ class core:
             def loss_wrapper(p):
                 return loss_fn(p, context, step_rng)
 
-            (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+            (total_loss, _aux), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+            individual_losses, extras = _aux if n_extra else (_aux, None)
 
             # ── per-model optimizer step (optax models only) ──
             for k in opt_keys:
@@ -1871,6 +1953,8 @@ class core:
                 bayesian_info[k] = info_dict
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
+            if n_extra:
+                bayesian_info = {**bayesian_info, _STEP_EXTRAS: extras if extra_reduce is None else extra_reduce(extras)}
             return trainable, opt_states, rng, next_epoch, total_loss, individual_losses, bayesian_info
 
         return step
@@ -2113,6 +2197,8 @@ class core:
         checkpoint_gradients=False,
         min_consecutive=1,
         jacobian=None,
+        extra_exprs=(),
+        extra_reduce=None,
     ):
         """Build a function that computes gradients without an optimizer update.
 
@@ -2133,15 +2219,27 @@ class core:
             jacobian: ``(rows, lids)`` to also return constraint-row Jacobians for a constrained optimiser
                 (MMA): the rows of ``individual_losses`` and the parameter blocks, raveled in that order.
                 ``None`` returns only the objective gradient.
+            extra_exprs: evaluated in the same forward pass as the rows, sharing its solves, not differentiated, and
+                returned after the Jacobian (``None`` without one), through ``extra_reduce`` if given.
         """
+        extra_exprs = list(extra_exprs)
+        n_extra = len(extra_exprs)
         loss_fn = self._make_loss_fn(
-            self.compiled_constraints_fn,
+            (
+                TraceCompiler.compile_multi_expression(list(self._constraint_exprs) + extra_exprs, self.all_ops)
+                if n_extra
+                else self.compiled_constraints_fn
+            ),
             batchsize,
             frozen,
             static,
             checkpoint_gradients=checkpoint_gradients,
             min_consecutive=min_consecutive,
+            n_extra=n_extra,
         )
+
+        def _reduced(extras):
+            return extras if extra_reduce is None else extra_reduce(extras)
 
         def grad_fn(trainable, rng, context):
             rng, step_rng = jax.random.split(rng)
@@ -2149,8 +2247,11 @@ class core:
             def loss_wrapper(p):
                 return loss_fn(p, context, step_rng)
 
-            (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
-            return grads, rng, total_loss, individual_losses
+            (total_loss, _aux), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+            if not n_extra:
+                return grads, rng, total_loss, _aux
+            individual_losses, extras = _aux
+            return grads, rng, total_loss, individual_losses, None, _reduced(extras)
 
         if jacobian is None:
             return grad_fn
@@ -2174,9 +2275,11 @@ class core:
 
             def loss_wrapper(p):
                 with jax.named_scope("jno/core/loss"):
-                    return loss_fn(p, context, step_rng)
+                    total_, aux_ = loss_fn(p, context, step_rng)
+                    losses_, extras_ = aux_ if n_extra else (aux_, [])
+                    return (total_, losses_), extras_
 
-            (total_loss, losses), pullback = jax.vjp(loss_wrapper, trainable)
+            (total_loss, losses), pullback, extras = jax.vjp(loss_wrapper, trainable, has_aux=True)
             n = 1 + len(rows)
             seed_total = jnp.zeros((n,) + jnp.shape(total_loss), total_loss.dtype).at[0].set(1)
             seed_rows = np.zeros((n,) + tuple(jnp.shape(losses)))
@@ -2191,7 +2294,8 @@ class core:
 
             flat, blocks = jax.lax.map(one, (seed_total, seed_rows))
             grads = ravel_pytree(trainable)[1](flat[0])
-            return grads, rng, total_loss, losses, blocks[1:] if rows else jnp.zeros((0, 1))
+            out = (grads, rng, total_loss, losses, blocks[1:] if rows else jnp.zeros((0, 1)))
+            return out + (_reduced(extras),) if n_extra else out
 
         return grad_jac_fn
 
@@ -2611,6 +2715,7 @@ class core:
         from jax._src import profiler as _jax_profiler
 
         _epochs_run = epochs  # lowered where a callback stops the loop early
+        _compile_mark = None  # the compile seconds when a reused step was found (`RECOMPILE_REPORT_SECONDS`)
 
         if not self.constraints:
             raise ValueError(
@@ -3796,6 +3901,32 @@ class core:
                 _handle.warmup = 0
                 self.log.info(f"Model {_lid}: window adaptation done — step_size={_adapted_kwargs['step_size']:.4g}")
 
+        # The trackers ride in the step's forward pass: they share its solves, need no program of their own (one that
+        # compiles as long as the step on a FEM problem), and read the design the logged rows read. A tracker with the
+        # rows' sample batch, or with none (an integral, a parameter: the step's map over the batch repeats it, and its
+        # value is the first), keeps its value and shape; one that would batch differently does not ride, nor do the
+        # trackers on the paths whose step carries no extras.
+        _ctx_all = self.domain_data.context
+        _row_sizes = frozenset().union(*(self._sample_batch_sizes(e, _ctx_all) for e in self._constraint_exprs))
+        _trk_sizes = [self._sample_batch_sizes(e, _ctx_all) for e in self._tracker_exprs]
+        _tracks_fit = (
+            bool(self._tracker_exprs) and self._points is None and all(s_ == _row_sizes or not s_ for s_ in _trk_sizes)
+        )
+        _trk_first = [bool(_row_sizes) and not s_ for s_ in _trk_sizes]  # mapped by the step only: take sample 0
+
+        def _tracks_reduce(ex):
+            return [v[0] if first else v for v, first in zip(ex, _trk_first)]
+
+        _tracks_in_plain_step = (
+            _tracks_fit
+            and not _has_before_update_hooks
+            and not _use_substeps
+            and not bayesian_handles
+            and inner_steps == 1
+            and accumulation_steps == 1
+            and not offload_data
+        )
+
         # ── 7. Build JIT-compiled step function ──
         step_fn = self.make_step_fn(
             per_model_opts=per_model_opts,
@@ -3807,6 +3938,8 @@ class core:
             checkpoint_gradients=checkpoint_gradients,
             min_consecutive=min_consecutive,
             bayesian_handles=bayesian_handles,
+            extra_exprs=self._tracker_exprs if _tracks_in_plain_step else (),
+            extra_reduce=_tracks_reduce if _tracks_in_plain_step else None,
         )
 
         # Optionally amortise Python dispatch overhead by running multiple
@@ -3865,6 +3998,10 @@ class core:
         if len(_jac_requests) > 1:  # one shared program serves one request; more fall back to their own
             _jac_requests = []
         _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)
+        _tracks_in_step = _tracks_fit and _has_before_update_hooks and not _use_accumulation
+        _tracks_ride = _tracks_in_plain_step or _tracks_in_step
+        if self._tracker_exprs and not _tracks_ride:
+            self.log.debug("trackers: evaluated in a program of their own (this step path carries no extras)")
         if _has_before_update_hooks and not _use_accumulation:
             # traced with poisoned residual gates: no host callback in the program, so JAX's persistent cache
             # can store it (a design step can take many minutes to compile); every step's outputs are then
@@ -3877,6 +4014,8 @@ class core:
                     checkpoint_gradients=checkpoint_gradients,
                     min_consecutive=min_consecutive,
                     jacobian=_jac_req,
+                    extra_exprs=self._tracker_exprs if _tracks_in_step else (),
+                    extra_reduce=_tracks_reduce if _tracks_in_step else None,
                 )
             )
             _hook_apply_fn = self.make_apply_fn(
@@ -3952,6 +4091,8 @@ class core:
                 for _f_t, _dt_t in _h_t.diagnostic_fields:
                     _per_handle[_f_t] = replicated
                 _bay_info_template[_bk_t] = _per_handle
+            if _tracks_in_plain_step:
+                _bay_info_template[_STEP_EXTRAS] = replicated  # the trackers (a prefix for the list)
 
             out_shardings = (
                 jax.tree_util.tree_map(_leaf_sharding, trainable),  # trainable
@@ -3989,13 +4130,16 @@ class core:
                     int(self.n_constraints),
                     bool(bayesian_handles),
                     _beacon.settings(),  # a solve inside the step traced with log= or without
+                    bool(_tracks_ride),
                 ),
             )
-            _cache = getattr(self, "_jit_program_cache", None)
-            if _cache is None or _cache.get("__key__") != _step_key or _step_key is None:
-                _cache = {"__key__": _step_key}
-                self._jit_program_cache = _cache
+            # THE PROGRAM SET: every program this solve runs besides the step (trackers, MMA's) lives in `_cache` with
+            # the step and is made at most once per step program. A later solve of the same problem finds them all; a
+            # rebuild or a new structure starts a new set.
+            _cache = self._program_set(_step_key)
             _cached_step = ("hit", _cache["step"]) if "step" in _cache else None
+            if _cached_step is not None:
+                _compile_mark = _COMPILE_SECONDS[0]
             if os.environ.get("JNO_DEBUG_STEP_KEY") == "1" and _cached_step is not None:
                 _names = ("trainable", "opt_states", "context", "optimizers", "settings", "constraints_fn")
                 for _n, _a, _b in zip(_names, _cached_step[0], _step_key or ()):
@@ -4070,7 +4214,9 @@ class core:
                         replicated,  # total_loss
                         replicated,  # individual_losses
                     )
-                    + ((replicated,) if _jac_req is not None else ()),  # constraint Jacobian rows
+                    # constraint Jacobian rows (None without them), the trackers
+                    + ((replicated,) if _jac_req is not None else ((None,) if _tracks_in_step else ()))
+                    + ((replicated,) if _tracks_in_step else ()),
                 )
                 jit_hook_apply = _cache.get("hook_apply") or jax.jit(
                     _hook_apply_fn,
@@ -4090,8 +4236,12 @@ class core:
                 if _step_key is not None:
                     _cache[_hg_key], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
-            if has_trackers:
-                jit_track = jax.jit(track_fn)
+            if has_trackers and not _tracks_ride:  # made once per program set: `track_fn` is a new closure every solve
+                jit_track = _cache.get("track")
+                if jit_track is None:
+                    jit_track = jax.jit(track_fn)
+                    if _step_key is not None:
+                        _cache["track"] = jit_track
 
             # ── 7b. Build per-substep JIT step functions ──
             if _use_substeps:
@@ -4252,7 +4402,7 @@ class core:
 
             # Pre-compile tracker JIT as well so profile windows focus on
             # steady-state train-step behavior instead of one-time compile work.
-            if has_trackers:
+            if has_trackers and not _tracks_ride:
                 _ = jit_track.lower(trainable, trace_context, self.rng).compile()
 
             # Warmup: run a few real dispatches on throw-away copies so
@@ -4304,7 +4454,7 @@ class core:
                         _tw, _ow, _rw, _ew, _, _pl, _ = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
                 del _ow, _pl
 
-            if has_trackers:
+            if has_trackers and not _tracks_ride:
                 _ = jit_track(_tw, trace_context, _rw)
 
             jax.effects_barrier()
@@ -4318,6 +4468,7 @@ class core:
                     _cb.on_solve_begin(
                         compiled_constraints_fn=self.compiled_constraints_fn,
                         compiled_inequality_fn=self.compiled_inequality_fn,
+                        program_cache=_cache,  # a callback's programs belong to the program set (see `_cache`)
                         n_constraints=self.n_constraints,
                         batchsize=batchsize,
                         frozen=frozen_arrays,
@@ -4965,6 +5116,8 @@ class core:
                         _hout = jit_hook_grad(trainable, self.rng, context)
                         _hgrads, self.rng, total_loss, individual_losses = _hout[:4]
                         _hjac = _hout[4] if len(_hout) > 4 else None
+                        if _tracks_in_step:
+                            _step_tracks = _hout[5]
                         _raise_if_step_not_finite(outer_epoch, total_loss, individual_losses, _hgrads, _hjac)
                         _release_idle_solver_memory()
                         for _cb in callbacks:
@@ -5004,6 +5157,8 @@ class core:
                             epoch_jnp,
                             prev_losses,
                         )
+                        if _tracks_in_plain_step:
+                            _step_tracks = _step_bayesian_info.pop(_STEP_EXTRAS)
 
                 if not _use_substeps:
                     prev_losses = individual_losses
@@ -5184,7 +5339,7 @@ class core:
                     # Trackers
                     track_stats_np = None
                     if has_trackers and any(outer_epoch % (max(1, intv // inner_steps)) == 0 for intv in tracker_intervals):
-                        track_vals = jit_track(trainable, context, self.rng)
+                        track_vals = _step_tracks if _tracks_ride else jit_track(trainable, context, self.rng)
                         track_stats_np = []
                         for _v, _rfn in zip(jax.device_get(track_vals), self._tracker_reduce_fns):
                             _arr = np.asarray(_v)
@@ -5463,6 +5618,14 @@ class core:
                 wandb_log_model(self)
 
         self._total_epochs += _epochs_run
+        if _compile_mark is not None:
+            _spent = _COMPILE_SECONDS[0] - _compile_mark
+            if _spent > RECOMPILE_REPORT_SECONDS:
+                self.log.warning(
+                    f"jno.core.solve: this solve reused its compiled step, yet {_spent:.1f} s went into tracing and "
+                    "compiling other programs again -- a program made anew per solve (a function jitted inside it) "
+                    "instead of once with the step. JAX_LOG_COMPILES=1 names them."
+                )
         # Hand the optimizer states to the next solve() so schedules continue across the call.
         self._opt_states = opt_states
 
@@ -5794,6 +5957,7 @@ class core:
                     "`size=` / `pitch=`) so the rebuilt cells meet it."
                 )
             self._jit_program_cache = None
+            self.__dict__.pop("_program_sets", None)  # they read the old discretisation
             self._eval_cache = weakref.WeakKeyDictionary()
             if self.domain in fired:
                 self.domain_data = self.prepare_domain_data(self.domain)
@@ -5885,38 +6049,46 @@ class core:
             return out
 
         def _batch_sizes(op):
-            """the sample-batch sizes the compiled function would see for ``op`` alone (its tags' leading axes)"""
-            from .trace import collect_tags
-            from .trace_compiler import CONTEXT_METADATA_TAGS
-
-            tags = collect_tags(op)
-            return frozenset(
-                int(arr.shape[0])
-                for tag, arr in ctx.items()
-                if tag in tags and tag != "__time__" and tag not in CONTEXT_METADATA_TAGS and getattr(arr, "ndim", 0) >= 1
-            )
+            return self._sample_batch_sizes(op, ctx)
 
         def _point_eval_all(ops):
             """Several expressions as ONE program (one evaluator scope, as the training step evaluates its list):
             a solve or integral they share is computed once, and there is one compile instead of one per
             expression. Expressions the compiled function would batch differently (different sample-batch sizes)
             keep one program each, so every result has the shape it has alone."""
-            if len(ops) < 2 or len({_batch_sizes(op) for op in ops}) > 1:
+            if len(ops) < 2:
                 return [_point_eval(op) for op in ops]
-            entry = self._eval_cache.get(ops[0])
-            if entry is None:
-                self._eval_cache[ops[0]] = entry = {}
-            slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
-            hit = entry.get(slot)
-            if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
-                raw_fn = TraceCompiler.compile_multi_expression(
-                    [cse(fuse_laplacian(refuse_point_index(op))) for op in ops], self.all_ops
-                )
-                hit = entry[slot] = (
-                    [weakref.ref(op) for op in ops[1:]],
-                    eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
-                )
-            out = list(hit[1](_models, ctx, batchsize=None, key=key))
+            # One program per sample-batch size: an expression with no sampled input (an integral, a parameter, a
+            # per-cell field) joins any group -- the group's program maps it over the sample axis like the others,
+            # where it is the same for every sample, so its value is the first. Ten rows of a problem on one mesh
+            # are one program, their shared solves computed once (they were one program each).
+            sizes = [_batch_sizes(op) for op in ops]
+            kinds = sorted({s for s in sizes if s}, key=lambda s: sorted(s))
+            groups = [[i for i, s in enumerate(sizes) if s == k] for k in kinds] or [list(range(len(ops)))]
+            groups[0] = sorted(groups[0] + [i for i, s in enumerate(sizes) if not s and i not in groups[0]])
+            out = [None] * len(ops)
+            for idx in groups:
+                gops = [ops[i] for i in idx]
+                if len(gops) == 1:
+                    out[idx[0]] = _point_eval(gops[0])
+                    continue
+                entry = self._eval_cache.get(gops[0])
+                if entry is None:
+                    self._eval_cache[gops[0]] = entry = {}
+                slot = ("together", min_consecutive, tuple(id(op) for op in gops[1:]))
+                hit = entry.get(slot)
+                if hit is None or any(r() is not op for r, op in zip(hit[0], gops[1:])):
+                    raw_fn = TraceCompiler.compile_multi_expression(
+                        [cse(fuse_laplacian(refuse_point_index(op))) for op in gops], self.all_ops
+                    )
+                    hit = entry[slot] = (
+                        [weakref.ref(op) for op in gops[1:]],
+                        eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
+                    )
+                vals = list(hit[1](_models, ctx, batchsize=None, key=key))
+                mapped = any(sizes[i] for i in idx)  # the program maps over the sample axis
+                for i, v in zip(idx, vals):
+                    out[i] = v[0] if mapped and not sizes[i] else v
             _release_idle_solver_memory()
             return out
 
@@ -6015,6 +6187,7 @@ class core:
         state["_eval_cache"] = None
         # Compiled step and hook programs hold device handles; they are rebuilt on the next solve().
         state.pop("_jit_program_cache", None)
+        state.pop("_program_sets", None)
 
         return state
 

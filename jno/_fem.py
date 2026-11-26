@@ -440,10 +440,27 @@ def _lower_unknowns(obj: Any) -> Any:
     bare = _bare(obj)
     if not isinstance(bare, Placeholder):
         return obj
-    from .trace import Jacobian, TemporalDerivative
+    from .trace import HistoryRef, Jacobian, StateUpdate, TemporalDerivative
+
+    if isinstance(bare, HistoryRef):
+        # `u.i(k)` on an unknown reads the history of its trial symbol: the buffer is keyed by the field's
+        # identity, so the read and the `.evolves` update (lowered below) must name the same symbol.
+        sym = _unknown_symbol_of(bare.target)
+        return obj if sym is None else HistoryRef(sym, bare.offset)
+
+    if isinstance(bare, StateUpdate):
+        # `_walk` does not descend into a state update (it is pulled out of the weak-form classification),
+        # so its state field and formula are lowered here, each like a term of its own.
+        target, formula = _lower_unknowns(bare.target), _lower_unknowns(bare.expr)
+        if target is bare.target and formula is bare.expr:
+            return obj
+        return StateUpdate(target, formula, region=bare.region)
 
     nodes = list(_walk(bare))
     mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    for n in nodes:
+        if isinstance(n, HistoryRef) and _unknown_symbol_of(n.target) is not None:
+            mapping[n] = HistoryRef(_unknown_symbol_of(n.target), n.offset)
     if not mapping:
         return obj
     for n in nodes:
@@ -4190,6 +4207,18 @@ class FEM:
         # drivers, whose tolerances the verdict knows. A user `solve_fn=` carries its own tolerances, and a
         # box-constrained solve root-finds the min-map, not the residual the verdict re-evaluates.
         _jno_driver = (solve_fn is None or from_slots) and not getattr(self, "_bound_specs", None)
+        # The per-step solver's value identity, for the history march's compiled-program cache: jNO's own
+        # drivers have one (the default, or one composed from the slots), under the same rule the steady
+        # nonlinear path uses -- a `precond=` holding state built from concrete values does not compile and
+        # is not cached. A user `solve_fn=` has none. Read BEFORE the box wrapper below, which hides it.
+        from .utils.solver.solver_api import precond_compiles
+
+        if solve_fn is None:
+            _march_key = ("default",)
+        elif getattr(solve_fn, "cache_key", None) is not None and precond_compiles(precond):
+            _march_key = solve_fn.cache_key
+        else:
+            _march_key = None
         if getattr(self, "_bound_specs", None):
             solve_fn = self._bounded_solve_fn(solve_fn)
 
@@ -4222,6 +4251,7 @@ class FEM:
                 contact=contact,
                 values=kwargs.get("values"),
                 checkpoint=checkpoint,
+                cache_key=_march_key,
             )
         if tau is not None:
             raise ValueError(
@@ -7865,14 +7895,8 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     # pair either, and a contribution left on it is added to its `u - g` -- measured: a coupling of 0.1
     # held such a wall at 0.4 where 0.5 was prescribed. The operator's own declaration joins in for the
     # paths that do not stash on the domain (1-D).
-    _d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
-    for _dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
-        _d.extend(int(i) for i in np.asarray(_dofs).reshape(-1))
-    _d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
-    _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
-    if _op_d is not None:
-        _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
-    d_dofs = jnp.asarray(unique_values(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
+    _d = _essential_dof_ids(domain, fem_obj._op)
+    d_dofs = jnp.asarray(_d, dtype=jnp.int32) if _d.size else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -8100,6 +8124,19 @@ def _refuse_point_indexing(constraints: Any) -> None:
 _TIED_CONSTANT_DOMAINS: List[Any] = []
 
 
+def _essential_dof_ids(domain: Any, op: Any) -> np.ndarray:
+    """Every DOF carrying an essential condition, sorted: constant-valued, time-varying and args-driven rows,
+    plus the ones the operator declares itself (the paths that do not stash on the domain, 1-D)."""
+    d = [int(p[0]) for p in (getattr(domain, "_fem_native_dirichlet_pairs", None) or [])]
+    for dofs, _node, _coords in getattr(domain, "_fem_native_dirichlet_tv", None) or []:
+        d.extend(int(i) for i in np.asarray(dofs).reshape(-1))
+    d.extend(int(i) for i in getattr(domain, "_fem_native_dirichlet_args_dofs", None) or [])
+    op_d = getattr(op, "dirichlet_dofs", None)
+    if op_d is not None:
+        d.extend(int(i) for i in np.asarray(op_d).reshape(-1))
+    return np.asarray(unique_values(np.asarray(d, dtype=np.int64)), dtype=np.int64) if d else np.zeros(0, np.int64)
+
+
 # docstring-from: jno._fem._fem_impl
 def fem(
     constraints: Any,
@@ -8160,15 +8197,30 @@ def fem(
     _fn._CHUNK_CONSUMED[0] = False
     _fn._QUAD_EXPLICIT[0] = quad_degree is not None
     _fn._QUAD_REPORTED.clear()
+    lowered = _lower_unknowns(list(constraints) if isinstance(constraints, tuple) else constraints)
+    from .utils.solver.nodal_trial import NetworkTrialResidual, split_network_trial
+
+    split = split_network_trial(lowered)
+    if split is not None:  # u = net(rho).field in the unknown's place: assemble with the FE trial, return its residual
+        inner = fem(split["constraints"], quad_degree=quad_degree, chunk=chunk, _dd_overlap=_dd_overlap)
+        if inner.mode != "linear":
+            raise NotImplementedError(
+                f"jno.fem: a network field trial (u = net(rho).field.bind(...)) needs a form linear in u; this one "
+                f"assembles as {inner.mode!r}. Nonlinear forms are not supported on this route yet."
+            )
+        from .utils.logger import get_logger
+
+        out = NetworkTrialResidual(inner, split["network"], split["data"])
+        get_logger().info(f"jno.fem: network field trial, the loss is the FE residual of its output ({out!r})")
+        return out
     try:
         with _host_assembly_scope():
             from .domain.equations import lower_complex_terms, lower_initial_values, lower_integral_equations
             from .domain.mapping import lower_mapped_regions
             from .domain.radiation import lower_radiation_terms
 
-            _terms = list(constraints) if isinstance(constraints, tuple) else constraints
-            # `d.unknown()` fields become their trial symbols first: every lowering below sees TrialFunctions
-            _terms = _lower_unknowns(_terms)
+            # `d.unknown()` fields became their trial symbols above: every lowering below sees TrialFunctions
+            _terms = lowered
             _terms, _initial_used = lower_initial_values(lower_complex_terms(_terms))
             _terms = lower_integral_equations(_terms)
             out = _fem_impl(

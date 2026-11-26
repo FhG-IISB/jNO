@@ -23,6 +23,7 @@ jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `
 - `jno.solve.coupling(x0={problem: state})`: where a steady participant starts (its first sweep and the stiffness probe), so a steady gas can take part; the interface data start from the starting states (each sender's value there, or the value that holds its condition at the receiver's start), not from zero.
 - `jno.solve.coupling(compile=True)`: a transient coupling runs every window after the first as one compiled program, traced once (`core.coupled.compiles`): a window of one sweep (data flowing one way, or `implicit=False`), or its interface fixed point with Aitken or a fixed relaxation. A coupled solve differentiates by the problems' trainable parameters: every window's fixed point implicitly at its root (`custom_root`, a GMRES tangent), the windows chained through their states.
 - `jno.core([...coupled problems, interface conditions]).solve(coupling=...)` returns the coupled solution as trace nodes (one per problem) when a coupled problem has a trainable parameter: a `jno.core` loss on them trains it through the coupling.
+- A neural operator's output as the trial of `jno.fem`: `u = net(rho).field.bind(x=xi, y=yi)`, written where the unknown goes, makes `jno.fem` return the FE residual `A u - b(rho)` of the prediction, per sample of a batched domain, and `.solve(precond=...)` preconditions it with any `jno.precond` spec: a physics-informed loss for operator learning without labels (Wen, Mishra & Zeinhofer 2026). Essential rows are imposed on the prediction, not trained for; linear forms only. Example: `docs/tutorial_examples/11_operator_learning/preconditioned_pino_poisson_2d.py`, an FNO for Poisson trained on a multigrid-preconditioned residual.
 
 ### Fixed
 - `jno.fdm`: a nodal data field injected as a traced value (`extra_params`, a march's `_override`: how a coupling and a `jno.core` inverse pass it) was read as `(N,)` where its stored value is `(N, 1)`, so a Neumann row `∇u·n - g` broadcast to `(N, N)`, lost its gradient part and the solve was singular (NaN with `lu`); a march read a Dirichlet data value from its stored value and ignored the injected one.
@@ -34,9 +35,11 @@ jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `
 - `jno.fvm`: a diffusive term inside `jnn.stack` in a vector equation (`jnn.stack([0, k*(T.xx + T.yy)], axis=-1)`) is a face flux of its row; it was evaluated cell by cell, a stencil twice as wide and not conservative. First-order terms (a pressure gradient `jnn.stack([p.x, p.y])`) stay volume terms.
 - `jno.fvm`: a nodal data field is read at a site through the mesh's P1/Q1 interpolant (vertex-centred sites were 0.4 % off); the `u.t` coefficient probe reads only the time-derivative terms (an axisymmetric gas's source made it NaN).
 - A window copy of a transient block shares the block's compiled marches (the march cache keys scalars by value and leaves out the start state).
+- `jno.fem`: a phase-field (history) march written with `domain.unknown()` builds and solves like one written with `fem_symbols()`: `.bounds()` on an unknown, a state update or history read `H.i(-1)` of an unknown, and a history seeded from a coordinate formula `H0(x)` all failed. A repeated march of the same problem reuses its compiled scan and adaptive pilot step, and a staggered sweep is keyed by its fields' order and names, so `[u, d]` and `[d, u]` are different solvers.
 
 ### Changed
 - `jno.fdm` and `jno.fvm` share their constraint classification, DOF layout and parameter machinery in `jno._strong_form.StrongFormProblem`. `jno.fdm` behaves as before.
+- An automatic-differentiation derivative of a network or data expression that depends on no coordinate (`grad(net(rho), x)` with `rho` per-sample data) raises and names `.field.bind`, instead of returning exactly 0.
 
 ## [0.4.3] — 2026-11-22
 
