@@ -1161,16 +1161,19 @@ def bdf_march(
         k, t, h, hist_t, hist_u, n_hist = operand
         t_new = t + h
 
-        def _one(kk):
+        def _pre(kk):
+            """The order-``kk`` formula's shifted state ``psi``, step ``g`` and warm start."""
             c, g = _formula(kk, t_new, h, hist_t, n_hist)
             psi = jnp.tensordot(c, hist_u, axes=1)
             # The step's solve starts from the predictor, O(h^(k+1)) from the answer, not from psi, which is
             # O(h) from it (CVODE / ode15s start Newton there too); before the predictor exists, from u^n.
             pred = _predictor(kk, t_new, hist_t, hist_u)
-            u_new = be_step(psi, t_new - g, g, guess=jnp.where(n_hist >= kk + 1, pred, hist_u[0]))
-            gap = u_new - pred
-            err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * gap, u_new, hist_u[0]), 0.0)
-            # the neighbouring orders' errors, for the order choice (inf where they cannot be estimated)
+            return psi, jnp.asarray(g, rt), jnp.where(n_hist >= kk + 1, pred, hist_u[0])
+
+        def _post(kk, u_new):
+            """The order-``kk`` error estimate, and the neighbouring orders' (inf where they cannot be estimated)."""
+            pred = _predictor(kk, t_new, hist_t, hist_u)
+            err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * (u_new - pred), u_new, hist_u[0]), 0.0)
             lo = (
                 _rms(err_c[kk - 1] * _pred_gap(kk - 1, u_new, t_new, hist_t, hist_u), u_new, hist_u[0])
                 if kk > 1
@@ -1185,9 +1188,15 @@ def bdf_march(
                 if kk < K
                 else jnp.asarray(jnp.inf, rt)
             )
-            return u_new, err, jnp.asarray(lo, rt), jnp.asarray(hi, rt)
+            return jnp.asarray(err, rt), jnp.asarray(lo, rt), jnp.asarray(hi, rt)
 
-        return jax.lax.switch(k - 1, [lambda kk=kk: _one(kk) for kk in range(1, K + 1)])
+        # The order only changes cheap vector work (the formula's weights and the error estimates), so the
+        # switch sits around those and the step itself is traced ONCE: a switch around the whole step traced
+        # the Krylov solve, its adjoint and the residual gate once per order (5x the program to compile).
+        psi, g, guess = jax.lax.switch(k - 1, [lambda kk=kk: _pre(kk) for kk in range(1, K + 1)])
+        u_new = be_step(psi, t_new - g, g, guess=guess)
+        err, lo, hi = jax.lax.switch(k - 1, [lambda u, kk=kk: _post(kk, u) for kk in range(1, K + 1)], u_new)
+        return u_new, err, lo, hi
 
     def body(carry, i):
         t, hist_t, hist_u, n_hist, k, n_at_k, dt, grow_ok = carry
