@@ -27,6 +27,12 @@ class TestUnitAlgebra:
         # '^', '**', and bare-digit spellings are equivalent.
         assert Unit.parse("m^2") == Unit.parse("m**2") == Unit({"m": 2})
 
+    def test_repeated_slash_divides_each_further_factor(self):
+        # W/m/K is W/(m*K), read left to right.
+        assert Unit.parse("W/m/K") == Unit.parse("W/(m*K)") == Unit.parse("W m^-1 K^-1")
+        assert Unit.parse("kg/m/s^2") == Unit.parse("Pa")
+        assert Unit.parse("J / kg / K") == Unit.parse("J/(kg K)")
+
     def test_dimensionless_spellings(self):
         for spec in ("", "1", "-", "rad"):
             assert Unit.parse(spec).is_dimensionless()
