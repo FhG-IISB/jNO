@@ -93,6 +93,15 @@ def _interface_normal(pts, gamma, into_geom):
     return nrm
 
 
+def _region_edge_nodes(cells, mask):
+    """Boolean node mask of the nodes inside ``mask`` that share a mesh cell with a node outside it."""
+    cells = np.asarray(cells).astype(int)
+    touches_outside = (~mask[cells]).any(axis=1)
+    edge = np.zeros(mask.shape, bool)
+    edge[cells[touches_outside].ravel()] = True
+    return edge & mask
+
+
 def _is_fem(prob):
     """A jno.fem subdomain exposes its assembled (region-local) matrix/vector; a jno.fdm one does not."""
     return hasattr(prob, "A") and hasattr(prob, "b")
@@ -590,9 +599,25 @@ class _Coupled:
         pts = np.asarray(dom.mesh_connectivity["points"])[:, :dim]
         n = pts.shape[0]
         masks = [_region_mask(pts, g) for g in geoms]
-        complements = [np.where(~m)[0].astype(int) for m in masks]
+        cells = np.asarray(dom.mesh_connectivity["triangles"]).astype(int)
+        # A finite-difference subdomain applies its strong-form stencil with the coefficient it was authored
+        # with, which holds only where that coefficient is the physical one around the node. Its region-edge
+        # nodes (those sharing a cell with the complement) are therefore received from the neighbour like the
+        # complement, never solved: a region that starts on a coefficient jump would otherwise apply its
+        # uniform-coefficient stencil ON the jump (where the flux condition, not that stencil, holds) and
+        # lose its convergence order. The FEM row of an edge node is a true weak-form equation, so a FEM
+        # subdomain keeps them.
+        edges = [_region_edge_nodes(cells, m) if not _is_fem(p) else np.zeros(m.shape, bool) for p, m in zip(probs, masks)]
+        for i, e in enumerate(edges):
+            if (e & ~masks[1 - i]).any():
+                raise ValueError(
+                    f"couple: the overlap is thinner than one mesh cell where subdomain {i} (finite differences) meets "
+                    "the other region, so its region-edge nodes have no neighbour solution to take values from. "
+                    "Widen the overlap to at least two cells or refine the mesh less."
+                )
+        complements = [np.where(~m | e)[0].astype(int) for m, e in zip(masks, edges)]
         overlap = masks[0] & masks[1]
-        mask0 = masks[0]  # owned by subdomain 0 (includes the overlap)
+        mask0 = masks[0] & ~edges[0]  # owned by subdomain 0 (the overlap, but not nodes it receives from 1)
 
         # Trainable parameters across the subdomains (a FEM coefficient / an FDM parameter). If any, the
         # coupled solve is a differentiable node (below); the values arrive in this order at solve time.
@@ -650,6 +675,13 @@ def couple(subdomains, interface_conditions=None):
     coupling in jNO syntax (value ``uA(iface)-uB(iface)`` / flux ``k*uA.d(n)-...`` on an ``interface_*``
     tag). The interface is inferred from the regions: a single line (partitioning tags) is coupled by
     Dirichlet-Neumann, an overlap by Schwarz.
+
+    **Overlap and finite differences.** A finite-difference subdomain does not solve its region-edge nodes
+    (those sharing a mesh cell with the other side): like the complement, it takes them from the neighbour's
+    field, so its uniform-coefficient stencil is never applied where the coefficient changes (a region may
+    start on a coefficient jump, #206). Keep the overlap at least two cells wide, otherwise nothing of the
+    overlap is solved by the finite-difference side; a FEM subdomain solves its edge nodes (their rows are
+    weak-form equations).
 
     ``.solve()`` returns the combined nodal field as a JAX array — **or**, when a subdomain carries a
     trainable ``jno.np.parameter`` and the regions overlap, a differentiable trace node (exactly as
