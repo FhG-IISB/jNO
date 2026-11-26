@@ -144,3 +144,12 @@ def test_gradient_flows_through_the_complex_factorisation():
     crux = jno.core([(node - u_obs).mae], domain=_DUMMY)
     crux.solve(250)
     assert abs(float(np.asarray(crux.eval([kappa])).reshape(-1)[0]) - true) < 0.05
+
+
+def test_only_pardiso_takes_a_complex_form_as_its_own_operator():
+    """cuDSS factors a complex form from the fused 2n block inside the program (complex LDL^T, runtime
+    parameters, gradients), so it must not be flagged complex-native: that sent it the n x n complex legs, which
+    refuse a runtime parameter and which the LDL path read against the 2n pattern."""
+    assert jno.solve.lu(backend="pardiso").traits["complex_native"] is True
+    assert jno.solve.lu(backend="cudss").traits["complex_native"] is False
+    assert jno.solve.lu(backend="host").traits["complex_native"] is False

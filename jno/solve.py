@@ -286,8 +286,10 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool | No
         "solver_context": backend == "cudss",
         # factors a COMPLEX form's n x n operator itself (MKL complex mtypes), so fem.solve hands it the
         # complex operator rather than the real-equivalent 2n block: half the factor memory, and the
-        # periodic reduction and host copies run on the n-sized legs
-        "complex_native": backend in ("pardiso", "cudss"),
+        # periodic reduction and host copies run on the n-sized legs. NOT cuDSS: its complex LDL^T
+        # (``cudss_ldl_solve``) takes the fused 2n block and factors R + jI from it inside the program, with
+        # runtime parameters and gradients; handed the complex legs it saw an operator of the wrong size
+        "complex_native": backend == "pardiso",
     }
     return LinearSolver(_fn, name=name, direct=True, traits=traits, settings={"reuse": reuse})
 
