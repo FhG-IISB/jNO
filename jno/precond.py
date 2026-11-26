@@ -2634,6 +2634,16 @@ def _fem_concrete_operator(fem):
     return _leg(op[0]) if hasattr(op[0], "evaluate") else op[0]  # (A, b) or (FemLinearSystem, …)
 
 
+def _hermitian(M):
+    """``Mᴴ`` of a BCOO (``Mᵀ`` when real): the restriction onto the auxiliary space of a tie-reduced system."""
+    T = M.T
+    if jnp.issubdtype(T.dtype, jnp.complexfloating):
+        from jax.experimental import sparse as jsp
+
+        return jsp.BCOO((jnp.conj(T.data), T.indices), shape=T.shape)
+    return T
+
+
 class _AMS(_Spec):
     """Spec for the H(curl) auxiliary-space Maxwell (AMS) preconditioner; see :func:`ams`."""
 
@@ -2642,6 +2652,7 @@ class _AMS(_Spec):
     def __init__(self, aux):
         self.aux = aux  # nodal aux solver; None -> host SuperLU factored ONCE per block, reused per apply
         self._G = None  # discrete gradient (node->edge), built once from the mesh topology
+        self._reduced = False  # G, Pi carried onto a tie-reduced space (periodic / Bloch)
         self._Pis = None  # (Π_x, Π_y, Π_z) nodal->edge vector interpolation
         self._frozen = None  # host-assembled auxiliary operators, set by .build() for traced solves
 
@@ -2688,7 +2699,7 @@ class _AMS(_Spec):
         explicit ``.build`` required. If only a tracer is available at this point (a raw ``jit``/``vmap``
         of ``fem.solve``, where there is no concrete operator to freeze from), freezing is deferred and
         :meth:`build` is the escape hatch — :meth:`materialize` says so."""
-        self._transfer(fem.domain)
+        self._transfer(fem)
         if self._frozen is None:
             try:
                 self.build(fem)  # auto-freeze when the operator is concrete & complete here
@@ -2708,10 +2719,16 @@ class _AMS(_Spec):
         field, so ``field=`` names the H(curl) trial symbol whose block AMS preconditions:
         ``ams().build(fem, field=u)``. Without it the operator and the discrete gradient disagree and
         this raises rather than failing inside the assembly."""
-        self._transfer(fem.domain)
+        self._transfer(fem)
         from .utils.solver.solver_api import LinearOperator, PrecondContext
 
-        ctx = PrecondContext(LinearOperator(_fem_concrete_operator(fem)), fem)
+        A_full = _fem_concrete_operator(fem)
+        per = getattr(fem, "_periodic", None)
+        if per is not None and self._G.shape[0] != int(A_full.shape[0]) and self._reduced:
+            from .utils.solver.fem_utils import reduce_matrix_periodic
+
+            A_full = reduce_matrix_periodic(per, A_full)  # the operator the tie-reduced solve runs on
+        ctx = PrecondContext(LinearOperator(A_full), fem)
         # On a MIXED system the concrete operator is the whole thing -- (n_edges + n_verts) for an
         # N1E x Lagrange pair -- while AMS's discrete gradient G is (n_edges, n_verts). Assembling the
         # auxiliaries against it produced a bare `matmul: dimension mismatch` from inside the assembly,
@@ -2736,12 +2753,19 @@ class _AMS(_Spec):
         self._frozen = self._assemble_aux(ctx)
         return self
 
-    def _transfer(self, domain):
-        from .utils.solver.ams import discrete_gradient, nodal_vector_interpolation
+    def _transfer(self, fem):
+        from .utils.solver.ams import discrete_gradient, nodal_vector_interpolation, reduce_transfers
 
-        topo = domain._fem_nonnodal_topology
-        self._G = discrete_gradient(topo)
-        self._Pis = nodal_vector_interpolation(topo)
+        topo = fem.domain._fem_nonnodal_topology
+        G, Pis = discrete_gradient(topo), nodal_vector_interpolation(topo)
+        # A periodic / Bloch tie runs the solve on P^H A P, so the transfers are reduced the same way.
+        per = getattr(fem, "_periodic", None)
+        self._reduced = False
+        if per is not None:
+            G2, Pis2 = reduce_transfers(topo, per, G, Pis)
+            self._reduced = G2 is not G
+            G, Pis = G2, Pis2
+        self._G, self._Pis = G, Pis
 
     def _assemble_aux(self, ctx: PrecondContext) -> dict:
         """Host (scipy) assembly of the nodal auxiliary operators from a **concrete** matrix — the part
@@ -2759,7 +2783,7 @@ class _AMS(_Spec):
                     "jno.precond.ams needs the owning FEM to read the N1E edge topology — "
                     "use it via fem.solve(precond=jno.precond.ams()), not on a bare operator."
                 )
-            self._transfer(ctx.fem.domain)
+            self._transfer(ctx.fem)
 
         # `build()` guards this too, but an UNBUILT ams() never goes through it -- which is exactly what
         # `real_equivalent(ams())` does. Checked HERE, before anything multiplies G against the operator:
@@ -2802,7 +2826,7 @@ class _AMS(_Spec):
         G_sp = _csr(self._G)
         Pi_sp = [_csr(P) for P in self._Pis]
 
-        A_G = (G_sp.T @ A_sp @ G_sp).tocsr()  # gradient-space auxiliary operator GᵀAG
+        A_G = (G_sp.conj().T @ A_sp @ G_sp).tocsr()  # gradient-space auxiliary operator GᴴAG (G real: GᵀAG)
         g_scale = float(np.abs(A_G.data).max()) if A_G.nnz else 0.0
         if g_scale < 1e-12 * (float(np.abs(A_sp.data).max()) or 1.0):
             raise ValueError(
@@ -2830,7 +2854,7 @@ class _AMS(_Spec):
         # (Π_α·1 = G·coordₐ is a gradient), so pinning node 0 in every auxiliary operator is correct.
         if not np.iscomplexobj(A_sp.data):
             g_op, g_csr = to_op(pin0(A_G))
-            p_pairs = [to_op(pin0((P.T @ A_sp @ P).tocsr())) for P in Pi_sp]
+            p_pairs = [to_op(pin0((P.conj().T @ A_sp @ P).tocsr())) for P in Pi_sp]
             return {
                 "complex": False,
                 "g_op": g_op,
@@ -2865,7 +2889,7 @@ class _AMS(_Spec):
         block = to_op if aux_takes_complex else _real_block
         b_ops, b_csrs, nvs = [], [], []
         for P in Pi_sp:
-            Ap = pin0((P.T @ A_sp @ P).tocsr())
+            Ap = pin0((P.conj().T @ A_sp @ P).tocsr())
             op, csr = block(Ap)
             b_ops.append(op)
             b_csrs.append(csr)
@@ -2998,7 +3022,7 @@ class _AMS(_Spec):
         f = self._frozen if self._frozen is not None else self._assemble_aux(ctx)  # frozen (built) or eager
 
         G, Pis = self._G, self._Pis
-        GT, PisT = G.T, [P.T for P in Pis]
+        GT, PisT = _hermitian(G), [_hermitian(P) for P in Pis]
         dinv = 1.0 / ctx.diag()  # Jacobi smoother — the traced diagonal carries A(θ) under a trace
         make = self._aux_solve_builder()  # build each aux solver's setup ONCE, reuse across every apply
 

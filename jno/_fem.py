@@ -6539,7 +6539,9 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
+    return _multifield_reduction(
+        blocks, off_full, off_red, is_bloch=red["is_bloch"], tie_spec=_tie_vertex_spec(domain, ties, vpts)
+    )
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6556,22 +6558,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
     cells = np.asarray(topo["cells"])
     n_verts = int(vpts.shape[0])
     field_maps = topo.get("field_dofmaps") or []
-    masks = {}
-    for tag in {t for tie in ties for t in tie[:2]}:
-        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
-        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
-        # ties along periodic edges would then miss their partners).
-        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
-        if m is None:
-            f = _face_nodes(domain, vpts, None, tag)
-            m = np.zeros(n_verts, dtype=bool)
-            if f is not None:
-                m[np.asarray(f, dtype=int).reshape(-1)] = True
-        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
-        if not m.any():
-            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
-        masks[tag] = m
-    spec = [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
+    spec = _tie_vertex_spec(domain, ties, vpts)
     n_fields = len(offsets) - 1
     blocks, off_full, off_red = [], [0], [0]
     is_bloch = False
@@ -6594,7 +6581,30 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch, tie_spec=spec)
+
+
+def _tie_vertex_spec(domain: Any, ties: List[Any], vpts: Any) -> list:
+    """``[(main_vertex_mask, secondary_vertex_mask, phase)]`` for the periodic / Bloch ties: the vertex
+    form :func:`fem_dofmap.periodic_prolongation` takes. Kept on the reduction (``tie_spec``) so a
+    consumer on the same mesh (the AMS transfers) can tie ANOTHER space with the very same masks and phases."""
+    n_verts = int(np.asarray(vpts).shape[0])
+    masks = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
+        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
+        # ties along periodic edges would then miss their partners).
+        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+        if m is None:
+            f = _face_nodes(domain, vpts, None, tag)
+            m = np.zeros(n_verts, dtype=bool)
+            if f is not None:
+                m[np.asarray(f, dtype=int).reshape(-1)] = True
+        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
+        if not m.any():
+            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
+        masks[tag] = m
+    return [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
