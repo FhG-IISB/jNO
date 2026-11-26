@@ -7682,7 +7682,6 @@ def _refuse_point_indexing(constraints: Any) -> None:
 _TIED_CONSTANT_DOMAINS: List[Any] = []
 
 
-# docstring-from: jno._fem._fem_impl
 def _essential_dof_ids(domain: Any, op: Any) -> np.ndarray:
     """Every DOF carrying an essential condition, sorted: constant-valued, time-varying and args-driven rows,
     plus the ones the operator declares itself (the paths that do not stash on the domain, 1-D)."""
@@ -7696,6 +7695,7 @@ def _essential_dof_ids(domain: Any, op: Any) -> np.ndarray:
     return np.asarray(unique_values(np.asarray(d, dtype=np.int64)), dtype=np.int64) if d else np.zeros(0, np.int64)
 
 
+# docstring-from: jno._fem._fem_impl
 def fem(
     constraints: Any,
     *,

@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ...trace import Hessian, Jacobian, ModelCall, Placeholder, TensorTag, TestFunction, TrialFunction, Variable, substitute
+from ..sets import unique_values
 from .parametric_helpers import _is_runtime_scalar_parameter
 
 
@@ -137,7 +138,7 @@ def split_network_trial(constraints) -> Optional[Dict[str, Any]]:
 def _node_reader(points: np.ndarray):
     """``read(out) -> (n_nodes,)``: one sample's network output (a grid, or one value per node) at the nodes."""
     n, dim = points.shape
-    axes = [np.unique(np.round(points[:, k], 12)) for k in range(dim)]
+    axes = [unique_values(np.round(points[:, k], 12)) for k in range(dim)]
     grid = tuple(len(a) for a in axes)
     index = None
     if int(np.prod(grid)) == n:
@@ -173,6 +174,12 @@ class NetworkTrialResidual:
     arXiv:2609.36216). Both are trace expressions for ``jno.core``; ``pde.mse`` is ``pde.solve().mse``.
     ``pde.field`` is the prediction in the FE node order with the essential values set, and ``pde.fem``
     the assembled problem behind it.
+
+    Args:
+        fem: The problem assembled with the FE trial in the network's place.
+        network: The network call whose output is the trial, one value per node or a grid of the nodes.
+        data: The network's input fields (``rho``) by name. ``fem`` takes each as a runtime parameter of
+            that name, so every sample's field enters the residual at the nodes.
     """
 
     def __init__(self, fem, network, data):
@@ -240,6 +247,7 @@ class NetworkTrialResidual:
 
     @property
     def mse(self):
+        """The mean square of the unpreconditioned residual, ``pde.solve().mse``: a loss term for ``jno.core``."""
         return self.solve().mse
 
     @property
