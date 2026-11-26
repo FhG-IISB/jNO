@@ -260,3 +260,80 @@ def test_grading_must_be_a_growth_ratio_above_one():
         _graded_stack().structured(grading=1.0)
     with pytest.raises(ValueError, match="grading"):
         _graded_stack().structured(grading=-2)
+
+
+# ---------------------------------------------------------------- periodic ties on a lattice of several boxes
+
+
+def _two_slabs():
+    """Two boxes side by side filling [0, 1]^2, the left one meshed finer: a rectilinear lattice whose x-spacing
+    changes at x = 0.5 and whose opposite faces still match node for node."""
+    return (R(0, 0, 0.5, 1).name("fine").size(0.05) + R(0.5, 0, 1, 1).name("coarse").size(0.125)).sized(0.1)
+
+
+def _tie_pairs(d, *names):
+    out = []
+    for nm in names:
+        c = d.variable(nm, split=True)
+        out.append((c[0], c[1]))
+    return out
+
+
+def test_lagrange_periodic_ties_on_a_multi_box_lattice_are_exact_and_converge():
+    """Nodal ties on a lattice of several boxes: every tied face matches node for node, so the tie is a 0/1 map
+    (`conforming`, no interpolation), and the doubly periodic Poisson solution matches the manufactured one."""
+    d = _two_slabs().structured().domain()
+    u, v = d.fem_symbols(names=("u", "v"))
+    xi, yi, _ = d.variable("interior", split=True)
+    ub, vb = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    f = 8 * np.pi**2 * jno.np.cos(2 * np.pi * xi) * jno.np.cos(2 * np.pi * yi)
+    left, right, bottom, top = _tie_pairs(d, "left", "right", "bottom", "top")
+    fem = jno.fem([ub.x * vb.x + ub.y * vb.y - f * vb, u(*left) - u(*right), u(*bottom) - u(*top), u.pin()])
+    s = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    assert fem._periodic["n_red"] < fem._periodic["n_full"]
+    assert fem._periodic["coupling"] == "conforming", fem._periodic["coupling"]
+    pts = np.asarray(fem.points)[:, :2]
+    err = s - np.cos(2 * np.pi * pts[:, 0]) * np.cos(2 * np.pi * pts[:, 1])
+    assert np.abs(err - err.mean()).max() < 3e-2  # P1 nodal error, measured 2.0e-2
+    corners = np.flatnonzero(np.isin(pts[:, 0].round(9), (0.0, 1.0)) & np.isin(pts[:, 1].round(9), (0.0, 1.0)))
+    assert corners.size == 4 and np.ptp(s[corners]) < 1e-12
+
+
+def test_bloch_ties_on_a_multi_box_lattice_recover_the_bloch_mode():
+    """A Bloch tie `u(left) = e^{-ik} u(right)` plus a plain one in y on the lattice of several boxes: the
+    manufactured mode `e^{ikx} cos(2 pi y)` of `-Δu + u = f` is recovered."""
+    k = np.pi / 2
+    d = _two_slabs().structured().domain()
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = (k**2 + 4 * np.pi**2 + 1.0) * jno.np.exp(1j * k * xi) * jno.np.cos(2 * np.pi * yi)
+    left, right, bottom, top = _tie_pairs(d, "left", "right", "bottom", "top")
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + u * vi - f * vi,
+            u(*left) - np.exp(-1j * k) * u(*right),
+            u(*bottom) - u(*top),
+        ]
+    )
+    sol = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).reshape(-1)
+    pts = np.asarray(fem.points)[:, :2]
+    exact = np.exp(1j * k * pts[:, 0]) * np.cos(2 * np.pi * pts[:, 1])
+    if sol.size == 2 * len(pts):  # real [Re; Im] layout
+        sol = sol[: len(pts)] + 1j * sol[len(pts) :]
+    assert fem._periodic["is_bloch"] and fem._periodic["coupling"] == "conforming"
+    assert np.abs(sol - exact).max() < 5e-2
+
+
+def test_periodic_ties_on_a_plan_that_does_not_fill_its_box_fail_by_name():
+    """An L-shaped union does not fill its bounding box: its left face (x = 0, y in [0, 1]) and right face
+    (x = 2, y in [0, 0.5]) are no translation of each other. The upper half of the left face has no partner;
+    it used to be clamped onto the end of the right face, tying the wrong nodes without a message."""
+    plan = (R(0, 0, 1, 1).name("a") + R(1, 0, 2, 0.5).name("b")).sized(0.1)
+    d = plan.structured().domain()
+    u, v = d.fem_symbols(names=("u", "v"))
+    xi, yi, _ = d.variable("interior", split=True)
+    ub, vb = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    left, right = _tie_pairs(d, "left", "right")
+    with pytest.raises(ValueError, match=r"periodic tie \(.*do not cover the same extent"):
+        jno.fem([ub.x * vb.x + ub.y * vb.y - vb, u(*left) - u(*right)]).solve()
