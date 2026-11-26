@@ -208,7 +208,7 @@ def test_the_post_solve_line_does_no_matvec():
     """A residual matvec in the log line was 10 % of every GPU solve (6.7 of 63 ms at 73k dofs), and
     redundant with the solve's own residual gate. The line must work with no operator products."""
     fem = _poisson()
-    out = fem.solve()
+    out = np.asarray(fem.solve())  # fem.solve() is a deferred node; the range is read from the evaluated array
 
     class NoMatvec:
         def __matmul__(self, other):

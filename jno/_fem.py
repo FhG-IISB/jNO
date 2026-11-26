@@ -3541,6 +3541,10 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
 
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), from inside the compiled program without stopping it. A deferred
+        solve reports when it is evaluated. Off by default, and then nothing is added to the program.
+
         A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
         (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
         ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
