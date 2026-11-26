@@ -83,6 +83,52 @@ def test_assembly_is_sparse_and_scales_past_the_dense_ceiling():
     assert np.max(np.abs(sol - exact)) < 1e-11, "the sparse assembly must stay nodally exact"
 
 
+def test_inner_of_grads_on_a_line_matches_the_u_x_spelling():
+    """`inner(grad(u, [x]), grad(v, [x]))` failed to build on a line ("cannot reshape array of shape (n, 1, 2, 1)")
+    while `u.x * v.x` built. 1D Poisson P1 is nodally exact, so both spellings recover x(1-x)/2."""
+    d = _line(0.1)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    grad, inner = jno.np.grad, jno.np.inner
+    fem = jno.fem([inner(grad(ui, [xi]), grad(vi, [xi])) - 1.0 * vi, u(xb) - 0.0])
+    x = np.asarray(d.mesh.points)[:, 0]
+    assert np.max(np.abs(np.asarray(fem.solve()) - x * (1.0 - x) / 2.0)) < 1e-11
+
+
+def test_inner_of_grads_in_a_transient_line_form_equals_the_u_x_spelling():
+    """The issue's form: `u.t*v + inner(grad(u,[x]), grad(v,[x]))` on a line with a time grid raised a reshape error.
+    It is the same operator and march as `u.t*v + u.x*v.x`."""
+    d = _line(0.1, time=(0.0, 0.05, 6))
+    u, phi = d.fem_symbols()
+    sp = d.variable("interior", split=True)
+    xi, ti = sp[0], sp[-1]
+    xb = d.variable("boundary", split=True)[0]
+    ci = d.variable("initial", split=True)[0]
+    ui, vi = u.bind(x=xi, t=ti), phi.bind(x=xi, t=ti)
+    bc = [u(xb) - 0.0, u(ci) - jno.np.sin(np.pi * ci)]
+    grad, inner = jno.np.grad, jno.np.inner
+    f_grad = jno.fem([ui.t * vi + inner(grad(ui, [xi]), grad(vi, [xi])), *bc])
+    f_dot = jno.fem([ui.t * vi + ui.x * vi.x, *bc])
+    sg, sd = f_grad.solve(), f_dot.solve()  # transient: trace nodes, evaluated rather than np.asarray-ed
+    traj = [np.asarray(jno.core([s.mean], domain=d).eval([s])) for s in (sg, sd)]
+    assert traj[0].shape[0] > 1 and np.isfinite(traj[0]).all()
+    np.testing.assert_allclose(traj[0], traj[1], rtol=1e-10, atol=1e-12)
+
+
+def test_inner_of_one_direction_grads_on_a_2d_domain_equals_the_u_x_spelling():
+    """`inner(grad(u, [x]), grad(v, [x]))` on a 2-D domain contracted the DOF axis of the test derivative away and
+    assembled a wrong (smaller) operator without an error."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    u, v = d.fem_symbols()
+    x, y = d.variable("interior", split=True)[:2]
+    a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    f_inner = jno.fem([jno.np.inner(jno.np.grad(a, [x]), jno.np.grad(t, [x])) + a.y * t.y])
+    f_dot = jno.fem([a.x * t.x + a.y * t.y])
+    np.testing.assert_allclose(_dense(f_inner.A), _dense(f_dot.A), rtol=1e-12, atol=1e-12)
+
+
 def test_line_domain_is_1d():
     d = _line(0.2)
     assert d.dimension == 1
