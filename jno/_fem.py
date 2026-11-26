@@ -9005,8 +9005,12 @@ def _fem_impl(
             # keyed in `_source_regions`) — pinning that region's whole node set, a volumetric hard
             # constraint used by subdomain / domain-decomposition solves. The default whole-domain
             # `volume` is still rejected (that signals a forgotten test function).
+            # A `domain.tag` point set that is not a boundary region (a corner node, a band of interior
+            # nodes) classifies as a volume term on that tag too; it pins its node set the same way.
             is_subregion_pin = support == "volume" and (
-                region in (getattr(domain, "_source_regions", {}) or {}) or _is_volume_region(domain, region)
+                region in (getattr(domain, "_source_regions", {}) or {})
+                or region in (getattr(domain, "_tag_predicates", {}) or {})
+                or _is_volume_region(domain, region)
             )
             if support != "boundary" and not is_subregion_pin:
                 raise ValueError(
