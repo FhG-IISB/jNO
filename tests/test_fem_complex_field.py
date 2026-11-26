@@ -183,3 +183,28 @@ def test_complex_dirichlet_written_with_bind_and_a_bare_part():
         sol, n, _ = _solve_dense(jno.fem([weak, *constraints]))
         np.testing.assert_allclose(sol[:n], 2.0, atol=1e-8)
         np.testing.assert_allclose(sol[n:], 0.0, atol=1e-8)
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32, np.complex128, np.complex64])
+@pytest.mark.parametrize("kind", ["jax", "numpy"])
+def test_a_constant_array_composes_with_a_complex_pair_in_every_operator(kind, dtype):
+    """`pair - jnp_array` used to raise "unsupported operand type(s)" while a numpy complex scalar worked:
+    `_as_pair` knew only Python numbers and expressions. A real array is a real constant, a complex array a pair of
+    constants, in `+ - *` and their reflected forms; the parts equal the same operation on Python complex numbers."""
+    import jax.numpy as jnp
+
+    from jno.trace import Literal
+    from jno.trace.views import ComplexPair
+
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.4).domain()
+    p, z = ComplexPair(Literal(3.0), Literal(4.0)), 3.0 + 4.0j
+    val = np.asarray([2.0 + 3.0j] if np.issubdtype(dtype, np.complexfloating) else [2.0]).astype(dtype)
+    arr, c = (jnp.asarray(val) if kind == "jax" else val), complex(val[0])
+    fwd = [lambda a, b: a + b, lambda a, b: a - b, lambda a, b: a * b]
+    for op in fwd + [lambda a, b, f=f: f(b, a) for f in fwd]:
+        got, want = op(p, arr), op(z, c)
+        assert isinstance(got, ComplexPair), f"expected a ComplexPair, got {type(got).__name__}"
+        parts = [e if e is not None else Literal(0.0) for e in (got._re, got._im)]
+        core = jno.core(parts, domain=d)
+        re, im = (np.asarray(v).reshape(-1)[0] for v in core.eval(core.constraints))
+        assert np.allclose([re, im], [want.real, want.imag], atol=1e-6), ([re, im], want)
