@@ -961,6 +961,12 @@ def _runtime_parameter_value_from_internal_vars(local, name):
     # Vector parameter: the whole vector; the form indexes it (k[i]) to a scalar coefficient.
     if name in local.get("vector_parameter_tags", ()):
         return flat
+    if arr.ndim >= 2:
+        # a nodal field parameter on a vector / tensor symbol: the cell's rows `(n_local, *value_shape)`, each
+        # component interpolated with the field's shape functions, `(n_quad, *value_shape)` like a field value
+        nodal = arr.reshape(arr.shape[0], -1)
+        at_q = jnp.sum(local.get("shape_vals")[:, :, None] * nodal[None, :, :], axis=1)
+        return _reshape_components_last(at_q, arr.shape[1:])
     # Scalar coefficient (incl. per-cell-constant): one value -> broadcast to quad.
     if flat.shape[0] == 1:
         return flat[0]
@@ -5823,7 +5829,7 @@ def sum_duplicate_triplets(A, nse: int | None = None):
     if nse is not None:
         return _sum_duplicates_static(A, nse=int(nse))
     try:
-        return A.sum_duplicates()  # nse inferred -> requires concrete indices
+        return A.sum_duplicates(remove_zeros=False)  # nse inferred -> concrete indices; a stored 0 keeps its derivative
     except Exception:  # noqa: BLE001 — traced operator: leave it alone rather than fail the assembly
         return A
 

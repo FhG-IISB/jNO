@@ -1781,6 +1781,20 @@ def assemble_fem_native(
                 "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component."
             )
     vector_parameter_tags: Tuple[str, ...] = tuple(sorted(_vector_param_sizes))
+    # A nodal field parameter on a VECTOR / tensor symbol holds `value_shape` values per vertex, rows by vertex. Its
+    # cell slice is gathered by rows, `(n_local, *value_shape)`, and interpolated per component. It was gathered
+    # as `flat[node ids]` from the flattened vector -- vertex j read component j % 2 of vertex j // 2 -- and that one
+    # scalar went into every component, with no error.
+    _field_vshape = {
+        n: tuple(np.shape(_rt_param_exprs[n].model.module.value)[1:])
+        for n in _field_param_names
+        if n not in _cell_field_names
+    }
+
+    def _field_param_zero(n):
+        if n in _field_vshape:
+            return jnp.zeros(np.shape(_rt_param_exprs[n].model.module.value))
+        return 0.0
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
@@ -3069,7 +3083,7 @@ def assemble_fem_native(
             elif name in _field_param_names:
                 # Nodal field parameter -> this cell's P1 vertex values, the space the parameter is
                 # defined on, independent of the fields whose terms mention it.
-                pv.append(flat[cells_j[c]])
+                pv.append(flat.reshape((-1,) + _field_vshape[name])[cells_j[c]])
             else:
                 # A parameter that is on NO FE space is a scalar, broadcast over the cell. An array
                 # here has no cell-to-value map, so `flat[:1]` would spread its FIRST entry over the
@@ -5317,12 +5331,22 @@ def assemble_fem_native(
                     # static-path trick) -- one extra single-point evaluation decides, shapes are static.
                     one = jnp.asarray(_eval_at(value_node, jnp.asarray(pts[:1]), params=a_one)).reshape(-1)
                 if raw.shape == one.shape or not node_ids:
-                    gvals = jnp.broadcast_to(raw.reshape(-1)[:1], (len(node_ids),))
+                    gtab = jnp.broadcast_to(one.reshape(1, -1), (len(node_ids), one.size))
                 else:
-                    gvals = raw.reshape(len(node_ids), -1)[:, 0]
+                    gtab = raw.reshape(len(node_ids), -1)
+                # one column per clamped component, as the static path: a vector value used to be cut to its first
+                # component and imposed on all of them (`u(b) - (0, a y)` imposed 0 -- the parameter never arrived)
+                n_values = int(gtab.shape[1])
+                if n_values != 1 and not (comp is None and n_values == vt):
+                    _dirichlet_value_columns(np.zeros((1, n_values)), vt, comp, region)  # the shape error, if one
+                    raise NotImplementedError(
+                        f"jno.fem: the Dirichlet value on {region!r} holds a parameter and {n_values} values per point "
+                        "on a symmetric field; prescribe it per component, `u(region)[i] - g_i`."
+                    )
                 for i, nid in enumerate(node_ids):
                     for c in range(vt) if comp is None else [int(comp)]:
-                        pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, gvals[i])))
+                        g_ic = gtab[i, 0] if n_values == 1 else gtab[i, c]
+                        pairs.append((offs[fidx] + nid * vt + c, _cover_g(fidx, nid, g_ic)))
                 continue
             if _vn is None or not _is_neural_coefficient(_vn):
                 continue
@@ -6165,7 +6189,8 @@ def assemble_fem_native(
         # arbitrary placeholder value they need not even lie in the mesh -- a solve always passes them.
         a0, b0 = _assemble_at(
             {_NO_POINTS: True}
-            | {n: 0.0 for n in runtime_parameter_tags}
+            # a nodal field parameter at zero in its own shape (one row per vertex), every other one a scalar zero
+            | {n: _field_param_zero(n) for n in runtime_parameter_tags}
             | {n: _neural_models[n].module for n in neural_param_names}
             | {n: m.module for n, m in _dir_net_models.items()}
             | {n: jnp.asarray(nd.model.module.value) for n, nd in _dir_param_exprs.items()}

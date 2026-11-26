@@ -606,7 +606,11 @@ class ScalarView(_DelegatesToPlaceholder):
             if getattr(_var, "_domain", None) is not None:
                 domain, coord_tag = _var._domain, getattr(_var, "tag", None)
                 break
-        frozen = FrozenField(self._expr, values, domain=domain, coord_tag=coord_tag)
+        # an unknown from `d.unknown()` is a valued field in this view; what is frozen is the trial symbol behind it,
+        # the field `fem_symbols()` would have handed out (as `u.test()` and `u.pin()` reach it)
+        source = self._expr
+        symbol = getattr(getattr(source, "model", None), "__dict__", {}).get("_unknown_symbol")
+        frozen = FrozenField(source if symbol is None else symbol, values, domain=domain, coord_tag=coord_tag)
         if cv:
             return _coords_dispatch(ScalarView(frozen), (), dict(cv))
         return ScalarView(frozen)

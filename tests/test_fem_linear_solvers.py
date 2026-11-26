@@ -500,3 +500,19 @@ def test_gmres_is_invariant_to_the_scale_of_the_data(scale):
     b = scale * jnp.ones(50)
     x = jno.solve.gmres(tol=1e-10)(jsp.BCOO.fromdense(A), b)
     assert float(jnp.linalg.norm(A @ x - b) / jnp.linalg.norm(b)) < 1e-9
+
+
+def test_the_sparse_direct_solve_differentiates_an_entry_stored_as_zero():
+    """an entry whose value is 0 but whose derivative is not (a P1 stiffness on a right-angled cell, a coefficient at 0)
+    still carries its derivative: merging repeated entries must not drop the stored zeros with their tangents"""
+    idx = jnp.asarray([[0, 0], [1, 1], [0, 1], [1, 0], [0, 0]], dtype=jnp.int32)  # (0, 0) repeated
+    b = jnp.asarray([1.0, 2.0])
+
+    def solve(s):
+        data = jnp.asarray([1.0, 2.0, 0.0, 0.0, 1.0]) + s * jnp.asarray([0.0, 0.0, 1.0, 1.0, 0.0])
+        return sparse_lu_solve(jsp.BCOO((data, idx), shape=(2, 2)), b)
+
+    _, got = jax.jvp(solve, (0.0,), (1.0,))
+    want = (solve(1e-6) - solve(-1e-6)) / 2e-6  # A = [[2, s], [s, 2]]: dx/ds = -A^-1 [[0, 1], [1, 0]] x
+    assert np.abs(np.asarray(want)).max() > 0.1
+    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-8)
