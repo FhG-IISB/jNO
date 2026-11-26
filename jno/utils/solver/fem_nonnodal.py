@@ -1495,7 +1495,9 @@ def assemble_fem_nonnodal(
                         C = jnp.einsum("q,qm,qcj->mcj", w, jnp.conj(E), J[:, :, s0:s1]) / area
                         return L, C
 
-                    L_f, C_f = jax.vmap(_per_facet)(jnp.arange(g["n_facets"]))  # (nf, M, n, n_test) / (nf, M, n, n_trial)
+                    L_f, C_f = jax.jit(jax.vmap(_per_facet))(
+                        jnp.arange(g["n_facets"])
+                    )  # (nf, M, n, n_test) / (nf, M, n, n_trial)
                     if C_f.shape[2] != n_c:
                         raise ValueError(
                             f"a face operator applied to a trace of {C_f.shape[2]} components declared {n_c}: apply it "
@@ -1518,9 +1520,21 @@ def assemble_fem_nonnodal(
                     # dense block ~6x bigger than the face and its factorisation front wider with it.
                     kr = _nonzero_lines(Lg)
                     kc = _nonzero_lines(Cg)
-                    blocks.append((rows_u[kr], cols_u[kc], jnp.einsum("mci,mcj->ij", Lg[:, :, kr], Cg[:, :, kc])))
-                for rows_u, cols_u, Ab in blocks:
-                    if wrap == "real":
+                    Lk, Ck = Lg[:, :, kr], Cg[:, :, kc]
+                    if wrap in ("real", "imag") and jnp.iscomplexobj(Lk) and jnp.iscomplexobj(Ck):
+                        # Only one part of the product is stored: a real GEMM over the stacked (re, im)
+                        # modes is half the flops and memory of the complex product.
+                        if wrap == "real":  # Re(L C) = Lr Cr - Li Ci
+                            Ls, Cs = jnp.concatenate([Lk.real, -Lk.imag]), jnp.concatenate([Ck.real, Ck.imag])
+                        else:  # Im(L C) = Lr Ci + Li Cr
+                            Ls, Cs = jnp.concatenate([Lk.real, Lk.imag]), jnp.concatenate([Ck.imag, Ck.real])
+                        blocks.append((rows_u[kr], cols_u[kc], jnp.einsum("mci,mcj->ij", Ls, Cs), True))
+                    else:
+                        blocks.append((rows_u[kr], cols_u[kc], jnp.einsum("mci,mcj->ij", Lk, Ck), False))
+                for rows_u, cols_u, Ab, taken in blocks:
+                    if taken:  # the wrapped part was already taken in the product
+                        pass
+                    elif wrap == "real":
                         Ab = Ab.real
                     elif wrap == "imag":
                         Ab = Ab.imag
@@ -1532,9 +1546,8 @@ def assemble_fem_nonnodal(
                                 "boundary term with its complex factor (e.g. -1j * ...), which makes the form complex."
                             )
                         Ab = Ab.real
-                    R_, C_ = np.meshgrid(rows_u, cols_u, indexing="ij")
-                    rows_all.append(R_.reshape(-1))
-                    cols_all.append(C_.reshape(-1))
+                    rows_all.append(np.repeat(rows_u.astype(np.int32), len(cols_u)))
+                    cols_all.append(np.tile(cols_u.astype(np.int32), len(rows_u)))
                     data_all.append(Ab.reshape(-1))
         idx = jnp.asarray(np.stack([np.concatenate(rows_all), np.concatenate(cols_all)], 1), dtype=jnp.int32)
         return idx, jnp.concatenate(data_all)
