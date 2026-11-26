@@ -426,8 +426,9 @@ class FVMParticipant(_StrongForm):
     stage_flux = True
 
     def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
-        """One window, compiled once per window length for an autonomous problem: the data are traced inputs
-        (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
+        """One window, compiled once per window length: the data and the window's start time are traced inputs
+        (the march reads the data through ``_override``, and the start as a shift of the clock a problem that reads
+        time marches on, ``_time_shift``: it marches ``[0, window]``). An explicit or IMEX scheme with ``cfl=`` decides its
         substeps inside the program, from the state at the window's start, so every window runs the same one.
         ``flux`` (a list of ``(expr, tag, interface)``): the march also takes the window mean of each flux as its
         scheme integrates it over its stages (see :meth:`Participant.march`)."""
@@ -435,15 +436,17 @@ class FVMParticipant(_StrongForm):
 
         params = params or {}
         keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
-        span = self._span(t0, window)
+        span = (0.0, float(window))
+        timed = not self.autonomous()
         state = jnp.asarray(state).reshape(-1)
         flux = list(flux or [])
         rows = [self._flux_rows(problem, e, tag, iface) for e, tag, iface in flux]
         sizes = [int(iface.weights.size) for _, _, iface in flux]
 
-        def run(values, pvalues, x0):
+        def run(values, pvalues, x0, start):
             d, p = dict(zip(keys, values)), dict(zip(pkeys, pvalues))
             problem._override = self._scope(problem, d, p)
+            problem._time_shift = start if timed else None
             try:
                 if not rows:
                     traj = jnp.asarray(problem._march(time=time, x0=x0, span=span))
@@ -451,17 +454,14 @@ class FVMParticipant(_StrongForm):
                 f = lambda U, t: jnp.concatenate([r(U, d, p) for r in rows])  # noqa: E731
                 traj, acc = problem._march(time=time, x0=x0, span=span, flux=f)
             finally:
-                problem._override = None
+                problem._override, problem._time_shift = None, None
             traj = jnp.asarray(traj)
             return traj.reshape(traj.shape[0], -1), acc / float(window)
 
-        args = ([data[k] for k in keys], [params[k] for k in pkeys], state)
+        args = ([data[k] for k in keys], [params[k] for k in pkeys], state, jnp.asarray(t0 if timed else 0.0, state.dtype))
         fkey = tuple((id(e), tag) for e, tag, _ in flux)
-        if not self.autonomous():  # its own times: compiled per window
-            out = _compiled({}, None, run, *args)
-        else:
-            cache = problem.__dict__.setdefault("_cpl_march", {})
-            out = _compiled(cache, (keys, pkeys, span, repr(time), fkey), run, *args)
+        cache = problem.__dict__.setdefault("_cpl_march", {})
+        out = _compiled(cache, (keys, pkeys, span, repr(time), fkey, timed), run, *args)
         if not rows:
             return self._frames(out)
         traj, mean = out
