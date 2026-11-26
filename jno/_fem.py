@@ -2160,7 +2160,9 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
                 )
             return comp, value_node
     if isinstance(bare, TrialFunction):
-        return None, 0.0
+        from .trace import Literal
+
+        return None, Literal(0.0)  # `u(region)` alone is `u(region) - 0.0`: a node, as every other value is
     raise ValueError(
         "jno.fem: could not read an essential condition from the residual. "
         "Write it as `u(region) - value` (e.g. `u(xl, yl) - 0.0`) or `u(xl, yl)[i] - value`."

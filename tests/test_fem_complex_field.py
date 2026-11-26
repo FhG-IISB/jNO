@@ -166,3 +166,20 @@ def test_plain_symbol_2d_parametric_complex_solves():
     uc = np.asarray(x[:n] + 1j * x[n : 2 * n])
     assert np.isfinite(np.asarray(x)).all()
     assert np.abs(uc.imag).max() > 1e-3, "the parametric 2D complex solve lost its imaginary part"
+
+
+def test_complex_dirichlet_written_with_bind_and_a_bare_part():
+    """``u.bind(x=xb, y=yb) - g`` on a boundary, with its parts listed as ``[c.real, c.imag]`` (the imaginary one
+    for a real ``g`` is the bare ``u_im``), and a bare ``u.imag(xb, yb)``, constrain like ``u.real(xb, yb) - g``:
+    a bare unknown on a boundary is ``u - 0``, not a float the evaluator cannot read."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3)
+    u, w = d.fem_symbols(complex=True)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ub, wb = u.bind(x=xi, y=yi), w.bind(x=xi, y=yi)
+    weak = (ub.x * wb.x + ub.y * wb.y).real  # Laplace: the boundary value fills the domain
+    bc = u.bind(x=xb, y=yb) - 2.0
+    for constraints in ([bc.real, bc.imag], [u.real(xb, yb) - 2.0, u.imag(xb, yb)], [bc]):
+        sol, n, _ = _solve_dense(jno.fem([weak, *constraints]))
+        np.testing.assert_allclose(sol[:n], 2.0, atol=1e-8)
+        np.testing.assert_allclose(sol[n:], 0.0, atol=1e-8)
