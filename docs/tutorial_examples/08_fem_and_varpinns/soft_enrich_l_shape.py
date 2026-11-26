@@ -53,7 +53,6 @@ from jno.utils.solver.fem_soft_cover import (  # noqa: E402
     ritz_energy,
     soft_solve,
 )
-from jno.utils.solver.linear import sparse_lu_solve  # noqa: E402
 
 L_SHAPE = [(0, 0), (1.0, 0), (1.0, 0.5), (0.5, 0.5), (0.5, 1.0), (0, 1.0)]
 BUMP = (0.74, 0.22, 0.17, 60.0)  # cx, cy, R, amplitude
@@ -81,8 +80,7 @@ def build(size, mask=None):
     return d, fem, ui
 
 
-def solve_fn(a, b):
-    return sparse_lu_solve(a, b)
+LU = jno.solve.lu()  # sparse-direct: `linear=LU` into each adaptive round, `LU(A, b)` on a matrix
 
 
 # --- compile counter (C) -------------------------------------------------------------------------------
@@ -99,7 +97,7 @@ jax.monitoring.register_event_duration_secs_listener(_on_event)
 # --- reference and the coarse fully enriched operator ---------------------------------------------------
 d_ref, fem_ref, _ = build(H_REF)
 A_ref, b_ref = fem_ref.operator
-PI_REF = float(ritz_energy(A_ref, b_ref, sparse_lu_solve(A_ref, b_ref)))
+PI_REF = float(ritz_energy(A_ref, b_ref, LU(A_ref, b_ref)))
 
 d0, fem0, ui0 = build(H)
 A, b = fem0.operator
@@ -140,7 +138,7 @@ print(f"  error (Pi - Pi_ref):  P1 {E_P1:.4e}    full cover {E_FULL:.4e}")
 # --- greedy enrich loop: the existing path, and the budgets every comparison uses -----------------------
 d_g, fem_g, ui_g = build(H)
 c0 = _compiles[0]
-fem_g.solve(solve_fn, adapt=jno.solve.enrich(criterion=jno.np.sqrt(ui_g.x**2 + ui_g.y**2), theta=0.5, max_iters=6))
+fem_g.solve(adapt=jno.solve.enrich(criterion=jno.np.sqrt(ui_g.x**2 + ui_g.y**2), theta=0.5, max_iters=6), linear=LU)
 compiles_greedy = _compiles[0] - c0
 rounds = fem_g.adapt_history
 masks_g = [np.asarray(r["enriched"], dtype=bool) for r in rounds] + [np.asarray(d_g._fem_enriched_nodes, dtype=bool)]
@@ -149,7 +147,7 @@ budgets = [int(m.sum()) for m in masks_g]
 
 # hard-path cross-check of the soft energy on the loop's final mask (the loop rebinds fem_g to it)
 A_m, b_m = fem_g.operator
-E_hard = float(ritz_energy(A, b, sparse_lu_solve(A_m, b_m))) - PI_REF
+E_hard = float(ritz_energy(A, b, LU(A_m, b_m))) - PI_REF
 E_soft = err(masks_g[-1].astype(float))
 print(f"  hard mask vs soft w in {{0,1}} on the loop's final mask: {E_hard:.6e} vs {E_soft:.6e}")
 

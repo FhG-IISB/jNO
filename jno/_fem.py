@@ -4157,15 +4157,24 @@ class FEM:
                 return run_adaptive_relocate(self, adapt, solve_fn=solve_fn, **kwargs)
             # x0= (warm start) and time= do not compose with a remesh — the DOF layout changes across it,
             # staling a warm start and any cached step operator. The nonlinear=/linear=/precond= slots DO
-            # compose: they configure the per-step (Newton / theta) solve, which is layout-independent —
-            # but only on the transient adaptive driver, which owns the march.
-            _adapt_step_slots = (nonlinear is not None) or (linear is not None) or (precond is not None)
-            if (x0 is not None) or (time is not None) or (_adapt_step_slots and self._mode != "transient"):
+            # compose: they configure the per-step (Newton / theta) solve or the steady solve, which is
+            # layout-independent. The transient driver takes them as arguments; the steady loop forwards
+            # them to the solve it repeats on every remeshed problem.
+            if (x0 is not None) or (time is not None):
                 raise NotImplementedError(
-                    "fem.solve: adapt= composes with the nonlinear=/linear=/precond= slots only on a "
-                    "transient problem; x0= (warm start) and time= do not compose with remeshing (the DOF "
-                    "layout changes across a remesh). Drop them, or pass solve_fn= for a custom loop."
+                    "fem.solve: adapt= does not take x0= (warm start) or time=: the DOF layout changes "
+                    "across a remesh, which stales both. Drop them, or pass solve_fn= for a custom loop. "
+                    "The nonlinear=/linear=/precond= slots are accepted."
                 )
+            if self._mode != "transient":
+                kwargs = {
+                    **kwargs,
+                    **{
+                        k: v
+                        for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond))
+                        if v is not None
+                    },
+                }
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if getattr(adapt, "split", False) and self._mode == "transient":

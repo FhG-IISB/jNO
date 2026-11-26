@@ -122,3 +122,25 @@ def test_a_criterion_run_returns_the_solution_on_the_final_mesh():
     assert np.asarray(out).size == int(fem.dofs) == int(np.asarray(fem.domain.mesh.points).shape[0])
     assert np.all(np.isfinite(out))
 
+
+def test_a_steady_adaptive_solve_takes_the_linear_slot_on_every_remeshed_problem():
+    """`linear=` reaches the solve of each round: a direct solve gives the default's answer on the adapted mesh,
+    and a one-iteration CG is refused by the solver's own residual gate, so the slot is demonstrably the one
+    that ran."""
+    spec = jno.solve.remesh(criterion=lambda dm: jno.le(dm.cell_aspect(), 2.0), max_iters=3)
+    _, f0 = _poisson(skew=0.45)
+    u_default = np.asarray(f0.solve(adapt=spec))
+    _, f1 = _poisson(skew=0.45)
+    u_lu = np.asarray(f1.solve(adapt=spec, linear=jno.solve.lu()))
+    assert len(f1.adapt_history) >= 2  # the slot ran on a remeshed problem too
+    assert u_lu.shape == u_default.shape
+    np.testing.assert_allclose(u_lu, u_default, atol=1e-5)
+    _, f2 = _poisson(skew=0.45)
+    with pytest.raises(RuntimeError, match="did not solve the system"):
+        f2.solve(adapt=spec, linear=jno.solve.cg(maxiter=1))
+
+
+def test_a_steady_adaptive_solve_still_refuses_a_warm_start():
+    _, fem = _poisson()
+    with pytest.raises(NotImplementedError, match="x0= .warm start. or time="):
+        fem.solve(adapt=jno.solve.remesh(max_iters=1), x0=np.zeros(1))

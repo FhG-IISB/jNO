@@ -91,15 +91,10 @@ def build(size, space="Lagrange", movable=False):
     return d, fem, stiff
 
 
-def solve_fn(a, b):
-    """Sparse-direct, handed to ``adapt=`` positionally.
-
-    ``adapt=`` does not take the ``linear=`` slot on a steady problem, so a non-default linear solver
-    has to arrive as ``solve_fn``. The reference reaches ~12k DOFs, where a dense factorisation is a
-    gigabyte; an enriched system is also the least well-conditioned of the three."""
-    from jno.utils.solver.linear import sparse_lu_solve
-
-    return sparse_lu_solve(a, b)
+# Sparse-direct for every solve below: the reference reaches ~12k DOFs, where a dense factorisation is a
+# gigabyte, and an enriched system is the least well-conditioned of the three. `linear=` carries it into
+# each adaptive round; `LU(A, b)` solves a matrix directly.
+LU = jno.solve.lu()
 
 
 def energy(fem, stiff, sol):
@@ -150,16 +145,16 @@ def _min_angle(pts, cells):
 # shows up as a negative error. A fully enriched (cover) reference is third order instead. The drift from
 # h=0.020 to h=0.015 is 4.8e-06 -- well under the smallest error below, which is what this is quoted to.
 d_ref, fem_ref, stiff_ref = build(0.015, space="cover")
-E_REF = energy(fem_ref, stiff_ref, solve_fn(fem_ref.A, fem_ref.b))
+E_REF = energy(fem_ref, stiff_ref, LU(fem_ref.A, fem_ref.b))
 
 d0, fem0, stiff0 = build(H)
-E0, n0 = energy(fem0, stiff0, solve_fn(fem0.A, fem0.b)), active_dofs(d0, fem0)
+E0, n0 = energy(fem0, stiff0, LU(fem0.A, fem0.b)), active_dofs(d0, fem0)
 pts0, tris0 = np.asarray(d0.mesh.points)[:, :2], np.asarray(d0.mesh.cells_dict["triangle"])
 
 # (1) h -- ADD elements. One call runs solve -> ZZ estimate -> Dorfler mark -> local remesh.
 d_h, fem_h, stiff_h = build(H)
-fem_h.solve(solve_fn, adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.7))
-E_h, n_h = energy(fem_h, stiff_h, solve_fn(fem_h.A, fem_h.b)), active_dofs(d_h, fem_h)
+fem_h.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.7), linear=LU)
+E_h, n_h = energy(fem_h, stiff_h, LU(fem_h.A, fem_h.b)), active_dofs(d_h, fem_h)
 pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_dict["triangle"])
 
 # (2) r -- RELOCATE a fixed node set, down a mesh functional, through the differentiable solve.
@@ -171,7 +166,7 @@ pts_h, tris_h = np.asarray(d_h.mesh.points)[:, :2], np.asarray(d_h.mesh.cells_di
 #     the QUADRATURE of the bump rather than the accuracy of u, and lands above the converged energy.
 d_r, fem_r, stiff_r = build(H, movable=True)
 pts_r0 = np.asarray(d_r.mesh.points)[:, :2].copy()  # coarse start, for the animation
-sol_r = np.asarray(fem_r.solve(solve_fn, adapt=jno.solve.relocate(max_iters=30, lr=5e-4))).reshape(-1)
+sol_r = np.asarray(fem_r.solve(adapt=jno.solve.relocate(max_iters=30, lr=5e-4), linear=LU)).reshape(-1)
 E_r, n_r = energy(fem_r, stiff_r, sol_r), active_dofs(d_r, fem_r)
 pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_dict["triangle"])
 
@@ -179,8 +174,8 @@ pts_r, tris_r = np.asarray(d_r.mesh.points)[:, :2], np.asarray(d_r.mesh.cells_di
 #     is only the value slots, so re-solve on the final space for the full coefficient vector (the loop
 #     leaves `fem` bound to it -- one solve, not a rebuild).
 d_p, fem_p, stiff_p = build(H, space="cover")
-fem_p.solve(solve_fn, adapt=jno.solve.enrich(theta=0.8, max_iters=5))
-E_p, n_p = energy(fem_p, stiff_p, solve_fn(fem_p.A, fem_p.b)), active_dofs(d_p, fem_p)
+fem_p.solve(adapt=jno.solve.enrich(theta=0.8, max_iters=5), linear=LU)
+E_p, n_p = energy(fem_p, stiff_p, LU(fem_p.A, fem_p.b)), active_dofs(d_p, fem_p)
 mask_p = np.asarray(d_p._fem_enriched_nodes, dtype=bool)
 pts_p = np.asarray(d_p.mesh.points)[:, :2]
 
@@ -191,10 +186,10 @@ pts_p = np.asarray(d_p.mesh.points)[:, :2]
 #     mask, and a loop that began fully enriched would have nothing left to select; enrich called a
 #     SECOND time does resume from the mask it left.
 d_hp, fem_hp, stiff_hp = build(H, space="cover")
-fem_hp.solve(solve_fn, adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.7))
+fem_hp.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=3, refine_factor=1.7), linear=LU)
 n_hp_after_h = active_dofs(d_hp, fem_hp)
-fem_hp.solve(solve_fn, adapt=jno.solve.enrich(theta=0.8, max_iters=4))
-E_hp, n_hp = energy(fem_hp, stiff_hp, solve_fn(fem_hp.A, fem_hp.b)), active_dofs(d_hp, fem_hp)
+fem_hp.solve(adapt=jno.solve.enrich(theta=0.8, max_iters=4), linear=LU)
+E_hp, n_hp = energy(fem_hp, stiff_hp, LU(fem_hp.A, fem_hp.b)), active_dofs(d_hp, fem_hp)
 mask_hp = np.asarray(d_hp._fem_enriched_nodes, dtype=bool)
 
 err = lambda E: E_REF - E  # noqa: E731  -- energy rises toward the truth; see the module docstring
@@ -257,7 +252,7 @@ plt.rcParams.update(
 TEAL, INK, BLUE, GRAY, RUST = "#0D9488", "#1A202C", "#0072B2", "#94A3B8", "#B45309"
 fig, ax = plt.subplots(1, 4, figsize=(17.0, 4.3))
 
-sol0 = np.asarray(solve_fn(fem0.A, fem0.b)).reshape(-1)
+sol0 = np.asarray(LU(fem0.A, fem0.b)).reshape(-1)
 tp = ax[0].tripcolor(Triangulation(pts0[:, 0], pts0[:, 1], tris0), sol0, shading="gouraud", cmap="magma")
 ax[0].add_patch(plt.Circle((cx, cy), R, fill=False, ec="white", lw=0.8, alpha=0.7))
 ax[0].plot([CORNER[0]], [CORNER[1]], "x", color="white", ms=8, mew=2.0)
