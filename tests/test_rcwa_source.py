@@ -56,12 +56,6 @@ def _engine_emit(eps_sub, orient=(1, 0, 0), amp=1.0, kind="delta", fwhm=0.2):
     return float(s.power("up")), float(s.power("down")), float(s.extraction("up"))
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_engine_vacuum_emits_symmetrically():
     """An x-dipole at the centre of a vacuum slab radiates equally up and down (symmetric environment)."""
     up, down, extr = _engine_emit(1.0)
@@ -69,12 +63,6 @@ def test_engine_vacuum_emits_symmetrically():
     assert extr == pytest.approx(0.5, abs=1e-6)
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_engine_orientation_matters():
     """A z-oriented dipole radiates differently from an in-plane (x) dipole — orientation is a real knob."""
     up_x, _, _ = _engine_emit(1.0, orient=(1, 0, 0))
@@ -82,17 +70,64 @@ def test_engine_orientation_matters():
     assert abs(up_z - up_x) > 1e-2
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_engine_power_scales_with_amplitude_squared():
     """Emitted power is quadratic in the source amplitude (|amp·source|²) — the differentiable scaling."""
     up1, _, _ = _engine_emit(1.0, amp=1.0)
     up2, _, _ = _engine_emit(1.0, amp=2.0)
     assert up2 / up1 == pytest.approx(4.0, rel=1e-5)
+
+
+def _emit_with(layers0, src_layer=1):
+    """A delta x-dipole at the centre of the slab film of ``layers0`` (full-stack
+    index ``src_layer``), returning (up, down)."""
+    rc = Rcwa(layers0, period=(1.0, 1.0), orders=60, wavelength=1.0, k_in=(1e-3, 1e-3), assume_periodic=True)
+    src = dict(
+        loc=[[0.5, 0.5]],
+        layer=src_layer,
+        t_upper=0.5,
+        t_lower=0.5,
+        kind="delta",
+        orient=(1, 0, 0),
+        amp=1.0,
+    )
+    s = rc.solve(source=src)
+    return float(s.power("up")), float(s.power("down"))
+
+
+def test_engine_isotropic_tuple_ambient_source_solve_matches_scalar():
+    """A TUPLE ambient (the sigma=0 PML identity 10-comp frame) in an internal-
+    source solve equals the scalar-air solve: the source seam now wires through
+    the SHARED ``_backend_materials`` (whose ``_amb`` reduces a tuple the same
+    way the plane-wave core does). The old hand-rolled local ``_amb`` in
+    ``_solve_source`` sliced a tuple wrongly (IndexError on a 5-tuple, or a
+    silently-broadcast (1,) eps_xx). Regression for iss_mwwg1tdr961kmc."""
+    frame0 = (1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0)  # sigma=0: identity tensor
+    up1, down1 = _emit_with([(float("inf"), 1.0), (1.0, 1.0), (float("inf"), 2.25)])
+    up2, down2 = _emit_with([(float("inf"), frame0), (1.0, 1.0), (float("inf"), 2.25)])
+    assert up2 == pytest.approx(up1, rel=1e-6)
+    assert down2 == pytest.approx(down1, rel=1e-6)
+
+
+def test_engine_anisotropic_tuple_ambient_source_solve_raises_loudly():
+    """A per-solve genuinely anisotropic TUPLE ambient in an internal-source
+    solve raises loudly (the compiled seam would corner-slice it to eps_xx) --
+    never a silent eps_xx solve. Regression for iss_mwwg1td18yoeng (per-solve
+    tuple ambients) surfaced through the source path (iss_mwwg1tdr961kmc)."""
+    with pytest.raises(RcwaError, match="anisotropic|ambient"):
+        _emit_with([(float("inf"), 1.0), (1.0, 1.0), (float("inf"), (2.0, 0.0, 0.0, 9.0, 2.0))])
+
+
+def test_engine_pml_folded_frame_source_solve_raises_aniso_film_limitation():
+    """A sigma>0 (folded) PML frame in an internal-source solve no longer dies
+    with the misattributed 'eps_grids has N entries for N+1 backend layers'
+    (the pre-fix ``eps_grids=grids[1:-1]`` slice stripped the folded film). The
+    fold-aware ``_backend_materials`` wiring reaches the backend, which raises
+    its OWN accurately-scoped limitation: anisotropic films are not supported
+    in internal-source solves. Regression for iss_mwwg1tdr961kmc."""
+    sxa, sya = 1.0 + 0.4j, 1.0 + 0.2j
+    lam = (sya / sxa, 0.0, 0.0, sxa / sya, sxa * sya)
+    with pytest.raises(RcwaError, match="scalar-isotropic|anisotropic"):
+        _emit_with([(float("inf"), lam + lam), (1.0, 1.0), (float("inf"), 2.25)])
 
 
 # ----------------------------- front door (author the emitter in the weak form) -----------------------------
@@ -152,12 +187,6 @@ def _emitter_cons(d, Lx, eps_sub=1.0, amp=None, eps_top=1.0):
     return [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt) * vbt, ul - ur, uf - ub]
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_frontdoor_emitter_readouts_finite_and_bounded():
     """Author a Gaussian emitter as a `- src·v` volume forcing: the front door infers it and returns finite
     up/down power with an extraction fraction in (0, 1)."""
@@ -171,12 +200,6 @@ def test_frontdoor_emitter_readouts_finite_and_bounded():
     assert float(s.power("total")) == pytest.approx(up + down, rel=1e-6)
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_frontdoor_high_index_substrate_biases_emission_down():
     """A higher-index substrate pulls emission downward — extraction into the top (up) drops. Classic
     substrate-emission physics, inferred from the traced problem."""
@@ -186,12 +209,6 @@ def test_frontdoor_high_index_substrate_biases_emission_down():
     assert extr_hi < extr_vac - 1e-2
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_source_amplitude_is_differentiable():
     """A trainable source amplitude (jno.np.parameter) flows through the emission solve: rc.solve().power is a
     trace node over it, and jax.grad matches a finite difference (power ∝ amp²)."""
@@ -212,12 +229,6 @@ def test_source_amplitude_is_differentiable():
     assert abs(g) > 1e-6  # the amplitude genuinely drives the power
 
 
-@needs_fmmax
-@pytest.mark.skip(
-    reason="internal-source emission solves are stage 2 (task T29): the backend's "
-    "Maxwell-jump source terms aren't wired yet; rc.solve(source=...) raises a "
-    "loud RcwaError naming the task."
-)
 def test_source_width_is_differentiable():
     """The emitter's Gaussian WIDTH (a jno.np.parameter) flows through the localization + emission solve: a
     wider soft source couples less into the propagating modes, and jax.grad of the emitted power w.r.t. the
@@ -259,7 +270,6 @@ def test_source_width_is_differentiable():
     assert abs(g) > 1e-2  # the width genuinely changes the emission
 
 
-@needs_fmmax
 def test_source_outside_finite_layer_raises():
     """A source that lands in a semi-infinite ambient (no permittivity contrast to define a finite slab) is
     rejected with a concrete fix."""
@@ -287,7 +297,6 @@ def test_source_outside_finite_layer_raises():
         jno.rcwa(cons, orders=40, grid=28)
 
 
-@needs_fmmax
 @pytest.mark.parametrize("dielectric_top", [True, False])
 def test_emitter_wavelength_is_the_vacuum_one_whichever_ambient_is_dielectric(dielectric_top):
     """#386: k0 is read from the vacuum-side ambient, so a dielectric top (or bottom) ambient must not make the
@@ -300,3 +309,160 @@ def test_emitter_wavelength_is_the_vacuum_one_whichever_ambient_is_dielectric(di
     assert abs(eps[0] - (n**2 if dielectric_top else 1.0)) < 1e-2, eps
     assert abs(eps[-1] - (1.0 if dielectric_top else n**2)) < 1e-2, eps
     assert abs(eps[1] - 6.0) < 1e-2, eps
+
+
+# ----------------------------- fmmax oracle (test-only) -----------------------------
+@needs_fmmax
+def test_engine_delta_source_matches_fmmax_oracle():
+    """The backend's jump-condition emission solve reproduces fmmax's
+    ``amplitudes_for_source`` powers (up/down) in the engine geometry -- the
+    audio chain, not self-consistency. Anchored at orders=60 in complex128."""
+    import fmmax
+    from fmmax import basis as fmmax_basis
+    from fmmax import fields as fmmax_fields
+    from fmmax import fmm, scattering, sources
+
+    def fmmax_powers(eps_sub, orient, amp, kind, fwhm):
+        lv = fmmax_basis.LatticeVectors(u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0]))
+        ex = fmmax_basis.generate_expansion(lv, approximate_num_terms=60)
+        kin = jnp.asarray((1e-3, 1e-3))
+        layers = [1.0, 1.0, eps_sub]
+
+        def ls(eps):
+            return fmm.eigensolve_isotropic_media(
+                wavelength=jnp.asarray(1.0),
+                in_plane_wavevector=kin,
+                primitive_lattice_vectors=lv,
+                permittivity=jnp.asarray([[eps]]),
+                expansion=ex,
+                formulation=fmmax.Formulation.FFT,
+            )
+
+        lsr = [ls(e) for e in layers]
+        before = lsr[:2]
+        before_t = [1.0, 0.5]
+        after = lsr[1:]
+        after_t = [0.5, 1.0]
+        s_before = scattering.stack_s_matrix(before, before_t)
+        s_after = scattering.stack_s_matrix(after, after_t)
+        loc = jnp.asarray([[0.5, 0.5]])
+        if kind == "gaussian":
+            base = sources.gaussian_source(jnp.asarray(fwhm), loc, kin, lv, ex)
+        else:
+            base = sources.dirac_delta_source(loc, kin, lv, ex)
+        ox, oy, oz = orient
+        ampv = jnp.asarray(amp) + 0j
+        jx, jy, jz = ampv * ox * base, ampv * oy * base, ampv * oz * base
+        bwd0, _, _, _, _, fN = sources.amplitudes_for_source(jx, jy, jz, s_before, s_after)
+        _, ub = fmmax_fields.directional_poynting_flux(jnp.zeros_like(bwd0), bwd0, lsr[0])
+        df, _ = fmmax_fields.directional_poynting_flux(fN, jnp.zeros_like(fN), lsr[-1])
+        return float(jnp.abs(jnp.sum(jnp.real(ub)))), float(jnp.abs(jnp.sum(jnp.real(df))))
+
+    from jno._rcwa import sources as jno_sources
+    from jno._rcwa.stack import StateStack
+
+    def ours(eps_sub, orient, amp, kind, fwhm):
+        st = StateStack(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            amb_sup=1.0,
+            amb_sub=eps_sub,
+            layers=[(1.0, 1.0)],
+            orders=60,
+            k_in=(1e-3, 1e-3),
+            dtype=jnp.complex128,
+        )
+        src = dict(
+            layer=0,
+            t_upper=0.5,
+            t_lower=0.5,
+            kind=kind,
+            loc=np.array([[0.5, 0.5]]),
+            orient=np.asarray(orient, float),
+            amp=amp,
+            fwhm=fwhm,
+        )
+        up, down = jno_sources.emission_solve(st, src)
+        return float(up), float(down)
+
+    for orient, kind in [((1, 0, 0), "delta"), ((0, 0, 1), "delta"), ((1, 0, 0), "gaussian")]:
+        for eps_sub in (1.0, 9.0):
+            up_o, down_o = fmmax_powers(eps_sub, orient, 1.0, kind, 0.2)
+            up, down = ours(eps_sub, orient, 1.0, kind, 0.2)
+            assert up == pytest.approx(up_o, rel=2e-4), (orient, kind, eps_sub, "up")
+            assert down == pytest.approx(down_o, rel=2e-4), (orient, kind, eps_sub, "down")
+
+
+# ----------------------------- energy + gradient anchors -----------------------------
+def test_emission_energy_anchor_absorption():
+    """The emitted power up+down equals the source's radiated power minus what a lossy
+    (absorbing) film consumes -- a monotone drop with the film's imaginary part."""
+    from jno._rcwa import sources as jno_sources
+    from jno._rcwa.stack import StateStack
+
+    def total(eps_film):
+        st = StateStack(
+            wavelength=1.0,
+            period=(1.0, 1.0),
+            amb_sup=1.0,
+            amb_sub=2.25,
+            layers=[(0.6, eps_film), (0.4, 1.0)],
+            orders=60,
+            k_in=(1e-3, 1e-3),
+            dtype=jnp.complex128,
+        )
+        up, down = jno_sources.emission_solve(
+            st,
+            dict(layer=0, t_upper=0.3, t_lower=0.3, kind="delta", loc=[[0.5, 0.5]], orient=[1, 0, 0], amp=1.0, fwhm=0.2),
+        )
+        return float(up) + float(down)
+
+    t0 = total(4.0)
+    assert t0 > 0 and np.isfinite(t0)
+    prev = t0
+    for imag in (0.1, 0.5, 1.0):
+        t = total(4.0 + 1j * imag)
+        assert t < prev * (1 - 1e-3), (imag, t, prev)  # absorption strictly eats power
+        prev = t
+
+
+def test_emission_gradient_matches_central_fd_c128():
+    """The emitted power is differentiable in the source-film permittivity: the native JVP
+    matches a random-direction CENTRAL finite difference anchored in complex128 at h=1e-2
+    (the lesson's design; a one-cell forward difference would read as a false mismatch)."""
+    from jno._rcwa import sources as jno_sources
+    from jno._rcwa.stack import StateStack
+
+    st = StateStack(
+        wavelength=1.0,
+        period=(1.0, 1.0),
+        amb_sup=1.0,
+        amb_sub=2.25,
+        layers=[(0.5, 4.0)],
+        orders=40,
+        k_in=(1e-3, 1e-3),
+        dtype=jnp.complex128,
+    )
+
+    def Pv(v):  # v: the source film's (traced) complex scalar permittivity
+        up, down = jno_sources.emission_solve(
+            st,
+            dict(layer=0, t_upper=0.25, t_lower=0.25, kind="delta", loc=[[0.5, 0.5]], orient=[1, 0, 0], amp=1.0, fwhm=0.2),
+            eps_grids=[jnp.full((1, 1), jnp.asarray(v, dtype=jnp.complex128))],
+        )
+        return up + down
+
+    v0 = jnp.asarray(4.0, dtype=jnp.float64)
+    rng = np.random.default_rng(0)
+    d = rng.standard_normal(2)
+    d = d / np.linalg.norm(d)
+    d_c = jnp.asarray(d[0] + 1j * d[1], dtype=jnp.complex128)  # random complex direction
+
+    def Pdir(t):
+        return Pv(v0 + t * d_c)
+
+    g = float(jax.grad(Pdir)(0.0))
+    h = 1e-2
+    fd = (float(Pdir(h)) - float(Pdir(-h))) / (2 * h)
+    assert abs(g) > 1e-4  # the permittivity genuinely drives the emission
+    assert g == pytest.approx(fd, rel=5e-3), (g, fd)

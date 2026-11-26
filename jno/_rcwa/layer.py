@@ -87,6 +87,7 @@ def assemble_M_L(
     z_permittivity: jnp.ndarray,
     transverse_permittivity: jnp.ndarray,
     transverse_permeability: Optional[jnp.ndarray] = None,
+    z_permeability: Optional[jnp.ndarray] = None,
 ) -> jnp.ndarray:
     """The ``4n x 4n`` operator ``M_L`` for a patterned layer.
 
@@ -95,8 +96,11 @@ def assemble_M_L(
         transverse_wavevectors: Per-order ``(n, 2)`` wavevectors.
         z_permittivity: Fourier matrix of the zz permittivity (``n x n``).
         transverse_permittivity: The transverse permittivity matrix ``E_t``
-            (from ``matrices.transverse_matrices_isotropic``).
+            (from ``matrices.transverse_matrices_isotropic`` or
+            ``..._anisotropic``).
         transverse_permeability: ``M_t``; ``None`` means nonmagnetic (identity).
+        z_permeability: Fourier matrix of the zz permeability (``n x n``);
+            ``None`` means nonmagnetic (``K = K_E^T K_E``).
 
     Returns:
         ``M_L`` of shape ``(4n, 4n)`` in the ``(u | v)`` block layout.
@@ -107,7 +111,7 @@ def assemble_M_L(
     two_n = 2 * n
 
     script_k = matrices.script_k_matrix_patterned(z_permittivity, transverse_wavevectors)
-    k_mat = matrices.k_matrix_patterned(transverse_wavevectors)
+    k_mat = matrices.k_matrix_patterned(transverse_wavevectors, z_permeability_matrix=z_permeability)
     if transverse_permeability is None:
         m_t = jnp.eye(two_n, dtype=dtype)
     else:
@@ -205,11 +209,151 @@ def matrix_inf_norm(x) -> float:
     return float(onp.max(onp.sum(onp.abs(onp.asarray(x)), axis=-1)))
 
 
+def uniform_aniso_spectral_norm(
+    eps_comps,
+    mu_comps,
+    transverse_wavevectors: jnp.ndarray,
+    omega,
+    thickness: float,
+    dtype: jnp.dtype = jnp.complex64,
+) -> float:
+    """Host-side bound on ``||expm(i M_L d)``'s argument for a *uniform* aniso layer.
+
+    The uniform-aniso transfer is a per-order problem: ``M_L`` is block-diagonal
+    over orders with ``4x4`` blocks ``[[0, B_i], [C_i, 0]]``. The Pade squaring
+    count must be static, so at build we bound ``max_i ||i M_L^{(i)} d||_infty``
+    from the CONCRETE prototype components -- the same stability-margin
+    discipline as ``squarings_for_spectral_norm`` on patterned layers. Returns
+    the norm (not the squaring count); the eager caller picks the count and the
+    traced core reuses it.
+    """
+    import numpy as onp
+
+    n = transverse_wavevectors.shape[0]
+    kx = onp.asarray(transverse_wavevectors[:, 0])
+    ky = onp.asarray(transverse_wavevectors[:, 1])
+
+    def _scalar(c):
+        """The tensor component as a complex scalar for the norm bound.
+
+        Uniform layers carry scalar/(1,1) values; a build-PATTERNED tensor layer
+        (which may collapse to a constant per-solve) contributes its max-abs
+        value -- a conservative upper bound on the per-order block norm, so the
+        static squaring count stays valid for any constant collapse within the
+        prototype's magnitude range."""
+        a = onp.asarray(c)
+        if a.ndim == 0:
+            return complex(a)
+        return complex(a.reshape(-1)[onp.argmax(onp.abs(a.reshape(-1)))])
+
+    ee = [_scalar(c) for c in eps_comps]
+    eps_xx, eps_xy, eps_yx, eps_yy, eps_zz = ee
+    if mu_comps is None:
+        mu_xx = mu_yy = mu_zz = 1.0
+        mu_xy = mu_yx = 0.0
+    else:
+        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = [_scalar(c) for c in mu_comps]
+    om = complex(omega)
+    cdt_eps = onp.result_type(*[onp.asarray(c).dtype for c in ee], dtype)
+    x = onp.zeros((n, 4, 4), cdt_eps)
+    kx2, ky2, kxky = kx * kx, ky * ky, kx * ky
+    # Per-order 2x2 blocks, transposed mirror of the JAX path (only used for the norm).
+    b = onp.stack(
+        [
+            onp.stack([om * mu_xx - ky2 / (eps_zz * om), om * mu_xy + kxky / (eps_zz * om)], -1),
+            onp.stack([om * mu_yx + kxky / (eps_zz * om), om * mu_yy - kx2 / (eps_zz * om)], -1),
+        ],
+        -2,
+    )
+    c = onp.stack(
+        [
+            onp.stack([om * eps_yy - kx2 / (mu_zz * om), om * (-eps_yx) - kxky / (mu_zz * om)], -1),
+            onp.stack([om * (-eps_xy) - kxky / (mu_zz * om), om * eps_xx - ky2 / (mu_zz * om)], -1),
+        ],
+        -2,
+    )
+    x[:, 0:2, 2:4] = b
+    x[:, 2:4, 0:2] = c
+    x = 1j * x * thickness
+    return float(onp.max(onp.sum(onp.abs(x), axis=-1)))
+
+
+# -----------------------------------------------------------------------------
+# Never-silent anisotropic tensor guard (eager, concrete values only).
+# -----------------------------------------------------------------------------
+
+
+def validate_anisotropic_tensor(eps_comps, mu_comps, layer_index=0, uniform=False):
+    """Loud guard for a physically-ill-posed anisotropic layer tensor.
+
+    Checks -- on CONCRETE values only (callers gate on ``_concrete``) -- the
+    failure mode that makes the state-space assembly singular:
+
+    * a zero zz component anywhere (``eps_zz == 0`` or ``mu_zz == 0`` at any
+      pixel / scalar): the inverse-rule z-matrix ``1/eps_zz`` (``script_K``)
+      and ``1/mu_zz`` (``K``) divide per-pixel, so a single zero pixel or a
+      zero uniform value blows the assembly to inf/NaN (never silent).
+
+    For a UNIFORM (constant-tensor) layer it additionally rejects a *singular
+    transverse* 2x2 tensor (``eps_xx*eps_yy - eps_xy*eps_yx == 0``): the
+    per-order B/C blocks then lose the polarization structure (evanescent
+    collapse, negated determinant = unphysical gain medium).
+
+    Raises ``ValueError`` naming the layer and the offending component -- the
+    house never-silent style (the seam wraps it as ``RcwaError``). Traced
+    values cannot be checked (the eager pre-run validates the concrete forward
+    pass).
+    """
+    import numpy as onp
+
+    def guard(comps, name):
+        if comps is None:
+            return
+        xx, xy, yx, yy, zz = [onp.asarray(c) for c in comps]
+        zz_flat = zz.reshape(-1)
+        zz_min = float(onp.min(onp.abs(zz_flat)))
+        if not zz_min > 0.0:
+            raise ValueError(
+                f"_rcwa: layer {layer_index} has a zero {name}_zz component "
+                f"(|{name}_zz|_min = {zz_min:.3g}) -- the inverse-rule z-matrix "
+                "(script_K / K) divides by it per pixel. Fix the tensor; the "
+                "assembly would silently produce inf/NaN otherwise."
+            )
+        if uniform:
+            xx0, xy0, yx0, yy0, zz0 = (
+                complex(xx.reshape(-1)[0]),
+                complex(xy.reshape(-1)[0]),
+                complex(yx.reshape(-1)[0]),
+                complex(yy.reshape(-1)[0]),
+                complex(zz.reshape(-1)[0]),
+            )
+            det = xx0 * yy0 - xy0 * yx0
+            if abs(det) == 0.0:
+                raise ValueError(
+                    f"_rcwa: layer {layer_index} has a singular transverse {name} tensor "
+                    f"(det = {name}_xx*{name}_yy - {name}_xy*{name}_yx = 0) -- the per-order "
+                    "B/C blocks collapse; a singular tensor is never silently solved. "
+                    "Fix the tensor."
+                )
+            # A REAL (lossless) tensor must be positive-definite: a negative
+            # eigenvalue (e.g. a negative-definite diagonal) is an unphysical
+            # gain medium, caught loudly instead of solving with a sign-flipped
+            # spectrum. Complex (lossy) tensors are left to the energy guard.
+            lossless = max(abs(xx0.imag), abs(xy0.imag), abs(yx0.imag), abs(yy0.imag), abs(zz0.imag)) <= 0
+            if lossless and not (float(xx0.real) > 0 and float(det.real) > 0 and float(zz0.real) > 0):
+                raise ValueError(
+                    f"_rcwa: layer {layer_index} has a non-positive-definite {name} tensor "
+                    f"(Re xx = {xx0.real:.3g}, det = {det.real:.3g}, zz = {zz0.real:.3g}); a "
+                    "negative-definite lossless tensor is an unphysical gain medium. Fix the tensor."
+                )
+
+    guard(eps_comps, "ε")
+    guard(mu_comps, "μ")
+
+
 # -----------------------------------------------------------------------------
 # Uniform-isotropic analytic shortcut (no expm, no eig).
 # -----------------------------------------------------------------------------
-
-
 def uniform_kz(
     transverse_wavevectors: jnp.ndarray,
     eps,
@@ -293,6 +437,129 @@ def uniform_layer_transfer(
         block2x2(btilde_11, btilde_12, btilde_12, btilde_22),
         block2x2(ctilde_11, ctilde_12, ctilde_12, ctilde_22),
         block2x2(a11, zero, zero, a22),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Uniform-anisotropic analytic* fast path (no expm of the 4n block, no eig).
+# -----------------------------------------------------------------------------
+
+
+def uniform_anisotropic_layer_transfer(
+    omega,
+    transverse_wavevectors: jnp.ndarray,
+    eps_comps,
+    mu_comps,
+    thickness: float,
+    squarings: int,
+    dtype: jnp.dtype = jnp.complex64,
+) -> jnp.ndarray:
+    """The ``4n x 4n`` transfer ``expm(i M_L d)`` of a *uniform* anisotropic layer.
+
+    A uniform layer (all 5/10 component grids constant) has a **block-diagonal**
+    ``M_L`` over diffraction orders: the zz Toeplitz matrices are diagonal
+    ``eps_zz I`` / ``mu_zz I``, ``script_K`` and ``K`` decouple per order, and
+    each order's state evolves by its own ``4x4`` block
+
+        M_L^{(i)} = [[0, B_i], [C_i, 0]],
+
+    with ``B_i = omega M_t^{(i)} - script_K_i/omega`` and
+    ``C_i = omega E_t^{(i)} - K_i/omega``. So the layer transfer is n small
+    independent ``4x4`` state transfers assembled block-diagonally -- the
+    uniform-anisotropic fast path (fmmax dense-eigs a ``2n`` matrix for the same
+    physics). Differective in traced ε̂/μ̂, no dense eig.
+
+    Args:
+        omega: Angular frequency.
+        transverse_wavevectors: Per-order ``(n, 2)`` wavevectors.
+        eps_comps: ``(eps_xx, eps_xy, eps_yx, eps_yy, eps_zz)`` scalars.
+        mu_comps: ``(mu_xx, mu_xy, mu_yx, mu_yy, mu_zz)`` scalars, or ``None``
+            for nonmagnetic (identity).
+        thickness: The (sub-slab) chunk thickness.
+        squarings: Static Pade scaling-squaring count (from the build-time
+            spectral bound; the caller guards it eagerly).
+        dtype: Output complex dtype.
+
+    Returns:
+        The ``4n x 4n`` transfer matrix.
+    """
+    omega = jnp.asarray(omega, dtype=dtype)
+    eps_xx, eps_xy, eps_yx, eps_yy, eps_zz = (jnp.asarray(c, dtype=dtype) for c in eps_comps)
+    if mu_comps is None:
+        mu_xx = jnp.asarray(1.0, dtype=dtype)
+        mu_xy = jnp.asarray(0.0, dtype=dtype)
+        mu_yx = jnp.asarray(0.0, dtype=dtype)
+        mu_yy = jnp.asarray(1.0, dtype=dtype)
+        mu_zz = jnp.asarray(1.0, dtype=dtype)
+    else:
+        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = (jnp.asarray(c, dtype=dtype) for c in mu_comps)
+    n = transverse_wavevectors.shape[0]
+    kx = transverse_wavevectors[:, 0]
+    ky = transverse_wavevectors[:, 1]
+
+    # Per-order 2x2 blocks: E_t and M_t from the constant tensor, script_K and
+    # K from the scalar zz components (the decoupling that makes this cheap).
+    e_t = jnp.stack(
+        [
+            jnp.stack([jnp.full(n, eps_yy), jnp.full(n, -eps_yx)], -1),
+            jnp.stack([jnp.full(n, -eps_xy), jnp.full(n, eps_xx)], -1),
+        ],
+        -2,
+    )  # (n, 2, 2)
+    m_t = jnp.stack(
+        [
+            jnp.stack([jnp.full(n, mu_xx), jnp.full(n, mu_xy)], -1),
+            jnp.stack([jnp.full(n, mu_yx), jnp.full(n, mu_yy)], -1),
+        ],
+        -2,
+    )
+    kx2, ky2, kxky = kx * kx, ky * ky, kx * ky
+    script_k = (
+        1.0
+        / eps_zz
+        * jnp.stack(
+            [
+                jnp.stack([ky2, -kxky], -1),
+                jnp.stack([-kxky, kx2], -1),
+            ],
+            -2,
+        )
+    )
+    k_mat = (
+        1.0
+        / mu_zz
+        * jnp.stack(
+            [
+                jnp.stack([kx2, kxky], -1),
+                jnp.stack([kxky, ky2], -1),
+            ],
+            -2,
+        )
+    )
+
+    b = omega * m_t - script_k / omega  # (n, 2, 2)
+    c = omega * e_t - k_mat / omega  # (n, 2, 2)
+    zeros = jnp.zeros((n, 2, 2), dtype=dtype)
+    m_l = jnp.block([[zeros, b], [c, zeros]])  # (n, 4, 4) per-order blocks
+
+    t = expm_pade_scaling_squaring(1j * m_l * thickness, squarings)  # (n, 4, 4)
+
+    def diag_block(a, b_, c_, d):
+        return block2x2(
+            jnp.diag(a),
+            jnp.diag(b_),
+            jnp.diag(c_),
+            jnp.diag(d),
+        )
+
+    # Assemble per-order 4x4 blocks into the component-major 4n state order
+    # (u1 over orders | u2 over orders | v1 | v2), matching the isotropic
+    # uniform transfer's block layout.
+    return block2x2(
+        diag_block(t[:, 0, 0], t[:, 0, 1], t[:, 1, 0], t[:, 1, 1]),
+        diag_block(t[:, 0, 2], t[:, 0, 3], t[:, 1, 2], t[:, 1, 3]),
+        diag_block(t[:, 2, 0], t[:, 2, 1], t[:, 3, 0], t[:, 3, 1]),
+        diag_block(t[:, 2, 2], t[:, 2, 3], t[:, 3, 2], t[:, 3, 3]),
     )
 
 

@@ -325,10 +325,34 @@ def test_order_index(slab_stack):
     assert res.flux_trn[i0] == pytest.approx(sum(res.flux_trn), rel=1e-5)
 
 
-def test_interior_fields_raise_loudly(slab_stack):
-    slab_stack.solve(validate=False)  # a solved stack is the entry point
-    with pytest.raises(NotImplementedError, match="stage 2"):
-        fields.interior_field_amplitudes(slab_stack, [0.1])
+def test_interior_fields_reconstruct_boundary_state(slab_stack):
+    """Stage-2d interior reconstruction: per-plane amplitudes recover the boundary
+    state, and the tangential fields are continuous across the interfaces (the last
+    superstrate plane and the first film plane share z, so their (ex, ey) must agree;
+    the film top is the interface state u_inc + u_ref exactly, since A(0) = I)."""
+    st = slab_stack
+    st.solve(validate=False)
+    znums, _z = fields.layer_z_sampling([1.0, 0.5, 1.0], 40.0)
+    planes = fields.field_planes([1.0, 0.5, 1.0], znums, ["sup", 0, "sub"], [st._chunks[0]])
+    ex, ey, ez, hx, hy, hz = fields.interior_field_amplitudes(
+        st, planes, st._prototype, 1.0, (0.0, 0.0), (1.0, 0.0), 1.0, 1.0
+    )
+    n = st.num_terms
+    assert ex.shape == (len(planes), n)
+    assert ey.shape == (len(planes), n)
+    assert ez.shape == (len(planes), n)
+    # tangential E continuity at the superstrate/film interface: the superstrate's end
+    # plane (offset 0) is the same z as the film's first plane (zeta 0), and both
+    # evaluate the interface state u_inc + u_ref -- (ex, ey) must agree.
+    sup_end, film_start = znums[0] - 1, znums[0]
+    assert float(jnp.max(jnp.abs(ex[film_start] - ex[sup_end]))) < 1e-5
+    assert float(jnp.max(jnp.abs(ey[film_start] - ey[sup_end]))) < 1e-5
+    # and at the substrate interface: film end == substrate start
+    sub_start, film_end = znums[0] + znums[1], znums[0] + znums[1] - 1
+    assert float(jnp.max(jnp.abs(ex[sub_start] - ex[film_end]))) < 1e-5
+    assert float(jnp.max(jnp.abs(ey[sub_start] - ey[film_end]))) < 1e-5
+    # the interior probe is finite everywhere (stable propagation, no standalone growth)
+    assert bool(jnp.all(jnp.isfinite(ex)) and jnp.all(jnp.isfinite(ez)))
 
 
 def test_shape_and_polarization_guards():
@@ -631,3 +655,287 @@ def test_slab_matches_fmmax():
     st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.4, jnp.asarray([[4.0]]))], orders=60)
     res = st.solve(validate=False)
     assert abs(float(res.T) - t_ref) / t_ref < 1e-3
+
+
+# -----------------------------------------------------------------------------
+# Stage 2a: anisotropic (5-/10-component) layers and the uniform fast path.
+# -----------------------------------------------------------------------------
+
+
+def _fmmax_aniso_slab(T_COMPONENTS, thickness=0.3, orders=41, formulation="FFT"):
+    """fmmax x64 T/R for a uniform general-anisotropic slab in vacuum."""
+    fmmax = _fmmax()
+    from fmmax import fields as ff
+    from fmmax import fmm, scattering, sources
+
+    jax.config.update("jax_enable_x64", True)
+    lv = fmmax.basis.LatticeVectors(jnp.array([PERIOD[0], 0.0]), jnp.array([0.0, PERIOD[1]]))
+    ex = fmmax.basis.generate_expansion(lv, orders)
+    form = fmm.Formulation.FFT if formulation == "FFT" else fmm.Formulation.JONES_DIRECT_FOURIER
+    comps10 = T_COMPONENTS if len(T_COMPONENTS) == 10 else tuple(T_COMPONENTS) + (1.0, 0.0, 0.0, 1.0, 1.0)
+    layers = [
+        fmm.eigensolve_isotropic_media(
+            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=form
+        ),
+        fmm.eigensolve_general_anisotropic_media(
+            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, *[jnp.asarray([[v]]) for v in comps10], ex, formulation=form
+        ),
+        fmm.eigensolve_isotropic_media(
+            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=form
+        ),
+    ]
+    s = scattering.stack_s_matrix(layers, [1.0, thickness, 1.0])
+    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
+    fwd = sources.amplitudes_for_fields(
+        jnp.ones((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        layers[0],
+    )[0]
+    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
+    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
+    fbw = ff.directional_poynting_flux(jnp.zeros_like(fwd), s.s21 @ fwd, layers[0])[1]
+    t_ref = float(jnp.sum(jnp.real(ft))) / pin
+    r_ref = -float(jnp.sum(jnp.real(fbw))) / pin
+    jax.config.update("jax_enable_x64", False)
+    return t_ref, r_ref
+
+
+def test_uniform_aniso_matches_fmmax_fft():
+    """Uniform 5-comp biaxial slab vs fmmax general-aniso eigensolve (rel ~1e-5 c64)."""
+    comps = (8.0, 0.0, 0.0, 4.0, 6.0)
+    t_ref, r_ref = _fmmax_aniso_slab(comps)
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps)], orders=41, formulation="FFT")
+    res = st.solve(validate=False)
+    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
+    assert abs(float(res.R) - r_ref) / max(abs(r_ref), 1e-12) < 5e-4
+
+
+def test_uniform_aniso_mu_matches_fmmax():
+    """Uniform 10-comp magnetic slab (mu != I) vs fmmax (the mu genuinely enters)."""
+    comps = (6.0, 0.0, 0.0, 4.0, 5.0, 1.0, 0.0, 0.0, 2.0, 1.5)
+    t_ref, r_ref = _fmmax_aniso_slab(comps)
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps)], orders=41, formulation="FFT")
+    res = st.solve(validate=False)
+    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
+    assert abs(float(res.R) - r_ref) / max(abs(r_ref), 1e-12) < 5e-4
+
+
+def test_uniform_aniso_fast_path_is_not_a_patterned_solve():
+    """Uniform-aniso layers take the analytic per-order fast path, never the
+    patterned expm -- the counting oracle must stay frozen (these are the
+    fmmax-uniform-analog solves, not patterned eigensolves)."""
+    from jno._rcwa.stack import count_patterned_solves
+
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (8.0, 0.0, 0.0, 4.0, 6.0))], orders=41, formulation="FFT")
+    _, n = count_patterned_solves(lambda: st.solve())
+    assert n == 0
+
+
+def test_uniform_aniso_mu_one_reduces_to_iso_fast_path():
+    """A 10-comp layer with mu=I reduces EXACTLY to the 5-comp anisotropic one."""
+    comps5 = (6.0, 0.0, 0.0, 4.0, 5.0)
+    comps10 = comps5 + (1.0, 0.0, 0.0, 1.0, 1.0)
+    st5 = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps5)], orders=41, formulation="FFT")
+    st10 = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps10)], orders=41, formulation="FFT")
+    r5, r10 = st5.solve(validate=False), st10.solve(validate=False)
+    assert abs(float(r5.T) - float(r10.T)) < 1e-9
+    assert abs(float(r5.R) - float(r10.R)) < 1e-9
+
+
+def test_uniform_aniso_conserves_energy_lossless():
+    """A lossless anisotropic slab conserves energy (T + R == 1)."""
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (8.0, 0.0, 0.0, 4.0, 6.0))], orders=41, formulation="FFT")
+    res = st.solve(validate=False)
+    assert abs(float(res.T) + float(res.R) - 1.0) < 1e-6
+
+
+def test_uniform_aniso_is_differentiable_in_eps():
+    """The fast path is differentiable in traced tensor components: jit+grad
+    through the per-order transfer (native JVP, no eig)."""
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (8.0, 0.0, 0.0, 4.0, 6.0))], orders=41, formulation="FFT")
+
+    def T(epsxx):
+        # Per-solve traced constant grid -- the backend's per-solve uniform
+        # dispatch sees (1,1) and takes the analytic path, which must carry
+        # the derivative through the traced components.
+        return st.solve(eps_grids=[(epsxx, 0.0, 0.0, 4.0, 6.0)], validate=False).T
+
+    fn = jax.jit(T)
+    g0 = float(fn(8.0))
+    grad = float(jax.grad(lambda e: jnp.real(fn(e)))(8.0))
+    h = 1e-3
+    fd = (float(fn(8.0 + h)) - float(fn(8.0 - h))) / (2 * h)
+    assert jnp.isfinite(grad) and abs(grad) > 1e-6
+    assert jnp.isfinite(g0)
+    assert abs(grad - fd) / max(abs(fd), 1e-30) < 5e-2
+
+
+def test_uniform_aniso_mismatched_components_raise_loudly():
+    """A tuple material of the wrong length is rejected loudly at build."""
+    with pytest.raises(ValueError, match="5.*eps|10.*eps"):
+        StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (1.0, 2.0, 3.0))], orders=41)
+    with pytest.raises(ValueError, match="5.*eps|10.*eps"):
+        StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (1.0, 2.0, 3.0, 4.0, 5.0, 6.0))], orders=41)
+
+
+def test_uniform_aniso_singular_tensor_raises_loudly():
+    """A zero-zz / singular transverse tensor is a loud guard at build, never a
+    silent inf/NaN shot through the solve (never-silent house rule)."""
+    with pytest.raises(ValueError, match="zero ε_zz|inverse-rule"):
+        StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (6.0, 0.0, 0.0, 4.0, 0.0))], orders=41)
+    # singular transverse 2x2: eps_xx*eps_yy - eps_xy*eps_yx == 0
+    with pytest.raises(ValueError, match="singular transverse"):
+        StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (4.0, 8.0, 2.0, 4.0, 6.0))], orders=41)
+    # negative-definite diagonal (unphysical gain medium)
+    with pytest.raises(ValueError, match="non-positive-definite"):
+        StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (-4.0, 0.0, 0.0, -4.0, 6.0))], orders=41)
+
+
+def test_aniso_squarings_indexed_per_layer_position():
+    """``_aniso_squarings`` holds one entry per LAYER POSITION (0 for a non-aniso
+    layer), so the traced consumer's absolute-layer read is safe. Regression for
+    the gate-2 blocker (iss_mwwg9iydi654q6): appending only per-aniso-layer
+    crashed iso-above-aniso stacks with IndexError (and, with two aniso films,
+    silently handed the first the SECOND's Pade squaring count)."""
+    comps_a = (8.0, 0.0, 0.0, 4.0, 6.0)
+    comps_b = (14.0, 0.0, 0.0, 9.0, 5.0)
+    st = StateStack(
+        1.0,
+        PERIOD,
+        1.0,
+        1.0,
+        [(0.2, jnp.asarray([[4.0]])), (0.3, comps_a), (0.4, comps_b)],
+        orders=41,
+        formulation="FFT",
+    )
+    assert len(st._aniso_squarings) == 3  # one per layer position
+    assert st._aniso_squarings[0] == 0  # the iso film carries None/zero
+    # Each aniso film receives ITS OWN build-time count (= its single-layer count):
+    # pre-fix, position 1 silently held comps_b's count (0) under the same layout.
+    single_a = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps_a)], orders=41, formulation="FFT")
+    single_b = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.4, comps_b)], orders=41, formulation="FFT")
+    assert st._aniso_squarings[1] == single_a._aniso_squarings[0]
+    assert st._aniso_squarings[2] == single_b._aniso_squarings[0]
+    assert st._aniso_squarings[1] != st._aniso_squarings[2]  # genuinely different counts
+
+
+def test_iso_film_above_aniso_films_solves_and_conserves():
+    """iso-above-aniso (the bread-and-butter multilayer) and iso-above-TWO-aniso
+    stacks solve without the pre-fix IndexError and stay chunk-invariant --
+    a silently-swapped squaring count would break the invariance for the
+    high-norm film. Regression for iss_mwwg9iydi654q6."""
+    comps_a = (8.0, 0.0, 0.0, 4.0, 6.0)
+    comps_b = (14.0, 0.0, 0.0, 9.0, 5.0)
+
+    def solve(layers, chunks=None):
+        st = StateStack(
+            1.0,
+            PERIOD,
+            1.0,
+            1.0,
+            layers,
+            orders=41,
+            formulation="FFT",
+            chunk_override=chunks,
+        )
+        return st.solve(validate=False)
+
+    base = [(0.2, jnp.asarray([[4.0]])), (0.3, comps_a)]
+    res = solve(base)
+    # lossless mixed stack conserves energy (the uniform-aniso path is exact; c64 floor)
+    assert abs(float(res.T + res.R) - 1.0) < 1e-5
+    assert jnp.isfinite(res.T) and jnp.isfinite(res.R)
+    # chunk-invariance across the mixed stack (uniform layers: inert chunk count)
+    res2 = solve(base, chunks=[2, 3])
+    assert abs(float(res2.T) - float(res.T)) < 1e-5
+    # iso above TWO aniso films
+    res3 = solve(base + [(0.05, comps_b)])
+    assert jnp.isfinite(res3.T)
+    assert abs(float(res3.T + res3.R) - 1.0) < 1e-5
+    res4 = solve(base + [(0.05, comps_b)], chunks=[2, 3, 2])
+    assert abs(float(res4.T) - float(res3.T)) < 1e-5
+
+
+def test_patterned_aniso_precision_guard_is_an_instructive_valueerror():
+    """A precision-class mismatch on a patterned anisotropic layer (complex128
+    component grids under a complex64 stack, jax_enable_x64 on) raises an
+    INSTRUCTIVE ValueError naming the two precision classes -- never the old
+    bare empty AssertionError (which ``python -O`` would strip entirely,
+    violating never-silent). Regression for iss_mwwg9iz893b1iw."""
+    _x64_prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        rng = np.random.default_rng(0)
+        n = 8
+        comps = tuple((1.0 + rng.uniform(0, 0.5, (n, n))).astype(np.complex128) for _ in range(5))
+        with pytest.raises(ValueError, match="precision"):
+            StateStack(
+                1.0,
+                PERIOD,
+                1.0,
+                1.0,
+                [(0.4, comps)],
+                orders=41,
+                formulation="JONES_DIRECT_FOURIER",
+                dtype=jnp.complex64,
+            )
+    finally:
+        jax.config.update("jax_enable_x64", _x64_prev)
+
+
+def test_patterned_aniso_matches_fmmax_fft():
+    """A PATTERNED anisotropic layer (in-plane varying tensor, FFT formulation)
+    vs fmmax -- exercises the general-aniso M_L assembly end to end."""
+    n = 16
+
+    def grid(base_lo, base_hi):
+        x = (np.arange(n) + 0.5) / n
+        xx, yy = np.meshgrid(x, x, indexing="ij")
+        inside = (xx - 0.5) ** 2 + (yy - 0.5) ** 2 < 0.3**2
+        return np.where(inside, base_hi, base_lo).astype(np.float32)
+
+    eps5 = tuple(grid(1.0, v) for v in (9.0, 0.4, -0.2, 6.0, 7.0))
+    mu10 = (np.ones((n, n)), np.zeros((n, n)), np.zeros((n, n)), np.ones((n, n)), np.ones((n, n)))
+    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, tuple(eps5) + tuple(mu10))], orders=41, formulation="FFT")
+    res = st.solve(validate=False)
+
+    # fmmax oracle for the same grids (x64 for the reference, ours c64)
+    fmmax = _fmmax()
+    from fmmax import fields as ff
+    from fmmax import fmm, scattering, sources
+
+    lv = fmmax.basis.LatticeVectors(jnp.array([PERIOD[0], 0.0]), jnp.array([0.0, PERIOD[1]]))
+    ex = fmmax.basis.generate_expansion(lv, 41)
+    jax.config.update("jax_enable_x64", True)
+    layers = [
+        fmm.eigensolve_isotropic_media(
+            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=fmm.Formulation.FFT
+        ),
+        fmm.eigensolve_general_anisotropic_media(
+            jnp.asarray(1.0),
+            jnp.asarray([0.0, 0.0]),
+            lv,
+            *[jnp.asarray(g) for g in eps5 + mu10],
+            ex,
+            formulation=fmm.Formulation.FFT,
+        ),
+        fmm.eigensolve_isotropic_media(
+            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=fmm.Formulation.FFT
+        ),
+    ]
+    s = scattering.stack_s_matrix(layers, [1.0, 0.3, 1.0])
+    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
+    fwd = sources.amplitudes_for_fields(
+        jnp.ones((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        jnp.zeros((g, g, 1), jnp.complex128),
+        layers[0],
+    )[0]
+    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
+    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
+    t_ref = float(jnp.sum(jnp.real(ft))) / pin
+    jax.config.update("jax_enable_x64", False)
+    assert abs(float(res.T) - t_ref) / t_ref < 5e-3

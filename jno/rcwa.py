@@ -39,9 +39,9 @@ and an **in-plane PML** (a complex coordinate stretch ``S = 1 + iσ/k`` written 
 coefficients of the scalar Helmholtz term). A uniaxial PML is exactly a diagonal Maxwell ``ε̂`` and ``μ̂``
 (``ε̂ = ε·Λ``, ``μ̂ = Λ``, ``Λ = diag(SᵧS_z/Sₓ, SₓS_z/Sᵧ, SₓSᵧ/S_z)``), so the traced stretch is honoured
 exactly and solved via the backend's anisotropic layer kind — turning a periodic supercell into an
-isolated scatterer (the absorbing frame decouples the walls). Stage 2 wires the anisotropic and
-internal-source layers into the backend (tasks T28/T29); until then a 5/10-component layer or an
-emitter raises a loud :class:`RcwaError` naming the stage-2 task.
+isolated scatterer (the absorbing frame decouples the walls). Both the anisotropic 5/10-component
+layers and the internal-source layers are wired in the backend; a patterned SCALAR-grid ambient (a
+non-tensor, in-plane-varying superstrate) remains a loud stage-2 exception (task T30).
 
 An **internal source** — a dipole / Gaussian emitter — is authored the same way you would drive `jno.fem`
 or a PINN: a forcing term in the residual, ``- f·v`` (scalar) or ``- inner(J, v)`` (vector current). The
@@ -90,12 +90,6 @@ def _concrete(x):
 # Relative spread below which a permittivity grid counts as uniform (see ``Rcwa._prepare_stack``).
 # Tight on purpose: the collapse is exact only for a genuinely constant layer, never a "nearly flat" one.
 _UNIFORM_RTOL = 1e-12
-
-# The stage-2 tasks that own the not-yet-wired backend kinds (named in every loud raise so nobody
-# mistakes a missing feature for a bug).
-_STAGE2_ANISO = "the anisotropic 5/10-component layers (task T28)"
-_STAGE2_SOURCE = "internal sources via Maxwell jump conditions (task T29)"
-_STAGE2_FIELDS = "interior field3d reconstruction (task T40)"
 
 
 class RcwaError(ValueError):
@@ -239,7 +233,13 @@ class _Sol:
 
     def order(self, m, n):
         """Diffraction efficiency into transmitted order ``(m, n)`` (raises if outside the truncation).
-        Returns a differentiable JAX scalar."""
+        Returns a differentiable JAX scalar.
+
+        An evanescent order (the substrate-side ``Re(kz) ~ 0``) reports EXACTLY 0 -- the fmmax-era
+        ``is_propagating`` convention -- instead of its ~1e-17 Poynting-noise readout; the gate uses
+        a tiny ``Re(kz)`` threshold (never exact 0) so fp32/fp64 rounding near the Rayleigh cutoff
+        cannot leak evanescent flux. Lossy substrates keep their genuinely-carrying evanescent-in-air
+        orders (their ``Re(kz) != 0``), and the ``T``/``R`` efficiency aggregates are unaffected."""
         bc = np.asarray(self._ex.basis_coefficients)  # static (truncation geometry) -> plain numpy index
         hit = np.where((bc[:, 0] == m) & (bc[:, 1] == n))[0]
         if len(hit) == 0:
@@ -250,7 +250,21 @@ class _Sol:
         # order both tangential components carry +z energy, so |sum over components| == sum of
         # |component| -- equal to the old per-component-abs form; only pathological (evanescent /
         # counter-propagating) orders differ, where the signed-sum form is the physical one.
-        return jnp.abs(self._s.flux_trn[i]) / self._Pin
+        flux = self._s.flux_trn[i]
+        eng = self._eng
+        grids = getattr(eng, "_prepared_grids", None)
+        if grids is not None:
+            # Per-order substrate kz, on the same side medium the flux was computed against (the
+            # analytic split scalar from the plane-wave seam: vacuum beyond a folded PML frame).
+            _, _, eps_sub = eng._backend_materials(tuple(grids))
+            kin = jnp.asarray(eng._prepared_kin)
+            k0 = 2 * jnp.pi / jnp.asarray(self._wl, kin.dtype)
+            gx, gy = bc[i]
+            kpar2 = (kin[0] + 2 * jnp.pi * gx / self._period[0]) ** 2 + (kin[1] + 2 * jnp.pi * gy / self._period[1]) ** 2
+            kz_re = jnp.real(jnp.sqrt(eps_sub * k0**2 - kpar2))  # Im(kz) >= 0 branch (uniform_kz)
+            thr = (1e-10 if jnp.dtype(jnp.real(flux).dtype).itemsize >= 8 else 1e-6) * k0
+            flux = jnp.where(kz_re < thr, jnp.zeros_like(flux), flux)
+        return jnp.abs(flux) / self._Pin
 
     def _input_pol(self, pol):
         """The normalized Jones pair for an alternate input polarization (``"x"`` or ``"y"``) -- re-solved
@@ -303,36 +317,102 @@ class _Sol:
         )
 
     def _field_volume(self, nx=80, density=40.0):
-        """Interior field reconstruction is stage-2 work (backend ``fields.py``, task T40).
+        """``(|E|^2, x, y, z)`` on the full 3-D reconstruction grid — the shared core of :meth:`field`
+        and :meth:`field3d`. ``|E|^2`` has shape ``(nx, nx, nz)`` (z along the last axis); ``x``/``y``
+        are 1-D axis coordinates and ``z`` the per-plane depths (1-D, endpoints shared between
+        neighbouring layers, cumulative from the superstrate top surface).
 
-        Loud and never silent: the backend owns interior state propagation + iFFT; until it lands,
-        calling any of ``field``/``field3d``/``_bulk`` names the stage-2 task instead of returning a
-        wrong answer."""
-        raise RcwaError(
-            "field()/field3d() need interior field reconstruction, which the state-space backend "
-            f"implements in stage 2 ({_STAGE2_FIELDS}). Plane-wave readouts (efficiency/order/jones/"
-            "aerial) are available now."
+        The interior reconstruction lives in the backend (``jno/_rcwa/fields.py``): the boundary
+        state is propagated to every plane through the stack's own chunked/impedance machinery and
+        inverse-Fourier-transformed here. Lossless anchors and the absorbed-power/z-profile tests
+        pin the energy balance through ``|E|^2``.
+        """
+        eng = self._eng
+        if self._thick is None:
+            raise RcwaError("field() needs the layer thicknesses; call .solve() (which records them).")
+        if eng._stack is None or eng._prepared_grids is None:
+            raise RcwaError("field() needs a solved stack; call .solve() first.")
+        if not (isinstance(nx, (int, np.integer)) and nx >= 2):
+            raise RcwaError(f"field(): the render grid nx must be an int >= 2, got {nx!r}.")
+        if not (isinstance(density, (int, float, np.floating)) and float(density) > 0):
+            raise RcwaError(f"field(): density (z samples per unit thickness) must be > 0, got {density!r}.")
+        from jno._rcwa import fields as _fields_mod
+
+        thicknesses = [float(jnp.real(jnp.asarray(t))) for t in self._thick]
+        znums, z = _fields_mod.layer_z_sampling(thicknesses, density)
+        n_full = len(thicknesses)
+        fold_top, fold_bot = getattr(eng, "_fold_amb", (False, False))
+        roles: list = []
+        film_count = 0
+        for i in range(n_full):
+            if i == 0 and not fold_top:
+                roles.append("sup")
+            elif i == n_full - 1 and not fold_bot:
+                roles.append("sub")
+            else:
+                roles.append(film_count)
+                film_count += 1
+        stack = eng._stack
+        planes = _fields_mod.field_planes(thicknesses, znums, roles, stack._chunks)
+        try:
+            _fields_mod.validate_grid_resolution(nx, eng._ex, "field3d")
+        except ValueError as e:
+            raise RcwaError(str(e)) from e
+        films, sup, sub = eng._backend_materials(eng._prepared_grids)
+        (ex, ey, ez, _hx, _hy, _hz) = _fields_mod.interior_field_amplitudes(
+            stack,
+            planes,
+            films,
+            eng._prepared_wl,
+            eng._prepared_kin,
+            self._pol,
+            sup,
+            sub,
         )
+        inten, x, y = _fields_mod.volume_intensity(ex, ey, ez, eng._ex, eng._prepared_kin, self._period, nx)
+        return inten, x, y, jnp.asarray(z)
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
 
         Returns ``(intensity, extent, layer_z)``: ``intensity`` = ``|E|²`` of shape ``(nz, nx)`` (z
         vertical, x horizontal) for ``imshow``; ``extent`` = ``[0, Px, z_min, z_max]``; ``layer_z`` = the
-        z-interfaces between layers (to annotate the patterned slab). Needs the finite ambient
-        thickness recorded at solve time (semi-infinite ambients are shown as unit-thick slabs).
+        z-interfaces between layers (to annotate the patterned slab). The finite ambient
+        thickness recorded at solve time is shown (semi-infinite ambients as unit-thick slabs).
 
-        Stage 2 (task T40) restores this via the backend's interior field reconstruction; today it
-        raises a loud :class:`RcwaError` naming the task."""
-        return self._field_volume(nx=nx, density=density)
+        Implemented by the backend's interior field reconstruction (task T31): ``|E|²`` is a JAX
+        array, differentiable in the design.
+
+        Caveat: at OBLIQUE incidence (``k_in`` tilted) the reconstructed ``|E|²`` is ~5% off the
+        accurate energy content (state-space split conditioning); efficiency/flux/absorbed-power
+        readouts are unaffected and are the accurate quantities for energy work."""
+        inten, x, y, z = self._field_volume(nx=nx, density=density)
+        j = int(jnp.argmin(jnp.abs(y - y_frac * float(self._period[1]))))
+        slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
+        zc = np.asarray(z)
+        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
+        return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
 
     def field3d(self, nx=80, density=40.0):
         """``|E|²`` on the full 3-D grid, for volume rendering / isosurfaces — the whole reconstruction
         rather than the single ``y``-slice :meth:`field` returns.
 
-        Stage 2 (task T40) restores this via the backend's interior field reconstruction; today it
-        raises a loud :class:`RcwaError` naming the task."""
-        return self._field_volume(nx=nx, density=density)
+        Returns ``(intensity, (x, y, z), layer_z)`` with ``intensity`` of shape ``(nx, ny, nz)`` and
+        ``x``/``y``/``z`` the 1-D coordinates of each axis. The semi-infinite ambients are rendered as
+        unit-thick slabs (see :meth:`field`), so ``z`` starts at 0 at the top of the superstrate, not at
+        any coordinate of the authored geometry — ``layer_z`` gives the interfaces in the same frame.
+
+        A JAX array, differentiable in the design (the layers' permittivity grids): ``jax.grad`` of a
+        functional of it (e.g. the absorbed power ``½ ω ε₀ Im ε |E|²`` heating a coupled thermal solve) flows
+        back through the interior-field reconstruction and the modal solve. The grid sizes (``nx``, the
+        per-layer ``nz`` from ``density``) and the layer thicknesses are static.
+
+        Caveat (documented + pinned in ``tests/test_rcwa_fields.py``): at OBLIQUE incidence the
+        reconstructed ``|E|²`` deviates ~5% from the accurate energy content -- use the
+        efficiency/absorbed-power readouts for quantitative energy work at tilted ``k_in``."""
+        inten, x, y, z = self._field_volume(nx=nx, density=density)
+        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
+        return inten, (x, y, z), layer_z
 
     def _spectrum(self, kind="T", fwd=None):
         """The complex diffraction spectrum for imaging: the transverse E-field Fourier coefficients
@@ -626,15 +706,16 @@ class Rcwa:
 
     Args:
         layers: the stack, ``[(thickness, eps), ...]`` from top to bottom; ``eps`` is a scalar or a
-            permittivity grid (2-D array; a ``(…, 3, 3)`` tensor grid is stage-2, task T28).
+            permittivity grid (2-D array), a 5-tuple ``(eps_xx, eps_xy, eps_yx, eps_yy, eps_zz)``
+            (anisotropic) or a 10-tuple adding ``(mu_xx, ...)`` (general, magnetic).
         period: the lattice periods ``(Lx, Ly)``.
         orders: Fourier truncation (approximate number of retained orders).
         wavelength: free-space wavelength; may instead be given to :meth:`solve`.
         k_in: transverse incident wavevector ``(kx, ky)``.
         formulation: the Fourier-factorization name, e.g. ``"JONES_DIRECT_FOURIER"`` (default; converges
             well for high-contrast dielectrics, where the naive ``"FFT"`` rule converges poorly). The
-            state-space backend now implements ``FFT`` and ``JONES_DIRECT_FOURIER``; the other vector
-            schemes land in stage 2 (task T30).
+            state-space backend implements all eight fmmax vector schemes plus ``FFT`` and a callable
+            tangent-field hook.
         assume_periodic: skip the check that each layer's grid is periodic.
         polarization: ``"x"``, ``"y"``, or a Jones vector ``(p_x, p_y)``.
     """
@@ -679,21 +760,17 @@ class Rcwa:
                 )
         self.layers_spec, self.period = layers, period
         self.orders, self.wavelength, self.k_in = orders, wavelength, tuple(k_in)
-        # The 3 layer kinds get dispatched at the seam: the owned backend ships scalar-isotropic layers
-        # in stage 1; the anisotropic 5/10-component kinds are stage-2 work and raise loudly, never
-        # silently wrong (the PML / tensor front door routes to them).
+        # Materials may be a scalar / grid (isotropic) or a 5-tuple (anisotropic eps)
+        # / 10-tuple (eps+mu) -- all wired in the owned backend. A RAW (...,3,3)
+        # tensor array is NOT a supported layer material (the front door produces
+        # the component tuples); reject it loudly, never guess which 5 components
+        # it stands for.
         for k, (_t, e) in enumerate(layers):
-            if isinstance(e, tuple) and len(e) in (5, 10):
-                n = len(e)
-                raise RcwaError(
-                    f"layer {k}: a {n}-component anisotropic layer is {_STAGE2_ANISO} -- the state-space "
-                    "backend solves scalar-isotropic stacks now. (Never silent, never wrong.)"
-                )
             if not isinstance(e, tuple) and jnp.ndim(e) >= 3:
                 raise RcwaError(
-                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer is "
-                    f"{_STAGE2_ANISO} -- the state-space backend solves scalar-isotropic stacks now. "
-                    "(Never silent, never wrong.)"
+                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer must be "
+                    "given as its 5-component (eps_xx..eps_zz) or 10-component (eps+mu) tuple; "
+                    "the raw (...,3,3) array is not a supported layer material."
                 )
         if not isinstance(formulation, Formulation):
             try:
@@ -719,9 +796,35 @@ class Rcwa:
 
     @staticmethod
     def _ambient_scalar(e):
-        """The scalar permittivity of a CONCRETE uniform ambient, or ``None`` when it is traced or
-        in-plane patterned (the stage-2 ambient corner -- the analytic plane-wave split needs a
-        structurally uniform medium; a patterned/traced ambient is loud, not silently wrong)."""
+        """The scalar permittivity of a CONCRETE uniform isotropic ambient, or ``None`` when it is
+        traced, in-plane patterned or anisotropic (the stage-2 ambient corner -- the analytic
+        plane-wave split needs a structurally uniform, isotropic medium; anything else is loud or
+        folded into the stack, never silently wrong).
+
+        Accepts a scalar, a constant grid, or a 5/10-TUPLE whose components are all constant and
+        represent an ISOTROPIC tensor (ε̂ = ε·I, μ̂ = I -- e.g. a σ=0 PML frame, which is the
+        identity tensor); such a tuple reduces to its scalar ε exactly. A tuple with constant but
+        genuinely ANISOTROPIC components is ``None`` too (a uniform-anisotropic ambient needs the
+        general-anisotropic plane-wave split, folded at build like a patterned one)."""
+        if isinstance(e, tuple):
+            comps = [np.asarray(c) for c in e]
+            # every component must be a constant grid (or scalar)
+            vals = []
+            for c in comps:
+                a = c.reshape(-1)
+                scale = max(float(np.abs(a).max()), 1.0)
+                if np.ptp(a.real) > _UNIFORM_RTOL * scale or np.ptp(a.imag) > _UNIFORM_RTOL * scale:
+                    return None
+                vals.append(complex(a[0]))
+            exx, exy, eyx, eyy, ezz = vals[:5]
+            # isotropic tensor: eps_xx == eps_yy == eps_zz, zero off-diagonals
+            if not (abs(exy) == 0.0 and abs(eyx) == 0.0 and exx == eyy and exx == ezz):
+                return None
+            if len(vals) == 10:  # mu must be the identity
+                mxx, mxy, myx, myy, mzz = vals[5:]
+                if not (abs(mxy) == 0.0 and abs(myx) == 0.0 and mxx == 1.0 and myy == 1.0 and mzz == 1.0):
+                    return None
+            return exx
         g = np.asarray(e)
         if g.ndim == 0:
             return complex(g)
@@ -735,19 +838,57 @@ class Rcwa:
     def _build_stack(self, wavelength):
         """Build the backend :class:`StateStack` from the CONSTRUCTION stack: the expansion, per-layer
         chunk counts, uniform/patterned flags and expm squaring guards are all decided here, eagerly,
-        before any trace. Ambients (layers 0 and -1) must be uniform and concrete."""
+        before any trace.
+
+        Ambients (layers 0 and -1): a CONCRETE uniform isotropic ambient becomes the analytic
+        plane-wave split scalar. A patterned or anisotropic-tensor ambient (the in-plane PML frame
+        slices) CANNOT be an analytic scalar -- owning the slab it sits in is not the physics either
+        -- so it is FOLDED into the stack as a finite layer of the jNO unit ambient thickness, with
+        the analytic split against vacuum (epsilon = 1) beyond: the supercell behaves as an isolated
+        scatterer in free space (exactly the in-plane PML's meaning, and how the fmmax-era seam
+        treated these slice layers -- unit-thick eigensolved slabs)."""
         if not _concrete(wavelength):
             raise RcwaError(
                 "the state-space backend needs a CONCRETE wavelength to fix its standing structure "
                 "(chunking/squaring guards); solve with a concrete wavelength or pass wavelength= at "
                 "construction."
             )
-        sup, sub = self._ambient_scalar(self.layers_spec[0][1]), self._ambient_scalar(self.layers_spec[-1][1])
-        if sup is None or sub is None:
+        sup = self._ambient_scalar(self.layers_spec[0][1])
+        sub = self._ambient_scalar(self.layers_spec[-1][1])
+        # A patterned / tensor ambient cannot be a scalar for the analytic plane-wave
+        # split; fold the ambient slice into the stack as a unit ambient layer (the old
+        # seam's inf -> 1.0 convention) and split against vacuum beyond (the PML supercell
+        # is an isolated scatterer). The check is PER-SIDE: a patterned SCALAR-grid
+        # ambient always raises loudly (task T30 corner) even when the other ambient is a
+        # tuple, and a genuinely anisotropic CONSTANT 5-component (eps-only) ambient also
+        # raises -- folding it would silently replace a semi-infinite birefringent
+        # substrate by a 1-wavelength slab over air. Only the coordinate-stretch PML
+        # frame (10-component eps^ + mu^ tensors, the stretch enters both) is folded,
+        # whether the frame is patterned (sigma graded in-plane) or constant (uniform
+        # sigma); that fold is the isolated-scatterer supercell model this code documents.
+        fold_top, fold_bot = sup is None, sub is None
+        for side, fold in ((0, fold_top), (-1, fold_bot)):
+            if not fold:
+                continue
+            spec = self.layers_spec[side][1]
+            if isinstance(spec, tuple) and len(spec) == 10:
+                continue  # a PML coordinate-stretch frame (eps^ + mu^) -- stays folded
+            if isinstance(spec, tuple):
+                # a 5-component eps-only uniform-anisotropic constant ambient
+                raise RcwaError(
+                    "a uniform-anisotropic constant 5-component ambient (eps^ only, mu = I) "
+                    "is the stage-2 ambient corner: the analytic plane-wave split needs a "
+                    "structurally uniform, isotropic medium, and the vacuum-beyond fold would "
+                    "silently model a semi-infinite anisotropic substrate as one wavelength of "
+                    "birefringent film over air. Only a 10-component coordinate-stretch PML "
+                    "frame (eps^ + mu^) is folded; use scalar/constant-grid ambients on both "
+                    "sides, or replace the semi-infinite ambient with a finite supercell."
+                )
+            # a patterned scalar grid ambient stays a loud stage-2 corner
             raise RcwaError(
-                "the ambients (layers 0 and -1) must be uniform, concrete permittivities for the "
-                "analytic plane-wave split; a traced or in-plane-patterned ambient is the stage-2 "
-                "corner (task T30) and raises here instead of returning a wrong answer."
+                "a patterned scalar-grid ambient is the stage-2 ambient corner (task T30): the "
+                "analytic plane-wave split needs a structurally uniform, isotropic medium; a "
+                "patterned scalar grid is not supported (never silently wrong)."
             )
         films = []
         for k, (_t, e) in enumerate(self.layers_spec[1:-1]):
@@ -757,62 +898,64 @@ class Rcwa:
             if not (np.isreal(t) and t > 0):
                 raise RcwaError(f"layer {k + 1} thickness must be > 0 (or None/inf for a ~unit ambient), got {t!r}.")
             films.append((float(t), e))
+        if fold_top:
+            films.insert(0, (1.0, self.layers_spec[0][1]))
+        if fold_bot:
+            films.append((1.0, self.layers_spec[-1][1]))
+        self._fold_amb = (fold_top, fold_bot)
         dtype = jnp.dtype(jnp.complex128) if jax.config.jax_enable_x64 else jnp.dtype(jnp.complex64)
         try:
             self._stack = StateStack(
                 wavelength=float(wavelength),
                 period=self.period,
-                amb_sup=sup,
-                amb_sub=sub,
+                amb_sup=1.0 if fold_top else sup,
+                amb_sub=1.0 if fold_bot else sub,
                 layers=films,
                 orders=self.orders,
                 k_in=self.k_in,
                 formulation=self.formulation,
                 dtype=dtype,
             )
-        except NotImplementedError as e:  # an unimplemented vector formulation on a patterned layer
-            raise RcwaError(
-                f"{e} -- that formulation is not wired in the state-space backend yet (stage 2, task T30)."
-            ) from e
+        except NotImplementedError as e:  # a backend feature the state-space engine does not implement yet
+            raise RcwaError(f"{e}") from e
         except ValueError as e:
             raise RcwaError(f"cannot build the state-space backend for this stack: {e}") from e
 
     def _prepare_stack(self, layers_spec, kin):
-        """Each layer's permittivity grid and the thickness list. EAGER on purpose: collapsing a uniform
-        layer reads its values, which a trace cannot do -- so this runs before the compiled solve and
-        hands it ``(1, 1)`` (the backend's uniform-isotropic shortcut) or patterned grids as arguments.
-
-        The 3 layer kinds are dispatched here: scalar-isotropic solves now; a 5/10-component
-        anisotropic layer is stage-2 work and raises loudly (never silently wrong)."""
+        """Each layer's permittivity material and the thickness list, EAGER on purpose: collapsing a
+        uniform layer reads its values, which a trace cannot do -- so this runs before the compiled
+        solve and hands it ``(1, 1)`` (the backend's uniform shortcut) or patterned grids as
+        arguments. A layer material may be a scalar, a grid, or a 5/10-component anisotropic tuple
+        (each component scalar or grid)."""
         kin = jnp.asarray(kin)
         cdt = jnp.result_type(kin.dtype, jnp.complex64)  # one complex dtype for the solve (robust to a
         for k, (_t, e) in enumerate(layers_spec):  # float32 design parameter vs float64 wavevectors)
-            if isinstance(e, tuple) and len(e) in (5, 10):
+            if isinstance(e, tuple):
                 n = len(e)
+                if n not in (5, 10):
+                    raise RcwaError(
+                        f"layer {k}: an anisotropic tuple material must have 5 (eps) or 10 (eps+mu) components, got {n}."
+                    )
+            elif jnp.ndim(e) >= 3:
                 raise RcwaError(
-                    f"layer {k}: a {n}-component anisotropic layer is {_STAGE2_ANISO} -- the state-space "
-                    "backend solves scalar-isotropic stacks now. (Never silent, never wrong.)"
-                )
-            if not isinstance(e, tuple) and jnp.ndim(e) >= 3:
-                raise RcwaError(
-                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer is "
-                    f"{_STAGE2_ANISO} -- the state-space backend solves scalar-isotropic stacks now. "
-                    "(Never silent, never wrong.)"
+                    f"layer {k}: a tensor-form ({tuple(jnp.shape(e))}) anisotropic layer must be "
+                    "given as its 5-component (eps_xx..eps_zz) or 10-component (eps+mu) tuple; "
+                    "the raw (...,3,3) array is not a supported layer material."
                 )
 
         def _grid(g):  # scalar -> (1, 1) grid; jax-native so a permittivity grid flows -> differentiable in ε
             g = jnp.asarray(g).astype(cdt)
             return jnp.full((1, 1), g) if g.ndim == 0 else g
 
-        def prepare(e):
-            """Collapse a CONCRETE constant grid to ``(1, 1)`` so the backend takes its ANALYTIC uniform
-            path (exact plane waves, no expm) instead of the patterned (4n) transfer. ``detect_layers``
-            hands back a full ``(Ng, Ng)`` grid for EVERY slab, so constant cladding / substrate / mirror
-            films must collapse -- ruinous otherwise for a mostly-uniform stack (a Bragg / Mo/Si
-            multilayer). Exact, not an approximation. A TRACED grid never collapses: under trace a
-            "uniform" grid may be a design parameter that merely starts flat, and collapsing it would
-            freeze the design's structure out of the solve."""
-            g = _grid(e)
+        def _collapse(g):
+            """Collapse a CONCRETE constant grid to ``(1, 1)`` so the backend takes its ANALYTIC
+            uniform path (exact plane waves, no expm) instead of the patterned (4n) transfer.
+            ``detect_layers`` hands back a full ``(Ng, Ng)`` grid for EVERY slab, so constant
+            cladding / substrate / mirror films must collapse -- ruinous otherwise for a
+            mostly-uniform stack (a Bragg / Mo/Si multilayer). Exact, not an approximation. A
+            TRACED grid never collapses: under trace a "uniform" grid may be a design parameter
+            that merely starts flat, and collapsing it would freeze the design's structure out of
+            the solve."""
             if _concrete(g) and g.size > 1:
                 a = np.asarray(g)
                 scale = max(float(np.abs(a).max()), 1.0)
@@ -820,9 +963,48 @@ class Rcwa:
                     return jnp.full((1, 1), a.reshape(-1)[0], dtype=cdt)
             return g
 
+        def prepare(e):
+            if isinstance(e, tuple):
+                comps = [_grid(c) for c in e]
+                # ALL-OR-NOTHING across the layer's components: a tensor layer collapses to
+                # uniform only when every component is concrete-constant -- a partly-uniform
+                # tensor must stay fully patterned (mirrors the old seam / fmmax shape rule:
+                # the backend's Fourier matrices need matching component shapes).
+                collapsed = [_collapse(c) for c in comps]
+                if all(tuple(jnp.shape(c)) == (1, 1) for c in collapsed):
+                    return tuple(collapsed)
+                return tuple(_grid(c) for c in e)
+            return _collapse(_grid(e))
+
         grids = [prepare(e) for _, e in layers_spec]
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
         return grids, thick
+
+    def _backend_materials(self, grids):
+        """The (films, amb_sup_scalar, amb_sub_scalar) handed to the StateStack core, EAGERLY.
+
+        With a folded ambient (in-plane PML: the grid at 0 or -1 is a patterned/tensor slice), the
+        ambient grid BECOMES the outermost film and the analytic split scalar is vacuum (= 1) beyond
+        it; otherwise the ambient is the uniform (1,1)/scalar medium and ``_amb`` reads its corner
+        value (jax-native, trace-safe). A TUPLE ambient (uniform-anisotropic tensor, validated
+        isotropic-constant at build) reduces to its diagonal value ``ε_xx``."""
+        fold_top, fold_bot = getattr(self, "_fold_amb", (False, False))
+
+        def _amb(g):
+            if isinstance(g, tuple):
+                g0 = jnp.asarray(g[0])  # eps_xx component; isotropic tensor => the diagonal value
+                return g0 if g0.ndim == 0 else g0[0, 0]
+            g = jnp.asarray(g)
+            return g if g.ndim == 0 else g[0, 0]
+
+        films = []
+        for i, g in enumerate(grids):
+            is_amb = (i == 0 and not fold_top) or (i == len(grids) - 1 and not fold_bot)
+            if not is_amb:
+                films.append(g)
+        sup = 1.0 if fold_top else _amb(grids[0])
+        sub = 1.0 if fold_bot else _amb(grids[-1])
+        return tuple(films), sup, sub
 
     def _ensure_stack(self, grids, thick, wl):
         """Lazy engine build + per-solve structure validation (count/shapes/thicknesses are fixed at
@@ -833,7 +1015,8 @@ class Rcwa:
         # Degenerate ambient-only stacks (0 finite films: a single homogenized medium, or a bare
         # super|sub pair) are legal -- the grids are the ambients, exactly as the fmmax-era engine
         # treated them (T = 1 trivially when the two sides share one medium).
-        n_film = max(0, len(grids) - 2)
+        films, _, _ = self._backend_materials(grids)
+        n_film = max(0, len(films))
         if n_film != len(st.layers):
             raise RcwaError(
                 f"per-solve layer stack has {n_film} finite layers but the engine was built with "
@@ -848,23 +1031,68 @@ class Rcwa:
         # resample, whose ambients are scalar-derived and therefore uniform at every trace point
         # (corner-slice exact); a traced-*patterned* ambient cannot be checked eagerly (values are
         # invisible under trace) and is a documented stage-2 limitation.
-        for gi in (0, len(grids) - 1):
-            gshape = tuple(jnp.shape(grids[gi]))
-            if _concrete(grids[gi]) and gshape not in ((), (1, 1)):
+        fold_top, fold_bot = getattr(self, "_fold_amb", (False, False))
+        for gi, folded in ((0, fold_top), (len(grids) - 1, fold_bot)):
+            if folded:
+                continue  # this ambient is a folded STACK film, not an analytic-split ambient
+            g = grids[gi]
+            if isinstance(g, tuple):
+                # A per-solve TUPLE ambient reaches an analytic-split side. `_ambient_scalar`
+                # validated the BUILD-time ambient; a per-solve override is NOT re-validated
+                # by anything (the fold flags were fixed at build), and the compiled seam's
+                # `_amb` corner-slices g[0][0, 0] = eps_xx for a whole tensor. So a per-solve
+                # tuple is allowed only when it reduces EXACTLY to its scalar (an
+                # isotropic-constant tensor: the corner slice is then the whole physics);
+                # a genuinely anisotropic per-solve tuple would be silently solved as an
+                # eps_xx isotrope -- the never-silent violation -- and raises loudly.
+                # (A TRACED per-solve tuple cannot be inspected eagerly: document the joint
+                # limitation alongside the traced-*patterned* ambient note above.)
+                if all(_concrete(c) for c in g):
+                    flat = tuple(np.asarray(jnp.asarray(c)) for c in g)
+                    if self._ambient_scalar(flat) is None:
+                        raise RcwaError(
+                            f"per-solve ambient {gi} is a genuinely anisotropic tensor tuple: the "
+                            "analytic plane-wave split was fixed at build for THIS stack's ambient "
+                            "kind, and the compiled seam would corner-slice it to eps_xx (never "
+                            "silently wrong). Pass the anisotropic tuples at construction (the "
+                            "stage-2 ambient corner, task T30), or create a fresh Rcwa."
+                        )
+                continue  # isotropic-constant tuple: the corner-slice is exact
+            gshape = tuple(jnp.shape(g))
+            if _concrete(g) and gshape not in ((), (1, 1)):
                 raise RcwaError(
                     f"ambient layer {gi}'s per-solve grid shape {gshape} is not a uniform (1,1) "
                     "permittivity -- the analytic plane-wave split needs a structurally uniform "
-                    "ambient; a patterned ambient is the stage-2 corner (task T30) and raises here "
-                    "instead of returning a wrong answer."
+                    "ambient; a patterned scalar-grid ambient is the stage-2 corner (task T30) and "
+                    "raises here instead of returning a wrong answer."
                 )
-        for li, g in enumerate(grids[1:-1]):
+        # The backend's build-time per-layer material shape may be exposed as the
+        # scalar-layer `_shapes` (stage-1) or, after the anisotropic refactor, the
+        # per-component `_comp_shapes` (one entry per layer, itself a tuple). Read
+        # whichever the backend exposes so the structure-freeze check works across
+        # both: a per-solve scalar-isotropic grid must match the (first) component.
+        if hasattr(st, "_shapes"):
+            build_shapes = list(st._shapes)
+        else:
+            build_shapes = [cs[0] for cs in st._comp_shapes]
+        for li, g in enumerate(films):
+            if isinstance(g, tuple):
+                gshape = tuple(tuple(jnp.shape(c)) for c in g)
+                bshape = st._comp_shapes[li]
+                ok = gshape == bshape or all(s == (1, 1) for s in gshape)
+                if not ok:
+                    raise RcwaError(
+                        f"layer {li + 1} material shapes {gshape} differ from the engine's "
+                        f"{bshape} (structure fixed at build) -- create a fresh Rcwa."
+                    )
+                continue
             gshape = tuple(jnp.shape(g))
             # A per-solve constant grid is collapsed to (1, 1) eagerly (exact): accept it for a
             # genuinely patterned build shape too -- the uniform shortcut is a per-solve property.
-            if gshape != st._shapes[li] and gshape != (1, 1):
+            if gshape != build_shapes[li] and gshape != (1, 1):
                 raise RcwaError(
                     f"layer {li + 1} grid shape {gshape} differs from the engine's "
-                    f"{st._shapes[li]} (structure fixed at build) -- create a fresh Rcwa."
+                    f"{build_shapes[li]} (structure fixed at build) -- create a fresh Rcwa."
                 )
         for li, t in enumerate(thick[1:-1]):
             # The built thickness may live in float32/complex64 storage (e.g. stored as a complex64
@@ -872,7 +1100,11 @@ class Rcwa:
             # float32, so a 1e-9 comparison against the exact float64 value fails spuriously. Compare
             # with a float32-safe relative tolerance (float32 eps ~1.2e-7, so 1e-6 rel. gives ~10x
             # margin) while keeping the guard's spirit: a genuinely different thickness still raises.
-            tb = float(np.real(st.layers[li][0]))
+            # With FOLDED ambients (in-plane PML) the engine inserts the ambient slices as the
+            # outermost films, so film index == full-layer index (``li + 1`` here); without a fold
+            # the films are the central slices, shifted by one from the full grid.
+            f = (li + 1) if fold_top else li
+            tb = float(np.real(st.layers[f][0]))
             if _concrete(t) and abs(float(t) - tb) > 1e-6 * max(1.0, abs(tb)):
                 raise RcwaError(
                     f"per-solve thickness {float(t):.6g} for layer {li + 1} differs from the engine's "
@@ -885,24 +1117,15 @@ class Rcwa:
         """Backend layer solves + chunked R-matrix stack assembly + incident state/flux at k_in -- the
         numerical core of a plane-wave solve, COMPILED once per stack structure (the ``_core_jit``
         cache, exactly as before, so re-solves across wavelength/design/k_in/pol reuse the executable).
-        Structural decisions (collapse, chunking, squaring guards) stay outside, eager."""
+        Structural decisions (collapse, chunking, squaring guards, the ambient fold) stay outside,
+        eager."""
         fn = self.__dict__.get("_core_jit")
         if fn is None:
             stack = self._stack
 
-            def _amb(g):  # the ambient's scalar permittivity (jax-native: (1,1) or (g,g) -> [0, 0])
-                g = jnp.asarray(g)
-                return g if g.ndim == 0 else g[0, 0]
-
             def core(grids, thick, wl, kin, pol):
-                return stack._solve_core(
-                    tuple(grids[1:-1]),
-                    wl,
-                    kin,
-                    pol,
-                    _amb(grids[0]),
-                    _amb(grids[-1]),
-                )
+                films, sup, sub = self._backend_materials(grids)
+                return stack._solve_core(films, wl, kin, pol, sup, sub)
 
             fn = self._core_jit = jax.jit(core)
         return _Result.from_tuple(
@@ -981,13 +1204,61 @@ class Rcwa:
         return sol
 
     def _solve_source(self, source, layers_spec, wl, kin):
-        """Internal-source (dipole / Gaussian) emission solve: the backend wires the Maxwell jump
-        conditions in stage 2 (``jno/_rcwa/fields.py`` + the source task); until then this raises
-        loudly instead of returning a wrong answer."""
-        raise RcwaError(
-            "internal-source (emitter) solves need the backend's Maxwell-jump source terms "
-            f"(stage 2, {_STAGE2_SOURCE}); plane-wave solves work now."
-        )
+        """Internal-source (dipole / Gaussian) emission solve. ``source`` is a dict from the front door
+        (or the same shape at engine level)::
+
+            {loc: (1,2) JAX, layer: int (full-stack index incl. ambients),
+             t_upper, t_lower: JAX, kind: 'delta'|'gaussian', fwhm: JAX,
+             orient: (ox,oy,oz), amp: scalar}
+
+        The backend's :func:`jno._rcwa.sources.emission_solve` closes the Maxwell jump conditions
+        (H_t jumps by j_t, E_t continuous; the z-current couples through the inverse-z-permittivity)
+        at the source plane between the two half-stacks -- the eig-free substitute for fmmax's
+        ``amplitudes_for_source``. Returns an :class:`_EmitterSol` with the power radiated up / down
+        (differentiable in ``amp``, ``orient``, ``loc``, ``t_upper``/``t_lower`` and the design ε)."""
+        from jno._rcwa import sources as _r_sources
+
+        grids, thick = self._prepare_stack(layers_spec, kin)
+        st = self._ensure_stack(grids, thick, wl)  # lazy engine build + structure validation
+
+        # The front door's `layer` indexes the FULL layer stack (ambients at 0 and -1, top-first);
+        # the backend StateStack holds only the finite films. Without a top fold the backend films
+        # are the central slices (subtract the top ambient); WITH a top fold the folded ambient
+        # slice became films[0], so a full-stack index k >= 1 maps to backend film k unchanged --
+        # the shift must be fold-aware (never the bare -1: under a PML frame it would silently
+        # place the source one film off).
+        fold_top, _ = getattr(self, "_fold_amb", (False, False))
+        if not isinstance(source["layer"], (int, np.integer)):
+            raise RcwaError(f"source layer must be an integer stack index, got {source['layer']!r}.")
+        src = dict(source)
+        src["layer"] = int(source["layer"]) - (0 if fold_top else 1)
+        try:
+            # Wire through the SAME shared _backend_materials path as the plane-wave core: the
+            # (films, sup, sub) triple already accounts for folded ambients (the folded slice
+            # lives inside `films`, and the analytic split scalar is vacuum beyond) and for
+            # tuple ambients (the validated isotropic-constant corner slice). A hand-rolled
+            # local `_amb` and a bare grids[1:-1] here would under-count backend layers under a
+            # fold (the "N entries for N+1 backend layers" misattribution) and silently slice a
+            # tuple ambient to eps_xx.
+            films, sup, sub = self._backend_materials(grids)
+            up, down = _r_sources.emission_solve(
+                st,
+                src,
+                wavelength=wl,
+                eps_grids=tuple(films),
+                k_in=kin,
+                amb_sup=sup,
+                amb_sub=sub,
+            )
+        except ValueError as e:
+            raise RcwaError(str(e)) from e
+        if _concrete(up) and not (np.isfinite(float(up)) and np.isfinite(float(down))):
+            raise RcwaError(
+                "non-finite emission (NaN/inf): the internal-source solve hit a Γ-point / Rayleigh "
+                f"degeneracy (k_in={tuple(float(k) for k in kin)}). Nudge k_in off exact normal, "
+                "e.g. k_in=(1e-3, 1e-3)."
+            )
+        return _EmitterSol(up, down)
 
 
 # =====================================================================================
@@ -2245,8 +2516,8 @@ def rcwa(
             inference (structure, source, wavelength) instead of their initial values.
         formulation: the Fourier-factorization name, e.g. ``"JONES_DIRECT_FOURIER"`` (default; converges
             well for high-contrast dielectrics, where the naive ``"FFT"`` rule converges poorly). The
-            state-space backend now implements ``FFT`` and ``JONES_DIRECT_FOURIER``; the other vector
-            schemes land in stage 2 (task T30).
+            state-space backend implements all eight fmmax vector schemes plus ``FFT`` and a callable
+            tangent-field hook.
         smoothing: Subpixel-smoothing factor (default ``1`` = off). ``smoothing=k`` supersamples each
             RCWA pixel ``k×k`` and area-averages the permittivity, anti-aliasing material boundaries.
             Recommended (``2``–``4``) for **inverse design**: it cuts Fourier (Gibbs) ringing so fewer

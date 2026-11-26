@@ -12,7 +12,7 @@ field-transport functions live on the ``jno._rcwa.fft`` module, whose name is
 kept from being shadowed by the like-named transform function (``fft.fft``).
 """
 
-from jno._rcwa import basis, fft, fields, layer, matrices, stack, utils  # noqa: E402,F401
+from jno._rcwa import basis, fft, fields, layer, matrices, sources, stack, utils  # noqa: E402,F401
 from jno._rcwa.basis import (
     Expansion,
     LatticeVectors,

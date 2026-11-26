@@ -419,7 +419,130 @@ def test_per_solve_uniform_ambient_override_solves():
     assert abs(T1 - T0) > 1e-4, "the overridden ambients genuinely change the answer"
 
 
-def test_energy_conservation_guard_raises_loudly():
+def test_per_solve_anisotropic_tuple_ambient_raises_loudly():
+    """A per-solve TUPLE ambient is only legal when it reduces EXACTLY to its
+    scalar (an isotropic-constant tensor): the compiled seam's `_amb` corner-
+    slices a tuple to eps_xx, so a genuinely anisotropic per-solve tuple would
+    be silently solved as an eps_xx isotrope -- it raises instead (stage-2
+    ambient corner). Regression for iss_mwwg1td18yoeng."""
+    from jno.rcwa import Rcwa
+
+    rc = Rcwa(
+        [(INF, 1.0), (0.3, 11.0), (INF, 1.0)],
+        period=(0.85, 0.85),
+        orders=5,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+    with pytest.raises(jno.RcwaError, match="anisotropic|ambient"):
+        rc.solve(layers=[(INF, 1.0), (0.3, 11.0), (INF, (2.0, 0.0, 0.0, 9.0, 2.0))])
+    # The isotropic-constant diag(4,4,4) tuple IS the scalar eps=4 (corner-slice
+    # exact): the two solves must agree, not raise.
+    T0 = float(rc.solve(layers=[(INF, 1.0), (0.3, 11.0), (INF, 4.0)]).efficiency("T"))
+    T1 = float(rc.solve(layers=[(INF, 1.0), (0.3, 11.0), (INF, (4.0, 0.0, 0.0, 4.0, 4.0))]).efficiency("T"))
+    assert abs(T1 - T0) < 1e-6
+
+
+def test_per_side_patterned_scalar_ambient_raises_beside_a_pml_tuple():
+    """A patterned SCALAR-grid ambient raises even when the OTHER ambient is a
+    folded tuple (the old guard's "both-or-neither-tuple" check silently folded
+    the scalar side in that layout) -- regression for iss_mwwg1tbthn43h5."""
+    from jno.rcwa import Rcwa
+
+    Pg, ng = 0.85, 8
+    xs = (np.arange(ng) + 0.5) / ng * Pg
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    pat = 1.0 + (((X - Pg / 2) ** 2 + (Y - Pg / 2) ** 2) < 0.2**2) * 0.5
+    # a constant coordinate-stretch PML frame (10 comps: eps^ = Lambda, mu^ = Lambda)
+    sxa, sya = 1.0 + 0.3j, 1.0 + 0.1j
+    lam = (sya / sxa, 0.0, 0.0, sxa / sya, sxa * sya)
+    with pytest.raises(jno.RcwaError, match="ambient corner"):
+        Rcwa(
+            [(None, pat), (0.3, 11.0), (None, lam + lam)],
+            period=(Pg, Pg),
+            orders=5,
+            wavelength=WL,
+            assume_periodic=True,
+        )
+
+
+def test_uniform_aniso_constant_ambient_raises_not_a_silent_slab():
+    """A constant 5-component anisotropic ambient (a birefringent substrate)
+    raises loudly at build instead of being silently folded as a 1-lambda slab
+    over vacuum -- the promised raise the old comment claimed (never-silent).
+    Regression for iss_mwwg1tei5ygsye. A constant 10-component PML
+    coordinate-stretch frame stays modelled (the documented isolated-scatterer
+    fold)."""
+    from jno.rcwa import Rcwa
+
+    with pytest.raises(jno.RcwaError, match="5-component|anisotropic"):
+        Rcwa(
+            [(None, np.full((8, 8), 4.0)), (0.3, 11.0), (None, (9.4, 0.0, 0.0, 4.9, 6.0))],
+            period=(0.85, 0.85),
+            orders=5,
+            wavelength=WL,
+            assume_periodic=True,
+        )
+    # the 10-comp PML frame is still folded and solved (documented model)
+    sxa, sya = 1.0 + 0.3j, 1.0 + 0.1j
+    lam = (sya / sxa, 0.0, 0.0, sxa / sya, sxa * sya)
+    rc = Rcwa(
+        [(None, np.full((8, 8), 4.0)), (0.3, 11.0), (None, lam + lam)],
+        period=(0.85, 0.85),
+        orders=5,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+    sol = rc.solve()
+    assert np.isfinite(float(sol.efficiency("T")))
+
+
+def test_order_evanescent_gate_reports_exact_zero():
+    """A sub-wavelength binary grating's evanescent orders report EXACTLY 0 (the
+    fmmax `is_propagating` convention), not the ~1e-17 Poynting-noise readout --
+    the tutorial contract ("exactly dark"). Regression for iss_mwwfkusay5cpv1;
+    the same physics is anchored end-to-end (front door) by tutorial
+    12_rcwa/01_binary_grating_orders.py."""
+    from jno.rcwa import Rcwa
+
+    P = 0.6  # sub-wavelength in x at wl = 1: only order (0,0) propagates
+    ng = 16
+    xs = (np.arange(ng) + 0.5) / ng * P
+    xx, yy = np.meshgrid(xs, xs, indexing="ij")
+    grid = 1.0 + np.where(xx < 0.5 * P, 10.0, 0.0)  # binary ridge in the left half
+    rc = Rcwa(
+        [(INF, 1.0), (0.2, grid), (INF, 1.0)],
+        period=(P, 0.3),
+        orders=40,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+    sol = rc.solve()
+    assert float(sol.order(1, 0)) == 0.0
+    assert float(sol.order(-1, 0)) == 0.0
+    assert float(sol.order(0, 0)) > 0.0
+    assert abs(float(sol.efficiency("T")) + float(sol.efficiency("R")) - 1.0) < 1e-4
+
+
+def test_iso_film_above_aniso_film_engine_level_solves():
+    """The seam-reachable blocker crash: an isotropic film above a uniform
+    anisotropic (5-component tuple) film must solve and conserve energy -- pre-
+    gate-2-fix this raised IndexError inside the compiled trace, escaping the
+    seam's RcwaError wrapper. Regression for iss_mwwg9iydi654q6."""
+    from jno.rcwa import Rcwa
+
+    rc = Rcwa(
+        [(INF, 1.0), (0.2, np.full((8, 8), 4.0)), (0.3, (9.0, 0.0, 0.0, 4.0, 6.0)), (INF, 1.0)],
+        period=(0.6, 0.6),
+        orders=9,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+    sol = rc.solve()
+    T, R = float(sol.efficiency("T")), float(sol.efficiency("R"))
+    assert np.isfinite(T) and np.isfinite(R)
+    assert abs(T + R - 1.0) < 1e-3
+
     """The seam's T+R > 1+5e-3 guard has a loud branch: a deliberately wrong
     (gain-medium, negative eps'') stack must trip it, never return the numbers."""
 
@@ -855,10 +978,6 @@ def _absorbed_fraction(sol, im_eps, nx=8, density=200.0):
 
 
 @needs_fmmax
-@pytest.mark.skip(
-    reason="field3d is stage 2 (task T40): backend interior field reconstruction is not "
-    "wired yet; plane-wave readouts (efficiency/order/jones/spectrum) pass now."
-)
 def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
     """Energy balance through the interior field: the power absorbed in a uniform lossy slab,
     (1/2) k0 Im eps integral |E|^2 dV per unit incident power, equals 1 - R - T of the same solve."""
@@ -899,10 +1018,6 @@ def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
 
 
 @needs_fmmax
-@pytest.mark.skip(
-    reason="field3d is stage 2 (task T40): backend interior field reconstruction is not "
-    "wired yet; plane-wave readouts (efficiency/order/jones/spectrum) pass now."
-)
 def test_field3d_is_differentiable_in_the_design():
     """field3d returns a JAX |E|^2: jax.grad of the absorbed power in a patterned lossy layer w.r.t. the
     layer's loss matches a central finite difference."""

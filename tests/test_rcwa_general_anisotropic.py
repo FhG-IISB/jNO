@@ -6,7 +6,6 @@ This is the engine foundation for an in-plane uniaxial PML (a coordinate stretch
 ε-only anisotropic path; a genuine μ̂ ≠ I must change the result (magnetic response actually enters).
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
@@ -28,17 +27,6 @@ def _x64():
 
 
 from jno.rcwa import Rcwa  # noqa: E402
-
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
-
-# All four tests need the 10-component general-anisotropic backend layer (task T28); stage 1's
-# state-space backend solves scalar-isotropic stacks and raises a loud RcwaError on tensor layers.
-pytestmark = pytest.mark.skip(
-    reason="10-component general-anisotropic layers are stage 2 (task T28): the state-space backend "
-    "solves scalar-isotropic stacks in stage 1, and the tensor layers raise a loud RcwaError naming "
-    "the task. Tasks T28/T37 restore these."
-)
 
 PERIOD = (0.6, 0.6)
 WL, ORDERS, D = 1.0, 60, 0.35
@@ -63,7 +51,6 @@ def _general10(eps, mu):  # (ε_xx..ε_zz, μ_xx..μ_zz) with diagonal μ̂ = μ
     return [(float("inf"), 1.0), (D, slab), (float("inf"), 1.0)]
 
 
-@needs_fmmax
 def test_general_mu_one_reduces_to_anisotropic():
     """μ̂ = I in the 10-tuple general layer must give exactly the ε-only anisotropic (5-tuple) result —
     the general eigensolve reduces to the anisotropic one when the medium is non-magnetic."""
@@ -73,7 +60,6 @@ def test_general_mu_one_reduces_to_anisotropic():
     assert Rg == pytest.approx(Ra, abs=1e-6)
 
 
-@needs_fmmax
 def test_general_mu_one_matches_isotropic():
     """And with ε̂ = ε·I, μ̂ = I it matches the plain isotropic slab — full reduction to the scalar path."""
     Tg, Rg = _T(_general10(EPS, 1.0))
@@ -82,7 +68,6 @@ def test_general_mu_one_matches_isotropic():
     assert Rg == pytest.approx(Ri, abs=1e-6)
 
 
-@needs_fmmax
 def test_magnetic_mu_changes_result():
     """A genuine μ̂ ≠ I changes the response: μ alters the wave impedance √(μ/ε), so reflection differs from
     the non-magnetic slab. Proves μ actually enters the solve (not silently dropped)."""
@@ -91,7 +76,6 @@ def test_magnetic_mu_changes_result():
     assert abs(Rm - Rn) > 1e-2
 
 
-@needs_fmmax
 def test_general_lossless_conserves_energy():
     """A lossless general-anisotropic slab (real ε̂, μ̂) conserves energy: T + R ≈ 1."""
     T, R = _T(_general10(EPS, 2.0))

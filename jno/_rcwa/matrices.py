@@ -14,8 +14,9 @@ corrected by a term involving the tangent vector field of the interfaces
 ``jno.rcwa`` default): the tangent field is found in the Fourier domain by one
 fixed-coefficient Newton step of an alignment loss (``vector.py`` conventions,
 grad-decoupled via ``stop_gradient`` so design gradients flow only through the
-permittivity itself). The remaining vector schemes and the callable hook are
-wired by the stage-2 task; this module already accepts a callable.
+permittivity itself). All eight fmmax vector schemes are implemented (``POL``,
+``NORMAL``, ``JONES``, ``JONES_DIRECT`` and their ``_FOURIER`` variants), plus
+the callable tangent-field hook.
 
 Everything below is jit- and grad-clean: only JAX ops in the traced functions,
 and no data-dependent control flow (the Newton trip count is a static integer).
@@ -36,9 +37,8 @@ from . import fft, utils
 
 
 #: How to compute the transverse permittivity matrix (fmmax-compatible names).
-#: ``FFT`` uses Laurent's rule; every other member is a vector formulation.
-#: Stage 2 wires the full suite; for now ``FFT`` and ``JONES_DIRECT_FOURIER``
-#: are implemented and the rest raise a loud ``NotImplementedError``.
+#: ``FFT`` uses Laurent's rule; every other member is a vector formulation, with
+#: weights and post-processing matching ``fmmax.vector.VECTOR_FIELD_SCHEMES``.
 class Formulation(enum.Enum):
     """Enumerates the supported Fourier-modal-method formulations.
 
@@ -65,7 +65,7 @@ VectorFn = Callable[
     Tuple[jnp.ndarray, jnp.ndarray],
 ]
 
-#: Vector-scheme weights, matching ``fmmax.vector`` for the default formulation.
+#: Vector-scheme weights, matching ``fmmax.vector`` member for member.
 _FOURIER_LOSS_WEIGHT_JONES_DIRECT = 0.05
 _SMOOTHNESS_LOSS_WEIGHT = 2.0
 _SMOOTHNESS_LOSS_WEIGHT_JONES_DIRECT = 0.5
@@ -80,15 +80,33 @@ _ATOL_1D_FIELD_ANGLE = 1e-2
 # -----------------------------------------------------------------------------
 
 
-def _scheme(formulation: Formulation) -> Tuple[bool, float, float]:
-    """Vector-scheme parameters ``(use_jones_direct, fourier_w, smoothness_w)``."""
+def _scheme(formulation: Formulation) -> Tuple[bool, float, float, Optional[str]]:
+    """Vector-scheme parameters for `formulation`.
+
+    Returns ``(use_jones_direct, fourier_loss_weight, smoothness_loss_weight,
+    tangent_post)``, where ``tangent_post`` is ``None`` (the tangent field is
+    used as computed), ``"jones"`` (converted to the complex Jones elliptical
+    field) or ``"normal"`` (element-wise normalized), matching
+    ``fmmax.vector.VECTOR_FIELD_SCHEMES`` member for member.
+    """
+    if formulation is Formulation.JONES_DIRECT:
+        return True, 0.0, _SMOOTHNESS_LOSS_WEIGHT_JONES_DIRECT, None
+    if formulation is Formulation.JONES:
+        return False, 0.0, _SMOOTHNESS_LOSS_WEIGHT, "jones"
+    if formulation is Formulation.NORMAL:
+        return False, 0.0, _SMOOTHNESS_LOSS_WEIGHT, "normal"
+    if formulation is Formulation.POL:
+        return False, 0.0, _SMOOTHNESS_LOSS_WEIGHT, None
     if formulation is Formulation.JONES_DIRECT_FOURIER:
-        return True, _FOURIER_LOSS_WEIGHT_JONES_DIRECT, 0.0
-    # The remaining schemes are stage-2 work; the enum members exist so the
-    # names/formulation strings already match the seam.
-    raise NotImplementedError(
-        f"formulation {formulation.value!r} is not implemented yet (stage 2); "
-        f"available now: 'FFT', 'JONES_DIRECT_FOURIER', or a custom callable hook."
+        return True, _FOURIER_LOSS_WEIGHT_JONES_DIRECT, 0.0, None
+    if formulation is Formulation.JONES_FOURIER:
+        return False, _FOURIER_LOSS_WEIGHT, 0.0, "jones"
+    if formulation is Formulation.NORMAL_FOURIER:
+        return False, _FOURIER_LOSS_WEIGHT, 0.0, "normal"
+    if formulation is Formulation.POL_FOURIER:
+        return False, _FOURIER_LOSS_WEIGHT, 0.0, None
+    raise ValueError(
+        f"{formulation!r} is not a vector formulation; `FFT` has no tangent field and is handled by the caller."
     )
 
 
@@ -213,6 +231,293 @@ def transverse_matrices_isotropic(
     return inverse_z_permittivity, z_permittivity, transverse, tangent_field
 
 
+# -----------------------------------------------------------------------------
+# Anisotropic media (5-component ε̂ and 10-component ε̂+μ̂), fmmax conventions.
+# -----------------------------------------------------------------------------
+TensorComponents = Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+TensorTuple = Tuple[TensorComponents, TensorComponents]  # (ε, μ) component tuples
+
+
+def transverse_permittivity_fft_anisotropic(
+    permittivity_xx: jnp.ndarray,
+    permittivity_xy: jnp.ndarray,
+    permittivity_yx: jnp.ndarray,
+    permittivity_yy: jnp.ndarray,
+    expansion: basis_mod.Expansion,
+) -> jnp.ndarray:
+    """The ``E_t`` matrix of an anisotropic layer, ``FFT`` (Laurent) rule.
+
+    Mirrors ``fmmax.fmm_matrices.transverse_permittivity_fft_anisotropic`` (Liu
+    eq. 15 with the anisotropic x/y block placement)::
+
+        E_t = [[Z(ε_yy), -Z(ε_yx)], [-Z(ε_xy), Z(ε_xx)]],
+
+    where ``Z`` is the Fourier-convolution (Toeplitz) matrix of each component.
+    """
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+    return jnp.block(
+        [
+            [_transform(permittivity_yy), _transform(-permittivity_yx)],
+            [_transform(-permittivity_xy), _transform(permittivity_xx)],
+        ]
+    )
+
+
+def transverse_permeability_fft_anisotropic(
+    permeability_xx: jnp.ndarray,
+    permeability_xy: jnp.ndarray,
+    permeability_yx: jnp.ndarray,
+    permeability_yy: jnp.ndarray,
+    expansion: basis_mod.Expansion,
+) -> jnp.ndarray:
+    """The ``M_t`` matrix of an anisotropic layer, ``FFT`` (Laurent) rule.
+
+    Mirrors ``fmmax.fmm_matrices.transverse_permeability_fft_anisotropic``::
+
+        M_t = [[Z(μ_xx), Z(μ_xy)], [Z(μ_yx), Z(μ_yy)]].
+    """
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+    return jnp.block(
+        [
+            [_transform(permeability_xx), _transform(permeability_xy)],
+            [_transform(permeability_yx), _transform(permeability_yy)],
+        ]
+    )
+
+
+def transverse_permittivity_vector_anisotropic(
+    permittivity_xx: jnp.ndarray,
+    permittivity_xy: jnp.ndarray,
+    permittivity_yx: jnp.ndarray,
+    permittivity_yy: jnp.ndarray,
+    tx: jnp.ndarray,
+    ty: jnp.ndarray,
+    expansion: basis_mod.Expansion,
+) -> jnp.ndarray:
+    """The ``E_t`` matrix of an anisotropic layer, vector formulation.
+
+    Port of ``fmmax.fmm_matrices.transverse_permittivity_vector_anisotropic``:
+    the tensor is rotated into tangent/normal coordinates at the interface, the
+    Fourier matrix is formed with Laurent's rule on the tangential/non-diagonal
+    blocks and the inverse rule on the normal block, and rotated back. This is
+    E2 of Liu eq. 51 generalized to a tensor (the tangential-field correction
+    that makes high-contrast convergence behave).
+    """
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+
+    (rotation_matrix, fourier_rotation_matrix, fourier_inverse_rotation_matrix) = _rotation_matrices(
+        t00=ty,
+        t01=tx.conj(),
+        t10=-tx,
+        t11=ty.conj(),
+        expansion=expansion,
+    )
+
+    permittivity_tensor = jnp.block(
+        [
+            [
+                permittivity_yy[..., jnp.newaxis, jnp.newaxis],
+                -permittivity_yx[..., jnp.newaxis, jnp.newaxis],
+            ],
+            [
+                -permittivity_xy[..., jnp.newaxis, jnp.newaxis],
+                permittivity_xx[..., jnp.newaxis, jnp.newaxis],
+            ],
+        ]
+    )
+    assert rotation_matrix.shape[-2:] == permittivity_tensor.shape[-2:] == (2, 2)
+    rotated_permittivity_tensor = jnp.linalg.solve(rotation_matrix, permittivity_tensor @ rotation_matrix)
+
+    fourier_permittivity_matrix = jnp.block(
+        [
+            [
+                _transform(rotated_permittivity_tensor[..., 0, 0]),
+                _transform(rotated_permittivity_tensor[..., 0, 1]),
+            ],
+            [
+                _transform(rotated_permittivity_tensor[..., 1, 0]),
+                jnp.linalg.inv(_transform(1 / rotated_permittivity_tensor[..., 1, 1])),
+            ],
+        ]
+    )
+    return fourier_rotation_matrix @ fourier_permittivity_matrix @ fourier_inverse_rotation_matrix
+
+
+def transverse_permeability_vector_anisotropic(
+    permeability_xx: jnp.ndarray,
+    permeability_xy: jnp.ndarray,
+    permeability_yx: jnp.ndarray,
+    permeability_yy: jnp.ndarray,
+    tx: jnp.ndarray,
+    ty: jnp.ndarray,
+    expansion: basis_mod.Expansion,
+) -> jnp.ndarray:
+    """The ``M_t`` matrix of an anisotropic layer, vector formulation.
+
+    Port of ``fmmax.fmm_matrices.transverse_permeability_vector_anisotropic``.
+    Note the rotation matrix differs from the permittivity one (there
+    ``T [Et, En]^T = [-Ey, Ex]``, here ``T [Ht, Hn]^T = [Hx, Hy]``), matching
+    fmmax's two distinct conventions.
+    """
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+
+    (rotation_matrix, fourier_rotation_matrix, fourier_inverse_rotation_matrix) = _rotation_matrices(
+        t00=tx,
+        t01=-ty.conj(),
+        t10=ty,
+        t11=tx.conj(),
+        expansion=expansion,
+    )
+
+    permeability_tensor = jnp.block(
+        [
+            [
+                permeability_xx[..., jnp.newaxis, jnp.newaxis],
+                permeability_xy[..., jnp.newaxis, jnp.newaxis],
+            ],
+            [
+                permeability_yx[..., jnp.newaxis, jnp.newaxis],
+                permeability_yy[..., jnp.newaxis, jnp.newaxis],
+            ],
+        ]
+    )
+    assert rotation_matrix.shape[-2:] == permeability_tensor.shape[-2:] == (2, 2)
+    rotated_permeability_tensor = jnp.linalg.solve(rotation_matrix, permeability_tensor @ rotation_matrix)
+
+    fourier_permeability_matrix = jnp.block(
+        [
+            [
+                _transform(rotated_permeability_tensor[..., 0, 0]),
+                _transform(rotated_permeability_tensor[..., 0, 1]),
+            ],
+            [
+                _transform(rotated_permeability_tensor[..., 1, 0]),
+                jnp.linalg.inv(_transform(1 / rotated_permeability_tensor[..., 1, 1])),
+            ],
+        ]
+    )
+    return fourier_rotation_matrix @ fourier_permeability_matrix @ fourier_inverse_rotation_matrix
+
+
+def _rotation_matrices(
+    t00: jnp.ndarray,
+    t01: jnp.ndarray,
+    t10: jnp.ndarray,
+    t11: jnp.ndarray,
+    expansion: basis_mod.Expansion,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Real-space and Fourier rotation matrices for the anisotropic vector rules.
+
+    Port of ``fmmax.fmm_matrices._rotation_matrices``: the tangent/normal frame
+    rotated into Fourier space so the rotated-tensor convolution stays consistent.
+    """
+    rotation_matrix = jnp.block(
+        [
+            [t00[..., jnp.newaxis, jnp.newaxis], t01[..., jnp.newaxis, jnp.newaxis]],
+            [t10[..., jnp.newaxis, jnp.newaxis], t11[..., jnp.newaxis, jnp.newaxis]],
+        ]
+    )
+
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+    fourier_rotation_matrix = jnp.block(
+        [
+            [_transform(t00), _transform(t01)],
+            [_transform(t10), _transform(t11)],
+        ]
+    )
+
+    denom = jnp.abs(t00 * t11 - t10 * t01)
+    denom_safe = jnp.where(jnp.isclose(denom, 0), 1.0, denom)
+    fourier_inverse_rotation_matrix = jnp.block(
+        [
+            [_transform(t11 / denom_safe), _transform(-t01 / denom_safe)],
+            [_transform(-t10 / denom_safe), _transform(t00 / denom_safe)],
+        ]
+    )
+    return rotation_matrix, fourier_rotation_matrix, fourier_inverse_rotation_matrix
+
+
+def transverse_matrices_anisotropic(
+    permittivities: TensorComponents,
+    permeabilities: Optional[TensorComponents],
+    expansion: basis_mod.Expansion,
+    formulation: Formulation | VectorFn,
+    primitive_lattice_vectors: basis_mod.LatticeVectors,
+    vector_field_source: Optional[jnp.ndarray] = None,
+) -> Tuple[
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    Optional[Tuple[jnp.ndarray, jnp.ndarray]],
+]:
+    """The six Fourier matrices of a patterned general-anisotropic layer.
+
+    Mirrors ``fmmax.fmm._fourier_matrices_patterned_anisotropic_media``:
+    returns ``(inverse_z_permittivity, z_permittivity, E_t,
+    inverse_z_permeability, z_permeability, M_t, tangent_field)``. All Toeplitz
+    transforms converge component-wise; the transverse matrices follow
+    `formulation` (FFT or a vector scheme / callable hook), and the z-matrix
+    inverse rules use the reciprocal of the zz component.
+
+    Args:
+        permittivities: ``(ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)`` real-space grids.
+        permeabilities: ``(μ_xx, μ_xy, μ_yx, μ_yy, μ_zz)``; ``None`` for
+            nonmagnetic media (all-ones z and identity transverse matrices).
+        expansion: The field expansion.
+        formulation: ``Formulation.FFT`` / a vector scheme / a callable hook.
+        primitive_lattice_vectors: Real-space lattice (vector gradients).
+        vector_field_source: Density fed to the tangent-field solver for vector
+            schemes (defaults to ``(ε_xx + ε_yy) / 2``, fmmax convention).
+    """
+    _transform = functools.partial(fft.fourier_convolution_matrix, expansion=expansion)
+
+    (permittivity_xx, permittivity_xy, permittivity_yx, permittivity_yy, permittivity_zz) = permittivities
+    inverse_z_permittivity = _transform(1 / permittivity_zz)
+    z_permittivity = _transform(permittivity_zz)
+
+    if permeabilities is None:
+        inverse_z_permeability = None
+        z_permeability = None
+        n = expansion.num_terms
+        ones = jnp.ones(permittivity_zz.shape[:-2] + (n,), dtype=jnp.result_type(permittivity_zz))
+        z_permeability = utils.batch_diag(ones)
+        inverse_z_permeability = utils.batch_diag(ones)
+        m_t = jnp.block(
+            [[z_permeability, jnp.zeros_like(z_permeability)], [jnp.zeros_like(z_permeability), z_permeability]]
+        )
+    else:
+        (permeability_xx, permeability_xy, permeability_yx, permeability_yy, permeability_zz) = permeabilities
+        inverse_z_permeability = _transform(1 / permeability_zz)
+        z_permeability = _transform(permeability_zz)
+        m_t = None  # decided below, per formulation
+
+    if formulation is Formulation.FFT:
+        e_t = transverse_permittivity_fft_anisotropic(
+            permittivity_xx, permittivity_xy, permittivity_yx, permittivity_yy, expansion
+        )
+        if m_t is None:
+            m_t = transverse_permeability_fft_anisotropic(
+                permeability_xx, permeability_xy, permeability_yx, permeability_yy, expansion
+            )
+        tangent_field = None
+    else:
+        if vector_field_source is None:
+            vector_field_source = (permittivity_xx + permittivity_yy) / 2
+        tx, ty = tangent_field_for(formulation, vector_field_source, expansion, primitive_lattice_vectors)
+        e_t = transverse_permittivity_vector_anisotropic(
+            permittivity_xx, permittivity_xy, permittivity_yx, permittivity_yy, tx, ty, expansion
+        )
+        if m_t is None:
+            m_t = transverse_permeability_vector_anisotropic(
+                permeability_xx, permeability_xy, permeability_yx, permeability_yy, tx, ty, expansion
+            )
+        tangent_field = (tx, ty)
+    return inverse_z_permittivity, z_permittivity, e_t, inverse_z_permeability, z_permeability, m_t, tangent_field
+
+
 def tangent_field_for(
     formulation: Formulation | VectorFn,
     permittivity: jnp.ndarray,
@@ -237,7 +542,7 @@ def tangent_field_for(
         return formulation(permittivity, expansion, primitive_lattice_vectors)
     if not isinstance(formulation, Formulation):
         raise TypeError(f"`formulation` must be a Formulation or a callable, got {formulation!r}.")
-    use_jones_direct, fourier_loss_weight, smoothness_loss_weight = _scheme(formulation)
+    use_jones_direct, fourier_loss_weight, smoothness_loss_weight, tangent_post = _scheme(formulation)
     tx, ty = compute_tangent_field(
         permittivity=permittivity,
         expansion=expansion,
@@ -246,6 +551,15 @@ def tangent_field_for(
         fourier_loss_weight=fourier_loss_weight,
         smoothness_loss_weight=smoothness_loss_weight,
     )
+    if tangent_post == "jones":
+        # The Jones method converts the linear field into a complex elliptical
+        # field of magnitude 1 (fmmax.vector.compute_field_jones).
+        jxjy = _normalize_jones(jnp.stack([tx, ty], axis=-1))
+        tx, ty = jxjy[..., 0], jxjy[..., 1]
+    elif tangent_post == "normal":
+        # The Normal method element-wise normalizes the linear field.
+        txty = _normalize_elementwise(jnp.stack([tx, ty], axis=-1))
+        tx, ty = txty[..., 0], txty[..., 1]
     return tx, ty
 
 
@@ -361,8 +675,9 @@ def omega_script_k_matrix(
 
 
 # -----------------------------------------------------------------------------
-# Tangent vector field generation (fmmax.vector conventions, no batch, no
-# smoothness term -- the wired schemes use a zero smoothness weight).
+# Tangent vector field generation (fmmax.vector conventions, no batch; the
+# smoothness term IS implemented and used by the non-FOURIER schemes -- the
+# JONES/NORMAL/POL have weight 2.0 and JONES_DIRECT 0.5, the _FOURIER four 0.0).
 # -----------------------------------------------------------------------------
 
 
@@ -391,19 +706,15 @@ def compute_tangent_field(
         primitive_lattice_vectors: Real-space lattice (gradient geometry).
         use_jones_direct: Whether to seek the complex Jones field (direct
             method); otherwise the target is the plain rotated gradient.
-        fourier_loss_weight: Weight of the high-frequency Fourier-penalty term.
-        smoothness_loss_weight: Must be ``0.0`` (not yet wired; the stage-2
-            schemes that use it will land with the rest of the suite).
+        fourier_loss_weight: Weight of the high-frequency Fourier-penalty term
+            (``0`` for the plain smoothness schemes).
+        smoothness_loss_weight: Weight of the real-space smoothness-penalty term
+            (``0`` for the ``_FOURIER`` schemes), fmmax convention.
         steps: Number of Newton iterations (static Python int).
 
     Returns:
         ``(tx, ty)``, each of shape ``(nx, ny)``.
     """
-    if not float(smoothness_loss_weight) == 0.0:
-        raise NotImplementedError(
-            "the tangent-field smoothness loss is not wired yet (stage 2); "
-            f"got smoothness_loss_weight={smoothness_loss_weight}."
-        )
     if permittivity.ndim != 2:
         raise ValueError(f"`permittivity` must be a 2-D real-space grid, got shape {permittivity.shape}.")
     arr = jax.lax.stop_gradient(permittivity)
@@ -463,7 +774,20 @@ def compute_tangent_field(
     field_1d = jnp.stack([jnp.sin(grad_angle), jnp.cos(grad_angle)])
     field = jnp.where(is_1d, field_1d, field)
     field = _normalize(field)
-    assert jnp.promote_types(arr.dtype, jnp.complex64) == jnp.promote_types(field.dtype, jnp.complex64)
+    # Never-silent precision-class guard: the tangent field must share its precision
+    # with the permittivity it discretizes (a mismatched pair would flow through the
+    # Fourier matrices silently). A plain assert would (a) carry no message and (b)
+    # vanish under `python -O`; raise an instructive ValueError instead. The comparison
+    # is over static dtype objects, so this stays trace-safe.
+    arr_prec = jnp.promote_types(arr.dtype, jnp.complex64)
+    field_prec = jnp.promote_types(field.dtype, jnp.complex64)
+    if arr_prec != field_prec:
+        raise ValueError(
+            f"tangent-field precision guard: permittivity promotes to {arr_prec} but the computed "
+            f"tangent field promotes to {field_prec} -- they must share a precision class. "
+            "Align the component-grid dtypes to the stack's dtype= (or pass dtype=jnp.complex128 "
+            "under jax_enable_x64); the newer dtype can no longer be promoted consistently."
+        )
     return field[..., 0], field[..., 1]
 
 
@@ -573,7 +897,6 @@ def _field_loss_value_jac_and_hessian(
     smoothness_loss_weight: float,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """:math:`(value, jac, hessian)` of the real alignment loss (holomorphic)."""
-    del smoothness_loss_weight  # asserted zero by the caller
     assert flat_fourier_field.ndim == 1
 
     def fn(flat_fourier_field):
@@ -585,6 +908,7 @@ def _field_loss_value_jac_and_hessian(
             target_field=target_field,
             elementwise_alignment_loss_weight=elementwise_alignment_loss_weight,
             fourier_loss_weight=fourier_loss_weight,
+            smoothness_loss_weight=smoothness_loss_weight,
         )
         return value, value
 
@@ -603,8 +927,9 @@ def _field_loss(
     target_field: jnp.ndarray,
     elementwise_alignment_loss_weight: jnp.ndarray,
     fourier_loss_weight: float,
+    smoothness_loss_weight: float,
 ) -> jnp.ndarray:
-    """The real-space alignment loss plus the weighted Fourier penalty."""
+    """The real-space alignment loss plus the weighted Fourier/smoothness penalties."""
     shape: Tuple[int, int] = target_field.shape[-3:-1]
     field = fft.ifft(
         y=fourier_field,
@@ -616,6 +941,8 @@ def _field_loss(
     loss = _alignment_loss(field, target_field, elementwise_alignment_loss_weight)
     if fourier_loss_weight > 0:
         loss += fourier_loss_weight * _fourier_loss(fourier_field, expansion, primitive_lattice_vectors)
+    if smoothness_loss_weight > 0:
+        loss += smoothness_loss_weight * _smoothness_loss(field, primitive_lattice_vectors)
     return loss
 
 
@@ -644,6 +971,41 @@ def _fourier_loss(
     area = jnp.abs(jnp.linalg.det(basis_vectors))
     kt = jnp.linalg.norm(transverse_wavevectors, axis=-1) * jnp.sqrt(area)
     return jnp.sum(jnp.abs(fourier_field) ** 2 * kt[..., jnp.newaxis] ** 2)
+
+
+def _smoothness_loss(field: jnp.ndarray, primitive_lattice_vectors: basis_mod.LatticeVectors) -> jnp.ndarray:
+    """The real-space smoothness loss of the tangent field (fmmax.vector).
+
+    Penalizes large forward-difference gradients of the tangent vector field,
+    evaluated on the real-space grid; scaled by the (sqrt-area-normalized)
+    lattice so the value is unit-cell-size independent.
+    """
+    basis_vectors = jnp.stack([primitive_lattice_vectors.u, primitive_lattice_vectors.v], axis=-1)
+    area = jnp.abs(jnp.linalg.det(basis_vectors))
+    normalized_basis = basis_vectors / jnp.sqrt(area)
+    grads = _field_forward_difference_gradient(field, normalized_basis)
+    return jnp.mean(jnp.abs(jnp.asarray(grads)) ** 2)
+
+
+def _field_forward_difference_gradient(field: jnp.ndarray, basis_vectors: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Forward-difference gradient of each real-space component of `field`."""
+    return (
+        _scalar_forward_difference_gradient(field[..., 0], basis_vectors),
+        _scalar_forward_difference_gradient(field[..., 1], basis_vectors),
+    )
+
+
+def _scalar_forward_difference_gradient(field: jnp.ndarray, basis_vectors: jnp.ndarray) -> jnp.ndarray:
+    """Forward-difference gradient of a scalar field in the lattice basis."""
+    axes = tuple(range(field.ndim - basis_vectors.shape[-1], field.ndim))
+    partial_grad = jnp.stack([_periodic_forward_difference(field, axis=ax) for ax in axes], axis=-1)
+    return _transform_gradient(partial_grad, basis_vectors)
+
+
+def _periodic_forward_difference(field: jnp.ndarray, axis: int) -> jnp.ndarray:
+    """``field[i+1] - field[i]`` with periodic wrap, scaled by the axis length."""
+    diff = jnp.roll(field, shift=-1, axis=axis) - field
+    return diff * field.shape[axis]
 
 
 # -----------------------------------------------------------------------------

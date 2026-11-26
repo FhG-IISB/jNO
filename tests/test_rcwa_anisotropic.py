@@ -6,7 +6,6 @@ door detects the tensor, samples its 5 components per layer, and routes to the a
 reducing exactly to the isotropic path when ε̂ = ε·I.
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
@@ -32,17 +31,7 @@ def _x64():
 import jno  # noqa: E402
 from jno.trace.views import MatrixView  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
-
-# All tests here need the 5-component anisotropic backend layer (task T28); stage 1's state-space
-# backend solves scalar-isotropic stacks and raises a loud RcwaError on tensor layers.
-pytestmark = pytest.mark.skip(
-    reason="5-component anisotropic layers are stage 2 (task T28): the state-space backend solves "
-    "scalar-isotropic stacks in stage 1, and the tensor layers raise a loud RcwaError naming the "
-    "task. Tasks T28/T37 restore these."
-)
 
 inner, vec = jno.np.inner, jno.np.vector
 K0 = 2 * jnp.pi
@@ -119,14 +108,12 @@ def _T(cons, R=False):
     return float(sol.efficiency("R" if R else "T"))
 
 
-@needs_fmmax
 def test_isotropic_tensor_reduces_to_scalar():
     """ε̂ = ε·I must give exactly the scalar-ε result — the anisotropic path reduces correctly (same eps fed
     to fmmax, isotropic vs anisotropic eigensolve agree for a scalar-diagonal tensor)."""
     assert _T(_aniso_constraints(6.0, 6.0, 6.0)) == pytest.approx(_T(_scalar_constraints(6.0)), abs=1e-6)
 
 
-@needs_fmmax
 def test_in_plane_anisotropy_x_pol_sees_exx():
     """Decisive anisotropy check: for a biaxial slab diag(εxx, εyy, εzz), an x-polarised normal-incidence
     wave sees εxx — so T matches the scalar-εxx result and differs from scalar-εyy/εzz. (ε_zz does NOT act
@@ -136,7 +123,6 @@ def test_in_plane_anisotropy_x_pol_sees_exx():
     assert abs(Tbi - _T(_scalar_constraints(6.0))) > 1e-3  # genuinely anisotropic, not the scalar answer
 
 
-@needs_fmmax
 def test_anisotropic_conserves_energy():
     """A lossless anisotropic slab conserves energy: T + R ≈ 1."""
     cons = _aniso_constraints(8.0, 4.0, 6.0)
@@ -148,7 +134,6 @@ def _jones(cons):
     return np.asarray(jnp.asarray(sol.jones("T"))), float(sol.efficiency("T"))
 
 
-@needs_fmmax
 def test_jones_isotropic_is_diagonal_and_energy_consistent():
     """An isotropic stack does not convert polarization: the Jones matrix is diagonal (zero cross-pol) with
     equal diagonal entries, and each input column's power sums to the total transmission efficiency."""
@@ -159,7 +144,6 @@ def test_jones_isotropic_is_diagonal_and_energy_consistent():
     assert p[:, 0].sum() == pytest.approx(T, abs=1e-4)  # |J[:,in]|² sums to efficiency("T")
 
 
-@needs_fmmax
 def test_jones_diagonal_biaxial_is_birefringent_no_conversion():
     """A biaxial slab diag(8,4,6) whose principal axes are x,y is birefringent but does NOT convert: the
     Jones matrix stays diagonal, with unequal diagonal entries (x-pol sees εxx=8, y-pol sees εyy=4)."""
@@ -169,7 +153,6 @@ def test_jones_diagonal_biaxial_is_birefringent_no_conversion():
     assert abs(p[0, 0] - p[1, 1]) > 1e-2  # but the two polarizations transmit differently (birefringence)
 
 
-@needs_fmmax
 def test_jones_rotated_tensor_converts_polarization():
     """A rotated in-plane tensor [[6,2],[2,6]] (off-diagonal εxy≠0) CONVERTS polarization: the Jones matrix
     has nonzero off-diagonal (cross-pol) entries, and stays symmetric (reciprocity for a lossless
