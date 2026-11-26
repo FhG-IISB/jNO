@@ -167,10 +167,14 @@ def test_engd_optimizer_explicit_gram_terms():
 
 
 def test_engd_optimizer_convergence():
-    """jno.optimizers.engd() must reach rel-L² < 1e-3 in 200 epochs (=callbacks form)."""
+    """jno.optimizers.engd() must reach rel-L² < 1e-3 in 200 epochs (=callbacks form).
+
+    ``rcond=1e-8``, not the default: the default pseudo-inverse cut sits at the rounding level of the Gram
+    matrix, so the result depended on the order of the floating-point sums (the CPU thread count) and landed
+    anywhere from 5e-8 (measured) to 2e-3 (reported on CI). At 1e-8 it is the same 2.9e-4 to the last digit on 1 to 12 threads."""
 
     net, losses, _, eval_error = _build_poisson2d(seed=0)
-    net.optimizer(engd(line_search=True))
+    net.optimizer(engd(line_search=True, rcond=1e-8))
     crux = jno.core(losses)
     crux.solve(200)
 
