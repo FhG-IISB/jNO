@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..jnp_ops import concat
+from ..jnp_ops import _small_det, _small_inv, concat
 from . import FunctionCall, Placeholder, _matmul
 
 # ---------------------------------------------------------------------------
@@ -2193,7 +2193,7 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def det(self) -> "ScalarView":
         """Determinant → ScalarView."""
-        return ScalarView(FunctionCall(jnp.linalg.det, [self._expr], "det", True))
+        return ScalarView(FunctionCall(_small_det, [self._expr], "det", True))
 
     def diag(self) -> "VectorView":
         """Diagonal elements → VectorView, shape ``[..., n]``."""
@@ -2201,7 +2201,7 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def inv(self) -> "MatrixView":
         """Matrix inverse → MatrixView."""
-        return MatrixView(FunctionCall(jnp.linalg.inv, [self._expr], "inv"))
+        return MatrixView(FunctionCall(_small_inv, [self._expr], "inv"))
 
     def eigvals(self) -> "VectorView":
         """Eigenvalues via ``jnp.linalg.eigh`` (symmetric input, ascending) → VectorView."""
@@ -2793,7 +2793,7 @@ class VoigtView(_DelegatesToPlaceholder):
                 - v[..., 4] ** 2
                 - v[..., 5] ** 2
             )
-            I3 = jnp.linalg.det(A)
+            I3 = _small_det(A)
             return jnp.stack([I1, I2, I3], axis=-1)
 
         return VectorView(FunctionCall(_fn, [self._expr, self.to_full()._expr], "invariants"))

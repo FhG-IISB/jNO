@@ -1052,7 +1052,19 @@ def inv(x) -> FunctionCall:
     Returns:
         FunctionCall: the inverse.
     """
-    return _attach_coords(FunctionCall(jnp.linalg.inv, [_u(x)], name="inv"), [x])
+    return _attach_coords(FunctionCall(_small_inv, [_u(x)], name="inv"), [x])
+
+
+def _small_inv(a):
+    from .utils.solver.small_linalg import small_inv  # lazy: jno.utils.solver imports this module's users
+
+    return small_inv(a)
+
+
+def _small_det(a):
+    from .utils.solver.small_linalg import small_det  # lazy: see _small_inv
+
+    return small_det(a)
 
 
 def det(x) -> FunctionCall:
@@ -1068,7 +1080,7 @@ def det(x) -> FunctionCall:
     Returns:
         FunctionCall: the determinant per point.
     """
-    return _attach_coords(FunctionCall(jnp.linalg.det, [_u(x)], name="det"), [x])
+    return _attach_coords(FunctionCall(_small_det, [_u(x)], name="det"), [x])
 
 
 def diff(target, wrt) -> Diff:

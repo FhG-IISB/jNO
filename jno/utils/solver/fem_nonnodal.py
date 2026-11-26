@@ -924,7 +924,7 @@ def assemble_fem_nonnodal(
                 per.append(
                     {
                         "shape_vals": lv,
-                        "shape_grads": lg @ jnp.linalg.inv(J),
+                        "shape_grads": lg @ small_inv(J),
                         "cell_sol": cell_sols[i].reshape(-1, _ncomp[i]),
                         "space": "Lagrange",
                     }
@@ -2792,7 +2792,7 @@ def _with_cell_size(ctx, meas, xq, verts=None):
         if verts is None:
             raise NotImplementedError("dom.cell_metric on this non-nodal path needs the cell's vertices.")
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
-        K = jnp.linalg.inv(J)
+        K = small_inv(J)
         out["cell_metric"] = jnp.broadcast_to(K.T @ K, (nq, dim, dim))
     return out
 
@@ -4238,7 +4238,7 @@ def _readback_kernel(dofmap, pts, derivative):
     def _one(c, cell, cf, rv, rg):
         V = pts[cell]
         J = jnp.stack([V[k] - V[0] for k in range(1, tdim + 1)], axis=1)
-        K = jnp.linalg.inv(J)
+        K = small_inv(J)
         B = jnp.diag(signs[c]) if signs is not None else transform_from_tables(tables, dofmap.ndof_local, c)
         v = jnp.einsum("ij,qjv->qiv", B, rv)
         g = jnp.einsum("ij,qjvm->qivm", B, rg)
@@ -4246,7 +4246,7 @@ def _readback_kernel(dofmap, pts, derivative):
             phi = jnp.einsum("ji,qnj->qni", K, v)
             gp = jnp.einsum("ji,qnjm,ml->qnil", K, g, K)
         elif mt == "contravariant":
-            dJ = jnp.linalg.det(J)
+            dJ = small_det(J)
             phi = jnp.einsum("ij,qnj->qni", J, v) / dJ
             gp = jnp.einsum("ik,qnkm,ml->qnil", J, g, K) / dJ
         else:

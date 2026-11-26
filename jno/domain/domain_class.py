@@ -4999,8 +4999,10 @@ class domain(MeshIOMixin):
 
         def _vol(*vals):
             v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            from ..utils.solver.small_linalg import small_det  # lazy: jno.utils.solver imports the domain
+
             jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
-            return jnp.abs(jnp.linalg.det(jac)) / fact
+            return jnp.abs(small_det(jac)) / fact
 
         def _vol_quad(*vals):
             """The shoelace area, which is exact for a quadrilateral of ANY shape.
@@ -5213,7 +5215,9 @@ class domain(MeshIOMixin):
             v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
             longest = jnp.max(jnp.stack([jnp.linalg.norm(v[:, j] - v[:, i], axis=-1) for i, j in pairs], axis=-1), axis=-1)
             jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
-            vol = jnp.abs(jnp.linalg.det(jac)) / fact
+            from ..utils.solver.small_linalg import small_det  # lazy: jno.utils.solver imports the domain
+
+            vol = jnp.abs(small_det(jac)) / fact
             # Facet measures by the Gram determinant, which is the one formula that covers both
             # dimensions: a triangle's facet is an edge (length) and a tet's is a triangle (area).
             surf = 0.0
@@ -5221,7 +5225,7 @@ class domain(MeshIOMixin):
                 keep = [i for i in range(dim + 1) if i != k]
                 e = jnp.stack([v[:, keep[i + 1]] - v[:, keep[0]] for i in range(dim - 1)], axis=-1)
                 gram = jnp.einsum("cij,cik->cjk", e, e)
-                surf = surf + jnp.sqrt(jnp.clip(jnp.linalg.det(gram), 0.0, None)) / fac_fact
+                surf = surf + jnp.sqrt(jnp.clip(small_det(gram), 0.0, None)) / fac_fact
             inradius = dim * vol / (surf + eps)  # r = d V / S for a d-simplex
             return longest / (norm * inradius + eps)
 

@@ -34,7 +34,6 @@ import numpy as np
 
 from ..trace import BinaryOp, FunctionCall, Jacobian, Literal, Placeholder, TestFunction, Variable
 from ..utils.sets import unique_values
-from ..utils.solver.small_linalg import small_det, small_inv
 
 _BINARY = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv, "**": operator.pow}
 
@@ -126,12 +125,16 @@ class _Map:
         def ginv(i, j):
             def fn(*xs):
                 J, shape = geom(*xs)
+                from ..utils.solver.small_linalg import small_inv  # lazy: jno.utils.solver imports the domain
+
                 return small_inv(jnp.swapaxes(J, 1, 2))[:, i, j].reshape(shape)  # (J^-T)_ij
 
             return fn
 
         def det(*xs):
             J, shape = geom(*xs)
+            from ..utils.solver.small_linalg import small_det  # lazy: jno.utils.solver imports the domain
+
             return small_det(J).reshape(shape)
 
         self.ginv = [

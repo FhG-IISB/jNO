@@ -878,7 +878,9 @@ class _TraceFDM(StrongFormProblem):
         pts, cells = _mesh(self.domain)
         dim = pts.shape[1]
         e = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim) edge vectors from vertex 0
-        size = (jnp.abs(jnp.linalg.det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
+        from .utils.solver.small_linalg import small_det
+
+        size = (jnp.abs(small_det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
         total = jnp.zeros(self._N).at[cells.reshape(-1)].add(jnp.repeat(size, cells.shape[1]))
         count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
         return total / jnp.maximum(count, 1.0)
