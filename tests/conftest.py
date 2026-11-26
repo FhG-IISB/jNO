@@ -87,6 +87,57 @@ def _free_jax_memory():
     jax.clear_caches()
 
 
+@pytest.fixture
+def forced_direct_backend(monkeypatch):
+    """Make the direct-solver dispatch observable without a GPU.
+
+    ``force(name)`` fixes ``jno.solve._preferred_direct_backend()`` to ``name`` (``"device"``, ``"host"``, ``"pardiso"``
+    where installed, or ``"cudss"``) and returns a ``Counter`` of calls to the ``linear.*_lu_solve`` functions, keyed
+    ``device`` / ``host`` / ``pardiso`` / ``cudss``. A site that ignores the preferred backend shows up as a count on
+    ``"device"`` (``sparse_lu_solve``) where another was forced.
+
+    ``"cudss"`` is a stand-in: the dispatch (the symmetric / complex branch of ``lu()``, the residual gate, the plan
+    keys) runs on the CPU with ``cudss_lu_solve`` replaced by host SuperLU of the same ``(A, b) -> x`` contract.
+    ``cudss_ldl_solve`` answers ``None`` (no in-program LDL^T), so ``lu()`` takes its LU branch. The kernels stay
+    covered by the GPU run."""
+    import collections
+
+    import jno.solve as _solve
+    import jno.utils.solver.linear as L
+
+    counts = collections.Counter()
+    real = {
+        "device": L.sparse_lu_solve,
+        "host": L.host_lu_solve,
+        "pardiso": L.pardiso_lu_solve,
+        "cudss": L.host_lu_solve,  # the stand-in for cuDSS: SuperLU behind the same contract
+    }
+    attr = {
+        "device": "sparse_lu_solve",
+        "host": "host_lu_solve",
+        "pardiso": "pardiso_lu_solve",
+        "cudss": "cudss_lu_solve",
+    }
+
+    def force(name):
+        if name == "pardiso" and not L._pardiso_available():
+            pytest.skip("the pardiso backend needs pypardiso")
+        for key, fn in real.items():
+
+            def counted(A, b, *a, _key=key, _fn=fn, **kw):
+                counts[_key] += 1
+                return _fn(A, b, *a, **kw)
+
+            monkeypatch.setattr(L, attr[key], counted)
+        if name == "cudss":
+            monkeypatch.setattr(L, "cudss_ldl_solve", lambda *a, **k: None)
+        monkeypatch.setattr(_solve, "_preferred_direct_backend", lambda: name)
+        jax.clear_caches()  # a compiled solve of an earlier run would not call the counted functions again
+        return counts
+
+    return force
+
+
 class MockDomain:
     """Minimal domain stub for creating Variables without a real mesh."""
 
