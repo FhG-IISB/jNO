@@ -2498,7 +2498,7 @@ def rosenbrock(method: str = "ros34pw2"):
     return _RosenbrockScheme(method)
 
 
-def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True):
+def exponential(*, order: int | None = None, mass: str = "lumped", symmetric: bool = True):
     """Matrix-**exponential** time scheme for ``fem.solve(time=...)`` — advances a linear block
     ``M u̇ + A u = f(t)`` with **time-independent** ``M``, ``A`` by ``u(t+dt) = exp(-dt·M⁻¹A) u(t) +
     forcing``, matrix-free. The homogeneous decay is **exact in time and unconditionally stable**, so it
@@ -2506,7 +2506,19 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     **time-varying** source ``f(t)`` is integrated by **ETD2** (the exponential trapezoidal rule) — sampled
     at both step ends with a ``φ₂`` ramp weight, so it is **exact for a source affine in time** and
     second-order for a general one (Hochbruck & Ostermann, *Exponential integrators*, Acta Numerica 19
-    (2010) 209–286, §2.3). ``order`` is the Krylov size (capped at the number of free unknowns).
+    (2010) 209–286, §2.3).
+
+    **Krylov size.** ``symmetric=True`` grows the Lanczos space **adaptively**: after 16, 32, 64, ... vectors it
+    reads the a-posteriori error estimate of the step (Saad, *Analysis of some Krylov subspace approximations
+    to the matrix exponential operator*, SIAM J. Numer. Anal. 29(1), 1992, Sec. 5.2: the generalized residual
+    ``β_{m+1}‖v‖|e_mᵀ φ₁(-dt·T_m) e₁|·dt``) and stops at the first size where it is below ``1e-10`` of ``‖v‖_M``
+    (``100·eps`` in float32), so a mild problem uses 16 vectors and a stiff one as many as it needs. ``order``
+    is the **cap** (default ``None``: 200, and never more than the number of free unknowns). If the cap is
+    reached with the estimate still above the tolerance a ``RuntimeWarning`` names the cap and the estimate
+    (also from inside a trace): take a smaller ``dt`` or raise ``order``. The loop is pure JAX (a ``lax.scan``
+    per stage under a ``lax.cond``), so it jits and differentiates in reverse mode; under ``vmap`` every stage
+    runs; each stage is re-run in the backward pass, so the reverse-mode memory stays ``O(order·n)``.
+    ``symmetric=False`` (Arnoldi) has **no** error estimate: ``order`` (default ``None``: 40) is its fixed size.
     ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, but a different spatial discretisation
     from the consistent one the other schemes integrate (4e-2 apart on P1 triangles, 8e-2 on Q1 hexes), and
     refused where the row sums are not positive (P2 vertices, Hermite slopes, edge DOFs).
