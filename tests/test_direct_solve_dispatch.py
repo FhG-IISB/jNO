@@ -11,6 +11,7 @@ backend fails here as "spsolve was called".
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -166,4 +167,66 @@ def test_newton_direct_uses_the_preferred_direct_backend(forced_direct_backend):
     got = solve()
     # (the adjoint's rescue branch still traces a `sparse_lu_solve`, so only the factorization of the tangent is pinned)
     assert counts["host"] >= 1, f"newton(direct=True) called {dict(counts)}"
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+
+
+# ---- the cuDSS-only half: the choice of LDL^T or LU, which a CPU run never reaches without the stand-in ----------------
+def _parametric_poisson(symmetric=True):
+    """A runtime-parametric form (the case `_default_direct` hands to cuDSS), symmetric or with a convection term."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    x, y = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    _r, s = d.fem_symbols(space="P0", names=("r", "s"))
+    k = jno.np.parameter(s, name="k")
+    k.dtype(jnp.float64)
+    u, v = d.fem_symbols(names=("u", "v"))
+    U, V = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    g = lambda f: jno.np.grad(f, [x, y])  # noqa: E731
+    wind = 0.0 if symmetric else inner(jno.np.vector(0.7 + 0 * x, 0.3 + 0 * x), g(U)) * V
+    fem = jno.fem([k * inner(g(U), g(V)) + wind - V, u(xb, yb) - 0.0])
+    return fem, len(d.mesh.cells_dict["triangle"])
+
+
+@pytest.mark.parametrize("symmetric", [True, False], ids=["symmetric", "non-symmetric"])
+def test_a_parametric_form_takes_the_ldl_branch_only_where_cudss_would(symmetric, forced_direct_backend):
+    """A symmetric operator is factored by the in-program LDL^T, a non-symmetric one by LU; on a CPU the stand-in
+    makes that choice, the residual gate and the plan keys run. spsolve is called by neither."""
+    fem, nc = _parametric_poisson(symmetric)
+    c = jnp.asarray(np.random.default_rng(0).uniform(0.7, 1.3, nc))
+    want = np.asarray(fem.solve(k=c))
+    counts = forced_direct_backend("cudss")
+    got = np.asarray(fem.solve(k=c))
+    assert counts["device"] == 0, f"spsolve was called: {dict(counts)}"
+    if symmetric:
+        assert counts["cudss_ldl"] >= 1, f"the symmetric branch was not taken: {dict(counts)}"
+    else:
+        assert counts["cudss"] >= 1 and counts["cudss_ldl"] == 0, f"the LU branch was not taken: {dict(counts)}"
+    np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
+
+
+def test_staggered_direct_uses_the_preferred_direct_backend(forced_direct_backend):
+    """#220: each field's block is factorized by the backend lu() resolves to."""
+
+    def solve():
+        # two Poisson fields coupled both ways, with a nonlinearity so the problem takes the residual (Newton) route
+        d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+        d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+        co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+        X = [co[0], co[1]]
+        a, phi = d.fem_symbols()
+        b, chi = d.fem_symbols()
+        fem = jno.fem(
+            [
+                inner(grad(a, X), grad(phi, X), 1) + a * phi - 1.0 * phi - 0.3 * b * phi + 0.05 * a * a * phi,
+                inner(grad(b, X), grad(chi, X), 1) + b * chi - 2.0 * a * chi,
+                a(*cb) - 0.0,
+                b(*cb) - 0.0,
+            ]
+        )
+        return np.asarray(fem.solve(nonlinear=jno.solve.staggered([a, b], rtol=1e-11, atol=1e-13, direct=True)))
+
+    want = solve()
+    counts = forced_direct_backend("host")
+    got = solve()
+    assert counts["host"] >= 1 and counts["device"] == 0, f"staggered(direct=True) called {dict(counts)}"
     np.testing.assert_allclose(got, want, rtol=1e-8, atol=1e-10)
