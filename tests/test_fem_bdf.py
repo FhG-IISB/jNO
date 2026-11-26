@@ -225,27 +225,73 @@ def test_the_step_solve_starts_from_the_predictor():
     assert np.median(seen) < 1e-4, f"median warm-start residual {np.median(seen):.1e}"
 
 
-@pytest.mark.parametrize("rtol, want", [(1e-4, 1e-6), (1e-6, 1e-8), (1e-9, 1e-10)])
+@pytest.mark.parametrize("rtol", [1e-4, 1e-6, 1e-9])
 @pytest.mark.parametrize("make", [lambda: jno.solve.bdf(), lambda: jno.solve.sdirk(3)], ids=["bdf", "sdirk3"])
-def test_step_solve_tolerance_follows_the_march_tolerance(monkeypatch, make, rtol, want):
-    """The default step solve of an error-controlled march stops at a fraction of the march's rtol (floor 1e-10),
-    not at a fixed 1e-10: a loose march must not pay for tight inner solves. The fixed grid keeps 1e-10."""
+def test_step_solve_tolerance_follows_the_march_tolerance(monkeypatch, make, rtol):
+    """The default step solve of an error-controlled march stops at a fraction of the march's tolerance (not at a
+    fixed 1e-10): ``min(1e-2 rtol, 1e-1 atol / max|u0|)``, within ``[10 eps, 1e-6]``. A loose march must not pay for
+    tight inner solves, a tight one must not drown its error estimate in solver noise. The fixed grid keeps 1e-10."""
     import jax.scipy.sparse.linalg as jsl
 
     seen = []
     real = jsl.bicgstab
 
     def spy(A, b, **kw):
-        seen.append(kw["tol"])
+        seen.append(float(kw["tol"]))
         return real(A, b, **kw)
 
     monkeypatch.setattr(jsl, "bicgstab", spy)
     fem = _form(6)
-    _run(make().adaptive(rtol=rtol, atol=1e-3 * rtol, max_steps=40), fem, SAVE[-1:])
-    assert seen and all(np.isclose(v, want, rtol=1e-6) for v in seen), seen
+    atol = 1e-3 * rtol
+    u0max = float(np.max(np.abs(np.asarray(fem.operator.state0))))
+    want = min(1e-2 * rtol, 1e-1 * atol / u0max)
+    want = min(max(want, 10 * np.finfo(np.float64).eps), 1e-6)
+    _run(make().adaptive(rtol=rtol, atol=atol, max_steps=40), fem, SAVE[-1:])
+    assert seen and all(np.isclose(v, want, rtol=1e-6) for v in seen), (seen, want)
     seen.clear()
     _run(jno.solve.sdirk(3), fem, SAVE)
     assert seen and all(v == 1e-10 for v in seen), seen
+
+
+def _exact_semidiscrete(fem, save):
+    """The exact solution of the semidiscrete heat system ``M u' = -A u`` (zero Dirichlet rows held at 0), by the
+    generalised eigendecomposition of the interior block: no time-stepping error, so a march's own is measured."""
+    import scipy.linalg as sl
+
+    blk = fem.operator
+    dense = lambda X: np.asarray(X.todense() if hasattr(X, "todense") else X)  # noqa: E731
+    M, A = dense(blk.M), dense(blk.A)
+    u0 = np.asarray(blk.state0).reshape(-1)
+    inner = np.abs(np.diag(M)) > 1e-14
+    lam, V = sl.eigh(A[np.ix_(inner, inner)], M[np.ix_(inner, inner)])
+    c = V.T @ (M[np.ix_(inner, inner)] @ u0[inner])
+    out = np.zeros((len(save), len(u0)))
+    for i, t in enumerate(np.asarray(save)):
+        out[i, inner] = V @ (np.exp(-lam * t) * c)
+    return out
+
+
+@pytest.mark.parametrize(
+    "make, gain", [(lambda: jno.solve.bdf(), 1.0), (lambda: jno.solve.sdirk(3), 8.0)], ids=["bdf", "sdirk3"]
+)
+def test_tight_tolerance_march_reaches_the_end_and_is_accurate(make, gain):
+    """A march at rtol 1e-8 (atol 1e-11) must finish inside a modest budget and be more accurate than at 1e-6.
+    With the fixed 1e-10 step solve the solver noise (about 1e-10 max|u| per component) sat above atol, the error
+    estimate never fell below 1 and bdf crawled on the step floor until the budget ran out (NaN).
+
+    bdf's gain is only asserted to be positive: its first steps sit on the step floor ``1e-4 * span`` and are accepted
+    there whatever the estimate says, which leaves a start-up error near 1e-6 that no rtol removes (a lower floor
+    does); sdirk3 starts with a third-order step and gains most of the 100x (its dense output limits the rest)."""
+    fem = _form(6)
+    ref = _exact_semidiscrete(fem, SAVE)
+    errs = []
+    for rtol in (1e-6, 1e-8):
+        out = np.asarray(_run(make().adaptive(rtol=rtol, atol=1e-3 * rtol, max_steps=1500), fem))
+        assert not np.any(np.isnan(out)), f"rtol={rtol}: budget exhausted"
+        errs.append(_worst(out, ref))
+    assert errs[1] < errs[0] / gain, f"tightening 100x gained only {errs[0] / errs[1]:.1f}x ({errs})"
+    if gain > 1:
+        assert errs[1] < 20 * 1e-8
 
 
 def _count_solves(scheme, fem, args=None):
