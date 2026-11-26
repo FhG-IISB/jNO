@@ -5665,7 +5665,9 @@ class domain(MeshIOMixin):
                 if point_data:
                     self.context[tag] = sample
                 else:
-                    tensor = jnp.asarray(sample)
+                    # a host array is used as it is (no second copy in RAM: jnp.asarray would make one); it goes to
+                    # the device per batch, or whole on the on-device path, when the solve places the context
+                    tensor = np.asarray(sample) if isinstance(sample, np.ndarray) else jnp.asarray(sample)
                     if tensor.ndim < 1:
                         tensor = tensor.reshape(1, 1)
                     self.context[tag] = self._normalize_tensor_time_axis(tag, tensor)

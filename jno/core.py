@@ -69,8 +69,8 @@ from .utils import (
     get_seed,
     statistics,
 )
-from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils import beacon as _beacon
+from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
@@ -1394,7 +1394,8 @@ class core:
                     context[tag] = arr
                     continue
 
-                arr = jax.device_put(arr, _cpu_device())
+                if not isinstance(arr, np.ndarray):  # a host array is already on the host: pinning it would copy it
+                    arr = jax.device_put(arr, _cpu_device())
 
                 if tag in metadata_tags:
                     context[tag] = arr

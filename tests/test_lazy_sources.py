@@ -89,7 +89,7 @@ class TestAttach:
         dom.variable("_f", _arr(B, 1, N, D))
         import jax.numpy as jnp
 
-        assert isinstance(dom.context["_f"], jnp.ndarray)
+        assert isinstance(dom.context["_f"], (np.ndarray, jnp.ndarray)) and not isinstance(dom.context["_f"], np.memmap)
 
     def test_shape_without_getitem_raises_naming_both_requirements(self):
         class Half:
@@ -197,3 +197,28 @@ class TestExtremes:
         src = Counting(_arr(B + 5, 6, 5, 1))  # neither B nor 1 -> "shared", never vmapped
         dom.variable("table", src)
         assert dom.context["table"] is src
+
+
+class TestEagerHostArrays:
+    """An eager np.ndarray tensor tag is used as it is: attaching or preparing it must not keep a second host copy
+    (a JAX CPU buffer next to the caller's array doubled the RAM of a large label set)."""
+
+    def test_attach_keeps_the_callers_array(self):
+        dom, _ = _dom()
+        a = _arr(B, 1, N, D)
+        dom.variable("_f", a)
+        assert np.shares_memory(np.asarray(dom.context["_f"]), a)
+
+    def test_prepared_context_shares_the_callers_array(self):
+        dom, x = _dom()
+        a = _arr(B, 1, dom.context["interior"].shape[2], D)  # one value per mesh point of _dom()
+        f = dom.variable("_f", a)
+        import foundax
+        import jax
+
+        net = jno.nn(foundax.mlp(1, output_dim=1, key=jax.random.PRNGKey(0)))
+        net.optimizer(optax.adam(1e-3))
+        crux = jno.core([(net(x) - f).mse])
+        assert np.shares_memory(np.asarray(crux.domain_data.context["_f"]), a)
+        crux.solve(2, batchsize=4, offload_data=True)  # streams from it
+        crux.solve(2, batchsize=4)  # and the on-device path still takes it
