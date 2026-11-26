@@ -13,6 +13,7 @@ Users always remain free to extract ``fem.operator`` and pass their own ``solve_
 
 from __future__ import annotations
 
+import contextlib
 import warnings
 from collections import OrderedDict
 from typing import Any
@@ -982,6 +983,11 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     idx = _np.ascontiguousarray(_np.asarray(indices))
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
     rows, cols = idx[:, 0], idx[:, 1]
+    # BCOO marks padding with an out-of-bounds index; JAX's own CSR conversion sorts it past the last row
+    # and never reads it, but scipy refuses it, so it is dropped here
+    keep = (rows < shape[0]) & (cols < shape[1])
+    if not keep.all():
+        data, rows, cols = data[keep], rows[keep], cols[keep]
 
     # MKL PARDISO does not defend itself against a non-finite operator: handed one it corrupts its
     # own heap and the PROCESS dies -- "double free or corruption", SIGABRT, no exception, nothing
@@ -1017,7 +1023,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     def _build(values, mtype):
         A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
         A.sum_duplicates()
-        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in (-2, 6, -4, 2, 4) else A
+        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
 
     b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
 
@@ -1027,7 +1033,9 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
         A = _build(data, mtype)
         solver = PyPardisoSolver(mtype=mtype)
-        solver._check_A(A)
+        _pardiso_set_pivoting(solver)
+        _pardiso_check_A(solver, A, _np)
+        threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
         solver.set_phase(11)  # symbolic analysis: the half that survives a value change
         solver._call_pardiso(A, b)
         solver.set_phase(22)
@@ -1041,28 +1049,136 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             "pat": pat,
             "kind": kind,
             "mtype": mtype,
+            "threads": threads,
         }
         while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
             _, old = _PARDISO_CACHE.popitem(last=False)
-            old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
+            with _pardiso_thread_count(old["solver"], old["threads"]):
+                old["solver"].free_memory()  # PARDISO holds its factors in MKL-owned memory
     else:
         _PARDISO_CACHE.move_to_end((skey, entry["kind"]))
-        if entry["dhash"] != dhash:
-            entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
-            entry["solver"].set_phase(22)
-            entry["solver"]._call_pardiso(entry["A"], b)
-            entry["dhash"] = dhash
 
     _PARDISO_LAST_KIND[skey] = entry["kind"]
-    solver, A = entry["solver"], entry["A"]
-    _pardiso_check_factorization(solver, A, b, _np, shape)
-    solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
-    solver.set_phase(33)
-    try:
-        x = solver._call_pardiso(A, b)
-    finally:
-        solver.set_iparm(12, 0)
+    solver = entry["solver"]
+    with _pardiso_thread_count(solver, entry["threads"]):
+        if entry["dhash"] != dhash:
+            entry["A"] = _build(data, entry["mtype"])  # same sparsity -> phase 22 only
+            solver.set_phase(22)
+            solver._call_pardiso(entry["A"], b)
+            entry["dhash"] = dhash
+        A = entry["A"]
+        _pardiso_check_factorization(solver, A, b, _np, shape)
+        solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
+        solver.set_phase(33)
+        try:
+            x = solver._call_pardiso(A, b)
+        finally:
+            solver.set_iparm(12, 0)
     return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+
+
+def _pardiso_set_pivoting(solver):
+    """Switch on scaling and weighted matching for the symmetric indefinite matrix types.
+
+    MKL enables both by default for the general types (11, 13) and neither for the symmetric indefinite
+    ones (-2, -4, 6), where a diagonal entry that cannot serve as a pivot is then replaced by a
+    perturbation. A saddle-point system has a whole zero diagonal block: measured on a 3-D Taylor-Hood
+    Stokes system, 12 pivots were perturbed and the field agreed with a pivoting LU to 2e-7 only; with
+    matching on, none was perturbed. MKL recommends the pair for exactly this class
+    (``iparm(11) = iparm(13) = 1``, "highly indefinite symmetric matrices, e.g. saddle point problems").
+    On a positive definite matrix it changed nothing that was measured: the same number of factor entries,
+    no pivot perturbed either way.
+
+    The defaults come from ``pardisoinit``, because an ``iparm`` set by hand is only read with
+    ``iparm(1) = 1``, and then every other entry must be given as well.
+    """
+    if solver.mtype not in (-2, -4, 6):
+        return
+    import ctypes
+
+    _pardiso_mkl(solver).pardisoinit(
+        solver.pt.ctypes.data_as(ctypes.c_void_p),
+        ctypes.byref(ctypes.c_int32(solver.mtype)),
+        solver.iparm.ctypes.data_as(ctypes.c_void_p),
+    )
+    solver.set_iparm(11, 1)  # scaling
+    solver.set_iparm(13, 1)  # weighted matching; needs the values in the analysis, which phase 11 gets
+
+
+def _pardiso_mkl(solver):
+    """The MKL runtime behind a ``PyPardisoSolver`` (a ``ctypes`` handle), for the thread-count calls."""
+    mkl = getattr(solver, "libmkl", None)
+    if mkl is None or not hasattr(mkl, "MKL_Set_Num_Threads_Local"):
+        raise RuntimeError(
+            "jno.solve.lu(backend='pardiso') cannot reach MKL's thread-count calls through this pypardiso "
+            "(PyPardisoSolver.libmkl with MKL_Set_Num_Threads_Local / MKL_Get_Max_Threads). Without them a "
+            "factorization can be entered with a thread count it was not analysed for, which corrupts memory "
+            "inside MKL, so jNO refuses the solve. Pin pypardiso>=0.4.4, or use backend='host'."
+        )
+    return mkl
+
+
+@contextlib.contextmanager
+def _pardiso_thread_count(solver, threads):
+    """Run this thread's MKL calls with exactly ``threads`` threads, then restore its own setting.
+
+    MKL PARDISO lays out its parallel schedule in the symbolic analysis (phase 11), for the thread count
+    of the thread that ran it. A later phase entered with another count is not refused: measured with an
+    analysis on 14 threads and a numeric factorization (phase 22) on 1, the solution came back with a
+    relative residual of order 1, or as NaN, or the process died with a glibc heap message. The count is
+    per CALLING thread (the OpenMP setting, ``mkl_set_num_threads_local``), and one cached factorization
+    is called from several: a pool thread under ``jax.jit``, the main thread when the solve is not
+    compiled. The main thread's count is lowered by anything that sets its own (a mesh generator, a
+    ``threadpoolctl`` limit), so compiling a solve and then calling it un-compiled was enough.
+
+    Nothing is lost by keeping the analysed count: a factorization analysed on one thread and refactored
+    from a 14-thread caller was measured slower than on one thread, not faster.
+    """
+    mkl = _pardiso_mkl(solver)
+    previous = mkl.MKL_Set_Num_Threads_Local(int(threads))  # returns this thread's earlier local setting
+    try:
+        yield
+    finally:
+        mkl.MKL_Set_Num_Threads_Local(previous)
+
+
+def _pardiso_check_A(solver, A, np):
+    """pypardiso's ``_check_A`` (square, CSR, sorted indices, no empty row), which also refuses any dtype
+    but float64. MKL PARDISO itself factors complex matrices (mtype 13, 6, -4), and ``_call_pardiso``
+    only passes the data pointer, so a complex operator is checked here and factored as itself rather
+    than as its real-equivalent ``2n`` block (half the factor memory)."""
+    if not np.iscomplexobj(A.data):
+        solver._check_A(A)
+        return
+    if A.shape[0] != A.shape[1] or A.format != "csr":
+        raise ValueError(f"MKL PARDISO needs a square CSR matrix, got {A.format} {A.shape}.")
+    solver.set_iparm(12, 0)
+    if not A.has_sorted_indices:
+        A.sort_indices()
+    if not np.diff(A.indptr).all():
+        raise ValueError("Matrix A is singular, because it contains empty row(s)")
+    if A.dtype != np.complex128:
+        raise TypeError(f"MKL PARDISO here takes float64 or complex128, got {A.dtype}.")
+
+
+#: the matrix types PARDISO is handed as an upper triangle (:func:`_pardiso_upper_with_diag`)
+_PARDISO_TRIANGLE_MTYPES = (-2, 6, -4, 2, 4)
+
+
+def _pardiso_apply(A, x, mtype):
+    """``M @ x`` for the operator ``M`` that PARDISO factored, given the matrix ``A`` it was handed.
+
+    For the symmetric and Hermitian types ``A`` is the upper triangle only, so ``A @ x`` is NOT the
+    operator: a residual taken with it is of order 1 for a correct solution. That is what the singularity
+    check did, so every symmetric system with a perturbed pivot was refused as singular -- a 3-D
+    Taylor-Hood saddle whose solution satisfied the full system to 7e-9 was reported with a relative
+    residual of 5.3.
+    """
+    if mtype not in _PARDISO_TRIANGLE_MTYPES:
+        return A @ x
+    lower = (A.conj().T if mtype in (-4, 4) else A.T) @ x
+    diagonal = A.diagonal()
+    return A @ x + lower - (diagonal[:, None] * x if x.ndim == 2 else diagonal * x)
 
 
 def _pardiso_check_factorization(solver, A, b, np, shape):
@@ -1086,7 +1202,7 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
     solver.set_phase(33)
     x = solver._call_pardiso(A, b)
     denom = np.linalg.norm(b)
-    rel = float(np.linalg.norm(A @ x - b) / (denom if denom > 0 else 1.0))
+    rel = float(np.linalg.norm(_pardiso_apply(A, x, solver.mtype) - b) / (denom if denom > 0 else 1.0))
     if rel > _SINGULAR_REL:  # the same singularity test as cuDSS; see _SINGULAR_REL
         raise RuntimeError(
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "

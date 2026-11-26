@@ -487,9 +487,8 @@ def test_impedance_mass_and_incident_load_are_exact_at_degree_two():
     ub = lambda X: np.stack([1 + X[:, 2], X[:, 0], X[:, 1]], 1)  # noqa: E731
     gx = lambda X: np.stack([np.ones(len(X)), X[:, 2], X[:, 0] * X[:, 1]], 1)  # noqa: E731
     exact_S = _cube_face_integral(lambda X, n: 2.0 * np.einsum("qi,qi->q", np.cross(ua(X), n), np.cross(ub(X), n)))
-    # the incident term is a SOURCE: it enters b with + (the convention of `_assemble_n1e_surface_load`,
-    # unchanged from degree 1), b ∋ +∮ g·(v×n)
-    exact_L = _cube_face_integral(lambda X, n: np.einsum("qi,qi->q", gx(X), np.cross(ub(X), n)))
+    # a trial-free term enters b as -term, like every source (the term list sums to zero): b ∋ -∮ g·(v×n)
+    exact_L = -_cube_face_integral(lambda X, n: np.einsum("qi,qi->q", gx(X), np.cross(ub(X), n)))
     np.testing.assert_allclose(a @ S @ b, exact_S, rtol=1e-10)
     np.testing.assert_allclose(b @ L, exact_L, rtol=1e-10)
 

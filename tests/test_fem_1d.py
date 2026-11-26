@@ -2079,3 +2079,14 @@ def test_tag_node_mask_resolves_a_fine_tolerance_without_x64():
         assert d.tag_node_mask("no_such_tag", pts) is None
     finally:
         jax.config.update("jax_enable_x64", prev)
+
+
+def test_complex_essential_value_on_a_real_1d_form_is_refused_by_name():
+    """It reached ``float(g)`` in the Dirichlet assembly and raised a bare TypeError."""
+    d = _line(0.2)
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="COMPLEX essential value"):
+        jno.fem([ui.x * vi.x, u(xb) - (1.0 + 2.0j)])

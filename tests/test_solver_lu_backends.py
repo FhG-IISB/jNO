@@ -158,9 +158,12 @@ def test_gradients_match_finite_differences_on_a_non_symmetric_system():
 @requires_cudss
 def test_composes_as_a_fem_linear_slot():
     """It must be a drop-in for the `linear=` slot, not a standalone function."""
-    d = jno.shape.rectangle(1.0, 1.0).domain(resolution=8)
-    u, phi = d.fem_symbols()
-    fem = jno.fem([jno.np.inner(jno.np.grad(u, d.coords), jno.np.grad(phi, d.coords)) - phi, u("boundary")])
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.125).domain()
+    u, v = d.fem_symbols()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
     sol = fem.solve(linear=jno.solve.lu(backend="cudss"))
     ref = fem.solve(linear=jno.solve.lu(backend="host"))
     np.testing.assert_allclose(np.asarray(sol), np.asarray(ref), rtol=1e-8, atol=1e-10)
@@ -695,6 +698,110 @@ def test_pardiso_singular_operator_raises():
         pardiso_lu_solve(A, jnp.ones(4)).block_until_ready()
 
 
+def _saddle(m):
+    """``[[K, B^T], [B, 0]]`` on an ``m^3`` grid: a vector Laplacian with a full-rank difference constraint.
+    Symmetric indefinite with a zero diagonal block, and non-singular."""
+    import scipy.sparse as sp
+
+    eye, lap = sp.identity(m), sp.diags([-1.0, 2.0, -1.0], [-1, 0, 1], shape=(m, m))
+    diff = sp.diags([-1.0, 1.0], [0, 1], shape=(m, m))  # forward difference: triangular, so non-singular
+    k3 = lambda a, b, c: sp.kron(sp.kron(a, b), c)
+    L = k3(lap, eye, eye) + k3(eye, lap, eye) + k3(eye, eye, lap)
+    B = sp.hstack([k3(diff, eye, eye), k3(eye, diff, eye), k3(eye, eye, diff)])
+    return sp.bmat([[sp.block_diag([L, L, L]), B.T], [B, None]]).tocoo()
+
+
+def _as_bcoo(S):
+    return jsp.BCOO((jnp.asarray(S.data), jnp.asarray(np.c_[S.row, S.col])), shape=S.shape)
+
+
+@requires_pardiso
+def test_pardiso_does_not_call_a_solvable_saddle_point_system_singular():
+    """PARDISO perturbs pivots on a zero diagonal block (168 of 864 here) and still returns the solution.
+    The singularity check then took its residual with the stored UPPER TRIANGLE instead of the operator,
+    read 0.81, and refused the system."""
+    from jno.utils.solver.linear import _PARDISO_CACHE
+
+    _PARDISO_CACHE.clear()
+    S = _saddle(6)
+    b = np.cos(np.arange(S.shape[0], dtype=np.float64))
+    x = np.asarray(pardiso_lu_solve(_as_bcoo(S), jnp.asarray(b)))
+    (entry,) = _PARDISO_CACHE.values()
+    assert entry["mtype"] == -2, "the saddle was not factored as symmetric indefinite, so this tests nothing"
+    assert np.linalg.norm(S @ x - b) / np.linalg.norm(b) < 1e-10
+    _PARDISO_CACHE.clear()
+
+
+@requires_pardiso
+def test_pardiso_singular_saddle_point_system_still_raises():
+    """The control for the test above: the same saddle with one constraint stated twice is singular, and
+    the check must still say so now that it measures the residual on the full operator."""
+    import scipy.sparse as sp
+
+    S = _saddle(6).tolil()
+    n = S.shape[0]
+    S[n - 1, :] = S[n - 2, :]
+    S[:, n - 1] = S[:, n - 2]
+    S = sp.coo_matrix(S)
+    with pytest.raises((RuntimeError, ValueError), match="SINGULAR"):
+        pardiso_lu_solve(_as_bcoo(S), jnp.cos(jnp.arange(n, dtype=jnp.float64))).block_until_ready()
+
+
+@requires_pardiso
+def test_pardiso_factors_a_saddle_point_system_without_perturbing_a_pivot():
+    """A zero diagonal block cannot be pivoted on as it stands. MKL's symmetric indefinite factorization
+    leaves weighted matching and scaling OFF by default and replaces the pivots it cannot use with a
+    perturbation (168 of 864 on this matrix), which costs accuracy. With both on it perturbs none."""
+    from jno.utils.solver.linear import _PARDISO_CACHE
+
+    _PARDISO_CACHE.clear()
+    S = _saddle(6)
+    b = np.cos(np.arange(S.shape[0], dtype=np.float64))
+    x = np.asarray(pardiso_lu_solve(_as_bcoo(S), jnp.asarray(b)))
+    (entry,) = _PARDISO_CACHE.values()
+    assert entry["mtype"] == -2, "the saddle was not factored as symmetric indefinite, so this tests nothing"
+    assert int(entry["solver"].get_iparm(14)) == 0, "PARDISO perturbed pivots of a non-singular saddle system"
+    assert np.linalg.norm(S @ x - b) / np.linalg.norm(b) < 1e-12
+    _PARDISO_CACHE.clear()
+
+
+@requires_pardiso
+def test_pardiso_solves_3d_taylor_hood_stokes_with_a_coefficient_parameter():
+    """The system the pivot perturbation broke: 3-D Taylor-Hood Stokes past a sphere with a per-cell
+    viscosity parameter. With 12 perturbed pivots PARDISO's field agreed with the host backend's to 2e-7
+    only."""
+    inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+    L, H, E = 1.2, 0.4, 1e-9
+    d = (jno.shape.box(0, 0, 0, L, H, H, size=0.3) - jno.shape.sphere(0.35, 0.2, 0.2, 0.1, size=0.1)).domain()
+    d.tag("inlet", lambda x, y, z: x < E)
+    on_sphere = lambda x, y, z: (x - 0.35) ** 2 + (y - 0.2) ** 2 + (z - 0.2) ** 2 < 0.101**2
+    d.tag("noslip", lambda x, y, z: (y < E) | (y > H - E) | (z < E) | (z > H - E) | on_sphere(x, y, z))
+    _, s_nu = d.fem_symbols(space="P0", names=("r_nu", "s_nu"))
+    nu = jno.np.parameter(s_nu, name="nu")
+    cells = max(len(c) for c in d.mesh.cells_dict.values())
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    X = d.variable("interior", split=True)[:3]
+    inlet, noslip = (d.variable(r, split=True)[:3] for r in ("inlet", "noslip"))
+    at = lambda f, Y: f.bind(**dict(zip("xyz", Y)))
+    gu, gv = grad(u, X), grad(v, X)
+    profile = 16.0 * inlet[1] * (H - inlet[1]) * inlet[2] * (H - inlet[2]) / H**4
+    fem = jno.fem(
+        [
+            nu * inner(gu, gv, n_contract=2) - at(p, X) * trace(gv),
+            -at(q, X) * trace(gu),
+            u(*inlet)[0] - profile,
+            u(*inlet)[1] - 0.0,
+            u(*inlet)[2] - 0.0,
+            u(*noslip) - (0.0, 0.0, 0.0),
+        ]
+    )
+    viscosity = jnp.ones(cells)
+    reference = np.asarray(fem.solve(linear=jno.solve.lu(backend="host"), nu=viscosity))
+    solution = np.asarray(fem.solve(linear=jno.solve.lu(backend="pardiso"), nu=viscosity))
+    assert np.linalg.norm(solution - reference) / np.linalg.norm(reference) < 1e-8
+
+
 # ---------------------------------------------------------------------------------------------
 # One threshold used to answer two different questions, and an 8-step budget used to end the loop
 # without saying so. A 165k Taylor-Hood saddle whose refinement reached 1.4e-6 -- four orders clear
@@ -765,3 +872,26 @@ def test_the_gate_sits_orders_clear_of_both_signatures_it_separates():
 
     assert _SINGULAR_REL / _CLEAN_REL >= 1e3  # a wide usable band between the two questions
     assert 1.0 / _SINGULAR_REL >= 1e3  # and far below the O(1) a real null space leaves
+
+
+# --------------------------------------------------------------------------------------
+# BCOO padding: entries parked at the out-of-bounds index (n, n)
+# --------------------------------------------------------------------------------------
+
+
+def _padded(A, n_pad=3):
+    """``A`` with ``n_pad`` extra entries at the padding index ``(n, n)``, as jax.experimental.sparse
+    leaves them when a fixed-length BCOO drops entries."""
+    n = A.shape[0]
+    pad = jnp.full((n_pad, 2), n, dtype=A.indices.dtype)
+    return jsp.BCOO((jnp.concatenate([A.data, jnp.full(n_pad, 9.0)]), jnp.concatenate([A.indices, pad])), shape=A.shape)
+
+
+@pytest.mark.skipif(not _pardiso_available(), reason="pypardiso not installed")
+def test_pardiso_ignores_padding_entries_as_jax_does():
+    """JAX's own sparse conversion sorts padding past the last row and never reads it; the PARDISO host
+    solve must do the same rather than hand scipy an out-of-range index."""
+    A, b = _spd(60), jnp.asarray(np.random.default_rng(2).normal(size=60))
+    x_ref = np.linalg.solve(np.asarray(A.todense()), np.asarray(b))
+    x = np.asarray(pardiso_lu_solve(_padded(A), b))
+    np.testing.assert_allclose(x, x_ref, rtol=1e-10, atol=1e-12)

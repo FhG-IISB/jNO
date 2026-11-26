@@ -300,8 +300,9 @@ class _Sol:
         smi = fm.stack_s_matrices_interior(self._layers, self._thick)
         amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
         efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
-        E = np.asarray(efield)  # (3, nx, ny, nz, 1)
-        return np.sum(np.abs(E) ** 2, axis=0)[..., 0], np.asarray(x), np.asarray(y), np.asarray(z)
+        # JAX all the way: |E|^2 stays differentiable in the design (permittivity grids), so it can feed a
+        # coupled objective (absorbed power -> heat). NumPy callers (plotting) accept the JAX array as is.
+        return jnp.sum(jnp.abs(efield) ** 2, axis=0)[..., 0], x, y, z  # efield: (3, nx, ny, nz, 1)
 
     def field(self, y_frac=0.5, nx=80, density=40.0):
         """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
@@ -313,7 +314,7 @@ class _Sol:
 
         See :meth:`field3d` for the whole volume rather than one slice."""
         inten, _x, y, z = self._field_volume(nx=nx, density=density)
-        j = int(np.argmin(np.abs(y[0, :] - y_frac * self._period[1])))
+        j = int(jnp.argmin(jnp.abs(y[0, :] - y_frac * self._period[1])))
         slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
         zc = z.reshape(-1)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
@@ -328,9 +329,10 @@ class _Sol:
         unit-thick slabs (see :meth:`field`), so ``z`` starts at 0 at the top of the superstrate, not at
         any coordinate of the authored geometry — ``layer_z`` gives the interfaces in the same frame.
 
-        NumPy, like :meth:`field`: this is the visualisation path. A differentiable ``|E|²`` for a
-        coupled (e.g. thermal) objective needs the JAX-valued volume, which this deliberately does not
-        return — see the roadmap in ``docs/rcwa.md``."""
+        A JAX array, differentiable in the design (the layers' permittivity grids): ``jax.grad`` of a
+        functional of it (e.g. the absorbed power ``½ ω ε₀ Im ε |E|²`` heating a coupled thermal solve) flows
+        back through the interior-field reconstruction and the modal solve. The grid sizes (``nx``, the
+        per-layer ``nz`` from ``density``) and the layer thicknesses are static."""
         inten, x, y, z = self._field_volume(nx=nx, density=density)
         layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
         return inten, (x[:, 0], y[0, :], z.reshape(-1)), layer_z
@@ -1001,9 +1003,13 @@ def _z_ambient_faces(domain):
     zmin, zmax = float(pts[:, 2].min()), float(pts[:, 2].max())
     normals = getattr(domain, "normals_by_tag", {})
     bottom = top = None
+    tol = 1e-6 * max(float(np.ptp(pts, axis=0).max()), 1.0)
     for tag, br in getattr(domain, "_boundary_regions", {}).items():
         if tag == "boundary" or br is None or len(getattr(br, "points", [])) == 0:
             continue
+        bz = np.asarray(br.points)[:, 2]
+        if not (np.all(np.abs(bz - zmin) < tol) or np.all(np.abs(bz - zmax) < tol)):
+            continue  # an ambient face lies in the bottom or top plane; interfaces and side faces do not
         if tag not in normals:
             # A MISSING normal used to read as a zero vector, and `0 < 0.8*(0+1e-30)` is True — so an
             # untagged-normal face was silently *disqualified* and the search failed with "could not
@@ -1348,27 +1354,31 @@ def _extract_source_coeff(term):
     test factor, distribute the coefficient into additive terms, and keep those with no trial. Returns the
     source expression (an evaluable coefficient), or None if the term carries no forcing (e.g. a purely
     absorbing boundary ``-i k0 u v``)."""
+    from jno.jnp_ops import cross as jno_cross
     from jno.trace import FunctionCall, TestFunction
 
-    def _vector_load_source(f):  # a factor `inner(g, n×v)` (trial-free g) -> the source g; else None
+    def _vector_load_source(f):
+        """A factor ``inner(g, v×n)`` (trial-free ``g``) -> the tangential forcing it applies, ``n×g`` (so
+        ``inner(cross(E_inc, n), v×n)`` gives ``E_inc,t``, the incident polarization); ``n×v`` flips the
+        sign. ``None`` for any other factor."""
+        from jno.utils.solver.fem_nonnodal import _n1e_tangential_cross
+
         if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
             return None
         a0, a1 = f.args
-
-        def _cross_test(x):
-            return isinstance(x, FunctionCall) and getattr(x, "_name", None) == "cross" and _contains_test(x)
-
-        if _cross_test(a0) and not (_contains_trial(a1) or _contains_test(a1)):
-            return a1
-        if _cross_test(a1) and not (_contains_trial(a0) or _contains_test(a0)):
-            return a0
+        for g, tr in ((a0, a1), (a1, a0)):
+            tv = _n1e_tangential_cross(tr, TestFunction)
+            if tv is not None and not (_contains_trial(g) or _contains_test(g)):
+                nvar = tr.args[1] if tv[0] > 0 else tr.args[0]
+                force = jno_cross(nvar, g)
+                return force if tv[0] > 0 else (-1.0) * force
         return None
 
     expr = getattr(term, "expr", term)
     parts = []
     for tsign, summand in _add_split(expr):
         fac = _mul_factors(summand)
-        # vector Maxwell incident source: a factor inner(g, n×v); source = (other factors) · g
+        # vector Maxwell incident source: a factor inner(g, v×n); source = (other factors) · n×g
         vinner = next((f for f in fac if _vector_load_source(f) is not None), None)
         if vinner is not None:
             part = _vector_load_source(vinner)
@@ -1395,7 +1405,7 @@ def _kin_from_source(src_coeff, period, z0, params):
     """Transverse wavevector k_in = ∇⊥(phase) of the incident wave, read from the source coefficient by a
     small phase difference across the illuminated face -- differentiable in a source ANGLE parameter.
 
-    Works for a scalar source (Helmholtz) and a VECTOR source (Maxwell, ``inner(g, n×v)``): a plane wave is
+    Works for a scalar source (Helmholtz) and a VECTOR source (Maxwell, ``inner(cross(E_inc, n), v×n)``): a plane wave is
     ``E_inc·e^{i k⊥·r}``, so every component carries the same transverse phase — read it off the dominant
     component (avoids the N1E edge-sign corruption that a b-based read suffers)."""
     dx, dy = period[0] * 1e-3, period[1] * 1e-3
@@ -1658,6 +1668,25 @@ def _bary_weights(node_coords, grid_pts):
     return nodes, w
 
 
+def _flat_face_normal(domain, tag):
+    """Outward unit normal of the flat boundary face ``tag``: the normal of the plane through its points
+    (least squares), pointing away from the mesh centroid. Raises if the face is not flat."""
+    fp = np.asarray(_boundary_points(domain, tag), dtype=float)
+    c = fp.mean(0)
+    _, sv, vt = np.linalg.svd(fp - c, full_matrices=False)
+    if sv[-1] > 1e-8 * max(1.0, sv[0]):
+        raise RcwaError(f"the source reads the normal of face {tag!r}, which is not flat.")
+    n = vt[-1]
+    return n if np.dot(c - np.asarray(domain.mesh.points, dtype=float)[:, : len(n)].mean(0), n) > 0 else -n
+
+
+def _boundary_points(domain, tag):
+    br = getattr(domain, "_boundary_regions", {}).get(tag)
+    if br is None or len(getattr(br, "points", [])) == 0:
+        raise RcwaError(f"boundary region {tag!r} has no points; cannot locate it.")
+    return br.points
+
+
 def _eval_coeff_points(coeff_node, pts, params):
     """Evaluate the permittivity coefficient at ``pts``, substituting trainable parameters from
     ``params`` (jax values). Returns a JAX array -- differentiable in the design parameters."""
@@ -1672,8 +1701,33 @@ def _eval_coeff_points(coeff_node, pts, params):
         if name is not None and name in params:
             mod = eqx.tree_at(lambda m: m.value, mod, jnp.asarray(params[name]))
         table[mc.model.layer_id] = mod
-    tags = {v.tag for v in _walk_nodes(coeff_node) if isinstance(v, Variable)}
-    ctx = {t: jnp.asarray(pts) for t in tags} if tags else {}
+    from jno._fem import _is_normal_variable
+    from jno.trace import RegionMask, region_mask_key
+
+    pts = jnp.asarray(pts)
+    ctx = {}
+    for v in _walk_nodes(coeff_node):
+        if isinstance(v, RegionMask):
+            # a region-attached coefficient (`.attach(eps=...)`): membership of the sample points, by the
+            # same geometric rule the FEM assembly applies to cell centroids
+            from jno.utils.solver.fem_utils import region_membership_at
+
+            dom = getattr(v, "_domain", None)
+            m = None if dom is None else region_membership_at(dom, v.region, np.asarray(pts)[:, : int(dom.dimension)])
+            if m is None:
+                raise RcwaError(
+                    f"the permittivity reads region {v.region!r}, which has no point membership here (a "
+                    "mesh-file volume region is known per cell only). Build the region with jno.shape, a "
+                    "geometry part or a domain.tag predicate so RCWA can sample it."
+                )
+            ctx[region_mask_key(v.region)] = jnp.asarray(m, dtype=float)
+            continue
+        if not isinstance(v, Variable) or v.tag in ctx:
+            continue
+        if _is_normal_variable(v):  # a source on a flat ambient face reads its (constant) outward normal
+            ctx[v.tag] = jnp.broadcast_to(jnp.asarray(_flat_face_normal(v._domain, v.tag[2:])), (pts.shape[0], 3))
+        else:
+            ctx[v.tag] = pts
     return TraceEvaluator(table).evaluate(coeff_node, context=ctx)
 
 
@@ -1970,7 +2024,7 @@ def _build_emitter_problem(
 
 
 def _source_jones(src_coeff, period, z0, params):
-    """The incident transverse Jones vector ``(E_x, E_y)`` of a VECTOR source (``inner(E_inc, n×v)``), or
+    """The incident transverse Jones vector ``(E_x, E_y)`` of a VECTOR source (``inner(cross(E_inc, n), v×n)``), or
     None for a scalar one. Read at the face centre; the plane-wave phase is common to every component."""
     pt = np.array([[period[0] * 0.5, period[1] * 0.5, z0]])
     v = np.asarray(_eval_coeff_points(src_coeff, pt, params)).reshape(-1)

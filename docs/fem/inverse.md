@@ -350,14 +350,21 @@ steady forms and **coupled (multi-field)** forms, and with the scalar C¹ famili
 **Unknown boundary / initial conditions.** A network as an *essential value* is a trainable *profile*
 (it enters the lift, not the operator): a *Dirichlet* value `u(∂Ω) - net(xb, yb)` (an unknown boundary
 profile) or an *initial condition* `u(initial) - net(xi, yi)` (an unknown starting state, recovered from
-a trajectory). Both supported for a **bare** `net(x)`, native Lagrange single-field — the Dirichlet on
-steady / nonlinear / linear-transient / nonlinear-transient forms, the IC on a linear-transient form; a
-compound value, or a net IC on a nonlinear transient, fails loud.
+a trajectory). The Dirichlet value is a **bare** `net(x)`, native Lagrange single-field, on steady /
+nonlinear / linear-transient / nonlinear-transient forms; a compound Dirichlet value fails loud. The
+initial condition may be **any expression** of networks and trainable `jno.np.parameter`s
+(`u(*ci) - a * sin(pi x) * sin(pi y)`, `u(*ci) - net(x) * u0`), on a linear or nonlinear first-order
+transient over 2-D/3-D Lagrange fields, single or coupled: the march re-forms its start from the runtime
+values under every time scheme, and the gradient matches finite differences
+(`tests/test_fem_transient_trainable_ic.py`). Where the initial state is fixed when the form is built
+(1-D lines, the non-nodal families, `u_tt` forms, complex transients), a trainable there is refused by
+name rather than frozen at its stored value.
 
 *Current scope:* steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
 coupled multi-field), steady scalar C¹ non-nodal, a bare `net(x)` steady/nonlinear/linear-transient/
-nonlinear-transient Dirichlet value, and a bare `net(x)` linear-transient initial condition. Not yet
-(each fails loud): a compound net essential value, a net IC on a *nonlinear* transient, a net Dirichlet
+nonlinear-transient Dirichlet value, and a trainable initial condition of any form on a first-order
+transient. Not yet (each fails loud): a compound net Dirichlet value, a trainable initial condition on 1-D,
+non-nodal, `u_tt` or complex transient forms, a net Dirichlet
 with a state-dependent mass, `net(u)` on the mass term, k(u) in complex forms, the complex transient, a
 net Dirichlet combined with a time-varying `g(x,t)` Dirichlet, `net(u)` on the vector edge families, and
 1D domains.
@@ -372,6 +379,15 @@ parameters — so a rate constant is recovered from a time series:
 fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(*ci) - u0])
 crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recovers alpha
 ```
+
+Every scheme in the `time=` slot differentiates the same way: the gradient through `theta`, `bdf2()`,
+`bdf()`, `sdirk()`, `rosenbrock()` and `exponential()` matches central finite differences to 1e-8 or
+better on a fixed grid, for a scalar coefficient, a network coefficient, a nonlinear form and the
+sparse-direct path of the C¹ families. On adaptive steps the step-size controller is held fixed under
+differentiation (as in Diffrax), so the gradient is that of the accepted steps; it differs from a finite
+difference of the whole adaptive march by the order of the tolerance (measured: 3e-7 relative at
+`bdf(order=5).adaptive(rtol=1e-6)`, up to 2e-3 for backward Euler at `rtol=1e-5`). `exponential()` takes a
+trainable coefficient as long as the operator does not read time.
 
 `fem.solve(my_integrator, save_ts=...)` swaps the integrator: `my_integrator(block, args, save_ts) ->
 trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A` / `block.state0` — form

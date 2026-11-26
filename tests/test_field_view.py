@@ -487,16 +487,26 @@ class TestArithmeticPreservation:
 
 class TestConflictingBindings:
     def test_conflicting_x_raises(self, cpu_only):
-        """Two FieldViewWithPartials with the same name bound to different
-        Variables raise ``ValueError`` on arithmetic."""
+        """Two views on one domain with the same name bound to different Variables of it raise ``ValueError`` on
+        arithmetic: which binding a derivative of the result reads would be ambiguous."""
+        H = 4
+        f = np.zeros((H, H), dtype=np.float32)
+        domain, a, x, y, _ = _make_spatial_setup(f)
+        xb, yb, _ = domain.variable("boundary")
+        u1 = a.field.bind(x=x, y=y)
+        u2 = a.field.bind(x=xb, y=yb)  # xb is a different Variable of the same domain
+        with pytest.raises(ValueError, match="coord binding conflict"):
+            _ = u1 + u2
+
+    def test_bindings_on_two_meshes_combine_and_keep_both(self, cpu_only):
+        """Views on two different domains combine, each binding kept (``_coord_sets``): an interface condition
+        between problems on their own meshes (``Tg - Ts``), which nothing differentiates across."""
         H = 4
         f = np.zeros((H, H), dtype=np.float32)
         _, a1, x1, y1, _ = _make_spatial_setup(f)
         _, a2, x2, y2, _ = _make_spatial_setup(f)
-        u1 = a1.field.bind(x=x1, y=y1)
-        u2 = a2.field.bind(x=x2, y=y2)  # x2 is a different Variable from x1
-        with pytest.raises(ValueError, match="coord binding conflict"):
-            _ = u1 + u2
+        u = a1.field.bind(x=x1, y=y1) - a2.field.bind(x=x2, y=y2)
+        assert [cv["x"] for cv in u._coord_sets] == [x1, x2]
 
 
 # ---------------------------------------------------------------------------

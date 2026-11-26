@@ -1289,31 +1289,19 @@ def test_dirichlet_net_scope_guards():
     with pytest.raises(NotImplementedError, match="bare|compound"):
         jno.fem([ui.x * vi.x + ui.y * vi.y - 0.0 * vi, u(xb, yb) - (1.0 + net(xb, yb))], quad_degree=3)
 
-    # compound INITIAL-condition value 1 + net(x): rejected (only a bare net(x) IC is supported)
+    # A compound INITIAL-condition value 1 + net(x), and a net IC on a NONLINEAR transient, are supported:
+    # the initial state is re-formed from the runtime args on every march (see
+    # tests/test_fem_transient_trainable_ic.py).
     d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, _psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.05, 6))
     net2 = _mlp_net(key=43)
-    with pytest.raises(NotImplementedError, match="bare|compound"):
-        jno.fem(
-            [
-                u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
-                u2(xb2, yb2) - 0.0,
-                u2(ci[0], ci[1]) - (1.0 + net2(ci[0], ci[1])),
-            ]
-        )
-
-    # net INITIAL CONDITION on a NONLINEAR transient form: rejected (state0_fn threads only the linear
-    # stepper). The net *Dirichlet* on a nonlinear transient IS supported — see
-    # test_dirichlet_net_nonlinear_transient_matches_const_and_differentiates.
-    d3, u3, phi3, (x3, y3), (xb3, yb3), ci3, u3i, v3i, u03 = _transient_setup(mesh_size=0.4, time=(0.0, 0.02, 3))
-    net3 = _mlp_net(key=44)
-    with pytest.raises(NotImplementedError, match="nonlinear transient"):
-        jno.fem(
-            [
-                u3i.t * v3i + (1.0 + u3i**2) * (u3i.x * v3i.x + u3i.y * v3i.y),
-                u3(xb3, yb3) - 0.0,
-                u3(ci3[0], ci3[1]) - net3(ci3[0], ci3[1]),
-            ]
-        )
+    fem2 = jno.fem(
+        [
+            u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
+            u2(xb2, yb2) - 0.0,
+            u2(ci[0], ci[1]) - (1.0 + net2(ci[0], ci[1])),
+        ]
+    )
+    assert fem2.operator.state0_fn is not None and len(fem2.operator.runtime_parameter_exprs) == 1
 
 
 def test_scope_guards_fail_loud():

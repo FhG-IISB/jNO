@@ -2318,8 +2318,70 @@ def test_coupled_nonlinear_march(monkeypatch):
         v(xi, yi) - 0.25 * bump,
     ]
     a = np.asarray(jno.fdm(terms).solve())
-    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    b = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu(), nonlinear=jno.solve.newton(direct=True)))
     assert np.isfinite(a).all() and np.abs(a - b).max() < 1e-12
+    # the default per-step Newton with lu() refreshes its tangent every iteration (newton(direct=True)), not the
+    # kept tangent of newton(reuse=True), which needs more iterations on a stiff reaction: the same iterates
+    default = np.asarray(jno.fdm(terms).solve(linear=jno.solve.lu()))
+    assert np.abs(default - b).max() < 1e-12
+
+
+@pytest.mark.parametrize("scheme", [None, "bdf2"])
+def test_repeated_march_is_traced_once(monkeypatch, scheme):
+    """Solving the same transient problem again reuses the traced march: fresh scheme and solver specs that are
+    equal by value hit the cache, the answer is identical, and a different slot traces anew. Each solve()
+    used to build a new block and so re-trace and re-compile the whole march (half of a warm 32x32
+    Brusselator solve)."""
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, 11))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    problem = jno.fdm(
+        [
+            ui.t - 0.1 * (ui.xx + ui.yy) + ui**3,  # nonlinear: the per-step Newton with an assembled tangent
+            u(xb, yb) - 0.0,
+            u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+        ]
+    )
+    traces = []
+    real = jax.make_jaxpr
+    monkeypatch.setattr(jax, "make_jaxpr", lambda *a, **k: traces.append(1) or real(*a, **k))
+    kw = lambda: dict(time=jno.solve.bdf2() if scheme else None, linear=jno.solve.lu())  # noqa: E731
+    first = np.asarray(problem.solve(**kw()))
+    n_first = len(traces)
+    again = np.asarray(problem.solve(**kw()))
+    assert n_first > 0 and len(traces) == n_first
+    # The same compiled march: equal up to the GPU's reduction order, which may differ from run to run (one ulp,
+    # 1.1e-16 relative, in 4 of 10 repeats on the RTX 3070); the bound allows a few ulps.
+    np.testing.assert_allclose(again, first, rtol=0, atol=1e-14 * np.abs(first).max())
+    np.asarray(problem.solve(time=kw()["time"], linear=jno.solve.lu(), nonlinear=jno.solve.newton(direct=True, rtol=1e-10)))
+    assert len(traces) > n_first
+
+
+def test_rosenbrock_marches_a_nonlinear_problem_with_an_assembled_step():
+    """`time=rosenbrock(), linear=lu()` on a nonlinear march: the stages solve with the assembled stage matrix
+    (no Newton) and land on the fine BDF2 march. jno.fdm used to fill in `nonlinear=newton(...)` itself, so the
+    scheme refused the march ('nonlinear= has nothing to drive') though the caller passed none."""
+    terms_of = lambda n: _cubic_heat_terms(n)  # noqa: E731
+    ros = np.asarray(jno.fdm(terms_of(21)).solve(time=jno.solve.rosenbrock(), linear=jno.solve.lu()))
+    ref = np.asarray(jno.fdm(terms_of(321)).solve(time=jno.solve.bdf2(), linear=jno.solve.lu()))
+    assert np.abs(ros[-1] - ref[-1]).max() < 1e-4 * np.abs(ref[0]).max()
+
+
+def _cubic_heat_terms(n_times):
+    d = jno.domain(jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).structured(), time=(0.0, 0.2, n_times))
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    return [
+        ui.t - 0.1 * (ui.xx + ui.yy) + ui**3,
+        u(xb, yb) - 0.0,
+        u(xi, yi) - jno.np.sin(np.pi * xi) * jno.np.sin(np.pi * yi),
+    ]
 
 
 def test_coupled_march_inverse_recovers_the_coupling():
@@ -3263,6 +3325,79 @@ def test_structure_is_decided_for_every_value_of_a_trainable_parameter():
     sol = np.asarray(prob._steady_solve(extra_params={lid: at_one})).reshape(-1)
     assert not prob._grid_linear
     np.testing.assert_allclose(sol, ref, atol=1e-8 * np.abs(ref).max())
+
+
+def _slab_with_data(make_cons, **domain_kw):
+    """The unit square with a nodal data field ``g`` (one value per mesh node, no optimizer: the kind a coupling
+    injects), the constraints from ``make_cons(d, g)``, and the problem's node coordinates."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, **domain_kw)
+    g = jno.np.parameter((_nodes(d).shape[0],), name="g")
+    prob = jno.fdm(make_cons(d, g))
+    return prob, g, np.asarray(prob._pts)
+
+
+def test_a_neumann_flux_injected_as_traced_data_gives_the_linear_solution_and_its_gradient():
+    """-Δu = 0, u = 1 on the left, ∂u/∂n = g on the right, insulated top and bottom: u = 1 + g·x, exact for the
+    boundary fit. ``g`` enters as ``extra_params`` (traced under jit), the route a coupling and a jno.core
+    inverse take. It used to return NaN: the injected (N,) value replaced the (N, 1) a data field is read as, so
+    the flux row ``∇u·n - g`` broadcast to (N, N) and lost its gradient part, and the system was singular.
+    Gradient: a uniform change δ of g moves u by δ·x, so the mean right-edge value moves by δ."""
+
+    def cons(d, g):
+        x, y, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        u = d.unknown()
+        out = [-(u.bind(x=x, y=y).d2(x) + u.bind(x=x, y=y).d2(y)), u(xl, yl) - 1.0]
+        out.append(u.bind(x=xr, y=yr).d(d.variable("right", normals=True)) - g)
+        for tag in ("top", "bottom"):
+            xt, yt, _ = d.variable(tag, split=True)
+            out.append(u.bind(x=xt, y=yt).d(d.variable(tag, normals=True)) - 0.0)
+        return out
+
+    prob, g, pts = _slab_with_data(cons)
+    right = jnp.asarray(np.isclose(pts[:, 0], 1.0))
+    lid = g.model.layer_id
+
+    @jax.jit
+    def solve(values):
+        scope = {lid: prob._trainable_module(g, values)}
+        return jnp.asarray(prob._steady_solve(extra_params=scope, linear=jno.solve.lu())).reshape(-1)
+
+    v = jnp.full(prob._N, 2.0)
+    # a direct solve of an exact discretisation: round-off of the LU (cond ~1e3 at h = 0.1)
+    np.testing.assert_allclose(np.asarray(solve(v)), 1.0 + 2.0 * pts[:, 0], atol=1e-10)
+    mean_right = lambda w: jnp.sum(jnp.where(right, solve(w), 0.0)) / jnp.sum(right)  # noqa: E731
+    np.testing.assert_allclose(float(jnp.sum(jax.grad(mean_right)(v))), 1.0, atol=1e-10)
+
+
+def test_a_dirichlet_value_injected_as_data_holds_in_a_march():
+    """A march reads injected data through ``_override`` (how a coupling's window passes its data). A Dirichlet
+    value that is a nodal data field used to be read from its STORED value there (0 here), so the boundary
+    ignored the injected 2. Backward Euler makes the Dirichlet row algebraic, so every saved state holds u = g on
+    the left. (Eager: tracing the fdm march itself is a later step.)"""
+
+    def cons(d, g):
+        x, y, t = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        xi, yi, _ = d.variable("initial", split=True)
+        u = d.unknown()
+        ui = u.bind(x=x, y=y, t=t)
+        return [ui.t - (ui.d2(x) + ui.d2(y)), u(xl, yl) - g, u(xr, yr) - 0.0, u(xi, yi) - 0.0]
+
+    prob, g, pts = _slab_with_data(cons, time=(0.0, 0.05, 5))
+    left = np.isclose(pts[:, 0], 0.0)
+
+    def march(values):
+        prob._override = {g.model.layer_id: prob._trainable_module(g, values)}
+        try:
+            return jnp.asarray(prob._march(x0=jnp.zeros(prob._N)))
+        finally:
+            prob._override = None
+
+    traj = np.asarray(march(jnp.full(prob._N, 2.0))).reshape(-1, prob._N)
+    np.testing.assert_allclose(traj[1:, left], 2.0, atol=1e-12)  # an algebraic row: exact to round-off
 
 
 def test_the_grid_linear_path_is_differentiable_in_the_source():

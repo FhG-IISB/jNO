@@ -20,7 +20,8 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, "benchmarks")
-from pypeec_layout import cells_in  # noqa: E402
+# benchmarks/ is not tracked, so a clean checkout (CI) has no harness to pin
+cells_in = pytest.importorskip("pypeec_layout", reason="benchmarks/pypeec_layout.py is not in this checkout").cells_in
 
 PITCH = 1.0
 NX = NY = 12

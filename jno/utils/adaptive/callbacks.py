@@ -1833,6 +1833,13 @@ class HessianSpectrumCallback(Callback, _LiveValue):
 # ---------------------------------------------------------------------------
 
 
+def _check_spring_args(momentum, damping, who):
+    if not 0.0 <= float(momentum) < 1.0:
+        raise ValueError(f"{who}: momentum must lie in [0, 1) (0 = plain ENGD, ~0.9 typical for SPRING), got {momentum!r}.")
+    if float(damping) < 0.0:
+        raise ValueError(f"{who}: damping (the Levenberg-Marquardt lambda added to G) must be >= 0, got {damping!r}.")
+
+
 class ENGDCallback(Callback):
     """Precondition parameter gradients with the energy Gram matrix (ENGD).
 
@@ -1900,6 +1907,20 @@ class ENGDCallback(Callback):
             :math:`\\alpha^* \\cdot G^{-1} \\nabla L` as the effective
             gradient so that an ``optax.sgd(1.0)`` optimizer applies the
             correct step.  Default ``False``.
+        momentum: SPRING momentum :math:`\\mu \\in [0, 1)` (Goldshlager, Abrahamsen & Lin
+            2024, arXiv:2401.10190; Jnini et al. 2026, arXiv:2604.05230, Sec. 2.3, eq. 26):
+            :math:`\\phi_k = \\mu\\phi_{k-1} + (G + \\lambda I)^{-1}(\\nabla L - \\mu G \\phi_{k-1})`,
+            then :math:`\\theta \\leftarrow \\theta - \\alpha_k \\phi_k`. ``0`` (default) is plain
+            ENGD; ``0.5``-``0.99`` were tested. With ``damping=0`` the momentum acts only in the
+            null space of the Jacobian (more parameters than residual points), so pair it with
+            ``damping > 0``. With ``line_search=True`` the carried :math:`\\phi_{k-1}` is the step
+            taken, :math:`\\alpha_{k-1}\\phi_{k-1}`, not eq. 26's unscaled direction (which
+            stalled at ``momentum=0.9``). :math:`\\phi` is reset at every ``solve()``.
+        damping: Levenberg-Marquardt :math:`\\lambda \\ge 0` added to :math:`G` and solved by
+            Cholesky instead of ``lstsq`` (then ``rcond`` is unused). ``0`` (default) keeps the
+            pseudo-inverse. A large :math:`\\lambda` turns the step into gradient descent with
+            rate :math:`1/\\lambda` and floors the reachable accuracy; start near ``1e-8``-``1e-6``
+            in float64.
 
     Example::
 
@@ -1920,9 +1941,12 @@ class ENGDCallback(Callback):
         gram_interval: int = 1,
         rcond: Optional[float] = None,
         line_search: bool = False,
+        momentum: float = 0.0,
+        damping: float = 0.0,
     ) -> None:
         from jno.trace import NetworkGradient
 
+        _check_spring_args(momentum, damping, "ENGDCallback")
         if not gram_terms:
             raise ValueError("ENGDCallback: gram_terms must not be empty.")
         for i, (expr, w) in enumerate(gram_terms):
@@ -1945,6 +1969,9 @@ class ENGDCallback(Callback):
         self._gram_interval = gram_interval
         self._rcond = rcond
         self._line_search = line_search
+        self._momentum = float(momentum)
+        self._damping = float(damping)
+        self._phi = None  # SPRING's previous direction, reset at every solve
         self._lid: int = lids[0]
         self._gram_and_solve_jit = None
         self._cached_solve_jit = None
@@ -2011,6 +2038,8 @@ class ENGDCallback(Callback):
             trainable_template=trainable,
             rcond=self._rcond,
             min_consecutive=kwargs.get("min_consecutive", 1),
+            momentum=self._momentum,
+            damping=self._damping,
         )
 
         self._gram_and_solve_jit = jax.jit(gram_and_solve_fn)
@@ -2018,9 +2047,11 @@ class ENGDCallback(Callback):
 
         # Warm up: pre-compile both JIT functions.
         flat_g = jax.numpy.zeros(P, dtype=flat_template.dtype)
-        nat, G = self._gram_and_solve_jit(trainable, kwargs["context"], kwargs["rng"], flat_g)
+        self._phi = jax.numpy.zeros_like(flat_g)
+        self._G_cache = None
+        nat, G = self._gram_and_solve_jit(trainable, kwargs["context"], kwargs["rng"], flat_g, self._phi)
         jax.block_until_ready((nat, G))
-        _ = self._cached_solve_jit(G, flat_g)
+        _ = self._cached_solve_jit(G, flat_g, self._phi)
         jax.block_until_ready(_)
 
         if self._line_search:
@@ -2095,13 +2126,20 @@ class ENGDCallback(Callback):
         flat_g, _ = jax.flatten_util.ravel_pytree(grads[self._lid])
 
         if self._G_cache is None or epoch % self._gram_interval == 0:
-            nat_flat, self._G_cache = self._gram_and_solve_jit(trainable, context, rng, flat_g)
+            nat_flat, self._G_cache = self._gram_and_solve_jit(trainable, context, rng, flat_g, self._phi)
         else:
-            nat_flat = self._cached_solve_jit(self._G_cache, flat_g)
+            nat_flat = self._cached_solve_jit(self._G_cache, flat_g, self._phi)
+        # SPRING's phi_{k-1}: the step actually taken. Without the line search that is phi_k itself
+        # (sgd(lr) applies the fixed rate, as in Goldshlager et al.). With it, eq. 26 of
+        # arXiv:2604.05230 carries the unscaled phi_k, but then a step the search cut to alpha << 1
+        # keeps pulling at full Gauss-Newton size: on Poisson2D (P = 501 > N = 192, 200 steps)
+        # mu = 0.9 reached rel-L2 2.3e-3 that way against 1.7e-6 carrying alpha_k * phi_k.
+        self._phi = nat_flat
 
         if self._ls_jit is not None:
             best_alpha = self._ls_jit(trainable, nat_flat, context, rng)
             nat_flat = nat_flat * best_alpha
+            self._phi = nat_flat
 
         return {**grads, self._lid: self._unravel(nat_flat)}
 
@@ -2337,6 +2375,8 @@ class callbacks:
         gram_interval: int = 1,
         rcond: Optional[float] = None,
         line_search: bool = True,
+        momentum: float = 0.0,
+        damping: float = 0.0,
     ) -> "ENGDCallback":
         """Create an :class:`ENGDCallback` for Energy Natural Gradient Descent.
 
@@ -2378,11 +2418,27 @@ class callbacks:
                 reproduction of the paper's results.  Use with
                 ``optax.sgd(1.0)``; the selected :math:`\\alpha^*` is
                 folded into the returned gradient so the optimizer applies
-                the full scaled natural gradient step.  Default ``False``.
+                the full scaled natural gradient step.  Default ``True``.
+            momentum: SPRING momentum :math:`\\mu \\in [0, 1)` (Goldshlager, Abrahamsen & Lin
+                2024, arXiv:2401.10190; Jnini et al. 2026, arXiv:2604.05230, Sec. 2.3, eq. 26):
+                :math:`\\phi_k = \\mu\\phi_{k-1} + (G + \\lambda I)^{-1}(\\nabla L - \\mu G \\phi_{k-1})`,
+                then :math:`\\theta \\leftarrow \\theta - \\alpha_k \\phi_k`. ``0`` (default) is plain
+                ENGD; ``0.5``-``0.99`` were tested. With ``damping=0`` the momentum acts only in the
+                null space of the Jacobian (more parameters than residual points), so pair it with
+                ``damping > 0``. With ``line_search=True`` the carried :math:`\\phi_{k-1}` is the step
+            taken, :math:`\\alpha_{k-1}\\phi_{k-1}`, not eq. 26's unscaled direction (which
+            stalled at ``momentum=0.9``). :math:`\\phi` is reset at every ``solve()``.
+            damping: Levenberg-Marquardt :math:`\\lambda \\ge 0` added to :math:`G` and solved by
+                Cholesky instead of ``lstsq`` (then ``rcond`` is unused). ``0`` (default) keeps the
+                pseudo-inverse. A large :math:`\\lambda` turns the step into gradient descent with
+                rate :math:`1/\\lambda` and floors the reachable accuracy; start near ``1e-8``-``1e-6``
+                in float64.
         """
         return ENGDCallback(
             gram_terms=gram_terms,
             gram_interval=gram_interval,
             rcond=rcond,
             line_search=line_search,
+            momentum=momentum,
+            damping=damping,
         )

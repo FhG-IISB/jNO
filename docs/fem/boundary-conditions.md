@@ -271,6 +271,90 @@ form (N1E / N2E / RT / DG, alone or mixed with Lagrange), real or complex, the w
 Transient, 1-D and VPINN problems never publish the assembler this rides on, and say so. Where it is unavailable the equivalent is `sum(fem.eval(F * phi, sol))`: a Lagrange basis is a
 partition of unity, so summing the weak term `F·φ` over every DOF is the same integral.
 
+### The exact open boundary of a periodic cell — `jno.np.sqrtm(L)`
+
+A wave leaving a periodic cell through a flat face is a sum of Fourier orders, and each order leaves with
+its own admittance: `du/dn = i k_z u`, `k_z = sqrt(k² - k_t²)`. That is the operator
+`du/dn = i (k² + Δ_t)^(1/2) u` on the face, the exact Dirichlet-to-Neumann map of the half-space (Givoli,
+*Non-reflecting boundary conditions*, J. Comput. Phys. 94, 1991, sec. 3). Write the operator in strong
+form as a function of the field, and `jno.np.sqrtm` takes its square root:
+
+```python
+S = jno.np.sqrtm(lambda w: k**2 * w + w.x.x)          # (k² + d_xx)^(1/2) on the top face
+jno.fem([
+    ui.x * vi.x + ui.y * vi.y - k**2 * ui * vi,
+    -1j * S(ut) * vt,                                  # du/dn = i S u
+    u(xb, yb) - g,
+    u(xl, yl) - u(xr, yr),                             # periodic in x
+])
+```
+
+`S ** p` takes a real power, and `S(trace)` applies the operator to the unknown's trace on that face. The
+result is a symbol like any field: `S(tE)[i]`, `S(tE).x`, `inner(S(tE), tF)`. Vector Maxwell on a face
+`z = const` is one operator for both polarisations,
+`n × curl E = -i (k² - curl_t curl_t)(k² + Δ_t)^(-1/2) E_t`, written after integrating the surface curl
+by parts:
+
+```python
+curl_t = lambda w: w.x[1] - w.y[0]
+S = jno.np.sqrtm(lambda w: k**2 * w + w.x.x + w.y.y) ** -1
+tE, tF = cross(n, u.vector.cross(n)), cross(n, v.vector.cross(n))      # E_t = n × (E × n)
+top = -1j * (k**2 * inner(S(tE), tF) - curl_t(S(tE)) * v.vector.curl(xt, yt, zt)[2])
+```
+
+A plane wave `E_inc` enters through such a face as a source on the tangential traces. On the face it
+comes in through, `n × curl E = DtN(E) + 2 i k E_inc,t`, so the term next to the face block is
+
+```python
+load = 2j * k * inner(cross(einc, n), v.vector.cross(n))              # 2 i k E_inc,t · v_t
+```
+
+Like every trial-free term it enters the load as `b = -term`, and `cross(einc, n)` reads the face's own
+normal. Measured on a quartz | air interface at normal incidence (degree-2 N1E, h = 0.2, about 3 cells per
+wavelength in the quartz): the field is within 5.6 % of the Fresnel field and stays x-polarised.
+
+The term is still linear. The assembler adds one dense block over the face's DOFs,
+`A_ij = Σ_m f(σ_m) ⟨φ_i, e_m⟩ ⟨e_m, trace(φ_j)⟩`, over the face's Fourier modes `e_m`.
+
+**Measured:**
+
+- 2-D Helmholtz, P1, one oblique order. The error falls as h² (3.6e-2, 9.5e-3, 2.4e-3 at h = 0.08,
+  0.04, 0.02). The first-order face `du/dn = i k u` stays at 18 % on the same meshes.
+- 3-D vacuum cell, degree-2 N1E. The oblique TE and TM orders leave with 3.0 % / 3.2 % error at
+  h = 0.25 and 1.5 % / 1.7 % at h = 0.17. The first-order face gives 19 % / 23 % (Engquist & Majda,
+  Math. Comp. 31, 1977: a local condition is exact at one angle only).
+- Bloch cell, 2-D Helmholtz at 30 degrees: 8.3e-3, 2.1e-3 at h = 0.04, 0.02; first-order face 9.7 %.
+- Transient diffusion under the exterior-Laplace face: the decaying mode to 0.9 % (the backward-Euler
+  time error; it halves with the step); an insulated top 18 %.
+- Nonlinear `-Δu + u^3 = f` with that face: h^2 (9.8e-4, 2.4e-4); matrix-free and assembled Newton agree.
+- See `tests/test_fem_face_operator.py`.
+
+!!! warning "Scope — each of these raises"
+    * The callable must be linear with constant coefficients. It is built from `w`, `+ - *` by numbers and
+      tangential derivatives. A derivative along the face normal, a product of fields, a traced coefficient
+      and a constant term are all refused.
+    * The face must be flat and normal to a coordinate axis.
+    * The cell must be periodic across the face. A Bloch tie `u(A) - phi * u(B)` (unit `|phi|`) shifts the
+      face modes to `exp(i (k_m + k_B)·x)`, with `k_B = arg(phi) / (x_A - x_B)`: oblique incidence works.
+      A Bloch tie across the face's own normal is refused.
+    * A negative power of an operator whose symbol vanishes is refused. That happens for an order at
+      grazing incidence, `k_z = 0`; change the period or the wavelength slightly.
+    * Steady, transient and nonlinear forms carry the block: it rides in the spatial residual (so a
+      Newton tangent, matrix-free or assembled, includes it) and in the spatial operator of a march, never
+      in the mass. A transient form must be real, as every non-nodal transient is: a real-symbol operator
+      such as the exterior-Laplace face `du/dn = -(-d_xx)^(1/2) u` of a quasistatic half-space. The
+      time-domain wave boundary is a different operator (nonlocal in time) and is not this.
+    * A runtime parameter inside the face term, trainable coordinates and per-cell matrices
+      (`elements=True`) are refused. A complex block on a real form is refused too: write the `1j`.
+
+    Conventions and limits that do not raise:
+
+    * The branch is the principal one: `sqrt` of a negative symbol is `+i sqrt(|.|)`. That is the
+      `exp(-iωt)` convention: an outgoing wave is `exp(+i k_z z)` and an evanescent one decays.
+    * The modes are truncated at the face mesh's Nyquist limit, `|m| ≤ P / 2h`. The count is logged.
+      Orders above it get no admittance.
+    * The block is dense over the face. It costs `O(n_face²)` memory and fills the factorisation.
+
 ### Tying a region to a constant — `u(region) - U`
 
 With `U = d.unknown.scalar(constant=True)`, the term `u(xr, yr) - U` makes every DOF of `u` on the region

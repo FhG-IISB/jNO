@@ -60,7 +60,9 @@ RCWA solves Maxwell's equations, so every solve has an incident polarization. `j
 the problem, logs it, and keeps it on `rc.spec.polarization` (a transverse Jones vector `(p_x, p_y)`) with
 the reason on `rc.spec.polarization_from`:
 
-- A **vector** (curl-curl) list states it: the transverse part of its incident field `E_inc`.
+- A **vector** (curl-curl) list states it: the transverse part of its incident field `E_inc`, the source
+  `inner(cross(E_inc, n), v.vector.cross(n))` on the lit face (`jno.rcwa` reads the forcing `n × g` of any
+  `inner(g, v×n)`, the field the FEM solve is driven with).
 - A **scalar** Helmholtz list is solved in the polarization for which Maxwell reduces *exactly* to the
   written equation `Δu + k0²ε u = 0`: the field along an in-plane axis every layer is invariant along,
   when the incidence has no component along it — TE, E parallel to the lines of a 1-D grating (either

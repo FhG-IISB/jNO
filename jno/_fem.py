@@ -1269,8 +1269,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
         return _normalize_quad_tag(tag, _bregions)
 
     def _is_across(tag) -> bool:
-        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
-        return isinstance(tag, str) and tag.startswith("across_")
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on; a face
+        # operator's symbol `S(trace)` (`faceop_*`) belongs to the face its trace is bound to
+        return isinstance(tag, str) and tag.startswith(("across_", "faceop_"))
 
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
@@ -1433,7 +1434,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_", "faceop_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -1597,6 +1598,26 @@ def _default_direct(fem_obj):
     if getattr(fem_obj, "_geometry", None) or periodic is not None:
         return None
     return lu(backend="cudss") if _preferred_direct_backend() == "cudss" else None
+
+
+def _default_saddle_step_solve(fem_obj):
+    """``jno.solve.lu()`` for a linear transient whose step operator is a SADDLE (an index-2 row: zero mass and
+    a zero diagonal, the incompressibility row), else ``None`` (the Krylov step default). Jacobi has nothing to
+    scale on those rows and the Schur complement shrinks with dt, so the Krylov default broke down: measured
+    on unsteady Stokes (P2/P1), fine at dt = 1e-3 and NaN at dt = 1e-4 and below. A moving mesh and a periodic
+    reduction keep their own drivers."""
+    if fem_obj._mode != "transient" or not fem_obj.is_linear or getattr(fem_obj, "_geometry", None):
+        return None
+    periodic = fem_obj._periodic_2n if fem_obj._complex_n is not None else fem_obj._periodic
+    if periodic is not None:
+        return None
+    from .utils.solver.solver_api import _is_saddle_block
+
+    if not _is_saddle_block(fem_obj._op):
+        return None
+    from .solve import lu
+
+    return lu()
 
 
 def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
@@ -2042,7 +2063,9 @@ def _refuse_stale_position(variables, where="a condition's value"):
             )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
+def _eval_value_node_at(
+    value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False, normals: Any = None
+) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -2063,10 +2086,22 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
     with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
     a constant. A matrix-valued condition therefore needs this.
+
+    ``normals`` ``(n_points, gdim)`` is the outward unit normal at ``points``, read by a boundary-normal
+    Variable ``n_<region>`` (``domain.variable(region, normals=True)``) inside the value -- a source
+    ``cross(E_inc, n)`` on a face. Without it such a value raises: the normal is not a function of the
+    point, and handing it the coordinates (what every other tag reads) gives a silently wrong vector.
     """
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    normal_tags = {v.tag for v in variables if _is_normal_variable(v)}
+    if normal_tags and normals is None:
+        raise ValueError(
+            f"jno.fem: a value or source reads the boundary normal ({sorted(normal_tags)}) where only the point "
+            "coordinates are known, so it cannot be evaluated. Write the value without the normal (for a flat "
+            "face, the constant normal vector), or as a boundary term the face assembly evaluates."
+        )
     _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
@@ -2076,8 +2111,9 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             "condition and in an initial condition (read at the start time); anywhere else write it without "
             "the time variable."
         )
-    tags = {v.tag for v in variables} - temporal
+    tags = {v.tag for v in variables} - temporal - normal_tags
     pts = jnp.atleast_2d(jnp.asarray(points))
+    nrm = None if normals is None else jnp.reshape(jnp.asarray(normals), (pts.shape[0], -1))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
     # it, so the coefficient stays differentiable in the design variable; else use the stored module
@@ -2102,18 +2138,32 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             table[m.layer_id] = mod
     if pointwise:
 
-        def _at(p):
+        def _at(p, nv):
             ctx = {tag: p[None, :] for tag in tags}
             for tag in temporal:
                 ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            for tag in normal_tags:
+                ctx[tag] = nv[None, :]
             return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
 
-        vals = jax.vmap(_at)(pts)
+        vals = jax.vmap(_at)(pts, pts if nrm is None else nrm)
         return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
+    for tag in normal_tags:
+        context[tag] = nrm
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
     return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
+
+
+def _is_normal_variable(v: Any) -> bool:
+    """Is ``v`` a boundary-normal Variable ``n_<region>`` (``domain.variable(region, normals=True)``)?"""
+    tag = getattr(v, "tag", None)
+    if not (isinstance(tag, str) and tag.startswith("n_")):
+        return False
+    dom = getattr(v, "_domain", None)
+    names = set(getattr(dom, "_boundary_regions", {}) or {}) | set(getattr(dom, "context", {}) or {})
+    return dom is None or tag[2:] in names
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
@@ -2321,7 +2371,9 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
             idx, inverse, nse = plan
             data = jax.ops.segment_sum(data, inverse, num_segments=nse)
             return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
-        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+        # traced indices (a parametric solve under jit): `sum_duplicates` would need a static nse, and the
+        # duplicates are harmless -- a BCOO matvec and every direct backend's COO -> CSR sum them
+        return jsp.BCOO((data, indices), shape=A_r.shape)
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
     return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
@@ -2370,7 +2422,14 @@ def _solve_complex_block(
         # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
         # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
         A_c = _complex_operator(A_r, A_i)
-        u = complex_solve(A_c, b_r + 1j * b_i)
+        b_c = b_r + 1j * b_i
+        if periodic is not None:
+            # the reduction summed a prescribed tie target's row into its partners: put it back, as every
+            # reduced-space solve does (the values are real: Re g, as on the fused path's first leg)
+            from .utils.solver.fem_utils import impose_reduced_dirichlet
+
+            A_c, b_c = impose_reduced_dirichlet(periodic, A_c, b_c)
+        u = complex_solve(A_c, b_c)
         if periodic is None:
             return u
         if periodic.get("is_bloch"):
@@ -2868,9 +2927,16 @@ class FEM:
         basis=None,
         shard=None,
         profile=False,
+        span=None,
         **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
 
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
@@ -3056,6 +3122,7 @@ class FEM:
             tau=tau,
             basis=basis,
             shard=shard,
+            span=span,
         )
         given = {k: v for k, v in slots.items() if v is not None}
         if profile:
@@ -3170,9 +3237,16 @@ class FEM:
         basis=None,
         shard=None,
         profile=False,
+        span=None,
         **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
 
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
@@ -3349,6 +3423,8 @@ class FEM:
             for a_ in (solve_fn, adapt, checkpoint, contact, continuation, x0, nonlinear, precond, time, tau, basis, shard)
         ):
             linear = _default_direct(self)
+        if linear is None and precond is None and solve_fn is None:
+            linear = _default_saddle_step_solve(self)
         linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 
@@ -3399,6 +3475,7 @@ class FEM:
                         time=time,
                         tau=tau,
                         shard=shard,
+                        span=span,
                         **kwargs,
                     )
             finally:
@@ -3653,6 +3730,7 @@ class FEM:
         tau=None,
         shard=None,
         continuation=None,
+        span=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
@@ -3728,8 +3806,22 @@ class FEM:
             _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
             if _values:
                 kwargs["values"] = _values
+        if (
+            self._mode == "transient"
+            and solve_fn is None
+            and linear is None
+            and precond is None
+            and getattr(self.domain, "_fem_prefer_direct", False)
+        ):
+            # The C0/C1 vertex families (Hermite/Argyris/Morley, the 1-D beam) march on a sparse-direct step,
+            # as their steady solve does: the Krylov default returned NaN on a u_tt beam, and its noise pins
+            # an adaptive controller at its smallest step (see `compose_transient_step_solvers`).
+            from . import solve as _solve_ns
+
+            linear = _solve_ns.lu()
         has_slots = (
             (x0 is not None)
+            or (span is not None)
             or (nonlinear is not None)
             or (linear is not None)
             or (precond is not None)
@@ -3938,6 +4030,7 @@ class FEM:
                 time=time,
                 shard=shard,
                 kwargs=kwargs,
+                span=span,
             )
             from_slots = True
         else:
@@ -4003,15 +4096,20 @@ class FEM:
                 "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
                 "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
             )
-        if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
-            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
-            # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
-            # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+        _cn_linear = bool((getattr(linear, "traits", None) or {}).get("complex_native"))
+        if from_slots and (getattr(precond, "complex_native", False) or _cn_linear) and self._complex_legs is not None:
+            # A complex-native preconditioner (AMS), or a direct backend that factors complex matrices
+            # (MKL PARDISO), solves the sparse COMPLEX operator ``A_r + i·A_i`` directly, never the
+            # real-equivalent block — so it wants the Re/Im legs the fusion retained, not the fused 2n
+            # system. The direct case halves the factor memory, and the periodic reduction and the host
+            # copies run on n-sized legs instead of a 2n block with four times the entries. Real-equivalent
+            # preconditioners (form/jacobi/…) stay on the block.
             if kwargs.get("values"):
                 raise NotImplementedError(
-                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
-                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
-                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                    "fem.solve(<complex-native linear or precond>, <parameter>=...): the complex-native solve works "
+                    "on the assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent solver (e.g. jno.solve.lu(backend='host')), or build the form with the "
+                    "value fixed."
                 )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -4405,7 +4503,7 @@ class FEM:
         except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
             return False
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs, span=None):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
@@ -4418,6 +4516,8 @@ class FEM:
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
             )
+        if span is not None and self._mode != "transient":
+            raise ValueError(f"fem.solve(span=...) marches a window of a transient problem; this one is {self._mode}.")
         if time is not None and getattr(time, "limit", None) is not None:
             # Checked here rather than in the scheme, because not every transient route reaches a
             # scheme's own `integrate` — and applying the wrong step-size criterion silently would be a
@@ -4433,12 +4533,12 @@ class FEM:
             # slot/precond see the step operator (M + theta dt A) -- materialized ONCE before the
             # scan when the operator is time-independent -- and the nonlinear slot drives each
             # implicit step. The bring-your-own (block, args, save_ts) contract is unchanged.
-            if x0 is not None:
-                raise ValueError(
-                    "fem.solve: x0= on a transient problem -- the initial state comes from the initial "
-                    "conditions, and each step already warm-starts from the previous state."
-                )
-            from .utils.solver.backend_blocks import _default_transient_integrate
+            from .utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate, window_block
+
+            if x0 is not None or span is not None:  # march a window from a given state (checked here, once)
+                _window_grid = _block_time_grid(window_block(self._op, span, x0, who="fem.solve"))
+                if kwargs.get("save_ts") is None:
+                    kwargs = {**kwargs, "save_ts": _window_grid}
             from .utils.solver.solver_api import (
                 _refresh_cadence,
                 _uncached,
@@ -4464,7 +4564,14 @@ class FEM:
                 else compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
             )
 
+            # A scheme's structural refusals read concrete values; inside `jno.core` the march is traced and
+            # they would skip, so the scheme gets to run them once here, on the built operator.
+            _preflight = getattr(time, "preflight", None)
+            if _preflight is not None:
+                _preflight(self._op)
+
             def _stepper(block, args, save_ts):
+                block = window_block(block, span, x0, who="fem.solve")  # the block itself without x0= / span=
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
                     return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
                 if _cadence is not None and not isinstance(save_ts, jax.core.Tracer):
@@ -6050,14 +6157,7 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": red["is_bloch"],
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6112,14 +6212,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": is_bloch,
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6186,7 +6279,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
@@ -6250,7 +6343,7 @@ def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cel
         )
         off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
         off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, region: str) -> Dict[int, np.ndarray]:
@@ -6526,6 +6619,21 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
     }
 
 
+def _multifield_reduction(blocks, off_full, off_red, **extra) -> dict:
+    """The multi-field periodic reduction dict, with its block-diagonal ``P`` built HERE, while the block
+    prolongations are concrete. ``reduce_matrix_periodic`` runs inside the traced Newton body; without the
+    cached ``P_blockdiag`` a non-selection block (an N1E tie, a Bloch phase) cannot be rebuilt there, and
+    ``PᵀJP`` silently falls onto the dense ``n x n`` path -- the slip builder has cached it for that reason."""
+    from .utils.solver.fem_utils import _blockdiag_bcoo
+
+    out = {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    Pg = _blockdiag_bcoo([b["P"] for b in blocks], off_full, off_red) if len(blocks) > 1 else None
+    if Pg is not None:
+        out["P_blockdiag"] = Pg
+    out.update(extra)
+    return out
+
+
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any, exclude_dofs: Any = None
 ) -> dict:
@@ -6580,7 +6688,7 @@ def _build_periodic_reduction_multifield(
             )
             off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
             off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-        return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+        return _multifield_reduction(blocks, off_full, off_red)
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
     blocks, off_full, off_red = [], [0], [0]
@@ -6603,7 +6711,7 @@ def _build_periodic_reduction_multifield(
         blocks.append({"P": P_i, "kept": kept_i, "vec": v_i, "is_selection": sel_i})
         off_full.append(off_full[-1] + int(P_i.shape[0]))
         off_red.append(off_red[-1] + int(P_i.shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _complex_recombine(n: int):
@@ -7664,6 +7772,9 @@ def fem(
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
     prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
+    from ._strong_form import _refuse_inside
+
+    _refuse_inside(constraints if isinstance(constraints, (list, tuple)) else [constraints], "jno.fem")
     _fn._CHUNK_CONSUMED[0] = False
     _fn._QUAD_EXPLICIT[0] = quad_degree is not None
     _fn._QUAD_REPORTED.clear()
@@ -7851,6 +7962,8 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # a face operator (`jno.np.sqrtm(L)`) reads the Bloch phase of the ties across its face
+    domain._faceop_ties = list(periodic_ties)
     # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
     # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
     # off before classification -- neither names a region the classifier could read.
@@ -7987,11 +8100,13 @@ def _fem_impl(
         for c in _net_trial_only:
             support, _rg = _region_and_support(c, domain)
             _comp, _val, _vnode = _dirichlet_spec(_bare(c))
-            if support not in ("boundary", "initial") or not _is_bare_neural_value_node(_vnode):
+            if support == "initial":
+                continue  # any expression: the initial state is re-formed from the runtime args (`state0_fn`)
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
                 raise NotImplementedError(
                     "jno.fem: a network in an essential (trial-only) constraint must be a *bare* net(x) value "
-                    "on a boundary region (a Dirichlet profile) or the 'initial' region (an initial "
-                    "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
+                    "on a boundary region (a Dirichlet profile), or any expression in an initial condition "
+                    "on the 'initial' region — a compound Dirichlet value (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
             if _trial_spaces(constraints) - _NATIVE_SPACES:
@@ -8308,6 +8423,7 @@ def _fem_impl(
         the values they were assembled with.
         """
         out = _finalize_core(fem_obj)
+        _refuse_frozen_ic_trainables(out, ic_residuals)
         if _mean_gauge_fields:
             out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
         # Structural, so it is known here for every mode -- and being known at BUILD time is what
@@ -8402,7 +8518,9 @@ def _fem_impl(
             classification.append("initial")
         elif has_test:
             _retag_coords_for_quadrature(c, support, region)
-            bare = _bare(c)
+            bare = _clean_weak_summands(_bare(c), support)
+            if bare is None:  # the whole term is a structural zero (`0 * v`): nothing to assemble
+                continue
             if support == "volume":
                 if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
@@ -8616,8 +8734,9 @@ def _fem_impl(
     # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
     # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
     # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    # A face operator `jno.np.sqrtm(L)(trace)` (`faceop_*`, a dense block over one face) is assembled there too.
     _reads_across = any(
-        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith(("across_", "faceop_"))
         for c in constraints
         for n in _walk(_bare(c))
     )
@@ -8815,8 +8934,19 @@ def _fem_impl(
         # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
         # 1D complex *inverse* rides the same path.
         _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        from .utils.solver.fem_1d import complex_dirichlet_regions
+
+        if not (_bares_have_complex_coeff(volume_terms) or _cx_bd) and (
+            _cx_real := complex_dirichlet_regions(domain, dirichlet_values)
+        ):
+            # A complex essential value on a REAL 1-D form reached `float(g)` in the Dirichlet assembly and
+            # failed with a bare TypeError; 2-D/3-D refuse it by name, so does 1-D now.
+            raise NotImplementedError(
+                f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_real))} of a real 1D form is "
+                "not supported -- the Dirichlet rows hold real values. Use a real essential value and carry the "
+                "complex part in the operator or the source (a `1j` there makes the form complex)."
+            )
         if _bares_have_complex_coeff(volume_terms) or _cx_bd:
-            from .utils.solver.fem_1d import complex_dirichlet_regions
             from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
 
@@ -9741,6 +9871,132 @@ def _ic_component(bare: Any) -> Any:
     return None if trial_side is None else _component_index_of(trial_side)
 
 
+def _weak_summands(node: Any, sign: float = 1.0) -> List[Tuple[float, Any]]:
+    """``[(sign, summand)]`` of a term's top-level ``+``/``-`` tree. Products are NOT distributed."""
+    from .trace import BinaryOp
+
+    op = getattr(node, "op", None)
+    if isinstance(node, BinaryOp) and op in ("+", "-"):
+        return _weak_summands(node.left, sign) + _weak_summands(node.right, sign if op == "+" else -sign)
+    return [(sign, node)]
+
+
+def _clean_weak_summands(bare: Any, support: str = "volume") -> Any:
+    """A weak term with its structural-zero summands dropped, refusing a summand that has no test function.
+
+    Every additive piece of a weak form pairs with a test function. A piece without one has no equation to
+    go into, and the assemblers met it four different ways: 1-D integrated it into a SILENTLY wrong answer
+    (``2 + u' v'`` moved the solution by 0.48), a 1-D transient and the 2-D transient failed with an
+    unrelated TypeError, the non-nodal path refused even the harmless ``0`` that builtin ``sum()`` seeds,
+    and only the native steady path said what was wrong. Decided here, once, for every assembler: a
+    concrete real literal zero (``_is_structural_zero``) is dropped; anything else without a test is refused.
+    Returns ``None`` when every summand is a structural zero."""
+    from .trace import BinaryOp, Literal
+    from .utils.solver.fem_utils import _is_structural_zero
+
+    parts = _weak_summands(bare)
+    # A zero that marks the form stays. A complex zero (`0j * u * v`) marks it complex: dropping it would
+    # assemble the real problem, with a complex essential value then cast to float. A zero reading step
+    # history (`0 * s.i(-1) * v`) marks a load-path march: dropping it would turn the march into one solve.
+    from .trace import HistoryRef
+
+    def _marks_the_form(t):
+        return any(_node_has_complex_literal(n) or isinstance(n, HistoryRef) for n in _walk(t))
+
+    kept = [(sg, t) for sg, t in parts if not (_is_structural_zero(t) and not _marks_the_form(t))]
+    for _sg, t in kept:
+        if not _contains(t, TestFunction):
+            raise ValueError(
+                f"jno.fem: a {support} weak-form summand carries no test field, so it belongs to no "
+                f"equation -- {t!r}. Every additive piece of a weak form pairs with a test function: a "
+                "source term is `- f * v`, not `- f`."
+            )
+    if len(kept) == len(parts):
+        return bare
+    if not kept:
+        return None
+    out = None
+    for sg, t in kept:
+        if out is None:
+            out = t if sg > 0 else BinaryOp("*", Literal(-1.0), t)
+        else:
+            out = BinaryOp("+" if sg > 0 else "-", out, t)
+    return out
+
+
+def _initialized_parameter_values(node: Any) -> dict:
+    """``{name: value}`` for every parameter in ``node`` whose ``.initialize(...)`` has not been applied yet.
+
+    The initializer is LAZY -- the training loop applies it when it sets the models up -- so a value read at
+    build time is still the zeros the parameter is born with. An initial state baked at build (a nodal data
+    field handed in as ``u(initial) - g``) then started the march from 0, with nothing to flag it."""
+    from .geometry.parametric import initial_value
+
+    out = {}
+    for nd in _walk(node):
+        m = getattr(nd, "model", None)
+        if type(nd).__name__ != "ModelCall" or not getattr(m, "_is_parameter", False):
+            continue
+        name = getattr(m, "_parameter_name", None)
+        val = initial_value(nd)
+        if (
+            val is None
+            and getattr(m, "_weight_tree", None) is not None
+            and not hasattr(m._weight_tree, "__fspath__")
+            and not isinstance(m._weight_tree, str)
+        ):
+            val = jnp.asarray(m._weight_tree)
+        if name is not None and val is not None:
+            out[name] = jnp.reshape(jnp.asarray(val), jnp.shape(m.module.value))
+    return out
+
+
+def _ic_trainable_names(ic_residuals: List[Any]) -> List[str]:
+    """Names of the trainable parameters and networks an initial condition's value reads.
+
+    An optimizer-less nodal DATA field (a known initial state handed in as a field) is not a trainable."""
+    from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs, _collect_runtime_parameter_exprs
+
+    names: List[str] = []
+    for ic in ic_residuals:
+        trial_side = _ic_trial_side(ic)
+        if trial_side is None:
+            continue
+        value = ic.right if trial_side is ic.left else ic.left
+        for pn, pd in _collect_runtime_parameter_exprs(value, {}).items():
+            pm = getattr(pd, "model", None)
+            if (
+                getattr(pm, "_opt_fn", None) is None
+                and np.asarray(getattr(getattr(pm, "module", None), "value", 0.0)).size > 1
+            ):
+                continue
+            names.append(pn)
+        names.extend(_collect_neural_coefficient_exprs(_bare(value)))
+    return names
+
+
+def _refuse_frozen_ic_trainables(fem_obj: Any, ic_residuals: List[Any]) -> None:
+    """A trainable in an initial condition that the built operator does not take as a runtime argument
+    would be read once, at its stored value: a silently frozen trainable (and one ``jno.core`` never sees).
+    The paths that re-form the initial state from the runtime arguments publish its name; refuse the rest."""
+    if not ic_residuals:
+        return
+    names = _ic_trainable_names(ic_residuals)
+    if not names:
+        return
+    taken = set(getattr(getattr(fem_obj, "_op", None), "runtime_parameter_exprs", None) or {})
+    missing = sorted(set(names) - taken)
+    if missing:
+        raise NotImplementedError(
+            f"jno.fem: the initial condition reads the trainable(s) {missing}, but this form's assembly path "
+            "fixes the initial state at build time, so they would never train. A trainable initial condition "
+            "is wired on a first-order-in-time (u_t) transient on 2-D/3-D Lagrange fields, single or coupled. "
+            "Not on: 1-D line domains, the non-nodal families (Hermite, Argyris, Morley, Nedelec, RT), "
+            "second-order-in-time (u_tt) forms, complex transients. There, put the trainable in a source "
+            "term or a Dirichlet value, or give the initial condition as a fixed value."
+        )
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -9757,17 +10013,17 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
-    from .utils.solver.parametric_helpers import _is_neural_coefficient
-
-    if _is_neural_coefficient(_bare(value_node)):
-        # A net-valued IC threads its weights only on the real, first-order-in-time transient path
-        # (``state0_fn`` re-forms the initial state from ``args``). This routine bakes the IC at assembly
-        # (complex-transient / second-order-in-time), so the weights would silently NOT train — reject it.
+    _trainables = _ic_trainable_names([bare])
+    if _trainables:
+        # A trainable IC (a network, or a ``jno.np.parameter`` anywhere in the value) threads only where the
+        # initial state is re-formed from the runtime args (``state0_fn``). This routine bakes the IC at
+        # assembly (1-D, complex-transient, second-order-in-time), so it would silently NOT train -- reject it.
         raise NotImplementedError(
-            "jno.fem: a net-valued initial condition u(initial) - net(x) is wired on a real, "
-            "first-order-in-time transient form (its weights thread the initial state); this path "
-            "(complex-transient or second-order-in-time) bakes the IC at assembly and cannot thread the "
-            "weights. Use a real first-order transient form, or a constant/field initial condition here."
+            f"jno.fem: the initial condition reads the trainable(s) {sorted(_trainables)}, and this form's "
+            "path (a 1-D line, a complex transient or a second-order-in-time u_tt form) fixes the initial state "
+            "at build time, so they would never train. A trainable initial condition is wired on a real "
+            "first-order (u_t) transient on 2-D/3-D Lagrange fields. Here, put the trainable in a source term "
+            "or a Dirichlet value, or give the initial condition as a fixed value."
         )
     comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
     n_nodes = int(jnp.asarray(pts).shape[0])
@@ -9779,7 +10035,14 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     from .utils.solver.time_route import _infer_time_window
 
     # an initial condition sits at the start time: a value written with the time variable reads it there
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
+    vals = jnp.asarray(
+        _eval_value_node_at(
+            value_node,
+            jnp.asarray(pts),
+            params=_initialized_parameter_values(value_node) or None,
+            t=_infer_time_window(domain)[0],
+        )
+    ).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)

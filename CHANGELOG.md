@@ -1,5 +1,94 @@
 # Changelog
 
+## [Unreleased]
+
+jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `jno.fdm` by integrating every term over a control volume, so it conserves to round-off and handles convection-dominated flow, shocks, systems of conservation laws and incompressible flow. Nothing in it is specific to a PDE: the fluxes, limiters, well-balancing, boundary conditions and pressure-velocity coupling all read the expressions you write. And `jno.core` couples `jno.fem`, `jno.fdm` and `jno.fvm` problems on their own meshes through interface conditions written as for one problem, differentiably: a `jno.core` loss trains a parameter through the coupling.
+
+### Added
+- `jno.fvm(constraints, centering="cell" | "vertex")`: cell-centred control volumes on line, triangle, quad, tet and hex meshes, or the median dual around the nodes. An outer derivative becomes a face flux, and other terms are evaluated at the centroid. Every boundary condition is one equation per face: Dirichlet, Neumann, Robin, any nonlinear flux law, or a slip wall `U·n = 0` on a vector unknown. Second order on every cell type; the problem has `.centroids`, `.volumes` and `.to_nodes(sol)`.
+- `jno.fv(flux=, limiter=, recon=, average=, speed=, equilibrium=, smooth=)`: the scheme of a flux, passed as `scheme=` on its outer derivative.
+  - Fluxes: Rusanov, HLL and a generic Roe flux (`|A| = sqrt(A^2 + d^2 I)`, no eigendecomposition) for any system, or a callable.
+  - Limiters for the MUSCL reconstruction: van Albada, minmod, van Leer, superbee, Barth-Jespersen, Venkatakrishnan, or a callable.
+  - `equilibrium=` preserves a given steady state to round-off (Berberich, Chandrashekar & Klingenberg 2021).
+  - `smooth=True` rounds the wave speeds' min / max (HLL, Rusanov), so the flux has a derivative at a sonic face and at rest: for steady solves and gradients.
+- Saddle pairs found by structure: an equation without its own unknown is a constraint, and its flux gets the Rhie-Chow correction, with a weight probed from the momentum equation. Incompressible Navier-Stokes, Stokes and Darcy run on the same code. On 32 x 32 cells, the Re = 100 lid-driven cavity is within 3.2e-3 of Ghia et al.
+- `q.bind(...).inside` (`jno.fvm`): a field read in the cell next to a boundary face, so a condition `qb - G(qb.inside)` gives the face its outer Riemann state: open outflows, outlets at a back pressure, inflows from a plenum, an injector that shuts into a wall. Comparisons (`p >= p0`) on views give the switch for `jnn.where`.
+- `jno.fvm(...).solve()` composes into `jno.core` for inverse problems and differentiates under `jax.grad`. `jno.precond.gmg()` runs on the cell lattice of a structured quad or hex mesh, and `jno.info` reports how each equation was read.
+- `jno.solve.erk(method, tableau=, cfl=)`: explicit Runge-Kutta for fvm, fdm and fem blocks: SSPRK2, SSPRK3, SSPRK(5,4), RK4, or any Butcher tableau. Zero-mass rows are solved at every stage, and `cfl=` takes the step from the spectral radius of the first-order operator.
+- `jno.solve.simple()` and `jno.solve.piso()`: pressure-correction solvers on the assembled tangent of any saddle system. `jno.precond.saddle(schur="simple")`: the SIMPLE Schur approximation, built from the assembled operator alone.
+- `jno.solve.ptc(positive=[...])`: pseudo-transient continuation for steady solves Newton cannot start (a steady gas): a pseudo-time step per control volume that grows as the residual falls, the named quantities kept positive, and an implicit gradient at the root (`jax.grad` through a steady solve). A Mach 3 wedge reaches the oblique-shock pressure ratio, and a 25,647-cell nozzle its steady state in 89 s on the GPU against 12 min of explicit march. `jno.solve.imex()`: IMEX Runge-Kutta (ARS(2,2,2), ARS(4,4,3)) with the cell-local terms of a `jno.fvm` problem (reactions, sources, algebraic closures) solved per cell; for stiff chemistry written as species transport.
+- `solve(time=..., x0=state, span=(t0, t1))` on fem, fdm and fvm marches a window of `domain.time` from a given state.
+- Docs: `docs/fvm.md` and `docs/coupling.md`; five tutorials in `tutorials/14-fvm` (Poisson, advection-diffusion, Burgers shock, Sod shock tube, lid-driven cavity) and two in `tutorials/15-coupling` (a rocket nozzle wall, a hot gas in a thick-walled vessel).
+- Coupling of problems on their own meshes: `jno.core([p1, p2, ..., interface conditions]).solve(coupling=jno.solve.coupling(...))` joins `jno.fem`, `jno.fdm` and `jno.fvm` problems through conditions written as for one problem (a value, a flux, a load). Each condition goes to one side by its structure (Dirichlet-Neumann by probed interface stiffness, Robin-Robin with `alpha=`, a floating steady side made Robin, one-way loads); values cross non-matching interfaces by interpolation and fluxes by an L2 (mortar) projection that keeps their total, also axisymmetric (`measure=`). Transient couplings advance window by window (quasi-steady partners, Aitken or IQN-ILS, implicit or loose). Checked against series slabs, two solids in contact, and a thick cylinder under gas pressure and a radial temperature. A flux from a sender that takes several steps per window is its mean over them, so heat crossing between a sub-stepping gas and a wall is conserved.
+- `jno.solve.coupling(x0={problem: state})`: where a steady participant starts (its first sweep and the stiffness probe), so a steady gas can take part; the interface data start from the starting states (each sender's value there, or the value that holds its condition at the receiver's start), not from zero.
+- `jno.solve.coupling(compile=True)`: a transient coupling runs every window after the first as one compiled program, traced once (`core.coupled.compiles`): a window of one sweep (data flowing one way, or `implicit=False`), or its interface fixed point with Aitken or a fixed relaxation. A coupled solve differentiates by the problems' trainable parameters: every window's fixed point implicitly at its root (`custom_root`, a GMRES tangent), the windows chained through their states.
+- `jno.core([...coupled problems, interface conditions]).solve(coupling=...)` returns the coupled solution as trace nodes (one per problem) when a coupled problem has a trainable parameter: a `jno.core` loss on them trains it through the coupling.
+
+### Fixed
+- `jno.fdm`: a nodal data field injected as a traced value (`extra_params`, a march's `_override`: how a coupling and a `jno.core` inverse pass it) was read as `(N,)` where its stored value is `(N, 1)`, so a Neumann row `∇u·n - g` broadcast to `(N, N)`, lost its gradient part and the solve was singular (NaN with `lu`); a march read a Dirichlet data value from its stored value and ignored the injected one.
+- `jno.fem`: a nodal field parameter in a boundary term failed with a broadcast error; a coupling's nodal data in an essential condition are read at solve time.
+- `jno.fvm`: an algebraic row beside a vector equation (`T - p/rho` next to `q.t + ...`) was taken for a pin; the time derivative of a bound vector view now keeps its binding. `jno.solve.imex(cfl=)` and `jno.solve.erk(cfl=)` decide their substeps inside a compiled program (a coupling window) instead of failing on a traced state; the IMEX stable step now sees a flux that reads the state through an algebraic unknown (it took one step where several were needed).
+- `jno.fvm`: an implicit march inside a compiled program (a coupling window, `jax.jit`) probed its Jacobian's sparsity at zeros, where a gas has negative densities and pressures and no pattern verifies ("could not assemble the residual's Jacobian"); it probes at the initial state now, so a gas steps implicitly in a coupling. A steady solve compiled with a traced start (a coupling participant) probes at the start its caller recorded, and says what to give when the check fails.
+- `jno.fvm` / `jno.fdm`: a steady vector equation made only of stacked fluxes (`F.d(x) - jnn.stack(...)`, no bound view on top) had no region, so an algebraic row beside it was taken for a pin and the system refused; it takes the region of its coordinates now.
+- `jno.fvm`: a diffusive term inside `jnn.stack` in a vector equation (`jnn.stack([0, k*(T.xx + T.yy)], axis=-1)`) is a face flux of its row; it was evaluated cell by cell, a stencil twice as wide and not conservative. First-order terms (a pressure gradient `jnn.stack([p.x, p.y])`) stay volume terms.
+- `jno.fvm`: a nodal data field is read at a site through the mesh's P1/Q1 interpolant (vertex-centred sites were 0.4 % off); the `u.t` coefficient probe reads only the time-derivative terms (an axisymmetric gas's source made it NaN).
+- A window copy of a transient block shares the block's compiled marches (the march cache keys scalars by value and leaves out the start state).
+
+### Changed
+- `jno.fdm` and `jno.fvm` share their constraint classification, DOF layout and parameter machinery in `jno._strong_form.StrongFormProblem`. `jno.fdm` behaves as before.
+
+## [0.4.3] — 2026-11-22
+
+jNO 0.4.3 adds second-order optimizers for PINNs from the recent literature (Levenberg-Marquardt, dual and Nyström natural gradient, NNCG, SCORE, SS-ESOAP and SPRING momentum for ENGD) and a limited-memory self-scaled Broyden for large networks. Coarse spaces and GenEO make two-level Schwarz a one-line preconditioner, and transient FEM gains variable-order BDF, adaptive steps with rejection and every time scheme on every element family. FEM builds and first solves are several times faster, with cuDSS as the direct default on a GPU. Function-space norms give an H^-1 residual loss for PINNs.
+
+### Breaking changes and migration
+- `schwarz(nullspace="rigid")` and `amg(nullspace="rigid")` raise and say what to write instead: `schwarz(coarse=<space>)`, or the rigid modes as formulas (#191).
+- `jno.solve.lu()` without a backend is cuDSS where the solve runs on a GPU in float64 with the extension installed, otherwise JAX's `spsolve`; the log line names what ran (#192).
+- `adaptive_march` rejects a step whose error is over the tolerance and retries it smaller; it used to commit it and only shrink the next one (#195).
+- A linear transient whose step operator has a zero-diagonal saddle row defaults to `jno.solve.lu()` (#195).
+- Parameters that nothing read are removed: `Rcwa.solve(inc=)`, `FEM.pinned_solver`'s extras, `TraceEvaluator.evaluate(active_region=)`, `build_single_layer_params(arg_shapes=)` and `Callback.on_training_end`'s arguments (#188).
+- `engd` solves from the SVD of the residual Jacobian. Results agree with 0.4.2 up to rounding, but on a near-singular Gram matrix the training path can differ (#214).
+
+### Added
+- PINN optimizers in `jno.optimizers`, each module citing its paper: `lm()` (Levenberg-Marquardt with adaptive damping), `dngd()` (Dual Natural Gradient Descent, dense or Nyström-preconditioned CG), `nystrom_ngd()` (matrix-free natural gradient), `dsgnar()` (doubly-sketched Gauss-Newton; not yet validated at the published scale), `nncg()` (NysNewton-CG), `score()` (self-scaled Broyden with a decrement-based step) and `ss_esoap()` (SOAP with a secant-energy scale). The residual-based ones are sentinels like `engd()` and share one detection path in `solve()` (#214).
+- `ssbroyden(pairs=m)` and `ssbfgs(pairs=m)`: the self-scaled metric on at most `m` directions, in `m·P` numbers instead of the dense `P × P` matrix, for networks too large for it (a 4 × 256 PINN: 160 MB at `m = 100` instead of 315 GB). The layout is the limited-memory reduced-Hessian method of Gill & Leonard (2003). `pairs=None`, the default, is the dense solver, unchanged (#214).
+- `engd(momentum=, damping=)`: SPRING, Gauss-Newton with momentum (Goldshlager, Abrahamsen & Lin 2024), and a Levenberg-Marquardt shift solved by Cholesky (#193).
+- `expr.norm(space)`: function-space norms of a field as a loss or metric, `r.norm("H-1")**2` for the H^-1 (Riesz-preconditioned) PINN residual loss, also `L2`, `L1`, `Linf`, `H1`, `H^s`. The backend comes from the domain: per-axis sine/cosine transforms on a structured lattice (any real s), P1 mass and stiffness with one AMG-preconditioned CG solve on a simplex mesh (s = ±1; `solver=`, `precond=`), and on a shape domain without a mesh the point rule (L2, L1) and the Green's kernel of (scale - Laplace) (H^-1), with |Omega| from the geometry. `.norm()` without a space keeps the pointwise norms. Tutorial: `08-fem-and-varpinns/h-minus-1-residual-loss` (#213).
+- Coarse spaces as values: `jno.precond.coarse(space, parts=)` turns formulas, arrays, sparse matrices, callables or computed spaces into a preconditioner, and `M1 >> M2` composes corrections, so two-level Schwarz is `Q >> S >> Q`. `jno.space.eigvecs(k)` and `jno.space.geneo(tau=, nev=)` (GenEO, Spillane et al. 2014) solve batched local eigenproblems on the device. Also `fem.eigs(deflate=)`, `jno.solve.trace(deflate=)` and a sparse block-Cholesky factor of large coarse matrices (#191).
+- `jno.solve.bdf()`: variable-step, variable-order BDF/NDF (orders 1-5, Shampine & Reichelt 1997), with dense output at the scheme's order. Every time scheme (theta, bdf2, bdf, sdirk, rosenbrock, exponential) marches Lagrange, Hermite, Morley, Argyris, N1E and 1-D line elements (#198).
+- Trainables through transient marches: `exponential()` integrates and differentiates a trainable operator, and a parameter, network or data field in the initial condition trains; where the initial state is fixed at build, a trainable there is refused by name (#198).
+- Embedded error estimates for `sdirk(2/3)` and `rosenbrock("ros34pw2")` (Alexander 1977; Rang & Angermann 2005): one step per attempt instead of three. Index-2 rows (incompressibility) leave the error norm (#195).
+- `jno.fdm`: a repeated `solve()` reuses its traced and compiled march, and `time=rosenbrock()` marches a nonlinear problem (#196).
+- RCWA: `field3d` returns a differentiable JAX |E|^2, and `.attach(eps=...)` reaches RCWA per region (#197).
+- N1E on periodic cells: an incident face load, a sparse periodic prolongation, an exact periodic DtN boundary through `jno.np.sqrtm(L)`, and tangential-trace face terms in nonlinear coupled forms (#197).
+- `.structured()` on a plan of axis-aligned boxes meshes a rectilinear lattice with exact interfaces, as voxels or Kuhn tets (#197).
+- `lu(backend="pardiso")` factors a complex form with MKL's complex types, and `jno.solve.gmres` reports its iterations in `fem.stats["linear_iterations"]` (#197).
+- Soft cover enrichment: where to raise the order as a differentiable design variable (private module, with a tutorial on the L-shape) (#194).
+- Full docstrings on every public object, so editor hovers show the options; `jno.np`/`jno.fn` functions are explicit definitions (#188).
+- A loaded `.msh` keeps a named physical point as a node region (#212).
+
+### Fixed: silent wrong answers
+- MKL PARDISO returned wrong values or NaN, or corrupted the heap, when a cached factorization was used with a thread count other than its analysis's (compiled and un-compiled solves mixed); every call now runs with the analysis's count (#211).
+- A face term coupling two N1E fields was added to the first field's diagonal block instead of its off-diagonal block (#197).
+- A test-free summand in a weak form gave a wrong answer on a 1-D line; it is now dropped when it is a literal `0 +` and refused otherwise, on every assembler (#198).
+- A transient march on a zero-diagonal saddle at small `dt` returned a NaN trajectory from a broken-down BiCGStab; the step solve now goes through the residual gate and raises by name (#195).
+
+### Fixed
+- A solvable saddle-point system was refused as singular by `lu(backend="pardiso")`: the check used only the upper triangle of a symmetric matrix. Symmetric indefinite systems are also factored with scaling and weighted matching (#211).
+- An enclosed material in a loaded `.msh` was treated as a boundary; it is a region (#212).
+- An unknown inside `expr.integrate(fem)` is the trial, not a parameter.
+- `engd` ran out of GPU memory at about a thousand parameters on a Laplacian residual: its Gram matrix comes from the residual Jacobian a chunk of parameters at a time. It solves from the SVD of that Jacobian, since forming G = JᵀJ squared its condition number (#214).
+- PARDISO ignores the padding entries of a fixed-length BCOO, as JAX's CSR conversion does (#194).
+- Adaptive steps keep the gradient through a rejected attempt, and a zero right-hand side gives a zero step instead of NaN (#195).
+- A periodic multi-field reduction inside a traced Newton, a periodic face split by gmsh, and `fem.eval` of a test-free integrand reading an `.attach`-ed coefficient (#197).
+- `.auglag()` raised `ImportError` (#191).
+
+### Performance
+- FEM builds 6.6-7.7x faster and first solves 8.7-16x faster on P2 problems of 0.7-1M dofs, at about half the XLA peak and host memory: sorted `unique`, hashed mesh promotion, byte-bounded element chunks, staged host-to-device transfers, hoisted program constants, and a CSR matvec that shares the operator's values. A parametric elastic solve with the default solver is 65x faster (#192).
+
+### Tooling
+- Tests run as balanced parallel shards with a kept compile cache; the nightly fits its timeout (#199, #211).
+
 ## [0.4.2] — 2026-10-23
 
 jNO 0.4.2 adds `jno.peec`, a differentiable partial-element equivalent-circuit solver, and makes a shape's coordinates design variables shared by PEEC and FEM. PINN derivatives are cheaper: every AD derivative on one point set now comes from one shared forward-mode pass. `jno.info` writes the equations in math notation. A comparison against other FEM libraries on the same problems found the FEM fixes below.
