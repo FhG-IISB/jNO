@@ -1716,6 +1716,10 @@ def assemble_fem_native(
     for _exprs in boundary_terms.values():
         for bare in _exprs:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    # The state readout reads the same packed slots, so a parameter that only an `.evolves` update uses
+    # (e.g. the initial notch length of a history field) is registered like one in a weak-form term.
+    for _su in (evolution or {}).values():
+        _collect_runtime_parameter_exprs(_su.formula, _rt_param_exprs)
     # Point loads handed over by `jno.fem` (`c * v(px, py, pz)`): their coefficients and coordinates may
     # be runtime parameters too, so they join the parameter set the solve threads through.
     # Their parameters ride `runtime_parameter_exprs` (so the solve receives their values in `args`) but stay
