@@ -1914,6 +1914,13 @@ class _RcwaProblem:
         return _profile_solve(run, eng) if profile else run()
 
 
+def _vacuum_ambient_index(first_coeff, last_coeff):
+    """Layer index (0 or -1) of the ambient k0 is read from. The coefficient only carries k0^2*eps, so which
+    ambient is vacuum is not written in the term list: take the one with the smaller coefficient (a substrate
+    under the source has eps = n^2 > 1 and must not rescale k0 to n*k0)."""
+    return 0 if first_coeff <= last_coeff else -1
+
+
 def _build_emitter_problem(
     femobj,
     domain,
@@ -1963,11 +1970,15 @@ def _build_emitter_problem(
     zm = [zmids[i] for i in o]
     zsp = [zspans[i] for i in o]
 
-    super_coeff = float(np.real(cl[0][1]).mean())  # top ambient (vacuum) ⇒ coeff = k0²
+    # k0 from the vacuum ambient (the smaller coefficient of the two), as in the plane-wave entry (#246)
+    ki = _vacuum_ambient_index(*(float(np.real(c[1]).mean()) for c in (cl[0], cl[-1])))
+    super_coeff = float(np.real(cl[ki][1]).mean())
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
     elif super_coeff <= 0:
-        raise RcwaError("cannot infer wavelength: the superstrate permittivity is non-positive; pass wavelength=.")
+        raise RcwaError(
+            "cannot infer wavelength: the vacuum-ambient permittivity coefficient is non-positive; pass wavelength=."
+        )
     else:
         k0 = float(np.sqrt(super_coeff))
     layers = [(t, np.asarray(e) / (k0 * k0)) for t, e in cl]  # scalar relative permittivity
@@ -2022,7 +2033,7 @@ def _build_emitter_problem(
 
     def resample(params):
         g = grid * sub  # supersampled lattice for subpixel smoothing
-        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[0]), params))))
+        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[ki]), params))))
         out = []
         for (thick, _), zmid in zip(layers, zm):
             cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g))
@@ -2266,7 +2277,7 @@ def rcwa(
             return float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
         return float(np.real(coeff_layers[i][1]).mean())
 
-    ki = 0 if _ambient_coeff(0) <= _ambient_coeff(-1) else -1  # the ambient k0 is read from (layer index)
+    ki = _vacuum_ambient_index(_ambient_coeff(0), _ambient_coeff(-1))  # the ambient k0 is read from (layer index)
     super_coeff = _ambient_coeff(ki)
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
