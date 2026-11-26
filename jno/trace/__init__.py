@@ -2365,6 +2365,15 @@ class Variable(Placeholder):
             raise KeyError(f"Variable tag '{tag}' not found in domain.context. Available: {list(domain.context.keys())}")
         self._domain = domain  # Reference to parent domain for inference
 
+    def __getitem__(self, key):
+        # A Variable that spans several columns (a coordinate array, a coefficient field read from the context)
+        # is a per-point vector: `w[1]` is its component 1, as `w[..., 1]` is, not quadrature point 1 -- which
+        # `x[1]` on an array would pick, silently giving the wrong value. One column is a per-point scalar and
+        # keeps the array meaning, as does any key that is not a single integer.
+        if isinstance(key, (int, np.integer)) and not isinstance(key, bool) and self.size > 1:
+            return Placeholder.__getitem__(self, (Ellipsis, int(key)))
+        return Placeholder.__getitem__(self, key)
+
     def __repr__(self):
         if self.axis == "temporal":
             return "Var(t)"

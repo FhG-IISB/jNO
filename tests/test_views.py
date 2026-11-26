@@ -1571,3 +1571,17 @@ class TestDerivativeKeepsBinding:
     def test_derivative_stays_the_plain_view(self):
         ua, x, y = self._bound_vector()
         assert type(ua.x) is type(ua).__mro__[1]
+
+
+def test_integer_index_of_a_per_point_vector_variable_is_a_component():
+    """``w[1]`` of a Variable spanning several columns is component 1 (as ``w[..., 1]``), not point 1; a one-column
+    Variable and a slice keep the array meaning."""
+    d, x, y = _domain_xy()
+    w = Variable("xy", [0, 2], domain=d)
+    pts = jnp.array([[0.5, 0.7], [1.5, 1.7], [2.5, 2.7]])
+    ctx = {"xy": pts}
+    np.testing.assert_allclose(np.asarray(_eval(w[1], ctx)).reshape(-1), [0.7, 1.7, 2.7])
+    np.testing.assert_allclose(np.asarray(_eval(w[-2], ctx)).reshape(-1), [0.5, 1.5, 2.5])
+    np.testing.assert_allclose(np.asarray(_eval(w[1], ctx)), np.asarray(_eval(w[..., 1], ctx)))
+    np.testing.assert_allclose(np.asarray(_eval(w[1:], ctx)), np.asarray(pts[1:]))  # a slice still slices the points
+    assert np.asarray(_eval(w[(1,)], ctx)).shape != ()  # a tuple key is the array's own, not a component
