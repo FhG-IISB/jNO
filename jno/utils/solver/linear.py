@@ -1049,6 +1049,125 @@ def _pardiso_upper_with_diag(A, sp, np):
     return sp.coo_matrix((vals, (rows, cols)), shape=A.shape).tocsr()
 
 
+def _pardiso_matrix(values, rows, cols, shape, mtype):
+    """The CSR matrix PARDISO is handed for ``mtype``: the full matrix, or its upper triangle for a symmetric type."""
+    import numpy as _np
+    import scipy.sparse as _sp
+
+    A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
+    A.sum_duplicates()
+    return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
+
+
+def _pardiso_new_entry(data, rows, cols, shape, b, dhash):
+    """Detect the matrix type, analyse (phase 11) and factor (phase 22) once: ``(kind, data, entry)``, where
+    ``entry`` is what :func:`_pardiso_host_solve` caches and :class:`FactorOnce` keeps."""
+    import numpy as _np
+    from pypardiso import PyPardisoSolver
+
+    order, orderT, pat = _cudss_sym_perms(rows, cols)
+    kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
+    mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
+    A = _pardiso_matrix(data, rows, cols, shape, mtype)
+    solver = PyPardisoSolver(mtype=mtype)
+    _pardiso_set_pivoting(solver)
+    _pardiso_check_A(solver, A, _np)
+    threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
+    solver.set_phase(11)  # symbolic analysis: the half that survives a value change
+    solver._call_pardiso(A, b)
+    solver.set_phase(22)
+    solver._call_pardiso(A, b)
+    entry = {
+        "solver": solver,
+        "A": A,
+        "dhash": dhash,
+        "order": order,
+        "orderT": orderT,
+        "pat": pat,
+        "kind": kind,
+        "mtype": mtype,
+        "threads": threads,
+    }
+    return kind, data, entry
+
+
+class FactorOnce:
+    """A sparse matrix factored ONCE on the host and applied to many right-hand sides: what a
+    preconditioner's direct inner solve is. MKL PARDISO where it is installed (real or complex, the
+    symmetric type when the matrix is one), else SuperLU; both keep a COMPLEX matrix as itself.
+
+    ``solve(b)`` solves ``A x = b`` and ``solve_t(b)`` the plain transpose ``A^T x = b`` from the same
+    factors. Not a differentiable solve: a preconditioner is never differentiated through."""
+
+    def __init__(self, A):
+        import threading
+        import weakref
+
+        import numpy as np
+        import scipy.sparse as sp
+
+        A = sp.csr_matrix(A)
+        A.sum_duplicates()
+        self.shape = tuple(A.shape)
+        self.dtype = np.complex128 if np.iscomplexobj(A.data) else np.float64
+        self._lock = threading.Lock()  # one factorization, called from whichever pool thread applies it
+        self._entry = None
+        self._lu = None
+        A = A.astype(self.dtype)
+        if _pardiso_available():
+            C = A.tocoo()
+            if not (np.isfinite(C.data).all()):
+                raise FloatingPointError("FactorOnce: the matrix has non-finite entries.")
+            b0 = np.zeros((self.shape[0], 1), dtype=self.dtype, order="F")
+            _kind, _data, self._entry = _pardiso_new_entry(C.data, C.row, C.col, self.shape, b0, None)
+            weakref.finalize(self, _pardiso_release, self._entry)
+        else:
+            import scipy.sparse.linalg as spla
+
+            self._lu = spla.splu(A.tocsc())
+
+    def _apply(self, b, transpose):
+        import numpy as np
+
+        b = np.asarray(b)
+        if np.iscomplexobj(b) and self.dtype == np.float64:  # a real matrix, a complex vector: two real solves
+            return self._apply(b.real, transpose) + 1j * self._apply(b.imag, transpose)
+        out_dtype = np.result_type(b.dtype, self.dtype)
+        with self._lock:
+            if self._lu is not None:
+                x = self._lu.solve(np.asarray(b, dtype=self.dtype), trans="T" if transpose else "N")
+                return np.asarray(x, dtype=out_dtype)
+            e = self._entry
+            solver = e["solver"]
+            rhs = np.asfortranarray(b.reshape(b.shape[0], -1).astype(self.dtype, copy=False))
+            with _pardiso_thread_count(solver, e["threads"]):
+                solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
+                solver.set_phase(33)
+                try:
+                    x = solver._call_pardiso(e["A"], rhs)
+                finally:
+                    solver.set_iparm(12, 0)
+            return np.asarray(np.asarray(x).reshape(b.shape), dtype=out_dtype)
+
+    def solve(self, b):
+        """Solve ``A x = b`` with the kept factorization; ``b`` is one right-hand side or a block of them
+        (columns), and ``x`` comes back in ``b``'s shape."""
+        return self._apply(b, False)
+
+    def solve_t(self, b):
+        """Solve ``A^T x = b`` with the same factorization (no second one is built); ``b`` as in :meth:`solve`."""
+        return self._apply(b, True)
+
+
+def _pardiso_release(entry):
+    """Hand a factorization's MKL-owned memory back (a finalizer: never raises)."""
+    try:
+        with _pardiso_thread_count(entry["solver"], entry["threads"]):
+            entry["solver"].free_memory()
+    except Exception:  # noqa: BLE001 -- interpreter shutdown, MKL already gone
+        pass
+
+
 def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     """One MKL PARDISO solve, with the phase-separated cache described on :data:`_PARDISO_CACHE`.
 
@@ -1063,8 +1182,6 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     import hashlib
 
     import numpy as _np
-    import scipy.sparse as _sp
-    from pypardiso import PyPardisoSolver
 
     def _h(*arrs):
         d = hashlib.blake2b(digest_size=16)
@@ -1123,36 +1240,13 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     entry, data = _typed_lookup(_PARDISO_CACHE, _PARDISO_LAST_KIND, skey, dhash, data)
 
     def _build(values, mtype):
-        A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
-        A.sum_duplicates()
-        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
+        return _pardiso_matrix(values, rows, cols, shape, mtype)
 
     b = _np.asfortranarray(rhs2)
 
     if entry is None:
-        order, orderT, pat = _cudss_sym_perms(rows, cols)
-        kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
-        mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
-        A = _build(data, mtype)
-        solver = PyPardisoSolver(mtype=mtype)
-        _pardiso_set_pivoting(solver)
-        _pardiso_check_A(solver, A, _np)
-        threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
-        solver.set_phase(11)  # symbolic analysis: the half that survives a value change
-        solver._call_pardiso(A, b)
-        solver.set_phase(22)
-        solver._call_pardiso(A, b)
-        _PARDISO_CACHE[(skey, kind)] = entry = {
-            "solver": solver,
-            "A": A,
-            "dhash": dhash,
-            "order": order,
-            "orderT": orderT,
-            "pat": pat,
-            "kind": kind,
-            "mtype": mtype,
-            "threads": threads,
-        }
+        kind, data, entry = _pardiso_new_entry(data, rows, cols, shape, b, dhash)
+        _PARDISO_CACHE[(skey, kind)] = entry
         while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
             _, old = _PARDISO_CACHE.popitem(last=False)
             with _pardiso_thread_count(old["solver"], old["threads"]):

@@ -1221,33 +1221,62 @@ class _Form(_Spec):
             # FACTOR ONCE, apply forever -- the same contract as AMS's default auxiliaries. The old
             # default handed every application to `jno.solve.lu()`, which re-factorises per call:
             # invisible on a small Schur block, hours on a 90k-edge auxiliary (a preconditioner is
-            # applied hundreds of times per solve). Host SuperLU behind a callback; a preconditioner
-            # is never differentiated through, so AD is unaffected.
+            # applied hundreds of times per solve). The factors live on the host behind a callback; a
+            # preconditioner is never differentiated through, so AD is unaffected.
+            #
+            # MKL PARDISO where installed (SuperLU otherwise), and a COMPLEX form is factored as the
+            # complex n x n operator it is, not as the real-equivalent 2n block: SuperLU with its default
+            # column ordering on that block needed about ten times the peak memory of a complex PARDISO
+            # factorization of the same system. The 2n vector the solve hands over is folded to n complex
+            # numbers and back around the factors.
             import jax as _jax
             import numpy as _np
-            import scipy.sparse.linalg as _spla
 
             from .utils.solver.amg import _to_scipy_csr
+            from .utils.solver.linear import FactorOnce
 
             if getattr(op, "bcoo", None) is None:
                 raise ValueError(
                     "jno.precond.form: the assembled auxiliary operator is matrix-free, so it cannot "
                     "be factored once. Pass an explicit iterative inner: form([...], inner=jno.solve.cg(...))."
                 )
-            _csr = _to_scipy_csr(op.bcoo).tocsc()
-            _lu = _spla.splu(_csr)
-            _dt = _np.complex128 if _np.iscomplexobj(_csr.data) else _np.float64
-            _n = _csr.shape[0]
+            _csr = _to_scipy_csr(op.bcoo).tocsr()
+            _fold = False
+            if self._op_cplx and not _np.iscomplexobj(_csr.data):
+                _cn = _complex_block_csr(_csr)  # None: not the block structure -> factor the real block as is
+                if _cn is not None:
+                    _csr, _fold = _cn, True
+            _fac = FactorOnce(_csr)
+            _n = int(_csr.shape[0])
+            _cplx_out = bool(_np.iscomplexobj(_csr.data) or ctx._is_complex())
+            _dt = _np.complex128 if _cplx_out else _np.float64
 
-            def _fwd_h(r):
-                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt)), dtype=_dt)
+            if _fold:  # r = [Re; Im] of a complex n-vector; M^T of the block is the block of M^H
+                _shape = (2 * _n,)
 
-            def _t_h(r):
-                return _np.asarray(_lu.solve(_np.asarray(r, dtype=_dt), trans="T"), dtype=_dt)
+                def _fwd_h(r):
+                    r = _np.asarray(r, dtype=_np.float64)
+                    y = _fac.solve(r[:_n] + 1j * r[_n:])
+                    return _np.concatenate([y.real, y.imag])
+
+                def _t_h(r):
+                    r = _np.asarray(r, dtype=_np.float64)
+                    y = _np.conj(_fac.solve_t(_np.conj(r[:_n] + 1j * r[_n:])))
+                    return _np.concatenate([y.real, y.imag])
+
+                _out = _np.float64
+            else:
+                _shape, _out = (_n,), _dt
+
+                def _fwd_h(r):
+                    return _np.asarray(_fac.solve(_np.asarray(r, dtype=_dt)), dtype=_dt)
+
+                def _t_h(r):
+                    return _np.asarray(_fac.solve_t(_np.asarray(r, dtype=_dt)), dtype=_dt)
 
             def _wrap(fn):
                 def go(r):
-                    return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((_n,), _dt), r, vmap_method="sequential")
+                    return _jax.pure_callback(fn, _jax.ShapeDtypeStruct(_shape, _out), r, vmap_method="sequential")
 
                 return go
 
@@ -1280,16 +1309,17 @@ class _Form(_Spec):
 @_reusable
 def form(terms, *, inner=None, quad_degree: int | None = None, float32: bool = False) -> _Form:
     """**Preconditioners as weak forms**: assemble an auxiliary operator ``Â`` from ordinary
-    traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default
-    ``jno.solve.lu()``).
+    traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default: factored once, below).
 
     This is how the classical physics-based preconditioners are written declaratively — in the
     *same language as the PDE*:
 
-    ``inner`` decides how ``Â^{-1}`` is applied. **Default (None): factored once** (host SuperLU)
-    and reused across every application — the AMS-auxiliary contract, and the only affordable
-    default (a per-application ``lu()`` re-factorises a 90k-DOF auxiliary hundreds of times per
-    solve). A ``jno.solve`` **solver** solves ``Â x = v`` per application (an inexact inner Krylov —
+    ``inner`` decides how ``Â^{-1}`` is applied. **Default (None): factored once** on the host (MKL
+    PARDISO where installed, else SuperLU) and reused across every application — the AMS-auxiliary
+    contract, and the only affordable default (a per-application ``lu()`` re-factorises a 90k-DOF
+    auxiliary hundreds of times per solve). A complex form is factored as the complex ``n x n`` operator
+    itself, not as its real-equivalent ``2n`` block. A complex-native inner spec (AMS) runs the whole solve
+    complex-native, and the form is then the complex operator. A ``jno.solve`` **solver** solves ``Â x = v`` per application (an inexact inner Krylov —
     pair with a flexible outer). A ``jno.precond`` **spec** — ``form([...], inner=jno.precond.ams())``
     — is materialized once against ``Â`` and applied once per call: a multigrid or auxiliary-space
     method acting on an operator *declared as a weak form* rather than taken from the system.
