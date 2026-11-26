@@ -674,3 +674,20 @@ def test_vector_of_test_function_components_on_a_face_is_the_test_vector():
     b_ref = np.asarray(jno.fem([vol, inner(w, Ft)]).b)
     np.testing.assert_allclose(b_vec, b_ref, rtol=1e-10, atol=1e-12)
     assert np.abs(b_ref).max() > 0.0
+
+
+def test_vector_of_bound_components_keeps_the_coordinate_binding():
+    """``jno.np.vector(Et[0], Et[1], 0.0 * Et[2])`` of a bound symbol is bound to the same region as ``Et``
+    (it used to drop every coordinate Variable, so a term relying on it alone had no region)."""
+    from jno._fem import _spatial_coord_vars
+
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+    u, _ = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E", order=1)
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    Et = u.bind(x=xb, y=yb, z=zb)
+    w = jno.np.vector(Et[0], Et[1], 0.0 * Et[2])
+    assert {id(v) for v in _spatial_coord_vars(w)} == {id(xb), id(yb), id(zb)}
+    assert getattr(w, "_coord_vars") == {"x": xb, "y": yb, "z": zb}
+    assert {id(v) for v in _spatial_coord_vars(jno.np.concat([Et[0], Et[1]]))} == {id(xb), id(yb), id(zb)}
+    plain = jno.np.vector(1.0 + 0.0 * xb, 0.0 * xb, 0.0 * xb)  # a bare x-only vector keeps just its own Variable
+    assert getattr(plain, "_coord_vars", None) is None

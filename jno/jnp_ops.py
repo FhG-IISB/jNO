@@ -783,7 +783,7 @@ def concat(items, axis: int = -1) -> FunctionCall:
         broadcasted = [jnp.broadcast_to(a, target_prefix + (a.shape[-1],)) for a in aligned]
         return jnp.concatenate(broadcasted, axis=-1)
 
-    return FunctionCall(_fn, [_u(i) for i in items], name="concat")
+    return _attach_coords(FunctionCall(_fn, [_u(i) for i in items], name="concat"), list(items))
 
 
 # docstring-from: jno.jnp_ops.concat
@@ -815,7 +815,12 @@ def vector(*components):
     """
     from .trace.views import VectorView
 
-    return VectorView(concat(list(components)))
+    call = concat(list(components))
+    out = VectorView(call)
+    cv = getattr(call, "_coord_vars", None)
+    if cv:  # the components' region binding, so `vector(Et[0], Et[1])` is bound as `Et` is
+        object.__setattr__(out, "_coord_vars", dict(cv))
+    return out
 
 
 def stack(items, axis: int = 0) -> FunctionCall:
