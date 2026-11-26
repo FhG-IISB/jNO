@@ -17,7 +17,7 @@ Two entry points, both on `jno.rcwa`:
   Inferred from the problem: **periodicity + period** (from the Floquet ties — absent ⇒ raise, never
   assumed), the **super/substrate ambients** (the z-normal radiation faces), the **permittivity**
   (the ``K0**2*eps`` coefficient recovered from the scalar Helmholtz volume term, sampled along z and
-  grouped by :func:`detect_layers`), the **wavelength** (``k0`` from the vacuum superstrate, or pass
+  grouped by :func:`detect_layers`), the **wavelength** (``k0`` from the vacuum ambient, the one with the smaller coefficient, or pass
   ``wavelength=`` to override), and the **incident wave** (illuminated face + transverse angle
   ``k_in``, read from the assembled forcing).
 
@@ -2102,7 +2102,7 @@ def rcwa(
     Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
     raise), the **super/substrate ambients**, the **permittivity** (the ``K0**2*eps`` coefficient
     recovered from the scalar Helmholtz volume term, sampled along z; a tensor ``ε̂`` from
-    ``inner(ε̂ @ u, v)``), the **wavelength** (``k0`` from the vacuum superstrate, unless ``wavelength``
+    ``inner(ε̂ @ u, v)``), the **wavelength** (``k0`` from the vacuum ambient, the one with the smaller coefficient, unless ``wavelength``
     is given), and the **incident wave** (illuminated face + transverse angle ``k_in``, from the
     assembled forcing). An **in-plane PML** (a complex coordinate stretch in the stiffness coefficients)
     is detected and honoured as a diagonal Maxwell ``ε̂``/``μ̂`` — the supercell then behaves as an
@@ -2230,19 +2230,25 @@ def rcwa(
     if not source_at_bottom:
         coeff_layers = list(reversed(coeff_layers))
         zmids = list(reversed(zmids))
-    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given. With a PML the superstrate
-    # is a vacuum framed by the absorber, so its transverse MEAN is stretched; read k0 at the physical-core
-    # centre instead (there Λ=1 and ε=1, so the mass coefficient is exactly k0²).
-    if is_pml:
-        center = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
-        super_coeff = float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
-    else:
-        super_coeff = float(np.real(coeff_layers[0][1]).mean())
+
+    # k0 from the VACUUM ambient (coeff = k0^2), unless wavelength is given. The coefficient only carries
+    # k0^2*eps, so which ambient is vacuum is not written in the term list: take the one with the smaller
+    # coefficient (a substrate under the source has eps = n^2 > 1 and must not rescale k0 to n*k0). With a PML
+    # the ambient is a vacuum framed by the absorber, so its transverse MEAN is stretched; read k0 at the
+    # physical-core centre instead (there Λ=1 and ε=1, so the mass coefficient is exactly k0²).
+    def _ambient_coeff(i):
+        if is_pml:
+            center = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[i]]])
+            return float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
+        return float(np.real(coeff_layers[i][1]).mean())
+
+    ki = 0 if _ambient_coeff(0) <= _ambient_coeff(-1) else -1  # the ambient k0 is read from (layer index)
+    super_coeff = _ambient_coeff(ki)
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
     elif super_coeff <= 0:
         raise RcwaError(
-            "cannot infer wavelength: the superstrate permittivity coefficient is non-positive; pass wavelength=."
+            "cannot infer wavelength: the vacuum-ambient permittivity coefficient is non-positive; pass wavelength=."
         )
     else:
         k0 = float(np.sqrt(super_coeff))
@@ -2268,7 +2274,7 @@ def rcwa(
     # differentiable re-sampling: re-evaluate the permittivity coefficient at each layer's representative z
     # from a parameter dict, so a design (jno.np.parameter) flows through the solve. Re-deriving the WHOLE
     # coefficient K0^2*eps handles an EPS/shape parameter (each layer's eps) AND a WAVELENGTH parameter
-    # (k0 = sqrt(coeff in the vacuum superstrate)) in one shot.
+    # (k0 = sqrt(coeff in the vacuum ambient)) in one shot.
     #
     # A per-node (free-form / topology-optimisation) density field is interpolated to the RCWA grid by a
     # precomputed node->grid BARYCENTRIC interpolation: the (node ids, weights) are fixed geometry, so
@@ -2303,21 +2309,23 @@ def rcwa(
             return {k: (gather(v) if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
 
         if is_pml:  # in-plane PML: k0 at the physical-core centre (Λ=1, ε=1 ⇒ mass = k0²); 10 ε̂/μ̂ grids per layer
-            center_pt = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[0]]])
-            k0 = jnp.sqrt(jnp.real(jnp.reshape(_eval_coeff_points(coeff_node, center_pt, at(0)), (-1,))[0]))
+            center_pt = np.array([[period[0] * 0.5, period[1] * 0.5, zmids[ki]]])
+            k0 = jnp.sqrt(jnp.real(jnp.reshape(_eval_coeff_points(coeff_node, center_pt, at(ki)), (-1,))[0]))
             out = [
                 (thick, _pml_layer_components(coeff_node, stretch, period, grid, zmid, at(li), k0 * k0, sub))
                 for li, (thick, zmid) in enumerate(zip(thicks, zmids))
             ]
         elif is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
-            sup_xx = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0)), (g, g, 3, 3))
+            sup_xx = jnp.reshape(
+                _eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[ki]), at(ki)), (g, g, 3, 3)
+            )
             k0 = jnp.sqrt(jnp.mean(jnp.real(sup_xx[..., 0, 0])))
             out = [
                 (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0, sub))
                 for li, (thick, zmid) in enumerate(zip(thicks, zmids))
             ]
         else:
-            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[0]), at(0))))
+            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmids[ki]), at(ki))))
             k0 = jnp.sqrt(sup)
             out = []
             for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
