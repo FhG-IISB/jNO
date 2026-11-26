@@ -1,0 +1,46 @@
+# Seconds per test file of its `-m slow` tests, for ci_plan.py slow-matrix. Measured on the workstation (CPU, 2 cores, loaded)
+# and multiplied by 3, the usual ratio of a hosted runner with a cold compile cache to that machine (compare ci_file_times.tsv).
+# Refresh from the slow-file-times-* artifacts of the nightly.
+tests/test_bayesian.py	47
+tests/test_domain_decomposition.py	216
+tests/test_dtypes.py	12
+tests/test_fdm.py	84
+tests/test_fdm_structured.py	31
+tests/test_fem_adapt.py	444
+tests/test_fem_adapt_quad.py	77
+tests/test_fem_adapt_transient.py	47
+tests/test_fem_bloch_eigs.py	153
+tests/test_fem_contact_gear_ratio.py	440
+tests/test_fem_contact_search.py	130
+tests/test_fem_convergence.py	3234
+tests/test_fem_cylinder_benchmark.py	52
+tests/test_fem_enclosure_radiation.py	688
+tests/test_fem_geometry_terms.py	96
+tests/test_fem_history_march.py	430
+tests/test_fem_lsc.py	207
+tests/test_fem_matfun.py	1048
+tests/test_fem_morley.py	26
+tests/test_fem_nedelec_3d.py	6
+tests/test_fem_neural_coefficients.py	167
+tests/test_fem_newton_krylov.py	31
+tests/test_fem_nonnodal_sparse_assembly.py	30
+tests/test_fem_periodic_bloch.py	12
+tests/test_fem_phase_field_sent.py	149
+tests/test_fem_plate_bc.py	20
+tests/test_fem_precond_algebra.py	14
+tests/test_fem_saddle_generality.py	23
+tests/test_fem_solver_amg.py	20
+tests/test_fem_solver_amg_jaxamg.py	1
+tests/test_fem_stabilised_flow.py	48
+tests/test_fem_tau_dirichlet_parameter.py	27
+tests/test_fem_time_schemes.py	232
+tests/test_flow.py	35
+tests/test_fvm_integration.py	118
+tests/test_fvm_saddle.py	82
+tests/test_fvm_systems.py	65
+tests/test_fvm_transient.py	40
+tests/test_models.py	4
+tests/test_one_language.py	103
+tests/test_operator_composition.py	15
+tests/test_pardiso_backend_abort.py	32
+tests/test_solve_imex.py	167

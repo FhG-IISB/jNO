@@ -44,6 +44,7 @@ jobs:
     outputs:
       run: ${{ steps.check.outputs.run }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      slow_matrix: ${{ steps.plan.outputs.slow_matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: check
@@ -66,7 +67,9 @@ jobs:
             echo "main unchanged since the last attempt -> skipping"; echo "run=false" >> "$GITHUB_OUTPUT"
           fi
       - id: plan
-        run: echo "matrix=$(python3 .github/ci_plan.py matrix)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "matrix=$(python3 .github/ci_plan.py matrix)" >> "$GITHUB_OUTPUT"
+          echo "slow_matrix=$(python3 .github/ci_plan.py slow-matrix)" >> "$GITHUB_OUTPUT"
 
   full:
     name: full (${{ matrix.group }} ${{ matrix.shard }}/${{ matrix.of }})
@@ -131,3 +134,56 @@ jobs:
           files: ./coverage.xml
           flags: nightly
           fail_ci_if_error: false
+
+  # ---------------------------------------------------------------- the slow pass
+  # The tests marked `slow` (long convergence studies and the fine versions of tests that have a
+  # coarse one in the PR run) are skipped by `-m 'not slow'` everywhere else, so this is the only
+  # automated place that runs them. Its own shards and its own timeouts, planned by
+  # `ci_plan.py slow-matrix` from .github/ci_slow_times.tsv, so a slow file can never push a
+  # `full` shard past its limit. The tutorials are slow-marked but run by tutorials.yml (manual).
+  slow:
+    name: slow (${{ matrix.shard }}/${{ matrix.of }})
+    needs: guard
+    if: needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.guard.outputs.slow_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          cache: true
+
+      - id: cpu
+        run: echo "id=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ steps.cpu.outputs.id }}-slow-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: jno-xla-${{ steps.cpu.outputs.id }}-slow-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-
+
+      - name: Select this shard's files
+        run: python3 .github/ci_plan.py slow-files ${{ matrix.shard }} ${{ matrix.of }} | tee files.txt
+
+      - name: Slow tests ${{ matrix.shard }}/${{ matrix.of }}
+        # One slow file (test_fem_convergence.py) is planned at about 54 min, above the 30 min default per file.
+        timeout-minutes: 65
+        run: pixi run -- env CI_SLOW=1 CI_FILE_TIMEOUT=60m bash .github/ci_test_per_file.sh $(cat files.txt)
+
+      - uses: actions/cache/save@v4
+        if: '!cancelled()'
+        with:
+          path: ~/.cache/jno
+          key: jno-xla-${{ steps.cpu.outputs.id }}-slow-${{ matrix.shard }}of${{ matrix.of }}-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # The per-file times of this pass, to refresh .github/ci_slow_times.tsv by hand.
+      - uses: actions/upload-artifact@v4
+        if: '!cancelled()'
+        with:
+          name: slow-file-times-${{ matrix.shard }}of${{ matrix.of }}
+          path: ci-file-times.tsv
+          retention-days: 14
