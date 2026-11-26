@@ -7,6 +7,8 @@ short chains on tiny problems so the suite stays under a second.
 
 from __future__ import annotations
 
+import functools
+
 import blackjax
 import equinox as eqx
 import foundax
@@ -1198,8 +1200,10 @@ class TestModelCallProxy:
 # ---------------------------------------------------------------------------
 
 
+@functools.lru_cache(maxsize=None)
 def _multichain_solve(K: int, *, warmup=50, keep=80, init_jitter=0.0):
-    """1-parameter NUTS inverse problem with K parallel chains."""
+    """1-parameter NUTS inverse problem with K parallel chains. Cached per argument set: the tests that
+    share one only read ``a.posterior_samples``, and a repeat run with the same seed is the same chain."""
     π = jno.np.pi
     dom = _line_domain()
     x, _ = dom.variable("interior")
