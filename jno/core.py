@@ -5922,22 +5922,39 @@ class core:
             a solve or integral they share is computed once, and there is one compile instead of one per
             expression. Expressions the compiled function would batch differently (different sample-batch sizes)
             keep one program each, so every result has the shape it has alone."""
-            if len(ops) < 2 or len({_batch_sizes(op) for op in ops}) > 1:
+            if len(ops) < 2:
                 return [_point_eval(op) for op in ops]
-            entry = self._eval_cache.get(ops[0])
-            if entry is None:
-                self._eval_cache[ops[0]] = entry = {}
-            slot = ("together", min_consecutive, tuple(id(op) for op in ops[1:]))
-            hit = entry.get(slot)
-            if hit is None or any(r() is not op for r, op in zip(hit[0], ops[1:])):
-                raw_fn = TraceCompiler.compile_multi_expression(
-                    [cse(fuse_laplacian(refuse_point_index(op))) for op in ops], self.all_ops
-                )
-                hit = entry[slot] = (
-                    [weakref.ref(op) for op in ops[1:]],
-                    eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
-                )
-            out = list(hit[1](_models, ctx, batchsize=None, key=key))
+            # One program per sample-batch size: an expression with no sampled input (an integral, a parameter, a
+            # per-cell field) joins any group -- the group's program maps it over the sample axis like the others,
+            # where it is the same for every sample, so its value is the first. Ten rows of a problem on one mesh
+            # are one program, their shared solves computed once (they were one program each).
+            sizes = [_batch_sizes(op) for op in ops]
+            kinds = sorted({s for s in sizes if s}, key=lambda s: sorted(s))
+            groups = [[i for i, s in enumerate(sizes) if s == k] for k in kinds] or [list(range(len(ops)))]
+            groups[0] = sorted(groups[0] + [i for i, s in enumerate(sizes) if not s and i not in groups[0]])
+            out = [None] * len(ops)
+            for idx in groups:
+                gops = [ops[i] for i in idx]
+                if len(gops) == 1:
+                    out[idx[0]] = _point_eval(gops[0])
+                    continue
+                entry = self._eval_cache.get(gops[0])
+                if entry is None:
+                    self._eval_cache[gops[0]] = entry = {}
+                slot = ("together", min_consecutive, tuple(id(op) for op in gops[1:]))
+                hit = entry.get(slot)
+                if hit is None or any(r() is not op for r, op in zip(hit[0], gops[1:])):
+                    raw_fn = TraceCompiler.compile_multi_expression(
+                        [cse(fuse_laplacian(refuse_point_index(op))) for op in gops], self.all_ops
+                    )
+                    hit = entry[slot] = (
+                        [weakref.ref(op) for op in gops[1:]],
+                        eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive)),
+                    )
+                vals = list(hit[1](_models, ctx, batchsize=None, key=key))
+                mapped = any(sizes[i] for i in idx)  # the program maps over the sample axis
+                for i, v in zip(idx, vals):
+                    out[i] = v[0] if mapped and not sizes[i] else v
             _release_idle_solver_memory()
             return out
 
