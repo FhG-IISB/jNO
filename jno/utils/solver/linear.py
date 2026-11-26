@@ -1026,6 +1026,13 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     data = _np.ascontiguousarray(data)
     idx = _np.ascontiguousarray(_np.asarray(indices))
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
+    out_dtype = rhs2.dtype  # the solution goes back in the right-hand side's precision
+    # PyPardiso factorises float64 / complex128 only and raises a TypeError on anything else. A run without
+    # jax_enable_x64 hands it float32, so the system is factored in double precision and the answer cast back
+    # (the cache key below sees the widened dtype, so a float32 and a float64 operator never share a factor).
+    cplx = _np.iscomplexobj(data)
+    data = data.astype(_np.complex128 if cplx else _np.float64, copy=False)
+    rhs2 = rhs2.astype(_np.complex128 if cplx or _np.iscomplexobj(rhs2) else _np.float64, copy=False)
     rows, cols = idx[:, 0], idx[:, 1]
     # BCOO marks padding with an out-of-bounds index; JAX's own CSR conversion sorts it past the last row
     # and never reads it, but scipy refuses it, so it is dropped here
@@ -1069,7 +1076,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         A.sum_duplicates()
         return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
 
-    b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
+    b = _np.asfortranarray(rhs2)
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -1118,7 +1125,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             x = solver._call_pardiso(A, b)
         finally:
             solver.set_iparm(12, 0)
-    return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+    return _np.asarray(x.reshape(rhs.shape), dtype=out_dtype)
 
 
 def _pardiso_set_pivoting(solver):
