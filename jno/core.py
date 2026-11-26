@@ -72,6 +72,24 @@ from .utils import (
 from .utils.adaptive.callbacks import Callback as _CallbackBase
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
+# A solve that reuses its compiled step should compile nothing: every other program it runs belongs to the program set
+# kept with the step. JAX reports each trace and backend compile; their seconds are summed here (process-wide, cheap)
+# and a reusing solve that spent more than this on them says so -- a program made anew per solve, by construction a
+# bug, shows up the first time it costs anything rather than as a slow run nobody explains.
+RECOMPILE_REPORT_SECONDS = 1.0
+# How many problem structures (a stage's frozen/trained split, its settings) a core keeps compiled: see `_program_set`.
+PROGRAM_SETS = 4
+_COMPILE_SECONDS = [0.0]
+_COMPILE_EVENTS = ("/jax/core/compile/jaxpr_trace_duration", "/jax/core/compile/backend_compile_duration")
+
+
+def _count_compile_seconds(event, seconds, **_kw):
+    if event in _COMPILE_EVENTS:
+        _COMPILE_SECONDS[0] += float(seconds)
+
+
+jax.monitoring.register_event_duration_secs_listener(_count_compile_seconds)
+
 
 def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
     """Return True if any ModelCall in the expression tree has layer_id == lid."""
@@ -1551,6 +1569,32 @@ class core:
 
         return loss_fn
 
+    def _program_set(self, key):
+        """The program set of a solve whose step program is described by ``key`` (`_step_program_key`): the step and
+        every program made with it (`_cache` in `solve`). A core keeps the sets of its last ``PROGRAM_SETS`` problem
+        structures, so a run that switches between stages (freeze one block, train another, and back) compiles each
+        stage once; sets of an earlier compiled problem (a rebuild recompiled its rows) are dropped at once, since
+        they can never run again and hold that discretisation's constants."""
+        sets = self.__dict__.setdefault("_program_sets", [])
+        rows = self.compiled_constraints_fn
+        sets[:] = [s for s in sets if s.get("__rows__") is rows]
+        found = None if key is None else next((s for s in sets if s["__key__"] == key), None)
+        if found is None:
+            found = {"__key__": key, "__rows__": rows}
+            if key is not None:  # an undescribable step is never reused, so not kept
+                sets.append(found)
+                while len(sets) > PROGRAM_SETS:
+                    sets.pop(0)
+                    self.log.info(
+                        f"jno.core: more than {PROGRAM_SETS} problem structures in one run; the least recently used "
+                        "one's programs are dropped (a return to it compiles again)."
+                    )
+        else:
+            sets.remove(found)
+            sets.append(found)  # most recently used last
+        self._jit_program_cache = found
+        return found
+
     def _make_track_fn(self, compiled_trackers, batchsize, frozen, static):
         """Create tracking function that evaluates monitored expressions.
 
@@ -2581,6 +2625,7 @@ class core:
         from jax._src import profiler as _jax_profiler
 
         _epochs_run = epochs  # lowered where a callback stops the loop early
+        _compile_mark = None  # the compile seconds when a reused step was found (`RECOMPILE_REPORT_SECONDS`)
 
         if not self.constraints:
             raise ValueError(
@@ -3960,11 +4005,13 @@ class core:
                     bool(bayesian_handles),
                 ),
             )
-            _cache = getattr(self, "_jit_program_cache", None)
-            if _cache is None or _cache.get("__key__") != _step_key or _step_key is None:
-                _cache = {"__key__": _step_key}
-                self._jit_program_cache = _cache
+            # THE PROGRAM SET: every program this solve runs besides the step (trackers, MMA's) lives in `_cache` with
+            # the step and is made at most once per step program. A later solve of the same problem finds them all; a
+            # rebuild or a new structure starts a new set.
+            _cache = self._program_set(_step_key)
             _cached_step = ("hit", _cache["step"]) if "step" in _cache else None
+            if _cached_step is not None:
+                _compile_mark = _COMPILE_SECONDS[0]
             if os.environ.get("JNO_DEBUG_STEP_KEY") == "1" and _cached_step is not None:
                 _names = ("trainable", "opt_states", "context", "optimizers", "settings", "constraints_fn")
                 for _n, _a, _b in zip(_names, _cached_step[0], _step_key or ()):
@@ -4059,8 +4106,12 @@ class core:
                 if _step_key is not None:
                     _cache[_hg_key], _cache["hook_apply"] = jit_hook_grad, jit_hook_apply
 
-            if has_trackers:
-                jit_track = jax.jit(track_fn)
+            if has_trackers:  # made once per program set: `track_fn` is a new closure every solve
+                jit_track = _cache.get("track")
+                if jit_track is None:
+                    jit_track = jax.jit(track_fn)
+                    if _step_key is not None:
+                        _cache["track"] = jit_track
 
             # ── 7b. Build per-substep JIT step functions ──
             if _use_substeps:
@@ -4287,6 +4338,7 @@ class core:
                     _cb.on_solve_begin(
                         compiled_constraints_fn=self.compiled_constraints_fn,
                         compiled_inequality_fn=self.compiled_inequality_fn,
+                        program_cache=_cache,  # a callback's programs belong to the program set (see `_cache`)
                         n_constraints=self.n_constraints,
                         batchsize=batchsize,
                         frozen=frozen_arrays,
@@ -5423,6 +5475,14 @@ class core:
                 wandb_log_model(self)
 
         self._total_epochs += _epochs_run
+        if _compile_mark is not None:
+            _spent = _COMPILE_SECONDS[0] - _compile_mark
+            if _spent > RECOMPILE_REPORT_SECONDS:
+                self.log.warning(
+                    f"jno.core.solve: this solve reused its compiled step, yet {_spent:.1f} s went into tracing and "
+                    "compiling other programs again -- a program made anew per solve (a function jitted inside it) "
+                    "instead of once with the step. JAX_LOG_COMPILES=1 names them."
+                )
         # Hand the optimizer states to the next solve() so schedules continue across the call.
         self._opt_states = opt_states
 
@@ -5754,6 +5814,7 @@ class core:
                     "`size=` / `pitch=`) so the rebuilt cells meet it."
                 )
             self._jit_program_cache = None
+            self.__dict__.pop("_program_sets", None)  # they read the old discretisation
             self._eval_cache = weakref.WeakKeyDictionary()
             if self.domain in fired:
                 self.domain_data = self.prepare_domain_data(self.domain)
@@ -5975,6 +6036,7 @@ class core:
         state["_eval_cache"] = None
         # Compiled step and hook programs hold device handles; they are rebuilt on the next solve().
         state.pop("_jit_program_cache", None)
+        state.pop("_program_sets", None)
 
         return state
 

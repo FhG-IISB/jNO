@@ -458,6 +458,58 @@ def _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, raa0, raa, d
 # ---------------------------------------------------------------------------
 # The callback that drives it
 # ---------------------------------------------------------------------------
+def _mma_programs(compiled_fn, ineq_fn, ineq_rows, lids, batchsize, min_consecutive, n_values):
+    """MMA's constraint-Jacobian program (and, for ``n_values > 0``, GCMMA's program of the first ``n_values`` row
+    values) as jitted functions of ``(trainable, frozen, static, context, rng)``: `MMACallback.on_solve_begin` keeps
+    them across solves."""
+    import equinox as eqx
+    import jax.numpy as jnp
+    import paramax as _paramax
+
+    from jno.utils.ad_mode import rowwise_jacobian
+
+    def reduced(fn, rows, trainable, frozen, static, context, rng):
+        full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
+        residuals = fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
+        # Only the asked-for rows are reduced, so whatever the others need -- the objective's own
+        # solve, typically the expensive part of the model -- is dead code and is dropped when
+        # this compiles. Stacking every row and pulling back a zero cotangent does NOT drop it:
+        # the zero is a computed array, so the adjoint solve runs on it and needs the forward one.
+        # Measured on an inductance design: the field solve re-ran every step, 190 ms of 550 ms.
+        return jnp.stack([jnp.mean(residuals[i]) for i in rows])
+
+    # `rowwise_jacobian`, not `jacrev`: `jacrev` vmaps its pullback across the output rows, which
+    # through a `fem.solve()` batches the adjoint `spsolve`s into block-diagonal systems (one
+    # matrix copy per row, all held at once -- see `rowwise_jacobian`). Only the `jno.le` rows are
+    # asked for; the objective's gradient already arrives through `grads`.
+    # Prefer the unit holding ONLY the inequality rows when core compiled one (``ineq_fn``): the pullbacks
+    # then never walk the objective's tape, which for a PDE-constrained problem carries a sparse
+    # factorisation no `jno.le` row here depends on. Correct either way -- a Jacobian over a
+    # function computing exactly these rows IS these rows -- so this is purely a cost choice.
+    fn, rows = (compiled_fn, list(ineq_rows)) if ineq_fn is None else (ineq_fn, list(range(len(ineq_rows))))
+    stacked = list(range(len(rows)))  # the reduced rows are numbered 0..n-1
+
+    def jac(trainable, frozen, static, context, rng):
+        if not rows:
+            return jnp.zeros((0, 1))
+        sub = {lid: trainable[lid] for lid in lids}
+        rest = {k: v for k, v in trainable.items() if k not in sub}
+        # Differentiate w.r.t. a LIST of blocks, not the dict: a dict's leaves come out in
+        # sorted-key order, while the design vector in `on_before_update` is concatenated in
+        # `self._blocks` order. A list preserves that order, so the Jacobian's columns line up
+        # with `x`, `df0`, `xmin` and `xmax`.
+        parts = [sub[lid] for lid in lids]
+        return rowwise_jacobian(
+            lambda ps: reduced(fn, rows, {**rest, **dict(zip(lids, ps))}, frozen, static, context, rng), parts, stacked
+        )
+
+    def values(trainable, frozen, static, context, rng):
+        # Values only, of every row: GCMMA's inner loop compares them with its approximation.
+        return reduced(compiled_fn, range(n_values), trainable, frozen, static, context, rng)
+
+    return eqx.filter_jit(jac), (eqx.filter_jit(values) if n_values else None)
+
+
 class MMACallback(_Callback):
     """Runs the MMA subproblem between gradient computation and the parameter update.
 
@@ -522,13 +574,6 @@ class MMACallback(_Callback):
             ``compiled_constraints_fn``, ``n_constraints``, ``batchsize``, ``frozen``, ``static``,
             ``min_consecutive`` and (optionally) ``constraint_names``.
         """
-        import equinox as eqx
-        import jax
-        import jax.numpy as jnp
-        import paramax as _paramax
-
-        from jno.utils.ad_mode import rowwise_jacobian
-
         compiled_fn = kw["compiled_constraints_fn"]
         # Names, so the feasibility report below can say `g_ang` rather than "row 2". A row the user
         # never named stays None and is reported by index.
@@ -537,65 +582,24 @@ class MMACallback(_Callback):
         batchsize, min_consecutive = kw["batchsize"], kw["min_consecutive"]
         self._n_constraints = int(kw["n_constraints"])
         lids = [lid for lid, _ in self._blocks]
-
-        def _losses(sub, rest, context, rng, rows):
-            trainable = {**rest, **sub}
-            full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
-            residuals = compiled_fn(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
-            # Only the asked-for rows are reduced, so whatever the others need -- the objective's own
-            # solve, typically the expensive part of the model -- is dead code and is dropped when
-            # this compiles. Stacking every row and pulling back a zero cotangent does NOT drop it:
-            # the zero is a computed array, so the adjoint solve runs on it and needs the forward one.
-            # Measured on an inductance design: the field solve re-ran every step, 190 ms of 550 ms.
-            return jnp.stack([jnp.mean(residuals[i]) for i in rows])
-
-        # `rowwise_jacobian`, not `jacrev`: `jacrev` vmaps its pullback across the output rows, which
-        # through a `fem.solve()` batches the adjoint `spsolve`s into block-diagonal systems (one
-        # matrix copy per row, all held at once -- see `rowwise_jacobian`). Only the `jno.le` rows are
-        # asked for; the objective's gradient already arrives through `grads`.
-        # Prefer the unit holding ONLY the inequality rows when core compiled one: the pullbacks then
-        # never walk the objective's tape, which for a PDE-constrained problem carries a sparse
-        # factorisation no `jno.le` row here depends on. Correct either way -- a Jacobian over a
-        # function computing exactly these rows IS these rows -- so this is purely a cost choice, and
-        # it falls back cleanly for any caller that does not supply the second unit.
         ineq_fn = kw.get("compiled_inequality_fn")
-
-        def _ineq_losses(sub, rest, context, rng):
-            trainable = {**rest, **sub}
-            full = _paramax.unwrap(eqx.combine(trainable, frozen, static))
-            residuals = compiled_fn_ineq(full, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
-            return jnp.stack([jnp.mean(r) for r in residuals])
-
-        if ineq_fn is not None and self._ineq:
-            compiled_fn_ineq = ineq_fn
-            losses_fn, rows = _ineq_losses, list(range(len(self._ineq)))
-        else:
-            # Reduce only the inequality rows, so the objective's own solve is dead code in the Jacobian
-            # (see `_losses`); the stacked rows are then numbered 0..n-1.
-            _ineq_rows = list(self._ineq)
-
-            def losses_fn(sub, rest, context, rng):
-                return _losses(sub, rest, context, rng, _ineq_rows)
-
-            rows = list(range(len(_ineq_rows)))
-
-        def jac(trainable, context, rng):
-            sub = {lid: trainable[lid] for lid in lids}
-            rest = {k: v for k, v in trainable.items() if k not in sub}
-            if not rows:
-                return jnp.zeros((0, 1))
-            # Differentiate w.r.t. a LIST of blocks, not the dict: a dict's leaves come out in
-            # sorted-key order, while the design vector in `on_before_update` is concatenated in
-            # `self._blocks` order. A list preserves that order, so the Jacobian's columns line up
-            # with `x`, `df0`, `xmin` and `xmax`.
-            parts = [sub[lid] for lid in lids]
-            return rowwise_jacobian(lambda ps: losses_fn(dict(zip(lids, ps)), rest, context, rng), parts, rows)
-
-        self._jac_fn = jax.jit(jac)
-        if self._gcmma:
-            # Values only, of every row: GCMMA's inner loop compares them with its approximation.
-            _all_rows = list(range(self._n_constraints))
-            self._values_fn = jax.jit(lambda trainable, context, rng: _losses(trainable, {}, context, rng, _all_rows))
+        ineq_fn = ineq_fn if ineq_fn is not None and self._ineq else None
+        # The programs are kept across solves, in jno.core's program set (kept with its step program): a closure made
+        # anew per solve would be compiled anew per solve. What changes between solves -- the frozen values and the
+        # static parts -- are ARGUMENTS of the cached programs. A caller without a program set makes them per solve.
+        key = ("mma", id(compiled_fn), id(ineq_fn), tuple(lids), tuple(self._ineq), batchsize, min_consecutive)
+        key += (self._n_constraints if self._gcmma else 0,)
+        cache = kw.get("program_cache")
+        cache = {} if cache is None else cache
+        programs = cache.get(key)
+        if programs is None:
+            programs = cache[key] = _mma_programs(
+                compiled_fn, ineq_fn, list(self._ineq), lids, batchsize, min_consecutive, key[-1]
+            )
+        jac_p, values_p = programs
+        self._jac_fn = lambda trainable, context, rng: jac_p(trainable, frozen, static, context, rng)
+        if values_p is not None:
+            self._values_fn = lambda trainable, context, rng: values_p(trainable, frozen, static, context, rng)
 
     def _report_initial_feasibility(self, g, dg):
         """Say where every ``jno.le`` row starts, and refuse one no step can ever satisfy.
