@@ -568,6 +568,27 @@ def _bay_key(lid: int, group_idx: int = 0) -> str:
     return f"{lid}.{group_idx}"
 
 
+def _rows_share_work(rows, objectives) -> bool:
+    """Whether any expression in ``rows`` shares a node with ``objectives`` that is neither a parameter (a
+    ``ModelCall`` of a ``jno.np.parameter``) nor a literal -- i.e. work both would compute."""
+    from ._fem import _walk
+
+    if not rows or not objectives:
+        return False
+
+    def heavy(e):
+        out = set()
+        for n in _walk(e):
+            t = type(n).__name__
+            if t == "Literal" or (t == "ModelCall" and getattr(getattr(n, "model", None), "_parameter_name", None)):
+                continue
+            out.add(id(n))
+        return out
+
+    obj = set().union(*(heavy(e) for e in objectives))
+    return any(heavy(r) & obj for r in rows)
+
+
 def _extract_user_name(orig_expr) -> str | None:
     """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None.
 
@@ -2529,6 +2550,14 @@ class core:
             if self._inequality_idx
             else None
         )
+        # Whether some inequality row shares work with the objective: a node of both that is neither a
+        # parameter nor a literal (a solve, an assembly). Only then does one shared program pay off -- one
+        # forward pass serving both; otherwise its pullbacks run the objective's backward pass once per row
+        # with a zero cotangent, and the rows' own unit above is cheaper.
+        self._ineq_shares_objective = _rows_share_work(
+            [constraint_exprs[_i] for _i in self._inequality_idx],
+            [e for _i, e in enumerate(constraint_exprs) if _i not in set(self._inequality_idx + self._penalty_idx)],
+        )
         # Boolean row selector for the entries the loss is the mean OF. Built once, here, so the
         # step function stays free of Python-level branching.
         _obj = np.ones(self.n_constraints, dtype=bool)
@@ -2849,12 +2878,13 @@ class core:
         from .optimizers import MMACallback as _MMACallback
         from .optimizers import MMAOptimizer as _MMAOptimizer
 
+        _prev_mma = getattr(self, "_mma_cb", None)  # its history carries on (`MMACallback.continue_from`)
         self._mma_cb = None
         _mma_blocks = [
             (_lid, _fm._opt_fn)
             for _lid, _fm in sorted(self._collect_flax_modules().items())
-            if isinstance(_fm._opt_fn, _MMAOptimizer)
-        ]
+            if isinstance(_fm._opt_fn, _MMAOptimizer) and not getattr(_fm, "_frozen", False)
+        ]  # a frozen block is no design variable of this solve; its history waits for the solve that trains it
         _plain_ineq = [i for i in getattr(self, "_inequality_idx", []) if i not in getattr(self, "_auglag_idx", [])]
         if _mma_blocks and getattr(self, "_auglag_idx", None):
             raise ValueError(
@@ -2872,6 +2902,9 @@ class core:
             import optax as _optax_mma
 
             _cb_mma = _MMACallback(_mma_blocks, list(self._inequality_idx))
+            # A second solve() continues the first, as the optax states do: MMA's asymptotes and iterates carry over
+            # instead of restarting at every call
+            _cb_mma.continue_from(_prev_mma)
             self._mma_cb = _cb_mma
             callbacks = [_cb_mma] + list(callbacks or [])
             for _lid, _ in _mma_blocks:
@@ -3995,6 +4028,9 @@ class core:
             (cb, cb.jacobian_request()) for cb in (callbacks or []) if callable(getattr(cb, "jacobian_request", None))
         ]
         _jac_requests = [(cb, req) for cb, req in _jac_requests if req is not None]
+        if not getattr(self, "_ineq_shares_objective", True):
+            # the rows read nothing the objective computes: their own unit (`compiled_inequality_fn`) is cheaper
+            _jac_requests = []
         if len(_jac_requests) > 1:  # one shared program serves one request; more fall back to their own
             _jac_requests = []
         _jac_cb, _jac_req = _jac_requests[0] if _jac_requests else (None, None)

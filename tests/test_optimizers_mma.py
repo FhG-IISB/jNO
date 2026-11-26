@@ -312,3 +312,59 @@ class TestMoveLimitDamping:
         xf = np.asarray(crux.eval([x])).reshape(-1)
         assert float(np.sum(c / xf)) == pytest.approx(f_star, rel=1e-5)
         assert xf.sum() <= V + 1e-8
+
+
+def _random_subproblem(seed, n=400, m=4, move=0.1):
+    """a subproblem with coupled rows of very different sizes, some inactive, most variables at their move limits"""
+    rng = np.random.default_rng(seed)
+    x = rng.uniform(0.2, 0.8, n)
+    xmin, xmax = np.zeros(n), np.ones(n)
+    low, upp = x - 0.5, x + 0.5
+    df0 = rng.normal(size=n)
+    basis = rng.normal(size=(2, n))
+    dg = rng.normal(size=(m, 2)) @ basis + 0.3 * rng.normal(size=(m, n))
+    dg *= (10.0 ** rng.uniform(-4, 4, m))[:, None]
+    g = (0.02 * np.abs(dg).sum(1)) * rng.uniform(-1.0, 1.0, m)
+    return x, df0, g, dg, low, upp, xmin, xmax, move
+
+
+def _kkt(x_new, lam, x, g, dg, low, upp):
+    """the rows' approximated values at ``x_new``, against 0: feasible, and tight where the multiplier is nonzero"""
+    from jno.optimizers.mma import _pq
+
+    span = np.ones_like(x)
+    out, size = [], []
+    for j in range(g.size):
+        p, q = _pq(dg[j], x, low, upp, span, 1e-5)
+        change = np.sum(p / (upp - x_new) + q / (x_new - low)) - np.sum(p / (upp - x) + q / (x - low))
+        out.append(g[j] + change)
+        size.append(np.sum(p / (upp - x_new) + q / (x_new - low)) + abs(g[j]))
+    return np.asarray(out), np.asarray(size), lam
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_the_dual_is_solved_to_its_kkt_conditions_with_coupled_rows(seed):
+    """the subproblem's rows are met exactly where they are active: an oracle that needs no second solver"""
+    from jno.optimizers.mma import _solve_approximation
+
+    x, df0, g, dg, low, upp, xmin, xmax, move = _random_subproblem(seed)
+    x_new, lam = _solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, 1e-5, 1e-5, 400)
+    rows, size, lam = _kkt(x_new, lam, x, g, dg, low, upp)
+    ok = np.isfinite(lam)
+    assert np.all(lam[ok] >= 0.0)
+    assert np.all(rows[ok] <= 1e-8 * size[ok]), f"rows violated: {rows / size}"
+    active = ok & (lam > 0.0)
+    assert np.all(np.abs(rows[active]) <= 1e-8 * size[active]), f"active rows not tight: {rows[active] / size[active]}"
+    assert np.all(x_new >= np.maximum(xmin, x - move) - 1e-12) and np.all(x_new <= np.minimum(xmax, x + move) + 1e-12)
+
+
+def test_the_dual_needs_few_evaluations_of_the_rows():
+    """the work per step, not a timing: a line search per row and a few Newton steps, not hundreds per row (the
+    compiled dual's own counters)"""
+    import sys
+
+    M = sys.modules["jno.optimizers.mma"]  # the package's `mma` is the constructor
+    x, df0, g, dg, low, upp, xmin, xmax, move = _random_subproblem(0)
+    M._solve_approximation(x, df0, g, dg, low, upp, xmin, xmax, move, 1e-5, 1e-5, 400)
+    s = M.last_dual_stats
+    assert s["rows"] < 200 and s["primal"] < 60, s

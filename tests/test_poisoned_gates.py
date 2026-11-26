@@ -60,9 +60,12 @@ def test_the_design_step_has_no_host_callback(monkeypatch):
     monkeypatch.setattr(jax.stages.Lowered, "compile", spy)
     crux, _J = _design(jno.solve.cg())
     crux.solve(1)
-    step = [t for name, t in texts.items() if "grad_jac" in name]
-    assert step, f"no constraint-gradient program was compiled: {sorted(texts)}"
-    assert "callback" not in step[0], "the design step still holds a host callback (it cannot be cached)"
+    # the objective's gradient and the bound rows' Jacobian: one joint program (`grad_jac_fn`) when the rows share the
+    # objective's solve, else each its own (this row reads only k)
+    step = {name: t for name, t in texts.items() if "grad" in name}
+    assert step, f"no gradient program was compiled: {sorted(texts)}"
+    held = sorted(name for name, t in step.items() if "callback" in t)
+    assert not held, f"the design step's programs {held} still hold a host callback (they cannot be cached)"
 
 
 def test_a_solve_that_fails_its_check_stops_the_design_step():
