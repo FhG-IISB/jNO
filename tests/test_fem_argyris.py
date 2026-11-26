@@ -49,7 +49,7 @@ _DUMMY = jno.domain.from_array({"_": np.zeros((1, 1))})
 
 def _eval(out):
     """A jno.fem solve to a concrete array (linear is already an array; nonlinear/transient is a node)."""
-    if isinstance(out, jax.Array):
+    if isinstance(out, (jax.Array, jno.Solution)):
         return np.asarray(out)
     crux = jno.core([out.mean], domain=_DUMMY)
     return np.asarray(crux.eval([out]))

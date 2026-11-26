@@ -1,17 +1,16 @@
-"""Enclosure radiation handle: ``domain.enclosure(tags)``.
+"""View factors of diffuse-grey enclosures: the geometry behind ``d.irradiation`` (``jno.domain.radiation``).
 
-An :class:`Enclosure` turns a set of boundary tags into the geometric ingredients an enclosure-radiation
-boundary condition needs — built directly from the **FEM mesh boundary edges**, so the view-factor rows
-align with global mesh nodes (and therefore FEM DOFs for a P1 field). The radiating surface is
-discretised into **boundary elements** (mesh edges in 2D / meridional segments in the axisymmetric
-``(r, z)`` plane); the element-to-element view-factor matrix ``F`` is *fully geometry-determined* —
-occlusion (visibility) and orientation (cosine) decide every entry, only the ``i == i`` self-pair is
-removed. Tags are merely element groups (for per-surface emissivity); they never block exchange, so a
-concave surface keeps its self-view.
+An :class:`Enclosure` turns a set of surfaces into the geometric ingredients of enclosure radiation, built
+directly from the **FEM mesh edges**, so the view-factor rows align with global mesh nodes. The radiating surface
+is discretised into **elements** (mesh edges in 2D / meridional segments in the axisymmetric ``(r, z)`` plane);
+the element-to-element view-factor matrix ``F`` is *fully geometry-determined* -- occlusion (visibility) and
+orientation (cosine) decide every entry, only the ``i == i`` self-pair is removed. Tags are merely element groups
+(for per-surface emissivity); they never block exchange, so a concave surface keeps its self-view.
 
-The radiosity physics (``q = (I-F)(I-diag(rho)F)^-1 diag(eps) sigma T^4``) is written by the user in
-``jno.np`` on top of ``enclosure.view_factor``; this module only supplies the quality-gated ``F``, the
-element/node bookkeeping, and the per-element measure used to scatter a flux back onto FEM nodes.
+:func:`enclosures_of_medium` finds the surfaces of every connected transparent medium and caches their view
+factors on disk; :func:`radiosity_irradiation` and :func:`radiosity_resolvent` are the radiosity solve and the
+resolvent its exact tangent needs. The radiation term itself is written as the equation, ``d.eps(T) * (SIGMA *
+T**4 - d.irradiation(T)) * v * dS``, and lowered in ``jno.domain.radiation``.
 
 Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4-5 (view factors; the net-radiation /
 radiosity method for diffuse-grey enclosures).
@@ -26,24 +25,39 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ..trace import Placeholder
 from ..utils.sets import unique_values
 from .mesh_utils import MeshUtils
 
 
-def _boundary_edge_third_vertex(triangles: np.ndarray):
-    """Map each boundary edge (a tuple of two global node indices, sorted) to the third vertex of its
-    one adjacent triangle. Boundary edges occur in exactly one triangle; the third vertex fixes the
-    outward (out-of-solid) normal direction."""
-    third: dict[tuple[int, int], int] = {}
-    seen: dict[tuple[int, int], int] = {}
-    for tri in triangles:
-        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
-        for i0, i1, opp in ((a, b, c), (b, c, a), (c, a, b)):
-            key = (i0, i1) if i0 < i1 else (i1, i0)
-            seen[key] = seen.get(key, 0) + 1
-            third[key] = opp
-    return third, seen
+def _area_cells(mesh):
+    """``(cells, cell_type)``: the 2-D cells of the mesh in their P1 view, triangles or quadrilaterals (meshio
+    vertex order, so consecutive vertices of a row are the cell's edges), and their meshio name."""
+    from .mesh_utils import p1_cells_dict, volume_cell_type
+
+    name = volume_cell_type(mesh, 2)
+    if name is None:
+        raise NotImplementedError(
+            f"enclosure radiation needs a mesh of triangles or quadrilaterals; it has {sorted(mesh.cells_dict)}."
+        )
+    return np.asarray(p1_cells_dict(mesh)[name]), name
+
+
+def _cell_edges(cells: np.ndarray):
+    """``(i0, i1, cell)``: the edges of every k-gon cell (consecutive vertices), with the cell each one belongs to."""
+    k = cells.shape[1]
+    i0 = cells.reshape(-1)
+    i1 = np.roll(cells, -1, axis=1).reshape(-1)
+    return i0, i1, np.repeat(np.arange(cells.shape[0]), k)
+
+
+def _boundary_edge_inside_point(cells: np.ndarray, pts: np.ndarray):
+    """Map each edge (a tuple of two global node indices, sorted) to a point inside its adjacent cell (the
+    cell's centroid; on an interior edge, the last cell seen). A boundary edge lies in exactly one cell; the
+    point fixes the outward (out-of-solid) normal direction. Any cell type with straight edges (triangles,
+    quadrilaterals): the centroid of a convex cell is on the same side of each of its edges as the cell."""
+    cent = pts[cells].mean(axis=1)
+    i0, i1, c = _cell_edges(cells)
+    return {(int(a), int(b)) if a < b else (int(b), int(a)): cent[int(ci)] for a, b, ci in zip(i0, i1, c)}
 
 
 def _element_visibility(mids: np.ndarray, own_edge: np.ndarray, occ0: np.ndarray, occ1: np.ndarray):
@@ -138,8 +152,8 @@ class _SolidSDF:
     solid or the chord steps straight over it, and in a real furnace that ratio is brutal (a 0.5 mm seed
     disc against ~500 mm chords needs ~3000 samples per chord, over ~650k pairs x n_phi azimuths). And a
     missed wall is not a benign inaccuracy -- it is occlusion that silently does not happen, so the ray
-    passes THROUGH a solid, inflating F and pushing row sums past the physical bound of 1. Measured on the
-    cg furnace, a 16-sample chord test wrongly called 12% of all *visible* pairs visible.
+    passes THROUGH a solid, inflating F and pushing row sums past the physical bound of 1. Measured on a
+    furnace geometry, a 16-sample chord test wrongly called 12% of all *visible* pairs visible.
 
     A distance field fixes both at once: you may safely advance by the distance to the nearest solid,
     because nothing can be hit within it. Steps are therefore LARGE in open space and shrink automatically
@@ -264,7 +278,7 @@ def _chord_blocked(sdf, ri, zi, rj, zj, cphi, sphi, depth, max_iter=160):
 
     **The grazing trap.** Sphere tracing converges only geometrically when a ray runs nearly PARALLEL to a
     surface: if the clearance shrinks by a fraction ``k`` of the distance travelled, the march needs
-    ``~log(eps)/log(1-k)`` steps. On the cg furnace a chord skimming the 0.5 mm seed disc has ``k ~ 0.016``
+    ``~log(eps)/log(1-k)`` steps. On a furnace geometry a chord skimming the 0.5 mm seed disc has ``k ~ 0.016``
     -- over 400 steps. Capping the iteration count and then treating the survivors as VISIBLE silently
     un-blocks every such ray, which is a hot-to-cold short circuit between surfaces that cannot see each
     other at all (it connected the crucible's inner cavity to the outer walls THROUGH 30 mm of solid seed).
@@ -341,7 +355,7 @@ def _chord_test_setup(geoms, union, r, z):
 
     ``cell`` must resolve the THINNEST solid (``w/8``) -- never the mesh. Scaling the chord test to the
     element size (as the legacy straight-line test's ``tol`` does) is a trap: a solid thinner than the
-    tolerance can then NEVER register as a block, at any sampling density. The cg furnace hits exactly
+    tolerance can then NEVER register as a block, at any sampling density. A furnace geometry hits exactly
     that, with a 0.5 mm seed disc against ~1.2 mm elements. It is also capped against the domain span, so a
     geometry whose only solid is thick does not end up with an absurdly coarse field.
 
@@ -406,8 +420,8 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, occluders=Non
     The fallback is the dangerous case, and it is why this argument exists. It makes a solid an
     occluder only if some radiating element happens to be *tagged* with it, so a solid that owns no
     radiating element -- or one whose elements were tagged under a different name -- is silently
-    transparent. Measured on the cg furnace, tagging every insulation element ``WallS`` left ``WallU``,
-    ``WallO`` and three quartz ports out of the occluder set, and **46% of the pairs this function
+    transparent. Measured on a furnace geometry, tagging every insulation element with one name left three
+    other walls and three ports out of the occluder set, and **46% of the pairs this function
     called visible had chords passing through solid material** (worst case: 99% of the chord buried in
     insulation). There is no error and the resulting ``F`` looks perfectly plausible. Callers that know
     their opaque geometry should pass it rather than let it be inferred from tags.
@@ -450,145 +464,6 @@ def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, occluders=Non
     return vis
 
 
-def _consistent_node_weights(areas: np.ndarray, endpoints, axisymmetric: bool) -> np.ndarray:
-    r"""Per-element P1 load weights ``(m, 2)``: the two endpoint shares of ``\int_elem N_i \,d\Gamma``.
-
-    **2D** — the measure is the edge length and ``N_i`` is symmetric about the midpoint, so each endpoint
-    takes half: ``(L/2, L/2)``.
-
-    **Axisymmetric** — the measure carries the ring Jacobian, ``d\Gamma = 2\pi r \,ds``, and ``r`` varies
-    linearly along the element (``r(s) = r_0 + s\,\Delta``, ``\Delta = r_1 - r_0``). The halves are then
-    *not* equal: the endpoint at the larger radius sweeps more area. With ``L`` the meridional length,
-
-    .. math::
-        \int_0^1 (1-s)\,r(s)\,2\pi L\,ds = \tfrac{\pi L}{3}(2r_0 + r_1), \qquad
-        \int_0^1 s\,r(s)\,2\pi L\,ds     = \tfrac{\pi L}{3}(r_0 + 2r_1)
-
-    which still sums to the ring area ``2\pi \bar{r} L`` but splits it ``(2r_0+r_1) : (r_0+2r_1)``. Using
-    the 2D half-and-half split instead is exact only for an element at constant radius (a cylindrical
-    wall, ``\Delta = 0``); for a radial element spanning ``0 \to R`` -- an end disc, which every closed
-    axisymmetric cavity has -- it puts ``R/4`` on each node where the truth is ``R/6`` and ``R/3``, i.e.
-    50% too much on the inner node. These weights integrate a linear test function EXACTLY (verified
-    against ``\int 2\pi r \cdot r\,dr``), which the equal split does not.
-    """
-    areas = np.asarray(areas, dtype=np.float64)
-    if not axisymmetric or endpoints is None:
-        half = 0.5 * areas
-        return np.stack([half, half], axis=1)
-    e0, e1 = (np.asarray(e, dtype=np.float64) for e in endpoints)
-    r0, r1 = e0[:, 0], e1[:, 0]
-    length = np.linalg.norm(e1 - e0, axis=1)
-    w0 = np.pi * length * (2.0 * r0 + r1) / 3.0
-    w1 = np.pi * length * (r0 + 2.0 * r1) / 3.0
-    return np.stack([w0, w1], axis=1)
-
-
-class PendingElementExpr:
-    """A per-element computation still waiting for the solution vector.
-
-    Produced by :meth:`Enclosure.field` when it is handed a *symbolic* trial function rather than a
-    concrete DOF vector, and consumed by :meth:`Enclosure.load`, which closes it into a
-    ``jno.Coupling``. Arithmetic records the operation instead of performing it, so a nonlocal term is
-    written as an expression in the ``jno.fem([...])`` list::
-
-        gap.load(G @ gap.field(u) ** 4)              # an expression, sits in the term list
-        lambda T: gap.load(G @ gap.field(T) ** 4)    # the same thing, written by hand
-
-    This is not radiation-specific. Every nonlocal term in jNO has the same **gather -> operate ->
-    scatter** shape -- integral and non-reflecting BCs, contact, peridynamics -- and ``field``/``load``
-    are already the gather and the scatter, so deferring them covers all of them with one mechanism.
-    The physics in between stays yours to write.
-
-    This is the **residual** spelling of that shape: it produces a load vector, in-residual, with the
-    nonlocality carried exactly in the tangent. :func:`jno.derived` is the **value** spelling -- a nodal
-    field, lagged, usable anywhere a field is. An enclosure flux fits either (divide ``load`` by the
-    consistent weights ``gap.load(ones)`` to get nodal values); a quantity needed INSIDE a term, like a
-    beam's attenuation multiplying a source, fits only the second. See ``docs/fem/geometry.md``.
-
-    .. important::
-       The block this produces is **dense** in element space. It reads like a weak term and is not
-       one: its Jacobian couples every element to every other, which is why ``fem.solve`` stays on
-       matrix-free Newton-Krylov rather than assembling a sparse tangent.
-
-    Args:
-        fn: the recorded computation, ``u -> per-element array``, applied once the solution is known.
-    """
-
-    __slots__ = ("_fn",)
-
-    # NumPy checks this before trying to coerce an unknown right operand, so `ndarray @ pending`
-    # reaches __rmatmul__ instead of being turned into an object array. JAX arrays already return
-    # NotImplemented for unrecognized operands, which routes there too.
-    __array_priority__ = 1000.0
-    __array_ufunc__ = None
-
-    def __init__(self, fn):
-        self._fn = fn
-
-    def __call__(self, u):
-        return self._fn(u)
-
-    def _lift(self, other, op, swap=False):
-        fn = self._fn
-        if isinstance(other, PendingElementExpr):
-            g = other._fn
-            return PendingElementExpr(lambda u: op(g(u), fn(u)) if swap else op(fn(u), g(u)))
-        return PendingElementExpr(lambda u: op(other, fn(u)) if swap else op(fn(u), other))
-
-    def __add__(self, o):
-        return self._lift(o, lambda a, b: a + b)
-
-    def __radd__(self, o):
-        return self._lift(o, lambda a, b: a + b, swap=True)
-
-    def __sub__(self, o):
-        return self._lift(o, lambda a, b: a - b)
-
-    def __rsub__(self, o):
-        return self._lift(o, lambda a, b: a - b, swap=True)
-
-    def __mul__(self, o):
-        return self._lift(o, lambda a, b: a * b)
-
-    def __rmul__(self, o):
-        return self._lift(o, lambda a, b: a * b, swap=True)
-
-    def __truediv__(self, o):
-        return self._lift(o, lambda a, b: a / b)
-
-    def __rtruediv__(self, o):
-        return self._lift(o, lambda a, b: a / b, swap=True)
-
-    def __matmul__(self, o):
-        return self._lift(o, lambda a, b: a @ b)
-
-    def __rmatmul__(self, o):
-        return self._lift(o, lambda a, b: a @ b, swap=True)
-
-    def __pow__(self, o):
-        return self._lift(o, lambda a, b: a**b)
-
-    def __neg__(self):
-        fn = self._fn
-        return PendingElementExpr(lambda u: -fn(u))
-
-    def apply(self, fn):
-        """Record an arbitrary elementwise/array function, for anything the operators do not cover
-        (``gap.field(u).apply(jnp.exp)``).
-
-        Args:
-            fn: an array function applied to the per-element values.
-
-        Returns:
-            PendingElementExpr: the extended record.
-        """
-        inner = self._fn
-        return PendingElementExpr(lambda u: fn(inner(u)))
-
-    def __repr__(self):
-        return "PendingElementExpr(<pending nonlocal term; pass to enclosure.load>)"
-
-
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
@@ -605,7 +480,7 @@ class Enclosure:
         nodes ((k,) np.ndarray): Unique global node indices used by the enclosure (FEM DOFs for a scalar
             P1 field).
 
-    Built by ``d.enclosure(...)``.
+    Built by :func:`build_enclosure`; ``d.irradiation`` builds one per transparent medium.
 
     Args:
         domain: the domain the surfaces belong to.
@@ -617,10 +492,9 @@ class Enclosure:
         normals: per-element unit normals into the enclosure.
         midpoints: per-element midpoints.
         axisymmetric: whether the geometry is axisymmetric (ring elements).
-        endpoints: per-element endpoint coordinates, when kept.
     """
 
-    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric, endpoints=None):
+    def __init__(self, domain, tags, F, elements, element_tags, areas, normals, midpoints, axisymmetric):
         self.domain = domain
         self.tags = list(tags)
         self._F = jnp.asarray(F)
@@ -630,7 +504,6 @@ class Enclosure:
         self.normals = jnp.asarray(normals)
         self.midpoints = np.asarray(midpoints)
         self.axisymmetric = bool(axisymmetric)
-        self._node_weights = jnp.asarray(_consistent_node_weights(np.asarray(areas), endpoints, self.axisymmetric))
 
     @property
     def size(self) -> int:
@@ -650,68 +523,6 @@ class Enclosure:
     def tag_mask(self, tag: str) -> np.ndarray:
         """Boolean (m,) mask of elements belonging to ``tag`` — e.g. to build a per-element emissivity."""
         return self.element_tags == tag
-
-    def emissivity(self, values) -> jnp.ndarray:
-        """Per-element emissivity ``(m,)`` from a ``{tag: eps}`` mapping (or a scalar for all surfaces).
-
-        Args:
-            values: a scalar for every surface, or ``{tag: eps}``.
-
-        Returns:
-            jnp.ndarray: one emissivity per element.
-        """
-        if np.isscalar(values):
-            return jnp.full(self.size, float(values))
-        eps = np.zeros(self.size)
-        for tag, val in dict(values).items():
-            eps[self.tag_mask(tag)] = float(val)
-        return jnp.asarray(eps)
-
-    def field(self, u) -> jnp.ndarray:
-        """Per-element temperature ``(m,)`` from the global solution ``u`` — the **nonlocal gather**.
-
-        Radiosity is piecewise-constant per boundary element, so each element's temperature is the mean
-        of its two endpoint (FEM node) values. Differentiable in ``u`` (used inside the Newton residual).
-
-        Handed a **symbolic** trial function (``u, v = d.fem_symbols()``) instead of a concrete DOF
-        vector, this returns a :class:`PendingElementExpr` instead: the gather is recorded, arithmetic
-        on it is recorded, and :meth:`load` closes it into a ``jno.Coupling``. That is what lets a
-        nonlocal term be written as an expression in the ``jno.fem([...])`` list rather than a lambda."""
-        if isinstance(u, Placeholder):
-            return PendingElementExpr(self.field)
-        u = jnp.asarray(u).reshape(-1)
-        return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
-
-    def load(self, q, *, size: Optional[int] = None) -> jnp.ndarray:
-        """Consistent global surface load ``(n_dofs,)`` from a per-element flux ``q`` ``(m,)``.
-
-        Scatters ``∫_Γ q v dΓ`` onto the FEM nodes for piecewise-constant ``q`` and P1 test functions.
-        In 2D the two endpoints split the edge evenly; in **axisymmetric** mode the ring Jacobian
-        ``2πr`` weights them by radius instead (see :func:`_consistent_node_weights`), which is what
-        makes the load exact for a linear test function on a radial element. ``size`` defaults to the
-        mesh node count (scalar P1 DOF layout).
-
-        .. important::
-           With ``axisymmetric=True`` this load is **per full revolution** (W, not W/m): the measure is
-           ``2πr ds``. jNO does not weight the FEM forms for you, so the weak form this load is added to
-           must carry the same ``2πr`` factor or the two sides differ by exactly that. See the
-           *Axisymmetric* section of ``docs/fem/geometry.md``.
-
-        Given a :class:`PendingElementExpr` (anything built from a symbolic ``field(u)``) this returns
-        the ``jno.Coupling`` that closes it over the solution vector, so the whole nonlocal term is an
-        expression that drops straight into the ``jno.fem([...])`` list."""
-        if isinstance(q, PendingElementExpr):
-            from .._fem import Coupling  # local: jno._fem imports the domain package
-
-            tags = ",".join(map(str, self.tags)) if getattr(self, "tags", None) else "enclosure"
-            return Coupling(lambda u: self.load(q(u), size=size), name=f"enclosure[{tags}]")
-        q = jnp.asarray(q).reshape(-1)
-        n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
-        w = self._node_weights.astype(q.dtype)
-        load = jnp.zeros(n, dtype=q.dtype)
-        load = load.at[jnp.asarray(self.elements[:, 0])].add(q * w[:, 0])
-        load = load.at[jnp.asarray(self.elements[:, 1])].add(q * w[:, 1])
-        return load
 
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
@@ -1100,16 +911,16 @@ def build_enclosure(
         tags = [tags]
     tags = [str(t) for t in tags]
     if not tags:
-        raise ValueError("domain.enclosure requires at least one boundary tag.")
+        raise ValueError("build_enclosure requires at least one boundary tag.")
     if int(getattr(domain, "dimension", 0)) != 2:
         raise NotImplementedError(
-            "domain.enclosure is implemented for 2D and axisymmetric (r, z) meshes; 3D enclosure radiation is future work."
+            "Enclosure radiation is implemented for 2D and axisymmetric (r, z) meshes; 3D enclosure radiation is future work."
         )
 
     mesh = domain.mesh
     pts = np.asarray(mesh.points)[:, :2]
-    triangles = np.asarray(mesh.cells_dict["triangle"])
-    boundary_edges = np.asarray(MeshUtils.extract_boundary_edges(jnp.asarray(triangles), pts.shape[0]))
+    cells, cell_type = _area_cells(mesh)
+    boundary_edges = np.asarray(MeshUtils._get_boundary_elements(cells, cell_type))
 
     # Per-tag node masks (global node indices on each radiating surface). Prefer the spatial predicate
     # registered by ``domain.tag`` (it takes coordinate arrays); fall back to a geometry-part node set.
@@ -1125,7 +936,7 @@ def build_enclosure(
             mask[np.asarray(tag_indices[tag], dtype=np.int64)] = True
             return mask
         raise ValueError(
-            f"domain.enclosure: tag '{tag}' has neither a spatial predicate (domain.tag) nor mesh node "
+            f"build_enclosure: tag '{tag}' has neither a spatial predicate (domain.tag) nor mesh node "
             "indices; define it with domain.tag(name, predicate) or as a geometry part."
         )
 
@@ -1133,7 +944,7 @@ def build_enclosure(
     elem_tag: List[str] = []
     if medium_tags is None:
         # Boundary mode: radiating elements are domain boundary edges whose endpoints lie on a tag.
-        third, _ = _boundary_edge_third_vertex(triangles)
+        inside = _boundary_edge_inside_point(cells, pts)
         tag_masks = {tag: _tag_mask(tag) for tag in tags}
         for a, b in boundary_edges:
             a, b = int(a), int(b)
@@ -1144,22 +955,20 @@ def build_enclosure(
                     elem_tag.append(tag)
                     break
         if not elem_nodes_list:
-            raise ValueError(f"domain.enclosure: no boundary elements found on tags {tags}.")
+            raise ValueError(f"build_enclosure: no boundary elements found on tags {tags}.")
     else:
         # Interface mode: radiating elements are internal solid|medium interface edges. ``tags`` are
         # solid geometry-part names; ``medium_tags`` are the transparent (meshed) media. The normal of
-        # each element points out of the solid into the medium (its solid-side third vertex sets it).
+        # each element points out of the solid into the medium (a point inside its solid-side cell sets it).
         medium_set = {str(m) for m in medium_tags}
         tag_set = set(tags)
-        tri_region = _classify_triangles(domain, triangles, pts)
+        cell_region = _classify_triangles(domain, cells, pts)
+        cent = pts[cells].mean(axis=1)
         edge_adj: dict = {}
-        for ti in range(triangles.shape[0]):
-            a, b, c = int(triangles[ti, 0]), int(triangles[ti, 1]), int(triangles[ti, 2])
-            rg = tri_region[ti]
-            for i0, i1, opp in ((a, b, c), (b, c, a), (c, a, b)):
-                key = (i0, i1) if i0 < i1 else (i1, i0)
-                edge_adj.setdefault(key, []).append((rg, opp))
-        third = {}
+        for a, b, ci in zip(*_cell_edges(cells)):
+            key = (int(a), int(b)) if a < b else (int(b), int(a))
+            edge_adj.setdefault(key, []).append((cell_region[int(ci)], cent[int(ci)]))
+        inside = {}
         for key, adj in edge_adj.items():
             if len(adj) != 2:
                 continue
@@ -1167,14 +976,14 @@ def build_enclosure(
             if r0 in tag_set and r1 in medium_set:
                 elem_nodes_list.append(key)
                 elem_tag.append(r0)
-                third[key] = t0
+                inside[key] = t0
             elif r1 in tag_set and r0 in medium_set:
                 elem_nodes_list.append(key)
                 elem_tag.append(r1)
-                third[key] = t1
+                inside[key] = t1
         if not elem_nodes_list:
             raise ValueError(
-                f"domain.enclosure: no solid|medium interface elements found between tags {tags} and "
+                f"build_enclosure: no solid|medium interface elements found between tags {tags} and "
                 f"medium_tags {list(medium_tags)}."
             )
     elem_nodes = np.asarray(elem_nodes_list, dtype=np.int64)  # (m, 2)
@@ -1186,17 +995,17 @@ def build_enclosure(
     edge_vec = e1 - e0
     length = np.linalg.norm(edge_vec, axis=1)
 
-    # Into-enclosure normals: perpendicular to the edge, pointing away from the adjacent triangle's
-    # third vertex (i.e. out of the solid -> into the gap).
+    # Into-enclosure normals: perpendicular to the edge, pointing away from a point inside the adjacent
+    # cell (i.e. out of the solid -> into the gap).
     normals = np.zeros_like(mids)
     for k in range(elem_nodes.shape[0]):
         a, b = int(elem_nodes[k, 0]), int(elem_nodes[k, 1])
         key = (a, b) if a < b else (b, a)
-        c = third.get(key)
+        c = inside.get(key)
         t = edge_vec[k]
         n = np.array([-t[1], t[0]])
         n = n / (np.linalg.norm(n) + 1e-30)
-        if c is not None and np.dot(mids[k] - pts[c], n) < 0:
+        if c is not None and np.dot(mids[k] - c, n) < 0:
             n = -n  # ensure it points away from the solid interior
         normals[k] = n
     if inward and medium_tags is None:
@@ -1228,20 +1037,20 @@ def build_enclosure(
             # enclosure would be built with an empty occluder model -- every pair mutually visible,
             # through solid metal and insulation alike. It fails silently: closure and reciprocity stay
             # perfect (they are enforced), so the F that comes out looks entirely plausible. Measured on
-            # the cg furnace, one Quartz.1->WallO pair read 0.024 unoccluded against 0.363 occluded, and
+            # a furnace geometry, one port-to-wall pair read 0.024 unoccluded against 0.363 occluded, and
             # the coupled solve landed 620 K cold.
             #
-            # The mesh already carries the answer: `tri_region` labels every cell, so each opaque
+            # The mesh already carries the answer: `cell_region` labels every cell, so each opaque
             # region's meridian outline is the union of its own cells. Exact for straight-edged regions
             # (the cells tile them), and it needs no shapely geometry from the caller.
             from shapely.geometry import Polygon as _SPoly
             from shapely.ops import unary_union as _uu
 
-            for _name in sorted({str(x) for x in tri_region if x is not None} - _transparent):
-                _sel = np.where(tri_region == _name)[0]
+            for _name in sorted({str(x) for x in cell_region if x is not None} - _transparent):
+                _sel = np.where(cell_region == _name)[0]
                 if not len(_sel):
                     continue
-                _g = _uu([_SPoly(pts[triangles[t]][:, :2]) for t in _sel]).buffer(0)
+                _g = _uu([_SPoly(pts[cells[t]][:, :2]) for t in _sel]).buffer(0)
                 if not _g.is_empty:
                     solid_geoms.append(_g)
 
@@ -1314,4 +1123,181 @@ def build_enclosure(
     if enforce_closure:
         F = _enforce_closure(F, areas, n_iter=closure_iters)
 
-    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric, endpoints=(e0, e1))
+    return Enclosure(domain, tags, F, elem_nodes, elem_tag_arr, areas, normals, mids, axisymmetric)
+
+
+STEFAN_BOLTZMANN = 5.670374419e-8  # W / (m^2 K^4)
+
+
+def radiosity_irradiation(F, eps, t):
+    """The incident radiation ``G = F J`` of one diffuse-grey enclosure, ``J = (I - diag(1-eps) F)^-1 eps sigma t^4``
+    (Modest, Ch. 5), by a dense solve."""
+    rhs = eps * STEFAN_BOLTZMANN * t**4
+    J = jnp.linalg.solve(jnp.eye(rhs.shape[0], dtype=rhs.dtype) - (1.0 - eps)[:, None] * F, rhs)
+    return F @ J
+
+
+def radiosity_resolvent(F, eps):
+    """``(I - diag(1-eps) F)^-1`` as a dense ``(m, m)`` array: what the exact tangent of ``G`` needs, once per
+    Newton step (``dG/dT = F (I - diag(1-eps) F)^-1 diag(h)``)."""
+    eye = jnp.eye(F.shape[0], dtype=jnp.result_type(eps, float))
+    return jnp.linalg.solve(eye - (1.0 - eps)[:, None] * F, eye)
+
+
+class EnclosureSet:
+    """The radiating faces of every connected transparent medium of a domain (what ``d.irradiation`` integrates
+    over), one :class:`Enclosure` per medium: each is its own radiosity system, no exchange between media."""
+
+    def __init__(self, parts, media):
+        self.parts = list(parts)
+        self.media = [list(m) for m in media]
+
+    @property
+    def size(self) -> int:
+        return int(sum(p.size for p in self.parts))
+
+    @property
+    def element_tags(self) -> np.ndarray:
+        return np.concatenate([p.element_tags for p in self.parts])
+
+    def __repr__(self):
+        return f"EnclosureSet({len(self.parts)} media: " + "; ".join(repr(p) for p in self.parts) + ")"
+
+
+def _enclosure_cache_dir():
+    import os
+    from pathlib import Path
+
+    return Path(os.environ.get("JNO_CACHE", Path.home() / ".cache" / "jno")) / "enclosures"
+
+
+def _cached_enclosure(domain, tags, medium, options, cache):
+    """build_enclosure(domain, tags, medium_tags=medium, **options), with the view factors cached on disk by a
+    hash of everything they depend on: the mesh (points and cells), the region membership of its cells, the
+    surfaces, the medium and the options. A mesh or option change is a new key, never a stale hit."""
+    import hashlib
+    import pickle
+    import time
+
+    from .mesh_utils import mesh_cell_region_membership
+
+    mesh = domain.mesh
+    regions = mesh_cell_region_membership(mesh, int(domain.dimension))
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(np.asarray(mesh.points, np.float64)).tobytes())
+    for c in mesh.cells:
+        h.update(c.type.encode())
+        h.update(np.ascontiguousarray(np.asarray(c.data, np.int64)).tobytes())
+    for name in sorted(set(tags) | set(medium)):
+        h.update(name.encode())
+        h.update(np.packbits(np.asarray(regions.get(name, np.zeros(0, bool)))).tobytes())
+    h.update(repr(sorted(options.items())).encode())
+    path = _enclosure_cache_dir() / f"{h.hexdigest()[:20]}.pkl"
+    from ..utils.logger import get_logger
+
+    log = get_logger()
+    if cache and path.exists():
+        st = pickle.loads(path.read_bytes())
+        enc = Enclosure.__new__(Enclosure)
+        enc.__dict__.update(st)
+        enc.domain = domain
+        enc._F, enc.areas, enc.normals = jnp.asarray(st["_F"]), jnp.asarray(st["areas"]), jnp.asarray(st["normals"])
+        log.info(f"enclosure[{','.join(medium)}]: view factors loaded from the cache ({path.name})")
+        return enc
+    t0 = time.time()
+    enc = build_enclosure(domain, tags, medium_tags=list(medium), **options)
+    if cache:
+        st = {k: (np.asarray(v) if isinstance(v, jax.Array) else v) for k, v in enc.__dict__.items() if k != "domain"}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(pickle.dumps(st))
+        tmp.replace(path)
+    log.info(
+        f"enclosure[{','.join(medium)}]: view factors built in {time.time() - t0:.1f} s"
+        + (f", cached as {path.name}" if cache else "")
+    )
+    return enc
+
+
+def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
+    """One enclosure per **connected** transparent medium among ``medium_regions``: the radiating surfaces are the
+    faces between the medium and every region next to it that is not itself transparent (read from the mesh's
+    interface cell sets ``A|B``). Refuses a medium with no solid neighbour, and a medium that reaches the domain
+    boundary away from the axis of an axisymmetric mesh (radiation would leave through a surface that is not
+    modelled)."""
+    import re
+
+    from .mesh_utils import mesh_cell_region_membership
+
+    mesh = domain.mesh
+    regions = mesh_cell_region_membership(mesh, int(domain.dimension))
+    medium_regions = [str(m) for m in medium_regions]
+    unknown = [m for m in medium_regions if m not in regions]
+    if unknown:
+        raise ValueError(f"d.irradiation: {unknown} are not volume regions of this mesh; known: {sorted(regions)}.")
+    cells2, _cell_type = _area_cells(mesh)
+    nodes = {m: set(np.unique(cells2[regions[m]]).tolist()) for m in medium_regions}
+
+    # connected media: regions sharing a node belong to one medium
+    parent = {m: m for m in medium_regions}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i, a in enumerate(medium_regions):
+        for b in medium_regions[i + 1 :]:
+            if nodes[a] & nodes[b]:
+                parent[find(a)] = find(b)
+    groups = {}
+    for m in medium_regions:
+        groups.setdefault(find(m), []).append(m)
+    media = [sorted(g) for g in groups.values()]
+
+    def side(name):
+        if name in regions:
+            return name
+        base = re.sub(r"\.\d+$", "", name)
+        return base if base in regions else None
+
+    # medium -> solid neighbours, from the interface sets
+    neighbours = {tuple(g): set() for g in media}
+    for key in getattr(mesh, "cell_sets", {}) or {}:
+        if "|" not in key:
+            continue
+        a, b = (side(x) for x in key.split("|", 1))
+        if a is None or b is None:
+            continue
+        for g in media:
+            if a in g and b not in medium_regions:
+                neighbours[tuple(g)].add(b)
+            if b in g and a not in medium_regions:
+                neighbours[tuple(g)].add(a)
+
+    # a medium must be closed: its cells may touch the domain boundary only on the axis (axisymmetric)
+    i0, i1, owner = _cell_edges(cells2)
+    edges = np.sort(np.stack([i0, i1], axis=1), axis=1)
+    uniq, inv, cnt = np.unique(edges, axis=0, return_inverse=True, return_counts=True)
+    bnd = cnt[inv.reshape(-1)] == 1
+    pts = np.asarray(mesh.points)
+    axis_tol = 1e-9 * max(float(np.ptp(pts[:, 0])), 1.0)
+    on_axis = np.all(pts[edges[:, :], 0] <= axis_tol, axis=1) if options.get("axisymmetric") else np.zeros(len(edges), bool)
+    parts = []
+    for g in media:
+        cells = np.zeros(len(cells2), bool)
+        for m in g:
+            cells |= np.asarray(regions[m])
+        leak = bnd & cells[owner] & ~on_axis
+        if leak.any():
+            raise ValueError(
+                f"d.irradiation: the transparent medium {g} reaches the domain boundary at "
+                f"{int(leak.sum())} edge(s), so radiation would leave it through a surface that is not modelled. "
+                "Close it with a solid part, or model the outside explicitly."
+            )
+        solids = sorted(neighbours[tuple(g)])
+        if not solids:
+            raise ValueError(f"d.irradiation: the transparent medium {g} has no solid neighbour to radiate from.")
+        parts.append(_cached_enclosure(domain, solids, g, options, cache))
+    return EnclosureSet(parts, media)

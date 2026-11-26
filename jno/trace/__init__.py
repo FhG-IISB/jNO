@@ -527,7 +527,14 @@ class Placeholder:
         return fc
 
     def __call__(self, *args):
-        """Call this expression with different variables (auto-wraps in operation)."""
+        """Call this expression with different variables (auto-wraps in operation).
+
+        An attached property, ``d.k``, called with FIELDS rather than coordinate variables -- ``d.k(T)`` --
+        is the same coefficient with its material laws evaluated at them (``domain._attached_coefficient``)."""
+        prop = getattr(self, "_jno_property", None)
+        if prop is not None and args and not all(isinstance(a, Variable) for a in args):
+            domain, name = prop
+            return domain._attached_coefficient(name, args)
         # Auto-wrap this expression in an OperationDef if not already one
         if not hasattr(self, "_auto_op"):
             self._auto_op = OperationDef(self)
@@ -4584,6 +4591,14 @@ class ModelCall(Placeholder):
         Returns:
             ``self``, for chaining.
         """
+        sym = getattr(self.model, "__dict__", {}).get("_unknown_symbol")
+        if sym is not None:
+            # `u = d.unknown()`: its start value / initial state (a number, an array, a formula), as on a field
+            # from fem_symbols -- see TrialFunction.initialize. Not the weights of a network.
+            if key is not None:
+                raise TypeError(f"{sym.name}.initialize: an unknown's starting value takes no key=.")
+            sym.initialize(weights)
+            return self
         self.model.initialize(weights, key=key)
         return self
 
@@ -6109,6 +6124,7 @@ class FemResidualOperator:
         # By the solver's VALUE identity where it has one: `fem.solve` builds a fresh composed solver
         # per call, so `id()` alone never matched and every call re-compiled.
         _sk = getattr(solve_fn, "cache_key", None) or id(solve_fn)
+        from ..utils import beacon as _beacon
         from ..utils.solver.newton_krylov import _FORCING
         from ..utils.solver.sharding import element_token
 
@@ -6116,7 +6132,7 @@ class FemResidualOperator:
         # must not answer a later `shard=False` call (nor the reverse); and by whether Newton steps are
         # inexact (`_FORCING`, read when the driver is traced), for the same reason.
         key = (
-            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0])
+            _sk, u0_t.shape, u0_t.dtype, tuple((v.shape, v.dtype) for v in vals_t), element_token(), bool(_FORCING[0]), _beacon.settings()
         )  # fmt: skip
         # A built preconditioner's arrays are ARGUMENTS of the program, not constants baked into it: a spec
         # rebuilt between solves (same shapes) reuses the program with its new arrays (`precond_state`).
@@ -6566,6 +6582,34 @@ class TrialFunction(_FieldComponentIndex, Placeholder):
             self._test = t
         return t
 
+    def initialize(self, value) -> "TrialFunction":
+        """The field's starting value: a number, a nodal array (one value per DOF, node-major for a vector
+        field), or a formula of the coordinates (``jno.np`` functions, a parameter, a network)::
+
+            T.initialize(1500.0); A.initialize(a0); I.initialize(300.0)
+            u.initialize(jno.np.sin(jno.np.pi * x))
+
+        * **Steady problem:** the solve's starting point -- Newton's first iterate, an iterative linear solver's
+          warm start. Read when ``fem.solve()`` is called, so it may change between solves of one ``fem``
+          (a continuation: ``u.initialize(sol)`` before each). Fields not initialized start at zero.
+        * **Time-dependent domain:** the initial state, exactly the term ``u(initial) - value`` (which still
+          works; giving both for one field raises). ``jno.fem`` reads it when it is built, so set it first;
+          a change after the build raises at ``fem.solve()``. A velocity initial condition of a second-order
+          problem stays the term ``u.t(initial) - v0``.
+
+        Read by ``jno.fem`` and ``jno.fdm`` alike. Returns the field, so it chains:
+        ``T = d.unknown.scalar("T").initialize(300.0)``."""
+        import os as _os
+
+        if isinstance(value, (str, bytes, _os.PathLike)) or (callable(value) and not isinstance(value, Placeholder)):
+            raise TypeError(
+                f"{self.name}.initialize: a field starts at a number, a nodal array or a formula of the coordinates; "
+                f"got {type(value).__name__} (checkpoints and weight initializers are for networks)."
+            )
+        self.__dict__["_initial"] = value
+        self.__dict__["_initial_version"] = self.__dict__.get("_initial_version", 0) + 1
+        return self
+
     def across(self, main: str, *, domain):
         """The trace of this field on the tagged boundary face ``main``, as a symbol usable in a weak
         term integrated on ANOTHER face -- the non-local ingredient of a two-face (thin-layer) condition.
@@ -6927,9 +6971,9 @@ class MeshVelocityField(FrozenField):
 
 class DerivedField(FrozenField):
     """A nodal field **computed from the current state** by a pure-JAX rule -- the value side of nonlocal
-    coupling, as opposed to :class:`jno.Coupling`'s residual side. Built by :func:`jno.derived`.
+    coupling, as opposed to a nonlocal residual term's (``d.irradiation``). Built by :func:`jno.derived`.
 
-    Where a :class:`Coupling` adds a nonlocal *residual vector* ``R(u) += c(u)``, a derived field carries a
+    Where a nonlocal residual term adds ``R(u) += c(u)``, a derived field carries a
     nonlocal *nodal value* ``d = f(u)`` that can be used **anywhere a field can** -- as a coefficient, a
     source, a material property. That is what a beam's optical depth ``tau(u)`` needs: ``exp(-tau)``
     multiplies a source, it is not a load.

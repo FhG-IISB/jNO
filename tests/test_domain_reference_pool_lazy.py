@@ -81,3 +81,15 @@ def test_it_pickles_as_the_full_dict():
     assert type(back) is dict
     assert set(back) == set(d._mesh_pool)
     assert all(isinstance(v, np.ndarray) and len(v) for v in back.values())
+
+
+def test_a_cloud_left_undrawn_is_still_drawn_after_the_mesh_is_built():
+    """Building the mesh consumes the mesh-free plan; a tag whose cloud was never read must still be drawn
+    from the geometry afterwards -- so a meshed domain pickles, as a cached mesh needs. (cloudpickle: the
+    mesh connectivity holds a closure, which plain pickle refuses.)"""
+    cloudpickle = pytest.importorskip("cloudpickle")
+    a = jno.shape.rect(0, 0, 1, 1).name("a")
+    d = (a + jno.shape.rect(0, 0, 2, 2).name("b")).sized(0.3).domain()
+    d.mesh  # noqa: B018  builds the deferred mesh
+    back = pickle.loads(cloudpickle.dumps(d))
+    assert len(back.mesh.points) == len(d.mesh.points)

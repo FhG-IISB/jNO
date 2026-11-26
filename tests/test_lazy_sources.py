@@ -73,13 +73,23 @@ class TestAttach:
         dom.variable("_f", np.memmap(path, dtype=np.float32, mode="r", shape=(B, 1, N, D)))
         assert dom.context["_f"].shape == (B, 1, N, D)
 
+    def test_np_memmap_is_stored_as_the_handle(self, tmp_path):
+        """np.memmap subclasses np.ndarray, but it is the lazy source a dataset larger than memory comes as:
+        it must stay the handle, not be read whole into a JAX array (a second full copy in RAM)."""
+        path = tmp_path / "f.npy"
+        np.save(path, _arr(B, 1, N, D))
+        mm = np.load(path, mmap_mode="r")
+        dom, _ = _dom()
+        dom.variable("_f", mm)
+        assert dom.context["_f"] is mm
+
     def test_eager_arrays_still_take_the_eager_path(self):
         """np.ndarray satisfies the duck-type too — it must NOT be treated as lazy."""
         dom, _ = _dom()
         dom.variable("_f", _arr(B, 1, N, D))
         import jax.numpy as jnp
 
-        assert isinstance(dom.context["_f"], jnp.ndarray)
+        assert isinstance(dom.context["_f"], (np.ndarray, jnp.ndarray)) and not isinstance(dom.context["_f"], np.memmap)
 
     def test_shape_without_getitem_raises_naming_both_requirements(self):
         class Half:
@@ -187,3 +197,28 @@ class TestExtremes:
         src = Counting(_arr(B + 5, 6, 5, 1))  # neither B nor 1 -> "shared", never vmapped
         dom.variable("table", src)
         assert dom.context["table"] is src
+
+
+class TestEagerHostArrays:
+    """An eager np.ndarray tensor tag is used as it is: attaching or preparing it must not keep a second host copy
+    (a JAX CPU buffer next to the caller's array doubled the RAM of a large label set)."""
+
+    def test_attach_keeps_the_callers_array(self):
+        dom, _ = _dom()
+        a = _arr(B, 1, N, D)
+        dom.variable("_f", a)
+        assert np.shares_memory(np.asarray(dom.context["_f"]), a)
+
+    def test_prepared_context_shares_the_callers_array(self):
+        dom, x = _dom()
+        a = _arr(B, 1, dom.context["interior"].shape[2], D)  # one value per mesh point of _dom()
+        f = dom.variable("_f", a)
+        import foundax
+        import jax
+
+        net = jno.nn(foundax.mlp(1, output_dim=1, key=jax.random.PRNGKey(0)))
+        net.optimizer(optax.adam(1e-3))
+        crux = jno.core([(net(x) - f).mse])
+        assert np.shares_memory(np.asarray(crux.domain_data.context["_f"]), a)
+        crux.solve(2, batchsize=4, offload_data=True)  # streams from it
+        crux.solve(2, batchsize=4)  # and the on-device path still takes it

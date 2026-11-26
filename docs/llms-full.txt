@@ -435,7 +435,7 @@ tau    = d.cell_size / (2 * beta.norm())            # SUPG stabilisation from th
 ```
 
 Geometry symbols: `d.variable(tag, normals=True, split=True)` → `nx, ny`; `d.cell_size`;
-`d.enclosure(tags)` (view factors for grey-body radiation). Second derivatives for 4th-order forms:
+`d.irradiation(T)` (incident radiation for grey-body radiation terms). Second derivatives for 4th-order forms:
 `jno.np.laplacian(ui, [xi, yi])`, `jno.np.hessian(ui, [xi, yi])` — needs `order >= 2`.
 
 > **Conformity caveat.** Lagrange is C⁰, so `∫Δu·Δv` over P2 is *non-conforming* and does not give

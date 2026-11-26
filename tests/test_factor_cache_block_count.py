@@ -122,3 +122,44 @@ def test_the_cache_still_evicts_so_it_cannot_grow_without_bound():
     assert len(_linear._FACTOR_CACHE) <= _linear._FACTOR_CACHE_MAX, (
         f"{len(_linear._FACTOR_CACHE)} entries against a cap of {_linear._FACTOR_CACHE_MAX}"
     )
+
+
+def _two_root_newton(linear):
+    """eps lap u + (u^2 - 1) v = 0 from u = 0.5: Newton takes several steps to the root u = 1."""
+    import jno
+
+    d = jno.shape.rect(0, 0, 1, 1).sized(0.1).domain()
+    x, y, _ = d.variable("interior", split=True)
+    u, v = d.fem_symbols()
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([1e-3 * (ui.d(x) * vi.d(x) + ui.d(y) * vi.d(y)) + (ui**2 - 1.0) * vi])
+    x0 = jnp.full(len(np.asarray(d.mesh.points)), 0.5)
+    sol = fem.solve(x0=x0, nonlinear=jno.solve.newton(direct=True, rtol=1e-12, atol=0.0, max_steps=40), linear=linear)
+    return np.asarray(sol)
+
+
+def test_a_newton_solve_keeps_none_of_its_step_factorizations():
+    """A Newton tangent changes every step, so a kept factorization is never hit again: the default keeps none
+    (a large coupled problem otherwise holds up to eight dead factorizations). An explicit reuse=True still keeps
+    them, and both give the same root."""
+    import jno
+
+    plain = _two_root_newton(jno.solve.lu(backend="host"))
+    assert len(_linear._FACTOR_CACHE) == 0, f"{len(_linear._FACTOR_CACHE)} Newton-step factorizations kept"
+    _linear._FACTOR_CACHE.clear()
+    kept = _two_root_newton(jno.solve.lu(backend="host", reuse=True))
+    assert len(_linear._FACTOR_CACHE) >= 2  # one per step: the explicit choice wins
+    np.testing.assert_allclose(plain, 1.0, atol=1e-10)
+    np.testing.assert_allclose(plain, kept, rtol=0, atol=1e-13)
+
+
+def test_outside_a_newton_solve_the_default_still_keeps():
+    """The constant-operator case the cache exists for: the default (reuse=None) keeps, and a repeat hits."""
+    n = 30
+    op, b = _operator(n, 1.0), jnp.ones(n)
+    _linear.host_lu_solve(op, b)
+    assert len(_linear._FACTOR_CACHE) == 1
+    with _linear.factorizations_not_kept():
+        _linear.host_lu_solve(_operator(n, 2.0), b)
+        _linear.host_lu_solve(_operator(n, 3.0), b, reuse=True)  # an explicit choice wins inside too
+    assert len(_linear._FACTOR_CACHE) == 2

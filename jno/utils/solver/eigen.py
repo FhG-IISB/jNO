@@ -26,6 +26,8 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
 
+from .. import beacon
+
 
 class ShiftInvertNotConverged(RuntimeError):
     """``jno.solve.eigs(sigma=...)`` / ``FEM.eigs(sigma=...)`` did not reach its residual gate.
@@ -352,6 +354,8 @@ def lobpcg_geneigh(
         Xn = proj(Xn)  # exact already in exact arithmetic; this keeps rounding from drifting back into span Y
         Xn = _m_orth_ordered(Xn, _blockmv(Mop, Xn), eps_chol)
         _l, _r, res_n = ritz(Xn, k)
+        if beacon.active():  # nothing is traced unless the solve has log=
+            beacon.emit("eigs", i + 1, res_n, tol, step=i + 1, last=(res_n <= tol) | (i + 1 >= maxiter))
         return (i + 1, Xn, Pn, res_n)
 
     V0 = jax.random.normal(jax.random.PRNGKey(seed), (n, kb), dtype=dtype.dtype)
@@ -1115,6 +1119,8 @@ def shift_invert_geneigh(
         # a dead or capped column among the k returned is never "converged" (a zero column has a zero
         # residual and would otherwise pass)
         rel = jnp.where(jnp.all(cls[order][:k] == 0), rel, jnp.inf)
+        if beacon.active():  # nothing is traced unless the solve has log=
+            beacon.emit("eigs", i + 1, rel, tol, step=i + 1, last=(rel <= tol) | (i + 1 >= maxiter))
         return (i + 1, Vn, rel, lam)
 
     key = jax.random.PRNGKey(seed)

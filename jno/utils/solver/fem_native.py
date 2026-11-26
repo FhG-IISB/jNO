@@ -92,6 +92,7 @@ from .fem_utils import (
     compress_plan,
     compress_plan_blocks,
     elem_map,
+    input_dependencies,
     raw_pattern_from_blocks,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
@@ -1137,6 +1138,18 @@ def _frozen_field_basis_index(node, fields, field_index):
     )
 
 
+def _unindexed_parameter_use(node, name, parent_indexes=False):
+    """True if runtime parameter ``name`` occurs in ``node`` other than as the direct operand of an
+    index (``k[i]``), i.e. used whole."""
+    from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+    from .solver_helper import iter_children
+
+    if _is_runtime_scalar_parameter(node) and _parameter_name(node) == name:
+        return not parent_indexes
+    indexes = getattr(node, "getitem_key", None) is not None
+    return any(_unindexed_parameter_use(c, name, indexes) for c in iter_children(node) or ())
+
+
 def _declared_parameter_size(expr):
     """Number of components a runtime parameter was declared with, or ``None`` if unreadable.
 
@@ -1167,6 +1180,90 @@ TOPOLOGY_ARG = "__topology__"
 
 
 _NO_POINTS = "__jno_no_point_loads__"  # an `args` flag: assemble without the point loads (static placeholders)
+
+
+def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
+    """``(conn, interior)``: the boundary facet connectivity with the facets of every INTERIOR interface tag in
+    ``regions`` appended, and a boolean over the result marking the appended ones.
+
+    An interface facet has two cells; its parent (whose basis evaluates the traces, and out of which its normal
+    points) is the cell on the side of the tag's FIRST region: for ``"A|B"`` the facet belongs to A and its
+    normal points from A into B. A tag without that form takes the first cell found. Continuous fields have the
+    same trace from either side, so only normals and one-sided derivatives depend on the choice."""
+    from ...domain.mesh_utils import mesh_cell_region_membership
+    from .fem_facets import FacetConnectivity, _boundary_faces
+
+    n_b = int(conn.n_bfaces)
+    if not hasattr(domain, "tag_facets") or not regions:
+        return conn, np.zeros(n_b, dtype=bool)
+    boundary_keys = {frozenset(int(x) for x in f) for f in np.asarray(conn.face_nodes)}
+    wanted = []
+    for region in regions:
+        if region == "boundary":
+            continue
+        named = domain.tag_facets(region)
+        if named is None:
+            continue
+        inner = [f for f in np.asarray(named) if frozenset(int(x) for x in f) not in boundary_keys]
+        if inner:
+            wanted.append((str(region), np.asarray(inner, dtype=np.int64)))
+    if not wanted:
+        return conn, np.zeros(n_b, dtype=bool)
+
+    local_faces, n_face_nodes = _face_table(cell_key)
+    flat, _sel, n_local = _boundary_faces(np.asarray(cells_p1), local_faces, n_face_nodes)
+    # one id per distinct node set, shared by the cell faces and the wanted facets (one unique over both,
+    # so the two sides are keyed identically)
+    all_facets = np.concatenate([f for _r, f in wanted])
+    _, ids = np.unique(np.concatenate([np.sort(flat, axis=1), np.sort(all_facets, axis=1)]), axis=0, return_inverse=True)
+    ids = np.asarray(ids).reshape(-1)
+    cell_ids, facet_ids = ids[: len(flat)], ids[len(flat) :]
+    order = np.argsort(cell_ids, kind="stable")
+    sorted_ids = cell_ids[order]
+    regions_cells = mesh_cell_region_membership(domain.mesh, int(domain.dimension))
+
+    def side_cells(name):
+        import re
+
+        for cand in (name, re.sub(r"\.\d+$", "", name)):
+            if cand in regions_cells:
+                return np.asarray(regions_cells[cand], dtype=bool)
+        return None
+
+    parent, local, nodes, seen = [], [], [], set(boundary_keys)
+    at = 0
+    for region, facets in wanted:
+        first = side_cells(region.split("|", 1)[0]) if "|" in region else None
+        for f, fid in zip(facets, facet_ids[at : at + len(facets)]):
+            k = frozenset(int(x) for x in f)
+            if k in seen:
+                continue
+            lo, hi = np.searchsorted(sorted_ids, fid, "left"), np.searchsorted(sorted_ids, fid, "right")
+            rows = order[lo:hi]
+            if rows.size == 0:
+                continue
+            row = rows[0]
+            if first is not None:
+                own = [r for r in rows if first[r // n_local]]
+                row = own[0] if own else rows[0]
+            seen.add(k)
+            parent.append(row // n_local)
+            local.append(row % n_local)
+            nodes.append(flat[row])
+        at += len(facets)
+    if not parent:
+        return conn, np.zeros(n_b, dtype=bool)
+    merged = FacetConnectivity(
+        parent_cell=np.concatenate([np.asarray(conn.parent_cell), np.asarray(parent, dtype=np.int64)]),
+        local_face=np.concatenate([np.asarray(conn.local_face), np.asarray(local, dtype=np.int64)]),
+        face_nodes=np.concatenate(
+            [np.asarray(conn.face_nodes).reshape(-1, n_face_nodes), np.asarray(nodes, dtype=np.int64)]
+        ),
+        n_bfaces=n_b + len(parent),
+    )
+    interior = np.zeros(merged.n_bfaces, dtype=bool)
+    interior[n_b:] = True
+    return merged, interior
 
 
 def assemble_fem_native(
@@ -1661,30 +1758,29 @@ def assemble_fem_native(
 
     refuse_space_field_parameters(_rt_param_exprs, "nodal Lagrange")
 
-    # A BARE (non-field) runtime parameter is packed as a single scalar -- ``flat[:1]`` in
-    # ``_runtime_vals`` below -- and read back as one. A multi-component one therefore had every entry
-    # past the first SILENTLY DISCARDED: `parameter((2,))` initialised to [2.0, 999.0] and to
-    # [2.0, 0.001] assembled bit-identical operators. Indexing it (`k[1] * ...`, the natural spelling
-    # for an anisotropic coefficient) instead died deep in the trace layer on a bare
-    # ``IndexError: array is 0-dimensional``, naming nothing the user wrote.
-    #
-    # Refuse it here, where the declared shape is still visible. Only when the size is *known* to
-    # exceed one: a shape this cannot read stays on the existing path rather than becoming a false
-    # refusal. Field (nodal) and cell (P0) parameters are exempt -- they are many-valued by
-    # construction and have their own gather.
+    # A VECTOR parameter (bare, declared with more than one component) reaches the kernel whole and is
+    # read component by component, ``k[0] * ui.x * vi.x + k[1] * ui.y * vi.y``: one vector lets one
+    # optimiser see every component jointly. Used whole it has no meaning in a scalar form (it would
+    # broadcast a vector into every quadrature value; it used to be truncated silently to its first
+    # entry), so every occurrence must be indexed. Only a size *known* to exceed one counts: a shape
+    # this cannot read stays on the scalar path. Field (nodal) and cell (P0) parameters are
+    # many-valued by construction and have their own gather.
+    _vector_param_sizes: Dict[str, int] = {}
     for _pname in runtime_parameter_tags:
         if _pname in _field_param_names or _pname in _cell_field_names:
             continue
         _psize = _declared_parameter_size(_rt_param_exprs.get(_pname))
         if _psize is not None and _psize > 1:
+            _vector_param_sizes[_pname] = _psize
+    for _pname, _psize in _vector_param_sizes.items():
+        _all_terms = [*volume_terms, *(e for _exprs in boundary_terms.values() for e in _exprs)]
+        if any(_unindexed_parameter_use(t, _pname) for t in _all_terms):
             raise NotImplementedError(
-                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components, but a "
-                "bare (non-field) parameter reaches the element kernel as a single scalar -- the "
-                "remaining components would be silently dropped, and indexing it (k[1]) fails inside the "
-                "trace layer. Use one scalar parameter per component (`kx = jno.np.parameter((1,)); ky = "
-                "jno.np.parameter((1,))`, then `kx * ui.x * vi.x + ky * ui.y * vi.y`), or a FIELD "
-                "parameter `jno.np.parameter(<P1 symbol>)` for one value per node."
+                f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components and is "
+                "used whole in a scalar form. Index it, k[i] for component i (e.g. "
+                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component."
             )
+    vector_parameter_tags: Tuple[str, ...] = tuple(sorted(_vector_param_sizes))
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
     # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
@@ -2054,6 +2150,11 @@ def assemble_fem_native(
     )
 
     conn = build_facet_connectivity(cells_p1, cell_key)
+    # Surface terms on INTERIOR interfaces (a tag such as "gas|solid" between two regions): their facets are not
+    # boundary facets, so append them, each once, to the facet list the surface assembly runs over. Without this
+    # such a term integrated over nothing, silently. Only facets a surface term names are added, so a form
+    # without interface terms is assembled exactly as before.
+    conn, _interior_facets = _with_interface_facets(domain, conn, cells_p1, cell_key, list(boundary_terms or {}))
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
     # Frozen outward-orientation sign per boundary facet, so the normals can be recomputed differentiably
     # from moved vertices (``_face_normals_jax``) when coordinates are trainable (Feature 3). The sign is
@@ -2172,8 +2273,15 @@ def assemble_fem_native(
             [
                 all(int(conn.face_nodes[fi, j]) in _rnodes for j in range(conn.face_nodes.shape[1]))
                 for fi in range(conn.n_bfaces)
-            ]
+            ],
+            dtype=bool,
         )
+        _mask &= ~_interior_facets  # interface facets belong only to the tag that names them
+        if not _mask.any() and _named is not None and len(_named) and region != "boundary":
+            raise ValueError(
+                f"jno.fem: the surface term on {region!r} selects none of that tag's {len(_named)} facets on this "
+                "mesh, so it would integrate over nothing. Check that the tag names facets of this mesh."
+            )
         return np.where(_mask)[0].astype(np.int32)
 
     # Boundary-face ids per region that carries a surface state (the faces its readout advances).
@@ -2946,12 +3054,15 @@ def assemble_fem_native(
                 _w = (
                     int(cells_j.shape[1])  # P1 nodes per cell -- the space a field parameter lives on
                     if (name in _field_param_names and name not in _cell_field_names)
-                    else 1
+                    else _vector_param_sizes.get(name, 1)
                 )
                 pv.append(jnp.zeros((_w,), dtype))
                 continue
             flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            if name in _cell_field_names:
+            if name in _vector_param_sizes:
+                # The whole vector, every cell alike; the kernel indexes it (a scalar placeholder broadcasts).
+                pv.append(jnp.broadcast_to(flat, (_vector_param_sizes[name],)))
+            elif name in _cell_field_names:
                 # P0 -> this cell's single value. Width 1, so the kernel takes its scalar branch and
                 # broadcasts it over the quad points -- which is what a per-element constant is.
                 pv.append(jnp.reshape(flat[c], (1,)))
@@ -3032,14 +3143,19 @@ def assemble_fem_native(
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
     def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
-                      seeded=True):  # fmt: skip
+                      seeded=True, cell_sols=None):  # fmt: skip
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
         O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
         per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
-        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh)."""
-        cell_sols = _split_cell_local(local_all)
+        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh).
+        ``cell_sols`` (per-field local vectors) stands in for ``local_all``: one input per field, which is how
+        :func:`input_dependencies` tells the fields a term reads apart."""
+        if cell_sols is None:
+            cell_sols = _split_cell_local(local_all)
+        else:
+            local_all = cell_sols[0]  # only its dtype is read below
         per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts, cells, cells_f)
         # The `dom.cell_size` / `dom.cell_metric` geometry symbols a stabilized form reads.
         h_qp, G_qp = _cell_geometry_symbols(meas, _J)
@@ -3053,6 +3169,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": rnames,
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + cell_masks,
             "trial_value_shape": fields[tfi]["value_shape"],
@@ -3158,6 +3275,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, "cell_size": h_qp, "cell_metric": G_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": rnames,
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + tuple(_region_mask_array(r)[c] for r in rnames),
             "trial_value_shape": fields[0]["value_shape"],
@@ -3481,6 +3599,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, f"n_{region}": n_vec},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
             # This face's 0/1 value for every tag the boundary terms reference, so `TagMask` resolves
@@ -3556,6 +3675,7 @@ def assemble_fem_native(
             "domain_context": {**ctx, f"n_{region}": n_vec},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
+            "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": (),
             "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
             "trial_value_shape": fields[0]["value_shape"],
@@ -3791,6 +3911,98 @@ def assemble_fem_native(
         cell, N = _point_shape(pos, pts_dyn)
         return cell, coef[:, None] * N
 
+    # --- DOFs held at 0 outside their field's region (`d.unknown(..., region=R)`) ------------------------
+    # Such a field numbers its DOFs on the whole mesh and pins those outside R (`_region_field_pins`), so
+    # after the Dirichlet elimination each is an identity row and column. Two things follow, both exact:
+    # a cell where every DOF of the TEST field is pinned contributes only to pinned rows, so its block
+    # need not be computed; and an entry in a pinned row or column is zeroed by the elimination, so it
+    # need not be STORED. Without the second, every pinned DOF kept its whole cell-block pattern as
+    # explicit zeros, and every consumer of the stored pattern (the LU's ordering and fill, the device
+    # matvec, the scatter) paid for it: 93% of a coupled flow-and-heat tangent's stored entries.
+    # Static connectivity only: a runtime triangulation moves the cells these sets are taken from.
+    _dead_cache: Dict[str, Any] = {}
+
+    def _dead_dofs():
+        """Bool ``(total,)`` of the pinned outside DOFs, or ``None`` when there are none."""
+        if "dead" not in _dead_cache:
+            dead = None
+            if not dynamic_topology and any(f.get("region") is not None for f in fields):
+                dead = np.zeros(int(total), dtype=bool)
+                dead[np.asarray([p for p, _v in _region_field_pins()], dtype=np.int64)] = True
+                dead = dead if dead.any() else None
+            _dead_cache["dead"] = dead
+        return _dead_cache["dead"]
+
+    def _live_cells(tfi):
+        """The cells holding a free DOF of test field ``tfi`` (int32), or ``None`` for every cell."""
+        key = ("cells", int(tfi))
+        if key not in _dead_cache:
+            dead, cells = _dead_dofs(), None
+            if dead is not None:
+                live = ~dead[np.asarray(cdofs[tfi])].all(axis=1)
+                cells = None if live.all() else np.flatnonzero(live).astype(np.int32)
+            _dead_cache[key] = cells
+        return _dead_cache[key]
+
+    def _drop_dead(plan):
+        """``plan`` without the slots in a pinned row or column; their raw triplets scatter out of range,
+        which ``segment_sum`` drops."""
+        dead = _dead_dofs()
+        if plan is None or dead is None:
+            return plan
+        idx, inv, nse = plan
+        keep = ~(dead[idx[:, 0]] | dead[idx[:, 1]])
+        if keep.all():
+            return plan
+        n_keep = int(keep.sum())
+        pos = np.where(keep, np.cumsum(keep) - 1, n_keep).astype(np.int32)
+        return (np.ascontiguousarray(idx[keep]), pos[inv], n_keep)
+
+    _term_cols_cache: Dict[Any, Any] = {}
+
+    def _term_cols(coeff, tfi, rnames):
+        """``(columns, own)`` of a volume term's tangent: the positions, in the cell's all-field local vector,
+        of the DOFs of every field the term reads (int32, field order), and where the test field's own block
+        sits among them (``None`` when the term does not read it).
+
+        The fields come from :func:`input_dependencies` over the term's element residual with one input per
+        field, which never leaves out a field the residual can depend on. A runtime triangulation keeps every
+        column (its host plan is built per triangulation from the full layout), and so does a term whose
+        element residual cannot be traced here for the analysis (it then costs columns, not correctness)."""
+        key = (id(coeff), int(tfi), rnames)
+        hit = _term_cols_cache.get(key)
+        if hit is not None and hit[0] is coeff:
+            return hit[1]
+        deps = list(range(len(fields)))
+        if not dynamic_topology:
+            sols0 = [jnp.zeros((n_local_f[i], vecs[i]), dtype=jnp.result_type(float)) for i in range(len(fields))]
+            try:
+                deps = [
+                    i - 1
+                    for i in input_dependencies(
+                        lambda c, *sl: _vol_elem_res(
+                            c, None, coeff, tfi, rnames, 0.0, None, None, None, None, seeded=True, cell_sols=list(sl)
+                        ),
+                        jnp.asarray(0, jnp.int32),
+                        *sols0,
+                    )
+                    if i >= 1
+                ]
+            except Exception:  # noqa: BLE001 -- not traceable without runtime args: keep every column
+                deps = list(range(len(fields)))
+        cols = (
+            np.concatenate([np.arange(loc_seg[i], loc_seg[i + 1]) for i in deps]).astype(np.int32)
+            if deps
+            else np.zeros(0, np.int32)
+        )
+        own = None
+        if tfi in deps:
+            lo = sum(loc_seg[i + 1] - loc_seg[i] for i in deps if i < tfi)
+            own = (int(lo), int(lo + loc_seg[tfi + 1] - loc_seg[tfi]))
+        out = (cols, own)
+        _term_cols_cache[key] = (coeff, out)
+        return out
+
     def _make_residual(terms, bterms=None):
         """Build the free global residual ``R(u_flat) -> (total,)`` (volume + optional surface).
 
@@ -3815,22 +4027,25 @@ def assemble_fem_native(
                 kernel = lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(  # noqa: E731
                     c, la, _e, _t, _r, t, args, pts_dyn, cl_d, clf_d
                 )
+                lc = _live_cells(tfi)  # None: every cell
+                cells_t = jnp.arange(n_cells) if lc is None else jnp.asarray(lc)
+                rows_t = cd_d[tfi] if lc is None else cd_d[tfi][lc]
                 if _emesh is None:
                     R = _elem_map(
                         kernel,
-                        (jnp.arange(n_cells), local_all),
-                        _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1]),
-                        scatter=(R, cd_d[tfi]),
+                        (cells_t, local_all if lc is None else local_all[lc]),
+                        _cell_chunk(int(cells_t.shape[0]), cd_d[tfi].shape[1], cad_d.shape[1]),
+                        scatter=(R, rows_t),
                     )
                 else:
                     Rp = _sharded_element_add(
                         Rp,
-                        cd_d[tfi],
+                        rows_t,
                         # indices, not gathered values: each device gathers only its own cells' DOFs
                         lambda xs, _k=kernel, _t=tfi: _elem_map(
                             _k, (xs[0], u_flat[xs[1]]), _cell_chunk(int(xs[0].shape[0]), cd_d[_t].shape[1], cad_d.shape[1])
                         ),
-                        (jnp.arange(n_cells), cad_d),
+                        (cells_t, cad_d if lc is None else cad_d[lc]),
                         _emesh,
                     )
             if Rp is not None:
@@ -3963,6 +4178,12 @@ def assemble_fem_native(
         tangent tensor and OOMs on any non-trivial mesh). The dense result is entry-for-entry
         identical to that global ``jacfwd``, just assembled within a per-element memory budget."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
+        # Each volume term's tangent is taken against the fields it READS (`_term_cols`), not every field of
+        # the cell: the columns of a field it does not read are zero for every state, so they are neither
+        # computed nor stored. A term that reads no unknown (a load) has no tangent block at all.
+        # `typed_with_masks` below is the tangent's term list: (coeff, test field, mask, columns, own block).
+        typed_with_masks = [t + _term_cols(*t) for t in typed_with_masks]
+        typed_with_masks = [t for t in typed_with_masks if t[3].shape[0] > 0]
 
         # --- hoist the (row, col) pattern out of the trace -------------------------------------
         # The triplet INDICES come exclusively from host-static mesh connectivity (`cdofs`,
@@ -4088,8 +4309,12 @@ def assemble_fem_native(
             _blocks = []
             _cdofs32 = [np.asarray(_c, dtype=np.int32) for _c in cdofs]
             _cad32 = np.asarray(cell_all_dofs, dtype=np.int32)
-            for _coeff_s, _tfi_s, _rn_s in typed_with_masks:
-                _blocks.append(("outer", _cdofs32[_tfi_s], _cad32))
+            for _coeff_s, _tfi_s, _rn_s, _sel_s, _own_s in typed_with_masks:
+                _lc = _live_cells(_tfi_s)
+                _cs = _cad32[:, _sel_s]
+                _blocks.append(
+                    ("outer", _cdofs32[_tfi_s], _cs) if _lc is None else ("outer", _cdofs32[_tfi_s][_lc], _cs[_lc])
+                )
             for _region_s, _face_ids_s, _btyped_s in surface_work:
                 _pc = np.asarray(parent_j, dtype=np.int64)[np.asarray(_face_ids_s, dtype=np.int64)]
                 _fcols = _cad32[_pc]
@@ -4133,7 +4358,7 @@ def assemble_fem_native(
                 # So fall through to the ordinary path.
             _idx_static = None
             try:
-                _plan = compress_plan_blocks(_blocks) if _blocks else None
+                _plan = _drop_dead(compress_plan_blocks(_blocks)) if _blocks else None
             except Exception:  # noqa: BLE001 -- a traced pattern would break the static-count invariant
                 # Drop the pattern as the pre-plan code always did: a TRACED one must not be cached
                 # across traces, and the fallback below rebuilds it in-trace anyway.
@@ -4171,10 +4396,11 @@ def assemble_fem_native(
                 dtype=np.int64,
             )
             rows, cols = [], []
-            for _c_s, _tfi_s, _rn_s in typed_with_masks:
-                sh = (n_cells, cdh[_tfi_s].shape[1], cadh.shape[1])
+            for _c_s, _tfi_s, _rn_s, _sel_s, _own_s in typed_with_masks:
+                _ch = cadh[:, _sel_s]
+                sh = (n_cells, cdh[_tfi_s].shape[1], _ch.shape[1])
                 rows.append(np.broadcast_to(cdh[_tfi_s][:, :, None], sh).reshape(-1))
-                cols.append(np.broadcast_to(cadh[:, None, :], sh).reshape(-1))
+                cols.append(np.broadcast_to(_ch[:, None, :], sh).reshape(-1))
             for _r_s, _fids_s, _bt_s in surface_work:
                 pc = ph[np.asarray(_fids_s, dtype=np.int64)]
                 fcols = cadh[pc]
@@ -4293,26 +4519,36 @@ def assemble_fem_native(
                 _off[0] += k
                 _nblk[0] += 1
 
-            for coeff, tfi, rnames in typed_with_masks:
+            for coeff, tfi, rnames, sel, own in typed_with_masks:
+                _sel_j = jnp.asarray(sel)
 
-                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
+                def _ke(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn, _s=_sel_j, _o=own):
                     # Forward over the SEEDED residual (one reverse pass per cell for every test DOF), not over
                     # the per-test-DOF evaluation: that one evaluated the integrand k_test x k_trial times per
                     # point. Its block is symmetric to round-off only, so it is averaged within the solver's
                     # own symmetry gate (`_symmetrise_own_block`), which makes it bitwise symmetric.
-                    Ke = jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True))(la)
-                    return _symmetrise_own_block(Ke, loc_seg[_t], loc_seg[_t + 1])
+                    # Against the term's own columns only (`_term_cols`); the rest of the cell's are zero.
+                    Ke = jax.jacfwd(
+                        lambda vs: _vol_elem_res(c, la.at[_s].set(vs), _e, _t, _r, t, args, _p, cl_d, clf_d, seeded=True)
+                    )(la[_s])
+                    return Ke if _o is None else _symmetrise_own_block(Ke, _o[0], _o[1])
 
-                _chunk_v = _cell_chunk(n_cells, cd_d[tfi].shape[1], cad_d.shape[1])
+                _lc = _live_cells(tfi)  # None: every cell (see `_dead_dofs`)
+                _cells_t = jnp.arange(n_cells) if _lc is None else jnp.asarray(_lc)
+                _n_t = int(_cells_t.shape[0])
+                _la_t = local_all if _lc is None else local_all[_lc]
+                _cd_t = cd_d[tfi] if _lc is None else cd_d[tfi][_lc]
+                _cad_t = cad_d[:, sel] if _lc is None else cad_d[_lc][:, sel]
+                _chunk_v = _cell_chunk(_n_t, cd_d[tfi].shape[1], int(sel.shape[0]))
                 if diag:
                     # per cell: the block's entries at (row a, the column holding the same global DOF)
                     _rows_t = cd_d[tfi]
 
-                    def _kd(c, la, _k=_ke, _rt=_rows_t):
-                        same = _rt[c][:, None] == cad_d[c][None, :]  # (n_test, n_local_all)
+                    def _kd(c, la, _k=_ke, _rt=_rows_t, _s=_sel_j):
+                        same = _rt[c][:, None] == cad_d[c][_s][None, :]  # (n_test, n_term_cols)
                         return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
 
-                    _dacc[0] = _elem_map(_kd, (jnp.arange(n_cells), local_all), _chunk_v, scatter=(_dacc[0], _rows_t))
+                    _dacc[0] = _elem_map(_kd, (_cells_t, _la_t), _chunk_v, scatter=(_dacc[0], _cd_t))
                     continue
                 if _plan is not None:
                     # Scatter each CHUNK's element blocks straight into the compressed slots (the residual's
@@ -4322,12 +4558,12 @@ def assemble_fem_native(
                     # 16^3 P1/P1 Navier-Stokes tangent, growing with the cell count where the chunked
                     # scratch does not.
                     k = _blk_sizes[_nblk[0]]
-                    n_t, n_l = int(cd_d[tfi].shape[1]), int(cad_d.shape[1])
-                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(n_cells, n_t * n_l))
+                    n_t, n_l = int(cd_d[tfi].shape[1]), int(sel.shape[0])
+                    inv_b = _inv_block(_plan, _nblk[0], _off[0], k, shape=(_n_t, n_t * n_l))
                     acc = _acc[0] if _acc[0] is not None else jnp.zeros((_plan[2],), dtype=local_all.dtype)
                     _acc[0] = _elem_map(
                         lambda c, la, _k=_ke: _k(c, la).reshape(-1),
-                        (jnp.arange(n_cells), local_all),
+                        (_cells_t, _la_t),
                         _chunk_v,
                         scatter=(acc, inv_b),
                     )
@@ -4336,14 +4572,14 @@ def assemble_fem_native(
                     continue
                 Ke = _elem_map(  # (n_cell, n_test_tfi, n_local_all)
                     _ke,
-                    (jnp.arange(n_cells), local_all),
+                    (_cells_t, _la_t),
                     _chunk_v,
                 )
                 _emit(
                     Ke.reshape(-1),
-                    lambda _K=Ke, _t=tfi: jnp.broadcast_to(cd_d[_t][:, :, None], _K.shape).reshape(-1),
-                    lambda _K=Ke: jnp.broadcast_to(cad_d[:, None, :], _K.shape).reshape(-1),
-                    lambda _K=Ke: jnp.broadcast_to(jnp.arange(_K.shape[0])[:, None, None], _K.shape).reshape(-1),
+                    lambda _K=Ke, _r=_cd_t: jnp.broadcast_to(_r[:, :, None], _K.shape).reshape(-1),
+                    lambda _K=Ke, _c=_cad_t: jnp.broadcast_to(_c[:, None, :], _K.shape).reshape(-1),
+                    lambda _K=Ke, _ct=_cells_t: jnp.broadcast_to(_ct[:, None, None], _K.shape).reshape(-1),
                 )
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
@@ -4732,6 +4968,24 @@ def assemble_fem_native(
                 # batched: one vmap over every boundary node x every region facet was the build's peak
                 mask = map_points(loc, coords, getattr(loc, "n_entities", 1)).astype(bool)
             bnodes = bnodes[mask]
+        # A tag on a body's faces INSIDE a conforming mesh (`d.tag(name, where, region=body)` over part of
+        # an interface): its nodes are not on any boundary facet, so the walk above finds only those that
+        # also touch the outer boundary. Measured on two stacked squares: `T(seg) - 1` pinned 1 of the
+        # segment's 11 nodes, silently. Add the body's nodes it shares with other cells (its surface
+        # inside the mesh, P2 midpoints included: the field's own connectivity) where `where` holds.
+        if region in (getattr(domain, "_interior_face_tags", ()) or ()):
+            _body = (getattr(domain, "_tag_regions", {}) or {}).get(region)
+            _pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
+            _cf = np.asarray(cells_f_real[fidx])
+            _in = np.asarray(_cell_region_mask(domain, _body)).reshape(-1) > 0
+            if _pred is None or _in.shape[0] != _cf.shape[0]:
+                raise NotImplementedError(
+                    f"Dirichlet on {region!r}: the faces of body {_body!r} inside the mesh could not be "
+                    "resolved on this field's cells. Pin a whole interface tag (domain.interface_tags()) instead."
+                )
+            _surf = np.intersect1d(np.unique(_cf[_in]), np.unique(_cf[~_in]))
+            _keep = np.asarray(_pred(*(pts_all[_surf, i] for i in range(dim))), dtype=bool).reshape(-1)
+            bnodes = np.union1d(np.asarray(bnodes, dtype=np.int64), _surf[_keep])
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of
         # a non-conforming interface have identical coordinates, so the predicate above selects BOTH;
         # ownership is the only thing that separates them, and it lives in the node ids.
@@ -4759,6 +5013,34 @@ def assemble_fem_native(
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]
 
+    def _region_field_pins() -> List[Tuple[int, float]]:
+        """``(dof, 0.0)`` for every DOF of a region field on a node outside its region.
+
+        The node set comes from :func:`_region_node_ids_from_cells` on the field's own connectivity -- the
+        same centroid classification the assembler integrates with -- so a node on the region's boundary
+        (shared with a cell inside) is IN the region and stays free. A region this cannot resolve raises:
+        pinning nothing would leave the field's outside DOFs in no equation, and pinning everything would
+        solve for zero."""
+        out: List[Tuple[int, float]] = []
+        for fidx, f in enumerate(fields):
+            region = f.get("region")
+            if region is None:
+                continue
+            inside = _region_node_ids_from_cells(domain, region, np.asarray(cells_f_all[fidx]))
+            if inside is None:
+                known = sorted(
+                    set(getattr(domain, "_source_regions", None) or {}) | set(getattr(domain, "_shape_regions", None) or {})
+                )
+                raise ValueError(
+                    f"jno.fem: a field is declared on region={region!r}, which is not a named region of this "
+                    f"domain (a shape part or a mesh-file volume). Known regions: {known}."
+                )
+            outside = np.ones(int(n_nodes_f[fidx]), dtype=bool)
+            outside[np.asarray(inside, dtype=int)] = False
+            vt = int(vecs[fidx])
+            out.extend((int(offs[fidx] + nid * vt + c), 0.0) for nid in np.flatnonzero(outside) for c in range(vt))
+        return out
+
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
         from ..._fem import _eval_value_node_at, _is_temporal_value_node
         from ...trace import ModelCall
@@ -4769,6 +5051,9 @@ def assemble_fem_native(
         # They get no constant pair either, and a consumer that zeroes "the constrained rows" -- a nonlocal
         # `Coupling` -- must see them, or it adds its contribution onto the row's `u - g` and shifts the wall.
         args_dofs: List[int] = []
+        # A field declared on one region (`d.unknown(..., region=R)`): its DOFs on every node outside R are
+        # held at 0. First in the list, so a condition the problem states on such a node wins (last wins).
+        pairs.extend(_region_field_pins())
 
         def _row_dofs(fidx, region, comp):
             vt = vecs[fidx]

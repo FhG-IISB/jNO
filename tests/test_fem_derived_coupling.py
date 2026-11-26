@@ -1,7 +1,7 @@
 """``jno.derived``: a nodal field computed from the state by a rule that is not a local integrand.
 
 A weak term is *local* -- an integrand at one quadrature point. Nonlocal physics is not, and jNO already
-carries the *residual* side of it (:class:`jno.Coupling`, ``R(u) += c(u)``). ``jno.derived`` is the *value*
+carries the *residual* side of it (a nonlocal term such as ``d.irradiation``, ``R(u) += c(u)``). ``jno.derived`` is the *value*
 side: ``d = f(u)`` on the nodes, usable anywhere a field is. The distinction is not cosmetic -- a beam's
 attenuation ``exp(-tau(u))`` MULTIPLIES a source, so it can never be written as a load.
 
@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno._fem import Coupling
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +149,7 @@ def test_the_same_physics_as_a_coupling_reaches_the_same_root():
     """Cross-check against the mechanism jNO already had, on physics written both ways.
 
     The source ``c*mean(u)`` is spatially constant, so its consistent load is ``c*mean(u)`` times the load
-    vector of ``1``: the identical physics fits :class:`jno.Coupling`'s residual signature exactly. Same
+    vector of ``1``: the identical physics fits the internal Coupling residual signature exactly. Same
     root, reached through a tangent that carries the coupling instead of lagging it -- which is the whole
     difference between the two mechanisms, and it must not show up in the answer.
     """
@@ -166,7 +167,9 @@ def test_the_same_physics_as_a_coupling_reaches_the_same_root():
     xi2, yi2, _ = d2.variable("interior", split=True)
     xb2, yb2, _ = d2.variable("boundary", split=True)
     ui2, vi2 = u2.bind(x=xi2, y=yi2), v2.bind(x=xi2, y=yi2)
-    coupled = jno.fem([ui2.x * vi2.x + ui2.y * vi2.y - 1.0 * vi2, lambda w: c * jnp.mean(w) * b1, u2(xb2, yb2) - 0.0])
+    coupled = jno.fem(
+        [ui2.x * vi2.x + ui2.y * vi2.y - 1.0 * vi2, Coupling(lambda w: c * jnp.mean(w) * b1), u2(xb2, yb2) - 0.0]
+    )
 
     # far below the default 1e-8: Newton's steps are inexact, so a root is only as good as its outer tolerance
     tight = jno.solve.newton(rtol=1e-12, atol=1e-12)
@@ -179,7 +182,7 @@ def test_the_same_physics_as_a_coupling_reaches_the_same_root():
 def test_a_coupling_too_strong_to_iterate_fails_loudly():
     """Past ``c*mean(w) = 1`` the fixed point does not converge -- and the solve must say so.
 
-    This is the honest cost of lagging, and it is why :class:`jno.Coupling` is not being retired. The
+    This is the honest cost of lagging, and it is why the radiation term keeps a nonlocal residual (an exact tangent). The
     solution also blows through a pole there (``1 - c*mean(w) -> 0``), so there is no right answer to
     return: silence would be the only bad outcome.
     """
@@ -232,7 +235,7 @@ def test_evaluating_once_per_step_costs_a_first_order_splitting_error():
 def test_a_parameter_inside_the_rule_threads_and_is_differentiable_as_the_picard_adjoint():
     """A ``jno.np.parameter`` used only inside the rule is invisible to the trace walk -- the rule is a
     plain function, not an expression -- so it is declared with ``params=[...]`` and merged into the
-    operator's runtime parameters, exactly as a :class:`jno.Coupling`'s is.
+    operator's runtime parameters, exactly as a nonlocal residual term's are.
 
     The gradient is the honest part. The parameter itself is NOT lagged, so the direct sensitivity through
     it is exact; the path through ``u`` uses the lagged Jacobian. What comes out is the standard Picard

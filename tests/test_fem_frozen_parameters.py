@@ -262,27 +262,38 @@ def test_a_frozen_field_on_a_space_the_form_lacks_is_refused_by_name():
 # =================================================================================================
 
 
-def test_multicomponent_bare_parameter_is_refused_by_name():
-    """A bare (non-field) parameter reaches the kernel as ONE scalar (``flat[:1]``), so a
-    multi-component one had every entry past the first silently discarded.
-
-    Measured before the guard: ``parameter((2,))`` initialised to ``[2.0, 999.0]`` and to
-    ``[2.0, 0.001]`` assembled **bit-identical** operators. Indexing it -- ``k[1] * ui.y * vi.y``,
-    the natural spelling for an anisotropic coefficient -- instead died inside the trace layer on a
-    bare ``IndexError: array is 0-dimensional``, naming nothing the user wrote. Both are now one
-    build-time refusal that names the parameter, its size, and the spelling that works.
-    """
+def test_unindexed_multicomponent_bare_parameter_is_refused_by_name():
+    """A bare (non-field) parameter with several components has no meaning as a whole inside a scalar
+    form: ``k * (ui.x * vi.x + ...)`` with ``k`` of size 2 would broadcast a vector into every
+    quadrature value. Before vector parameters existed it was silently truncated to its first entry
+    (``[2.0, 999.0]`` and ``[2.0, 0.001]`` assembled bit-identical operators); now it is a build-time
+    refusal that names the parameter, its size and the indexed spelling ``k[i]``."""
     d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
     k = jno.np.parameter((2,), name="k")
     k.initialize(lambda key, s, dtype=jnp.float64: jnp.asarray([2.0, 999.0], dtype).reshape(s))
-    with pytest.raises(NotImplementedError, match=r"2 components"):
+    with pytest.raises(NotImplementedError, match=r"2 components.*k\[i\]"):
         jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - 1.0 * vi, u(xb, yb) - 0.0])
 
-    # the indexed spelling is the same refusal, not an IndexError from three layers down
-    k2 = jno.np.parameter((2,), name="k2")
-    k2.initialize(lambda key, s, dtype=jnp.float64: jnp.full(s, 1.0, dtype))
-    with pytest.raises(NotImplementedError, match=r"2 components"):
-        jno.fem([k2[0] * ui.x * vi.x + k2[1] * ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+def test_a_vector_parameter_enters_the_form_component_by_component():
+    """``k = parameter((2,))`` used as ``k[0]`` and ``k[1]`` is the same problem as two scalar
+    parameters: same solution for the same values (and a different one when the second entry changes,
+    so nothing is truncated), and the same gradient. One vector lets one optimiser (L-BFGS, say) see
+    all components jointly, which separate scalar parameters cannot."""
+    d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
+    k = jno.np.parameter((2,), name="k")
+    fem_v = jno.fem([k[0] * ui.x * vi.x + k[1] * ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    kx, ky = jno.np.parameter((1,), name="kx"), jno.np.parameter((1,), name="ky")
+    fem_s = jno.fem([kx * ui.x * vi.x + ky * ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+
+    sol_v = lambda kv: fem_v.solve(k=kv)  # noqa: E731
+    sol_s = lambda kv: fem_s.solve(kx=kv[:1], ky=kv[1:])  # noqa: E731
+    kv = jnp.asarray([2.0, 0.5])
+    np.testing.assert_allclose(np.asarray(sol_v(kv)), np.asarray(sol_s(kv)), rtol=1e-10, atol=1e-14)
+    assert np.abs(np.asarray(sol_v(jnp.asarray([2.0, 5.0])) - sol_v(kv))).max() > 1e-3
+
+    J = lambda sol: lambda kv: jnp.sum(sol(kv) ** 2)  # noqa: E731
+    np.testing.assert_allclose(np.asarray(jax.grad(J(sol_v))(kv)), np.asarray(jax.grad(J(sol_s))(kv)), rtol=1e-8)
 
 
 def test_the_guard_does_not_fire_on_scalar_or_field_parameters():

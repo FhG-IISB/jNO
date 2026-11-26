@@ -349,7 +349,50 @@ def _apply_region_sizes(dim: int, shape) -> Optional[float]:
     top = shape._size if isinstance(shape._size, (int, float)) else None
     if top is not None:
         gmsh.option.setNumber("Mesh.MeshSizeMax", float(top))
+    _apply_size_callbacks(shape)  # a size function on the plan refines on top of the region sizes (min)
     return float(min(applied))
+
+
+def _apply_size_callbacks(shape) -> bool:
+    """Register every size callable in the plan as one gmsh ``setSizeCallback`` (min with the size gmsh
+    computed from the other controls). Shared by the field path and the region path, so a callable on a
+    multi-region plan whose regions carry their own sizes still grades. Returns whether one was set."""
+    import gmsh
+
+    callables = [s for s in _plan_sizes(shape) if callable(s)]
+    if not callables:
+        return False
+    fns = tuple(callables)
+
+    # Arity, checked HERE rather than inside the callback. gmsh calls a mesh-size function as
+    # f(x, y, z) -- three coordinates in 2-D as well as 3-D -- and `f(x, y)` is the natural thing
+    # to write for a rectangle. Raised from inside gmsh's C callback the TypeError surfaces as
+    # "Wrong mesh element size lc = 0 (lcmin = 0, lcmax = 1e+22)", which names neither the
+    # callable, nor its signature, nor the shape it came from; worse, whether it surfaces at all
+    # depends on gmsh's global state, so the same wrong function can mesh silently in one process
+    # and fail in another. One probe call before registering makes the refusal deterministic.
+    for _f in fns:
+        try:
+            _f(0.0, 0.0, 0.0)
+        except TypeError as _e:
+            raise TypeError(
+                "jno.shape(size=...): a mesh-size callable is called as f(x, y, z) -- three "
+                "coordinates, in 2-D as well as 3-D, where z is 0.0. Write "
+                "`size=lambda x, y, z: ...` (a 2-D function can simply ignore z). "
+                f"Calling it with three arguments raised: {_e}"
+            ) from _e
+
+    def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
+        # `np.asarray(...).reshape(-1)[0]` rather than `float(...)`: a size function that returns a
+        # 1-element ARRAY -- which any numpy-vectorised one does -- makes bare `float()` raise, and
+        # an exception inside gmsh's C callback surfaces as `lc = 0` ("Wrong mesh element size
+        # lc = 0"), naming neither the callback nor the shape it came from.
+        import numpy as _np
+
+        return float(min([lc] + [float(_np.asarray(f(x, y, z)).reshape(-1)[0]) for f in _fns]))
+
+    gmsh.model.mesh.setSizeCallback(_size_cb)
+    return True
 
 
 def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], shape) -> Optional[float]:
@@ -393,38 +436,7 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
             field.setNumbers(mn, "FieldsList", [float(t) for t in thresholds])
             field.setAsBackgroundMesh(mn)
 
-    callables = [s for s in _plan_sizes(shape) if callable(s)]
-    if callables:
-        fns = tuple(callables)
-
-        # Arity, checked HERE rather than inside the callback. gmsh calls a mesh-size function as
-        # f(x, y, z) -- three coordinates in 2-D as well as 3-D -- and `f(x, y)` is the natural thing
-        # to write for a rectangle. Raised from inside gmsh's C callback the TypeError surfaces as
-        # "Wrong mesh element size lc = 0 (lcmin = 0, lcmax = 1e+22)", which names neither the
-        # callable, nor its signature, nor the shape it came from; worse, whether it surfaces at all
-        # depends on gmsh's global state, so the same wrong function can mesh silently in one process
-        # and fail in another. One probe call before registering makes the refusal deterministic.
-        for _f in fns:
-            try:
-                _f(0.0, 0.0, 0.0)
-            except TypeError as _e:
-                raise TypeError(
-                    "jno.shape(size=...): a mesh-size callable is called as f(x, y, z) -- three "
-                    "coordinates, in 2-D as well as 3-D, where z is 0.0. Write "
-                    "`size=lambda x, y, z: ...` (a 2-D function can simply ignore z). "
-                    f"Calling it with three arguments raised: {_e}"
-                ) from _e
-
-        def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
-            # `np.asarray(...).reshape(-1)[0]` rather than `float(...)`: a size function that returns a
-            # 1-element ARRAY -- which any numpy-vectorised one does -- makes bare `float()` raise, and
-            # an exception inside gmsh's C callback surfaces as `lc = 0` ("Wrong mesh element size
-            # lc = 0"), naming neither the callback nor the shape it came from.
-            import numpy as _np
-
-            return float(min([lc] + [float(_np.asarray(f(x, y, z)).reshape(-1)[0]) for f in _fns]))
-
-        gmsh.model.mesh.setSizeCallback(_size_cb)
+    callables = _apply_size_callbacks(shape)
 
     top = shape._size if isinstance(shape._size, (int, float)) else None
     if top is not None:
@@ -782,15 +794,33 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                 "general geometry (Recombine3DAll on a plain box returns 944 tetrahedra and no "
                 "hexahedra). Add .structured() -- `shape.box(...).structured().quad()`."
             )
-        if _cell == "quad":
-            # Mesh triangles, then RECOMBINE them into quadrilaterals. This is gmsh's only general
-            # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
-            # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
-            # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
-            # no hexes, which is why `shape.quad()` refuses a 3-D shape rather than quietly meshing
-            # it with tetrahedra.)
-            gmsh.option.setNumber("Mesh.RecombineAll", 1)
+        # A quad mesh: triangles, then RECOMBINED into quadrilaterals. This is gmsh's only general
+        # route to a quad mesh and it works on arbitrary 2-D geometry -- measured, a disk
+        # recombines to 69 pure quads and a rectangle to 78, neither leaving any triangle behind.
+        # (The 3-D analogue does not exist: `Recombine3DAll` on a plain box returns 944 tets and
+        # no hexes, which is why `shape.quad()` refuses a 3-D shape rather than quietly meshing
+        # it with tetrahedra.)
+        # Set on every build, not only for quads: gmsh keeps options between models of one session, so a quad
+        # build followed by a triangle build in an already-initialised gmsh would recombine the second too.
+        gmsh.option.setNumber("Mesh.RecombineAll", 1 if _cell == "quad" else 0)
+        gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeFactor", 1.0)
         gmsh.model.mesh.generate(dim)
+        if _cell == "quad" and dim == 2 and len(gmsh.model.mesh.getElementsByType(_TRI)[0]):
+            # Blossom cannot pair the triangles of a surface with an odd count (a plain triangle at
+            # h = 0.21 keeps some; tests/test_quad_mesh_completeness.py). Those would be lost to the quad
+            # block. Mesh again at twice the size and split every cell into quads (each quad into four,
+            # each leftover triangle into three): all quadrilaterals, at about the size asked for.
+            gmsh.model.mesh.clear()
+            gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
+            gmsh.option.setNumber("Mesh.MeshSizeFactor", 2.0)
+            gmsh.model.mesh.generate(dim)
+            left = len(gmsh.model.mesh.getElementsByType(_TRI)[0])
+            if left:
+                raise RuntimeError(
+                    f"shape.quad(): gmsh left {left} triangles after subdividing into quadrilaterals; "
+                    "the quad mesh would miss them."
+                )
         if int(order) > 1:
             # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
             # SYNTHESISES its higher-order nodes by interpolating reference points through the affine

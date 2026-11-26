@@ -315,9 +315,9 @@ downgraded.
 When a solve is **pure-Bayesian** — every Bayesian model on the same `num_chains`/`warmup`/`keep`/`thin`;
 no `.optimizer()` models, no `substeps=`, no `offload_data=True`, no trackers, no adaptive resampling,
 `inner_steps == 1` — `solve()` auto-dispatches to a scan-based fastpath (no outer `value_and_grad`, one
-XLA dispatch per `print_rate` steps, one host transfer per chunk). It is fully automatic (no kwarg); jno
+XLA dispatch per progress interval (`crux.solve(log=N)`), one host transfer per chunk). It is fully automatic (no kwarg); jno
 logs one line at solve-start so the decision is visible. Non-qualifying solves run the per-epoch Python
-loop unchanged, with identical output at the same `print_rate` cadence.
+loop unchanged, with identical output at the same cadence.
 
 ## Variational Inference (mean-field)
 

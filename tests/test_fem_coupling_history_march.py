@@ -1,4 +1,4 @@
-"""A nonlocal ``jno.Coupling`` on a step-history form marched over ``domain(tau=...)``.
+"""A nonlocal (internal) ``Coupling`` on a step-history form marched over ``domain(tau=...)``.
 
 The Coupling wrapper rebuilt the residual operator and kept only the residual, so the step-history
 layout and the state readout the assembler hangs on it were dropped: ``fem.solve()`` no longer saw a
@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno._fem import Coupling
 
 DT, NS, K, EPS = 0.02, 5, 3.0, 1e-9
 PI = np.pi
@@ -75,7 +76,7 @@ def _march(reaction, *, tie, M=None):
     if tie:
         terms.append(u(*on("l")) - u(*on("r")))
     if reaction == "nonlocal":
-        terms.append(jno.Coupling(lambda U: K * (M @ U), name="mass"))
+        terms.append(Coupling(lambda U: K * (M @ U), name="mass"))
     fem = jno.fem(terms)
     s = fem.solve()
     return np.asarray(s.fn() if hasattr(s, "fn") else s), np.asarray(fem.points)

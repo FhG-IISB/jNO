@@ -144,3 +144,47 @@ def test_segments_from_polygons_includes_interior_rings():
     assert len(segs) == 8  # 4 exterior + 4 interior edges
     assert np.isclose(np.abs(segs[:, [0, 2]]).max(), 1.0)
     assert ((segs[:, 0] > 0.29) & (segs[:, 0] < 0.61)).any()
+
+
+def test_occluders_out_of_reach_change_nothing():
+    """A side no chord of the enclosure can reach (above, below or outside it) blocks nothing, so adding
+    hundreds of them leaves F bit-identical. They are pruned before the per-pair interval arrays are
+    stacked: kept, those arrays grew with every solid of the domain (tens of GB on a full furnace)."""
+    E0, E1, N = stack(
+        seg((1e-9, 0.0), (0.1, 0.0), 12, (0.0, 1.0)),
+        seg((0.1, 0.0), (0.1, 0.1), 12, (-1.0, 0.0)),
+        seg((0.1, 0.1), (1e-9, 0.1), 12, (0.0, -1.0)),
+    )
+    block = np.array(
+        [[0.02, 0.04, 0.05, 0.04], [0.05, 0.04, 0.05, 0.06], [0.05, 0.06, 0.02, 0.06], [0.02, 0.06, 0.02, 0.04]]
+    )
+    far = np.array(
+        [[0.2 + 1e-3 * k, 0.0, 0.2 + 1e-3 * k, 0.1] for k in range(100)]  # outside: r > max r
+        + [[0.0, 0.5 + 1e-3 * k, 0.05, 0.5 + 1e-3 * k] for k in range(100)]
+    )  # above the cavity
+    F = vf(E0, E1, N, occluders=block, n_quad=3)
+    np.testing.assert_array_equal(vf(E0, E1, N, occluders=np.vstack([block, far]), n_quad=3), F)
+    assert (F < vf(E0, E1, N, n_quad=3) - 1e-6).any()  # and the block itself does occlude
+
+
+def test_an_outline_in_mesh_sized_pieces_gives_the_corner_sides_and_the_same_factors():
+    """A solid outlined by the union of its mesh cells comes as many short collinear pieces per wall; they are
+    merged into the outline's real sides, and the view factors do not change."""
+    from shapely.geometry import Polygon
+
+    corners = [(0.02, 0.04), (0.05, 0.04), (0.05, 0.06), (0.02, 0.06)]
+    fine = []
+    for (x0, y0), (x1, y1) in zip(corners, corners[1:] + corners[:1]):
+        fine += [(x0 + t * (x1 - x0), y0 + t * (y1 - y0)) for t in np.linspace(0.0, 1.0, 25)[:-1]]
+    sides = segments_from_polygons([Polygon(fine)])
+    assert len(sides) == 4
+    E0, E1, N = stack(
+        seg((1e-9, 0.0), (0.1, 0.0), 12, (0.0, 1.0)),
+        seg((0.1, 0.0), (0.1, 0.1), 12, (-1.0, 0.0)),
+        seg((0.1, 0.1), (1e-9, 0.1), 12, (0.0, -1.0)),
+    )
+    np.testing.assert_allclose(
+        vf(E0, E1, N, occluders=sides, n_quad=3),
+        vf(E0, E1, N, occluders=segments_from_polygons([Polygon(corners)]), n_quad=3),
+        atol=1e-14,
+    )

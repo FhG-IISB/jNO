@@ -124,7 +124,7 @@ whole mesh, each on its own element.
 | `d.variable(tag, normals=True, reverse_normals=True, split=True)` | the same normals, **negated** | an enclosure or cavity where the meshed side faces inward |
 | `d.variable(tag, return_indices=True, split=True)` | one extra placeholder: the sampled point **indices** | scattering a result back onto the mesh, or tying a subset to data |
 | `d.cell_size` | element size `h` (\|detJ\|^(1/dim)) at quad points | **SUPG/GLS stabilization** `τ = h/(2·|β|)` |
-| `d.enclosure(tags)` | view-factor matrix + measures | grey-body radiation (`.view_factor`, `.field()`, `.load()`) |
+| `d.irradiation(T)` | incident radiation G on the faces of every `kappa == 0` medium | grey-body radiation, `d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS` |
 
 ```python
 # SUPG-stabilized advection–diffusion, fully declarative:

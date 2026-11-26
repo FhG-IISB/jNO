@@ -142,6 +142,7 @@ def assemble_fem_nonnodal(
         bcoo_eliminate_dirichlet,
         bcoo_zero_rows_cols,
         compress_eager,
+        input_dependencies,
     )
     from .weak_form import (
         _apply_sign,
@@ -1698,6 +1699,10 @@ def assemble_fem_nonnodal(
     # only; guided = rotation only; free = neither. Value BCs arrive in ``dirichlet_raw``; rotation BCs in
     # ``rotation_bcs`` (normalised to the same 5-tuple shape, value node = the prescribed ∂u/∂n).
     _rot_as_dir = [(fk, region, None, None, vn) for (fk, region, vn) in rotation_bcs]
+    # A field declared on one region (`d.unknown(..., region=R)`): its DOFs outside R are held at 0, as the
+    # nodal assembler does (`fem_native._region_field_pins`). First in the list, so a condition the problem
+    # states on such a DOF wins (the dedupe below keeps the last pin per DOF).
+    pins = _region_field_pins(fields, spaces, cdofs, offs, domain) + pins
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
@@ -1771,6 +1776,27 @@ def assemble_fem_nonnodal(
                 _typed.append((_coeff, _tfi, tuple(sorted(_collect_region_mask_names(_coeff)))))
 
         _cell_all_dofs = jnp.concatenate([cdofs[i] for i in range(len(fields))], axis=1)  # (n_cells, n_local_all)
+        # DOFs held at 0 outside their field's region (`d.unknown(..., region=R)`), as in
+        # `fem_native._dead_dofs`: the Dirichlet elimination leaves each an identity row and column, so a
+        # cell whose TEST-field DOFs are all pinned need not be assembled and no entry in a pinned row or
+        # column need be stored. Both exact; without them every pinned DOF kept its whole cell-block
+        # pattern as explicit zeros (93% of a coupled flow-and-heat tangent's stored entries).
+        _dead = None
+        if any(f.get("region") is not None for f in fields):
+            _dead = np.zeros(int(total), dtype=bool)
+            _dead[
+                np.asarray([p_ for p_, _v in _region_field_pins(fields, spaces, cdofs, offs, domain)], dtype=np.int64)
+            ] = True
+            _dead = _dead if _dead.any() else None
+
+        def _live_cells(tfi):
+            """Cells holding a free DOF of test field ``tfi`` (int32 numpy), or ``None`` for every cell."""
+            if _dead is None:
+                return None
+            live = ~_dead[np.asarray(cdofs[tfi])].all(axis=1)
+            return None if live.all() else np.flatnonzero(live).astype(np.int32)
+
+        _lcells = {}
         _field_splits = list(np.cumsum([0] + [int(cdofs[i].shape[1]) for i in range(len(fields))]))
         _asm_local_zero = jnp.zeros((n_cells, _cell_all_dofs.shape[1]), zeros.dtype)  # u=0: the LINEAR default
         # TERMS SHARING A TEST FIELD are one GROUP: their element blocks have identical (row, col)
@@ -1783,7 +1809,85 @@ def assemble_fem_nonnodal(
             if _tfi_p not in _gpos:
                 _gpos[_tfi_p] = len(_groups)
                 _groups.append((_tfi_p, []))
+                _lcells[_tfi_p] = _live_cells(_tfi_p)
             _groups[_gpos[_tfi_p]][1].append((_cf_p, _rn_p))
+
+        def _env(args):
+            """What an element residual reads from ``args``: the runtime parameters, the coordinates, the nets."""
+            _a = args or {}
+            rt_scalar = {
+                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
+                for name in runtime_parameter_tags
+                if name not in _field_param_names
+            }
+            field_vals = {
+                name: _field_array(name, _a.get(name, _param_zeros(name)), zeros.dtype) for name in _field_param_names
+            }
+            _nt = neural_local_table(_neural, args)
+            _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
+            _fz_a = _frozen_vals_at(args)
+            return rt_scalar, field_vals, _nt, _pts_dyn, _fz_a
+
+        def _elem_res_sols(env, c, cell_sols, coeff, tfi, rnames):
+            """This cell's element residual (n_test of field ``tfi``,) from its per-field local dof vectors."""
+            rt_scalar, field_vals, _nt, _pts_dyn, _fz_a = env
+            per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
+            _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
+            vol_vars = tuple(
+                (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
+                for name in runtime_parameter_tags
+            )
+            local = {
+                "physical_quad_points": xq,
+                "fields": per,
+                "field_index": field_index,
+                "tag": "fem_gauss",
+                "surface": False,
+                "domain_context": _ctx_c,
+                "temporal_tags": (),
+                "runtime_parameter_tags": runtime_parameter_tags,
+                "region_mask_names": rnames,
+                "volume_vars": vol_vars + _cell_masks(c, rnames),
+            }
+            if (
+                _field_param_names or _frozen_gathered
+            ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                local["shape_vals"] = p1_shape_vals
+            if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+                local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
+            if _coef_specs:  # coefficient fields on their own element space
+                local["coef_fields"] = _coef_slots(c, field_vals, _pts_dyn, None, _fz_a)
+            if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
+                local["neural_coefficients"] = _nt
+            return _integrate_term(domain, coeff, local, qw * meas)
+
+        def _split_la(la):
+            return [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
+
+        # --- each group's tangent is taken against the fields its terms READ, not every field of the cell ---
+        # `input_dependencies` finds them from the jaxpr of the group's element residual with one input per
+        # field: a field it leaves out has a zero tangent for every value, so its columns are neither computed
+        # nor stored. Before, every block was (n_test x n_local_all) -- all fields of the cell -- whatever the
+        # term read. `_gcols[gi]`: the group's columns as positions in the cell's all-field DOF vector.
+        _env0 = _env(None)
+        _gcols = []
+        for _tfi_p, _terms_p in _groups:
+            _c0 = jnp.asarray(0, jnp.int32)
+            _sols0 = [jnp.asarray(_asm_local_zero[0, _field_splits[i] : _field_splits[i + 1]]) for i in range(len(fields))]
+
+            def _gres(c, *sols, _g=tuple(_terms_p), _t=_tfi_p):
+                r = None
+                for _e, _rn in _g:
+                    v = _elem_res_sols(_env0, c, list(sols), _e, _t, _rn)
+                    r = v if r is None else r + v
+                return r
+
+            _dep = [i - 1 for i in input_dependencies(_gres, _c0, *_sols0) if i >= 1]
+            _gcols.append(
+                np.concatenate([np.arange(_field_splits[i], _field_splits[i + 1]) for i in _dep]).astype(np.int32)
+                if _dep
+                else np.zeros(0, np.int32)
+            )
 
         # THE SYMBOLIC PASS, once, on the host, in numpy end to end: the unique sparsity pattern and
         # the inverse map from every emitted entry to its final slot. Element values then SCATTER-ADD
@@ -1809,13 +1913,18 @@ def assemble_fem_nonnodal(
         if _groups or _sgs:
             try:
                 _enc_l = []
-                for _tfi_p, _terms_p in _groups:
+                for _gi_p, (_tfi_p, _terms_p) in enumerate(_groups):
                     _nt = int(cdofs[_tfi_p].shape[1])
-                    _nl = int(_cell_all_dofs.shape[1])
-                    _r = np.broadcast_to(np.asarray(cdofs[_tfi_p])[:, :, None], (n_cells, _nt, _nl))
-                    _c = np.broadcast_to(np.asarray(_cell_all_dofs)[:, None, :], (n_cells, _nt, _nl))
+                    _nl = int(_gcols[_gi_p].shape[0])
+                    _lc = _lcells[_tfi_p]
+                    _rd, _cd = np.asarray(cdofs[_tfi_p]), np.asarray(_cell_all_dofs)[:, _gcols[_gi_p]]
+                    if _lc is not None:
+                        _rd, _cd = _rd[_lc], _cd[_lc]
+                    _n = int(_rd.shape[0])
+                    _r = np.broadcast_to(_rd[:, :, None], (_n, _nt, _nl))
+                    _c = np.broadcast_to(_cd[:, None, :], (_n, _nt, _nl))
                     _enc_l.append((_r.astype(np.int64) * np.int64(total) + _c.astype(np.int64)).reshape(-1))
-                    _grp_sizes.append(n_cells * _nt * _nl)
+                    _grp_sizes.append(_n * _nt * _nl)
                     del _r, _c
                 for _g, _cols in zip(_sgs, _s_cols):
                     _nt = int(cdofs[_g["tfi"]].shape[1])
@@ -1830,6 +1939,13 @@ def assemble_fem_nonnodal(
                 del _enc_l
                 _unq, _inv = np.unique(_enc, return_inverse=True)
                 del _enc
+                if _dead is not None:  # drop the slots in a pinned row or column; their values scatter out of range
+                    _keep = ~(_dead[_unq // np.int64(total)] | _dead[_unq % np.int64(total)])
+                    if not _keep.all():
+                        _pos = np.where(_keep, np.cumsum(_keep) - 1, int(_keep.sum()))
+                        _unq, _inv = _unq[_keep], _pos[_inv]
+                        del _pos
+                    del _keep
                 _uidx = jnp.stack(
                     [
                         jnp.asarray((_unq // np.int64(total)).astype(np.int32)),
@@ -1850,10 +1966,14 @@ def assemble_fem_nonnodal(
                 _vol_nse = None  # fall back to the uncompressed (still correct) operator
         if _vinv is None and (_groups or _sgs):
             _vol_rows_l, _vol_cols_l = [], []
-            for _tfi_p, _terms_p in _groups:
-                _kshape = (n_cells, int(cdofs[_tfi_p].shape[1]), _cell_all_dofs.shape[1])
-                _vol_rows_l.append(jnp.broadcast_to(cdofs[_tfi_p][:, :, None], _kshape).reshape(-1))
-                _vol_cols_l.append(jnp.broadcast_to(_cell_all_dofs[:, None, :], _kshape).reshape(-1))
+            for _gi_p, (_tfi_p, _terms_p) in enumerate(_groups):
+                _lc = _lcells[_tfi_p]
+                _rd = cdofs[_tfi_p] if _lc is None else cdofs[_tfi_p][_lc]
+                _cd = _cell_all_dofs[:, _gcols[_gi_p]]
+                _cd = _cd if _lc is None else _cd[_lc]
+                _kshape = (int(_rd.shape[0]), int(cdofs[_tfi_p].shape[1]), int(_gcols[_gi_p].shape[0]))
+                _vol_rows_l.append(jnp.broadcast_to(_rd[:, :, None], _kshape).reshape(-1))
+                _vol_cols_l.append(jnp.broadcast_to(_cd[:, None, :], _kshape).reshape(-1))
             for _g, _cols in zip(_sgs, _s_cols):
                 _rr = jnp.asarray(cdofs[_g["tfi"]])[_g["cell"]]
                 _kshape = (_g["n_facets"], int(_rr.shape[1]), _cols.shape[1])
@@ -1876,51 +1996,11 @@ def assemble_fem_nonnodal(
             # from mesh connectivity, so the hoisted `_vol_idx` and its compression plan carry over
             # untouched and only the element DATA becomes state-dependent.
             _local_u = _asm_local_zero if u_flat is None else jnp.asarray(u_flat)[_cell_all_dofs]
-            _a = args or {}
-            rt_scalar = {
-                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=zeros.dtype), (-1,))[:1]
-                for name in runtime_parameter_tags
-                if name not in _field_param_names
-            }
-            field_vals = {
-                name: _field_array(name, _a.get(name, _param_zeros(name)), zeros.dtype) for name in _field_param_names
-            }
-            _nt = neural_local_table(_neural, args)
-            _pts_dyn = _apply_coord_params(pts, _a)  # traced iff coordinates are trainable
-            _fz_a = _frozen_vals_at(args)
+            _envx = _env(args)
+            rt_scalar, field_vals, _nt, _pts_dyn, _fz_a = _envx
 
             def _elem_res(c, la, coeff, tfi, rnames):
-                """This cell's element residual (n_test of field ``tfi``,) from its local dof vector ``la``."""
-                cell_sols = [la[_field_splits[i] : _field_splits[i + 1]] for i in range(len(fields))]
-                per, xq, meas = _cell_fields(c, cell_sols, _pts_dyn)
-                _ctx_c = _with_cell_size(ctx, meas, xq, (pts if _pts_dyn is None else _pts_dyn)[cells_j[c]])
-                vol_vars = tuple(
-                    (_gather_param(name, field_vals[name], c) if name in _field_param_names else rt_scalar[name])
-                    for name in runtime_parameter_tags
-                )
-                local = {
-                    "physical_quad_points": xq,
-                    "fields": per,
-                    "field_index": field_index,
-                    "tag": "fem_gauss",
-                    "surface": False,
-                    "domain_context": _ctx_c,
-                    "temporal_tags": (),
-                    "runtime_parameter_tags": runtime_parameter_tags,
-                    "region_mask_names": rnames,
-                    "volume_vars": vol_vars + _cell_masks(c, rnames),
-                }
-                if (
-                    _field_param_names or _frozen_gathered
-                ):  # P1 basis to interpolate a field parameter (top-level, param-only key)
-                    local["shape_vals"] = p1_shape_vals
-                if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
-                    local["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
-                if _coef_specs:  # coefficient fields on their own element space
-                    local["coef_fields"] = _coef_slots(c, field_vals, _pts_dyn, None, _fz_a)
-                if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
-                    local["neural_coefficients"] = _nt
-                return _integrate_term(domain, coeff, local, qw * meas)
+                return _elem_res_sols(_envx, c, _split_la(la), coeff, tfi, rnames)
 
             # values scatter into their final slots PER GROUP: the full-length data vector exists
             # only on the unplanned fallback, where the uncompressed triplet path still needs it
@@ -1929,24 +2009,31 @@ def assemble_fem_nonnodal(
             data_l = []  # fallback only; the (row, col) pattern is `_vol_idx`
             _tag_rows, _tag_cols, _tag_cells = [], [], []  # elements=True
             for gi, (tfi, terms_g) in enumerate(_groups):
+                _sel = jnp.asarray(_gcols[gi])  # the group's columns: the local DOFs of the fields it reads
 
-                def _ke(c, la, _g=tuple(terms_g), _t=tfi):
+                def _ke(c, la, _g=tuple(terms_g), _t=tfi, _s=_sel):
                     # ONE jacfwd of the SUMMED residual: linearity makes it equal to the sum of the
                     # per-term jacobians, at one element-block buffer per GROUP instead of per term
                     # (and `_cell_fields` is shared across the group's terms instead of recomputed).
-                    def _res_sum(v):
+                    # Against the group's own fields only (`_gcols`): every other column is zero.
+                    def _res_sum(vs):
+                        v = la.at[_s].set(vs)
                         r = None
                         for _e, _rn in _g:
                             t = _elem_res(c, v, _e, _t, _rn)
                             r = t if r is None else r + t
                         return r
 
-                    return jax.jacfwd(_res_sum)(la)
+                    return jax.jacfwd(_res_sum)(la[_s])
 
-                Ke = _elem_map(  # (n_cells, n_test_tfi, n_local_all)
+                _lc = _lcells[tfi]  # None: every cell
+                _cells_g = jnp.arange(n_cells) if _lc is None else jnp.asarray(_lc)
+                Ke = _elem_map(  # (n_cells, n_test_tfi, n_group_cols)
                     _ke,
-                    (jnp.arange(n_cells), _local_u),
-                    _cell_chunk_of(n_cells, int(cdofs[tfi].shape[1]), int(_cell_all_dofs.shape[1]), _chunk_setting),
+                    (_cells_g, _local_u if _lc is None else _local_u[_lc]),
+                    _cell_chunk_of(
+                        int(_cells_g.shape[0]), int(cdofs[tfi].shape[1]), max(1, int(_gcols[gi].shape[0])), _chunk_setting
+                    ),
                 )
                 if _acc is not None:
                     _acc = _acc.at[_vinv[gi]].add(Ke.reshape(-1).astype(_acc.dtype))
@@ -3475,6 +3562,40 @@ def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_n
             gdofs = np.concatenate([cells[c], n_verts + ce[c]])
         np.add.at(b, np.asarray(int(base) + gdofs, dtype=np.intp), contrib)
     return jnp.asarray(b)
+
+
+def _region_field_pins(fields, spaces, cdofs, offs, domain):
+    """``(dof, 0.0)`` for every DOF of a region field (``d.unknown(..., region=R)``) that no cell of R touches.
+
+    The cells of R come from :func:`fem_utils._cell_region_mask` (a cell is in R iff its centroid is) -- the
+    classification the assembler integrates with -- so a DOF on R's boundary, shared with a cell inside,
+    stays free and takes the problem's conditions there. Without these pins the outside DOFs sit in no
+    equation and the operator is singular. Scalar nodal Lagrange fields only (any order); anything else
+    with a region raises rather than leaving its outside DOFs unconstrained."""
+    from .fem_utils import _cell_region_mask
+
+    out = []
+    for i, f in enumerate(fields):
+        region = f.get("region")
+        if region is None:
+            continue
+        if spaces[i] != "Lagrange" or int(f.get("vec", 1)) != 1:
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): region={region!r} is wired for scalar Lagrange fields on this path, not a "
+                f"{spaces[i]} field with {f.get('vec', 1)} components (this form takes the non-nodal assembler "
+                "because of a non-nodal family, a term on interior faces or an `across` coupling). Write a vector "
+                "as one scalar unknown per component."
+            )
+        m = np.asarray(_cell_region_mask(domain, region)).reshape(-1)
+        cd = np.asarray(cdofs[i])
+        if m.shape[0] != cd.shape[0] or not m.any():
+            raise ValueError(
+                f"jno.fem (non-nodal): a field is declared on region={region!r}, which no cell of the mesh is in."
+            )
+        free = np.zeros(int(offs[i + 1]) - int(offs[i]), dtype=bool)
+        free[np.unique(cd[m > 0]) - int(offs[i])] = True
+        out.extend((int(offs[i]) + int(k), 0.0) for k in np.flatnonzero(~free))
+    return out
 
 
 def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None):

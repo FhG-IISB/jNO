@@ -259,6 +259,44 @@ sol = spo.root(lambda v: np.asarray(fem.residual(v)),
                jac=lambda v: np.asarray(fem.jacobian(v)), method="hybr")
 ```
 
+### Starting point and initial state — `u.initialize`
+
+A field's starting value is set on the field itself: a number, a nodal array (one value per DOF), or a
+formula of the coordinates (`jno.np` functions, a parameter, a network).
+
+```python
+T.initialize(1500.0)                                  # a number fills the field
+A.initialize(a0)                                      # nodal values (complex for a complex field)
+I.initialize(300.0)                                   # a constant unknown
+u.initialize(jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y))   # a formula, evaluated at the nodes
+```
+
+- **Steady problem:** the solve's starting point (Newton's first iterate, an iterative solver's warm start).
+  It is read when `fem.solve()` is called, so one `fem` can be solved again from a new start (a continuation:
+  `u.initialize(previous)` before each solve). Fields not initialized start at zero. When a problem has
+  several solutions, the start picks one.
+- **Time-dependent domain:** the initial state, the same as the term `u(initial) - u0` (which still works;
+  giving both for one field raises). `jno.fem` reads it when it builds the form, so set it first; changing it
+  afterwards raises at `fem.solve()`.
+- Not with `adapt=`: a start does not survive the change of mesh.
+- The same `u.initialize` is read by `jno.fdm` (steady start and initial state alike).
+
+### The solution by field
+
+`fem.solve()` returns a `jno.Solution`: the vector of every DOF, which also reads its fields by name:
+
+```python
+u = fem.solve()
+u.T, u.A, u.I              # nodal T, complex nodal A, the constant's value (u["T"] works too; u.fields lists them)
+u[0], 2 * u, jnp.linalg.norm(u), np.asarray(u), fem.solve(x0=u)   # still the flat vector
+```
+
+A scalar field gives `(n,)`, a vector field `(n, k)`, a constant unknown its value, a complex field one complex
+array; a transient trajectory keeps its time axis on every field. A field's name wins over the array attribute of
+the same name (`u.T` is the field `T`; the transpose is `u.flat.T`). The fields are slices of the vector, so they
+are differentiable, and a `Solution` is a pytree of that one vector (`jit`, `grad`, `vmap` pass through it). A
+deferred solve (a trace node inside `jno.core`) is not a `Solution`.
+
 ### Transient (semidiscrete `M u̇ + A u = c`)
 
 ```python
@@ -274,7 +312,7 @@ A weak form carrying a **second** time derivative (`ui.tt`) is auto-reduced to t
 first-order system in `y = [u, v]` (velocity `v = u_t`) and integrated by the energy-conserving
 **trapezoidal rule** (θ=½, equivalent to Newmark average-acceleration — Newmark 1959, β=¼, γ=½) —
 backward Euler would spuriously damp an undamped wave. A second-order problem needs **two** initial
-conditions: displacement `u(initial) - u0` and velocity `u.t(initial) - v0` (bind the velocity IC with
+conditions: displacement `u.initialize(u0)` (or the term `u(initial) - u0`) and velocity `u.t(initial) - v0` (bind the velocity IC with
 the `"initial"`-slice coordinates *and time*, `u.bind(x=xi0, y=yi0, t=ti0).t`; a missing velocity IC
 defaults to zero).
 
@@ -287,10 +325,10 @@ xi0, yi0, ti0 = d.variable("initial", split=True)          # initial slice: coor
 ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
 ui0 = u.bind(x=xi0, y=yi0, t=ti0)
 
+u.initialize(jno.fn(u0_fn, [xi, yi]))                      # displacement IC
 # u_tt = Δu  ->  ∫ u_tt φ + ∫ ∇u·∇φ = 0
 fem = jno.fem([ui.tt * vi + (ui.x * vi.x + ui.y * vi.y),
                u(xb, yb) - 0.0,                            # fixed boundary
-               u(xi0, yi0) - jno.fn(u0_fn, [xi0, yi0]),    # displacement IC
                ui0.t - 0.0])                               # velocity IC (here: at rest)
 ```
 

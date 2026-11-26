@@ -26,7 +26,7 @@ if _hoist_constants and not _hoist_after_import:
 
 from . import bayesian, fn, litho, lora, optimizers, precond, solve, space, trackers
 from . import jnp_ops as np
-from ._fem import Coupling, derived, fem, lag
+from ._fem import Solution, derived, fem, lag
 from ._fvm import fv, fvm
 from .architectures.models import nn, parameter
 from .core import core
@@ -226,6 +226,7 @@ __all__ = [
     "Path",
     "do",
     "fem",
+    "Solution",
     "fdm",
     "fv",
     "fvm",
@@ -234,7 +235,6 @@ __all__ = [
     "Rcwa",
     "RcwaError",
     "litho",
-    "Coupling",
     "derived",
     "Model",
     "Variable",

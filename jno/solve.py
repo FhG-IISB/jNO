@@ -106,7 +106,7 @@ def _preferred_direct_backend() -> str:
     return "device"
 
 
-def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = True) -> LinearSolver:
+def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool | None = None) -> LinearSolver:
     """Differentiable sparse-direct solve (JAX ``spsolve``: cuSolver on GPU, native LU on CPU).
 
     Wraps the existing :func:`jno.utils.solver.linear.sparse_lu_solve` -- robust on the
@@ -141,7 +141,7 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
             points (0.15x-0.81x of its time). Read that as *cuSolver's sparse LU is weak*, not as
             *GPUs lose*: see ``"cudss"``. Its factorization is cached on the operator's CONTENT, so a
             constant-operator march factorizes once for the trajectory (measured 2.9x at 23,934 DOFs
-            over 51 steps) and the adjoint reuses it; a Newton loop gets nothing and pays a hash.
+            over 51 steps) and the adjoint reuses it; a Newton loop's steps are not kept (see ``reuse``).
 
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
             on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w
@@ -189,17 +189,12 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
         host: Deprecated alias for ``backend="host"``, kept so existing calls keep working. Passing
             both is an error.
         reuse: keep the factorization for a repeating operator (``"host"`` only; the other backends
-            manage their own plan caches). Default ``True``, which is right for a constant-operator
-            march and for an adjoint -- ``A^T x = b`` comes free from the forward factorization.
-
-            **Pass ``reuse=False`` for a Newton march.** A Newton tangent changes every iteration, so
-            the cache never hits; what it does instead is hold host memory. XLA:CPU runs each
-            ``pure_callback`` on a different thread, so a factorization retained past the callback
-            that built it is freed on a LATER thread and glibc cannot return that arena -- one
-            factorization's worth of unreclaimable RSS per Newton iteration. Measured on a 4-field
-            melt pool at 13,278 DOFs over 200 steps: ``reuse=True`` OOM-kills a 62 GB machine,
-            ``reuse=False`` peaks at **2.08 GB** and is **44% faster** (343 s against 494 s for
-            ``backend="device"``), with the two answers agreeing to ten significant figures.
+            manage their own plan caches). Default ``None``: kept -- right for a constant-operator march and
+            for an adjoint, where ``A^T x = b`` comes free from the forward factorization -- except in a
+            Newton driver's forward steps. A Newton tangent changes every iteration, so the cache never hits
+            there; keeping the factorizations held up to 8 of them (measured: 38.9 GB at 44,313 DOFs, against
+            a flat 3.0 GB uncached at 28,675). The factorization at the converged root is kept, so the
+            gradient's transpose solve reuses it. ``True`` / ``False`` force the choice everywhere.
     """
     if host is not None:
         if backend is not None:
@@ -246,11 +241,10 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
                 if x is not None:
                     return x
         if op.bcoo is not None:
-            # Only the opted-in case changes the call: `reuse=True` is the long-standing behaviour and
-            # keeps the long-standing two-argument convention, so nothing that wraps or stubs
-            # host_lu_solve has to know this option exists.
-            if backend == "host" and not reuse:
-                return solve(op.bcoo, b, reuse=False)
+            # Only an explicit choice changes the call: the default keeps the two-argument convention, so
+            # nothing that wraps or stubs host_lu_solve has to know this option exists.
+            if backend == "host" and reuse is not None:
+                return solve(op.bcoo, b, reuse=reuse)
             return solve(op.bcoo, b)
         # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
         # nse, which does not exist under jit/vmap tracing. SAY SO when that silently drops a
@@ -678,8 +672,22 @@ def amg(
 
 def _root_driver(
     name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c, direct=False,
-    reuse=False, anderson=0,
+    reuse=False, anderson=0, stall=None, ptc=None,
 ) -> NonlinearSolver:  # fmt: skip
+    from .utils.solver.newton_krylov import _ptc_check, _stall_check
+
+    stall = _stall_check(stall)
+    ptc = _ptc_check(ptc)
+    if ptc is not None and direct is False:
+        raise ValueError(
+            f"jno.solve.{name}(ptc=...) scales its pseudo-time term by the diagonal of the ASSEMBLED tangent; the "
+            f"matrix-free mode (direct=False) never assembles one: use direct=True or the default direct=None."
+        )
+    if ptc is not None and reuse:
+        raise ValueError(
+            f"jno.solve.{name}(ptc=...) shifts the tangent by a new pseudo-time step every step, so there is no "
+            f"tangent to reuse: drop reuse=True."
+        )
     if reuse and direct is False:
         raise ValueError(
             f"jno.solve.{name}(reuse=True) keeps the ASSEMBLED tangent between steps (and, for the sparse-direct "
@@ -694,6 +702,13 @@ def _root_driver(
         # with reuse=True and an assembled tangent. `info` (a dict) receives the solve's own residual norms
         # and, with reuse, its last tangent; see newton_direct.
         carry = {"info": info} if jacobian is not None and direct is not False else {}
+        if ptc is not None:
+            if jacobian is None and not direct:
+                raise ValueError(
+                    f"jno.solve.{name}(ptc=...) needs the assembled tangent, and this problem has none (a residual-only "
+                    f"operator): use direct=True, which materialises it, or drop ptc."
+                )
+            carry["ptc"] = ptc
         if reuse and jacobian is not None and direct is not False:
             carry["tangent0"] = tangent0
         if direct is None and jacobian is not None:
@@ -714,20 +729,16 @@ def _root_driver(
                 ls_c=ls_c,
                 linear_solve=linear_solve if linear_solve is not None else assembled_krylov_solve(inner_tol, inner_maxit),
                 reuse=reuse,
+                stall=stall,
                 **carry,
             )
         if direct:
             # Sparse-direct Newton: factorize the ASSEMBLED tangent each step (robust on saddles / stiff
             # drag where the matrix-free Krylov inner solve stalls). Needs the assembler-provided Jacobian.
             if jacobian is None:
-                raise ValueError(
-                    "The sparse-direct Newton needs the ASSEMBLED Jacobian, which only the native "
-                    "nonlinear FEM assembler / transient stepper provides -- a matrix-free residual has "
-                    "no assembled tangent to factorize. Reached either via "
-                    "fem.solve(nonlinear=jno.solve.newton(direct=True)) or by a direct linear slot "
-                    "(fem.solve(linear=jno.solve.lu()/dense()/amg()), which selects this driver); on a "
-                    "matrix-free-only problem use an iterative linear= (cg/bicgstab/gmres/fgmres)."
-                )
+                # No assembled tangent (a residual-only operator, or a nonlocal term that did not declare
+                # which DOFs it touches): the user asked for a direct solve, so materialise the Jacobian DENSELY.
+                jacobian, linear_solve = _dense_tangent(residual_fn, u0, linear_solve)
             from .utils.solver.newton_krylov import newton_direct
 
             return newton_direct(
@@ -745,6 +756,7 @@ def _root_driver(
                 # the historic sparse-LU default
                 linear_solve=linear_solve,
                 reuse=reuse,
+                stall=stall,
                 **carry,
             )
         from .utils.solver.newton_krylov import newton_krylov
@@ -765,6 +777,7 @@ def _root_driver(
             ls_max=ls_max,
             ls_c=ls_c,
             anderson=anderson,
+            stall=stall,
         )
 
     # The tolerances travel WITH the spec, not just inside the closure: a driver run under `lax.scan`
@@ -778,6 +791,10 @@ def _root_driver(
         config["anderson"] = anderson
     if reuse:
         config["reuse"] = reuse
+    if stall is not None:
+        config["stall"] = stall
+    if ptc is not None:
+        config["ptc"] = ptc
     return NonlinearSolver(
         _fn,
         name=name,
@@ -785,6 +802,30 @@ def _root_driver(
         traits={"rtol": rtol, "atol": atol, "carries_tangent": bool(reuse), "reports_info": direct is not False},
         config=config,
     )
+
+
+def _dense_tangent(residual_fn, u0, linear_solve):
+    """``(jacobian, linear_solve)`` for a direct Newton on a problem with no assembled tangent.
+
+    The Jacobian is formed by forward-mode AD of the whole residual -- ``n`` JVPs per Newton step into an
+    ``n x n`` dense matrix -- and factorised with dense LU unless a ``linear=`` slot was given (it then
+    receives the dense matrix). Exact and differentiable, but its cost is ``O(n^2)`` memory and ``O(n^3)``
+    per factorisation, so it is announced with its size. There is no cap: what fits depends on the machine,
+    and an allocation that does not fit fails where it is made."""
+    from .utils.logger import get_logger
+
+    n = int(_np.size(u0))
+    get_logger().warning(
+        f"newton(direct=True): this problem has no assembled tangent (a residual-only operator, or a "
+        f"nonlocal term that does not declare the DOFs it touches), so its Jacobian is materialised DENSE by "
+        f"forward-mode AD: {n} x {n} = {8 * n * n / 2**20:.1f} MB, {n} JVPs and a dense LU per Newton step. "
+        f"Fine for small problems; for large ones use the matrix-free default (drop direct=True)."
+    )
+
+    def jacobian(u):
+        return jax.jacfwd(lambda v: jnp.asarray(residual_fn(v)).reshape(-1))(jnp.asarray(u).reshape(-1))
+
+    return jacobian, linear_solve if linear_solve is not None else (lambda A, b: jnp.linalg.solve(A, b))
 
 
 def newton(
@@ -800,6 +841,8 @@ def newton(
     ls_c: float = 1e-4,
     direct: bool | None = None,
     reuse: bool = False,
+    stall: int | None = None,
+    ptc: float | None = None,
 ) -> NonlinearSolver:
     """Newton root-find, as a configurable slot. Three inner-solve modes:
 
@@ -845,7 +888,33 @@ def newton(
     tangent from step to step as well: the tangent of a march changes little between steps, so it is
     assembled a handful of times per march rather than at every Newton iteration (measured on a stabilised
     3-D flow: once for 8 steps, 0.80 -> 0.30 s per step). An explicit ``nonlinear=newton()`` keeps a fresh
-    tangent per iteration."""
+    tangent per iteration.
+
+    ``stall=N`` ends the solve once ``N`` steps in a row have not brought the residual norm 1% below the best
+    it had reached, and raises saying it stalled (with the residual, the step it stopped at, and what to try),
+    instead of spending the rest of ``max_steps`` at the same residual. A globalised Newton (``damping``,
+    ``line_search``) that meets a minimum of ``||r||`` that is no root, or a tangent that does not match the
+    residual, can sit there for every remaining step, each a full assembly and factorization; a caller with a
+    fallback (another damping, a continuation) gets to it at once. ``None`` (the default) runs to ``max_steps``
+    as before. A converging solve is unchanged: every step that lowers the residual 1% resets the count.
+
+    ``ptc=dtau0`` (a number > 0) is **pseudo-transient continuation**, for a steady problem whose Newton diverges
+    from where it starts (a buoyant flow from rest, a stiff source): each step solves
+    ``(V / dtau_k + J) delta = -r`` with ``V = |diag J|``, starting at ``dtau_0 = dtau0``. An accepted step grows
+    ``dtau`` by the factor the residual fell (switched evolution relaxation; Kelley & Keyes, SIAM J. Numer. Anal.
+    35(2), 1998, Sec. 2; Mulder & van Leer, J. Comput. Phys. 59, 1985), at least 2x and at most 4x per step; a step that does not
+    lower the residual is REJECTED (the iterate stays) and ``dtau`` shrinks 4x -- except the first step, which
+    is always taken: it satisfies the linear constraints (continuity), which a small ``dtau`` cannot relax. The safeguard is there because
+    uncapped growth reached full Newton too early on a buoyant flow, at a residual where full Newton still
+    diverged. Far from the root the pseudo-time term damps and stabilises the step per row; as the residual
+    falls ``dtau`` grows and the step becomes Newton's (a rejected step counts as one of ``max_steps`` and of
+    ``stall``). The
+    residual is unchanged, so the root and its implicit gradient are too. ``V = |diag J|`` makes the term
+    unit-free (rows in different units each get their own scale) and leaves rows with a zero diagonal alone --
+    a Taylor-Hood pressure, a multiplier: constraints get no time term. ``dtau0 = 1`` doubles the first step's
+    diagonal; smaller is more cautious. It composes with ``damping`` and ``line_search``. It needs an assembled
+    tangent (``direct=True`` or the default; refused with ``direct=False``) and a fresh one each step (refused
+    with ``reuse=True``)."""
     return _root_driver(
         "newton",
         damping=damping,
@@ -859,6 +928,8 @@ def newton(
         ls_c=ls_c,
         direct=direct,
         reuse=reuse,
+        stall=stall,
+        ptc=ptc,
     )
 
 

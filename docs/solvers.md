@@ -51,9 +51,10 @@ Pick by structure:
     and steps aside on a tracer, leaving a transformed solve otherwise unguarded.
 
 
-### Warm starts — what `x0=` actually buys
+### Warm starts — what a starting point actually buys
 
-`x0=` is free to pass and easy to misjudge, so here is the rule, measured. A Krylov solve has to
+A starting point is set on the fields, `u.initialize(u0)` (see the FEM guide: number, nodal array or
+formula). It is free to give and easy to misjudge, so here is the rule, measured. A Krylov solve has to
 cover the distance from its initial residual down to `rtol`. A warm start removes the decades it
 already starts below, so the **fraction of iterations saved is a ratio of logarithms** — not a
 ratio of errors:
@@ -96,9 +97,9 @@ warm start — it is smooth, and it is *wrong in the same modes* the operator is
 
     The arithmetic is why, and it is not an engineering problem: at a realistic surrogate accuracy of
     1e-2 to 1e-3 the law caps the prize at 20–30 %, and collecting it needs an output that is smooth as
-    well as accurate. Reach for `x0=` where a *nearby solve* already exists — a continuation sweep
+    well as accurate. Reach for a warm start where a *nearby solve* already exists — a continuation sweep
     (`jno.solve.continuation`, which warm-starts for you), a transient step (which warm-starts
-    automatically, and rejects `x0=` for that reason), or a Newton loop. Those are smooth by
+    automatically), or a Newton loop. Those are smooth by
     construction and free.
 
 ### A learned **subspace** is worth far more than a learned point
@@ -438,7 +439,7 @@ fem.solve(linear=jno.solve.fgmres(),
 For Navier–Stokes, lag the convecting velocity (`jno.lag`, [above](#the-momentum-block-picard-not-newton))
 so the velocity block AMG is built on is the Oseen operator. `reuse=k` is **refused**
 here rather than ignored: a rebuild every `k` Newton iterations would need the loop cut into chunks,
-which the steady solve does not do. To rebuild at a better state, solve again from that state (`x0=`).
+which the steady solve does not do. To rebuild at a better state, solve again from that state (`u.initialize(state)`).
 
 ### When the pressure mass is not enough
 
@@ -1509,6 +1510,42 @@ numbers; only the label and the advice differ. It covers the default θ march, `
     and unchecked as a preconditioner application. The convergence contract belongs to the outer
     solve, and that one is still gated.
 
+### Watching a solve while it runs — `log=`
+
+The lines above come before and after a solve. To follow one *while* it runs, give it `log=`:
+
+```python
+u = fem.solve(log=True)                  # each Newton step
+# INFO: newton step 1: residual 2.636e-03 (target 1.0e-08), forcing 1.0e-01
+# INFO: newton step 2: residual 2.554e-04 (target 1.0e-08), forcing 1.0e-01
+# ...
+traj = fem.solve(log=100).fn()           # every 100th time step and the last (a transient solve runs at .fn())
+lam, X = K.eigs(mass=m, k=6, precond=jno.precond.jacobi(), log=10)
+crux.solve(epochs=50_000, log=1000)      # the training line every 1000 epochs
+```
+
+`log=True` reports every step, `log=N` every N-th step of each loop and always its last, `log=False` (the
+default) nothing.
+
+| Solve | What `log=` reports |
+|---|---|
+| `fem.solve` / `fdm.solve`, nonlinear | each Newton step: residual, its target, the forcing term |
+| a transient march (`fem` or `fdm`) | each time step: step, `t`, `max \|u\|`, after that step's Newton lines |
+| `fem.eigs` with `precond=` (LOBPCG) or `sigma=` | each iteration: residual and its target |
+| `jno.core(...).solve` | the training line every N epochs (default: a tenth of the run, a thousandth above 100 000 epochs; `log=False`: none) |
+
+A linear steady solve reports nothing extra (its only loop is the Krylov iteration), and neither does the
+non-symmetric eigensolver, whose Arnoldi iteration runs inside ARPACK.
+
+Each solve reports only when it is given `log=`. A `jno.fem` inside a `jno.core` loss
+(`expr.integrate(fem)`, or a `fem.solve()` node) stays quiet, so the training lines stay readable; a
+`fem.solve(log=True)` there reports its Newton steps on every epoch, before that epoch's training line.
+
+The lines come from inside the compiled program without stopping it: each reported step writes a few
+numbers into a buffer in host memory, and a reader thread prints them, so the device never waits for
+Python as it would for a `jax.debug.callback`. Without `log=` nothing is added: the solve compiles to the
+same program as before.
+
 ### Where the time went — `fem.solve(profile=True)`
 
 `fem.stats` says *what* the solver did; `profile=True` says *how long* and *where*. It runs the solve
@@ -1691,7 +1728,8 @@ compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so co
 `linear`/`precond` see the step operator `M + θ·dt·A` — when it is time-independent the step matrix is
 formed **once** and the preconditioner materialized **once before the time loop** — and `nonlinear` drives
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
-block. Each step warm-starts from the previous state (so `x0=` is rejected).
+block. Each step warm-starts from the previous state; the first state is the initial condition
+(`u.initialize(u0)` or `u(initial) - u0`).
 
 With no `linear=`/`precond=`, a linear block's step is solved by Jacobi-BiCGStab with a GMRES rescue, except
 on a **saddle**: a row with zero mass and a zero diagonal (the incompressibility row of unsteady Stokes)
@@ -1730,8 +1768,8 @@ Complex problems are assembled as one real `2n` system over the stacked `[Re; Im
 real-equivalent block `[[A_r, -A_i], [A_i, A_r]]` — at assembly rather than at solve time. A complex
 transient is therefore an ordinary transient block (the slots configure its per-step solve as above, and
 `theta` / `adaptive` / `exponential` all apply), and a complex steady problem is an ordinary linear
-system: the `linear` / `precond` slots and `x0=` work on it, with a **complex** `x0` mapped into the
-block layout for you. Its default solver stays **sparse-direct**, not the matrix-free BiCGStab real
+system: the `linear` / `precond` slots and a start work on it: `A.initialize(a0)` with a **complex** `a0`
+fills both real parts for you. Its default solver stays **sparse-direct**, not the matrix-free BiCGStab real
 elliptic systems get — the real-equivalent block is indefinite for Helmholtz/PML, where Jacobi-BiCGStab
 does not converge.
 

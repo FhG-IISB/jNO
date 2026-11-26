@@ -330,10 +330,9 @@ tie it needs the same bound on both tied faces, and beside a weighted eliminatio
 slip) it is refused by name.
 
 Not carried, each rejected with a clear error: a real `u.t` transient (drive time through `tau` instead),
-a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, and VPINN. A nonlocal `jno.Coupling` term
+a complex form, 1D, non-nodal (Argyris/Morley/edge) elements, and VPINN. A nonlocal term (`d.irradiation`)
 composes: it is added to every step's residual (a coupling `U -> k M U` matches the local `k u v` to 1e-8,
-tied or not, `tests/test_fem_coupling_history_march.py`), and the step's Newton goes matrix-free, as it
-does for any coupling, because the assembled tangent cannot see an opaque function.
+tied or not, `tests/test_fem_coupling_history_march.py`).
 
 !!! danger "A step that did not converge is refused, not carried forward"
     The march runs its per-step Newton

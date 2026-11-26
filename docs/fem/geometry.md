@@ -773,6 +773,65 @@ and is not watched.
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms (fail loud). 3-D sub-regions are
 > defined by a predicate `where(x, y, z)`.
 
+### Material laws — `d.k(T)`
+
+A property can depend on a field: conductivity on temperature, reluctivity on the flux density, permeability
+on the pressure head. Attach the law with the material, as a function, and evaluate it where the weak form
+uses it, the way the equation is written, ∫ k(T) ∇T·∇v:
+
+```python
+d = (felt.name("insulation").attach(k=lambda T: 0.05 + 2e-4 * T)   # a law of the field T
+     + crystal.name("crystal").attach(k=220.0)                      # a number, as before
+     ).domain()
+T, v = d.fem_symbols(names=("T", "v"))
+Ti, vi = T.bind(x=x, y=y), v.bind(x=x, y=y)
+heat = d.k(T) * (Ti.x * vi.x + Ti.y * vi.y) - d.q * vi              # numbers pass through, laws are evaluated
+```
+
+Write the law as the equation it is, e.g. a fibre insulation whose conductivity grows with the radiation
+between its fibres, k(T) = k0 + k1 T + k3 T^3:
+
+```python
+k_felt = lambda T: k0 + k1 * T + k3 * T**3
+```
+
+Any callable that is not a jNO expression is a law: a lambda, a function, or an object with `__call__` (a
+table of datasheet points interpolated with `jno.np` operations, where no formula is known).
+
+**Trainable coefficients.** A coefficient of the law may be a `jno.np.parameter`; `fem.solve()` then returns a
+trace node and `jno.core` fits the coefficient through the nonlinear solve (implicit differentiation, never an
+unrolled Newton loop):
+
+```python
+theta = jno.np.parameter((2,), name="theta")             # .initialize(...), .optimizer(optax.lbfgs())
+d.attach("insulation", k=lambda T: theta[0] * (1 + theta[1] * T))
+T_h = jno.fem([d.k(T) * (Ti.x * vi.x + Ti.y * vi.y), ...]).solve(nonlinear=jno.solve.newton(direct=True))
+jno.core([(T_h - T_measured).mse]).solve(30)
+```
+
+Only what the data can see is recovered: with the temperature fixed on both ends of a slab, a uniform
+scale of k leaves T unchanged, so `theta[0]` stays where it started while `theta[1]` is found (measured:
+b = 2.0000 from a start of 0.5, `tests/test_fem_material_laws.py`). The argument is any expression -- the field, a bound
+view of it, or a derived quantity (`d.nu(Bx**2 + By**2)`). Because the law contains the unknown, the form is
+nonlinear and Newton's tangent carries dk/dT exactly; nothing is passed to `fem.solve()`.
+
+The rules that keep a law apart from a **function of position** (`.attach(k=lambda r, z: ...)`, called with
+the coordinates when `d.k` is read, as before):
+
+* A plain function whose parameters are exactly the coordinates (one per dimension) is a function of
+  position, unless one of its parameters is named after a declared field (`fem_symbols(names=...)`), which
+  makes it a law. So `lambda T, c: ...` on a 2-D domain is a law once `T` is a field, not silently a function
+  of (x, y).
+* A property with a law **must be called**: bare `d.k` returns a placeholder that raises in any arithmetic,
+  naming the regions and the fix. `d.k(T)` on a property of numbers only is the same coefficient as `d.k`,
+  so one spelling serves either way.
+* `d.k(x, y)` with coordinate variables keeps its meaning (binding to those coordinates).
+* A law is captured as written: re-attaching it after `jno.fem` is built refuses at the next solve (the
+  re-attached number path still re-assembles).
+
+Pinned in `tests/test_fem_material_laws.py` (a law and a number in two layers against the exact Kirchhoff
+profile, a datasheet object, and each guard).
+
 ### `domain.mask` — a field's values on one region
 
 `d.mask(name)` is a boolean mask over the mesh nodes (`d.mesh.points`): every node of the region's
@@ -894,153 +953,128 @@ what the continuity equation and the pressure term must both use.
     validated), or derive and write the cylindrical operator yourself as an ordinary scalar/coupled
     form. jNO ships no axisymmetric H(curl)/H(div) element and no meridional/azimuthal split.
 
-!!! warning "Enclosure radiation carries the same factor"
-    `domain.enclosure(tags, axisymmetric=True)` gives ring areas `2πr̄·L` and a
-    `gap.load(q)` that is **per full revolution** (W, not W/m). The weak form you add it to must carry
-    the same `2πr`, or the two sides differ by exactly that factor. jNO cannot check this for you.
+!!! warning "Radiation carries the same factor"
+    On an axisymmetric domain the radiating faces of `d.irradiation` are rings: write the term with
+    `dS = 2πr`, as the volume terms carry `dV = 2πr`, or the two sides differ by exactly that factor.
 
 ---
 
-## Enclosure radiation (nonlocal boundary flux)
+## Mapped regions — `.attach(map=f)`
 
-Grey-body radiation between surfaces is **nonlinear** (`T⁴`) and **nonlocal** (every surface element
-exchanges with every other via the view-factor matrix `F`), so it cannot be a local weak term. jNO
-provides the *geometric* building block — the view matrix — and you write the radiosity **as math** in
-`jno.np`; there is no `jno.radiation()` helper.
+A region of the mesh can stand for another region of space. Attach the map from its mesh coordinates x′ to the
+physical coordinates x = f(x′), written with `jno.np`, and every weak term integrated there is evaluated by the
+change of variables (J = ∂f/∂x′ by automatic differentiation of f): a coordinate becomes f(x′), a derivative becomes
+J⁻ᵀ∇′, the measure picks up det J. The equations are written once for the whole domain.
 
-`domain.enclosure(tags)` discretises the radiating boundary surfaces into **elements** aligned to the
-FEM mesh nodes and returns a handle:
+The unbounded outside of a body, closed by a finite shell whose outer edge is infinity:
 
 ```python
-gap = d.enclosure(["inner_gap", "outer_gap"])   # name the surfaces once
-gap.check()                          # F-quality gate: closure (Σ_j F_ij→1) + reciprocity (A_i F_ij=A_j F_ji)
-F   = gap.view_factor                # (m, m) element view factor — fully geometry-determined
-eps = gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6})         # per-element ε from a {tag: ε} map
-rho = 1.0 - eps
+def to_infinity(r, z):                      # rho = R^2 / (2R - rho'): R <= rho' <= 2R covers R <= rho < infinity
+    rho = jno.np.sqrt(r**2 + z**2)
+    q = R**2 / ((2 * R - rho) * rho)
+    return r * q, z * q
+
+d = (... + (half(2 * R) - half(R)).name("infinity").attach(map=to_infinity)).sized(h).domain()
+fem = jno.fem([nu * curl(A) @ curl(W) * dV - J * W * dV, A(axis) - 0.0, A(arc) - 0.0])   # arc = infinity
 ```
+
+Every decaying mode rho^-(n+1) becomes a polynomial of the mesh coordinate, so a coarse shell resolves it. A complex
+map is an absorbing layer for waves (rho~ = rho′ + (i/k) ∫σ, with Bermúdez' σ = 1/(L − s) needing no tuning); the
+form then becomes complex and goes through the real-equivalent complex route. Maps along one axis close half-spaces
+(with corner regions mapping both axes).
+
+**Checked:** f must be the identity where the region meets an unmapped one (otherwise the field would jump; raises).
+**Scope (first version):** first derivatives (a second derivative in a mapped region raises); volume terms (Dirichlet
+values are not mapped; surface terms on a mapped region's own faces are not supported); fields whose components
+transform as numbers -- not edge or face elements, which need a Piola map. A 1/rho field in an axisymmetric shell
+wants the shell graded towards its outer edge (measured: error ~h^0.8 on a uniform shell, ~h^2 graded).
+
+Pinned in `tests/test_fem_mapped_regions.py`: a current loop (elliptic-integral field), a sphere at fixed temperature
+in an unbounded medium, a line source under a grounded surface (axis maps and corners), a 2-D net source, an outgoing
+wave through a complex map (Hankel), and the interface guard.
+
+## Enclosure radiation
+
+Grey-body radiation between surfaces is **nonlinear** (`T⁴`) and **nonlocal** (every face exchanges with every
+other through the view-factor matrix `F`), so it is not a local integrand. It is still written as the equation:
+`d.irradiation(T)` is the incident radiation G on every radiating face, and `jno.fem` integrates a term that
+contains it over those faces (below). There is no radiation helper, enclosure handle or residual function to
+write.
 
 ??? note "How the view factors are computed"
     `F` is computed purely from geometry (occlusion + orientation) by **double-area Gauss quadrature** of
-    the diffuse kernel — so a *concave* surface keeps its self-view. Tags only group elements (for
-    per-surface emissivity); they never block exchange. The enclosure **inherits** `axisymmetric` from the
-    domain (see below), so its ring areas and the FEM measure cannot disagree; passing a contradicting value
-    raises. By default the boundary normals point *out of* the mesh (radiation across an un-meshed gap); for
-    an **oven/furnace cavity** where the meshed fluid is inside, pass `inward=True` so the facing walls see
-    one another (see the *Oven* tutorial); for a meshed *medium* between solids use `medium_tags`.
+    the diffuse kernel — so a *concave* surface keeps its self-view. The radiating faces are found from the
+    transparent medium (attached `kappa == 0`): every face between a connected medium and the regions next to
+    it, one enclosure per connected medium. Element tags (the solid regions) only group faces for their
+    emissivity; they never block exchange. Closure is enforced on each enclosure. The view factors are cached
+    on disk by a hash of the mesh, the regions and the options (`$JNO_CACHE/enclosures`, `~/.cache/jno`
+    by default).
 
-??? note "What blocks a ray — interface mode"
-    Every meshed region that is *not* listed in `medium_tags`
-    is opaque — including a solid that carries no radiating surface of its own. The occluder set is
-    resolved once from the region list, not inferred from element tags, and is shared by the visibility
-    test and the near-field refinement: a solid with no radiating surface still blocks, and a chord
-    through it is never counted as visible.
+??? note "What blocks a ray"
+    Every meshed region that is not transparent is opaque — including a solid that carries no radiating face
+    of its own. The occluder set is resolved once from the region list, not inferred from face tags, and is
+    shared by the visibility test and the near-field refinement: a chord through a solid is never counted as
+    visible.
 
-??? note "Axisymmetric near field, and when the graded rule runs"
-    The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`,
-    so a uniform `n_phi` rule overshoots every near-touching pair (two surfaces meeting in a wedge, and
-    every element's own ring self-view) by roughly `dφ/(d/r)`. A graded azimuthal rule fixes it and
-    restores closure to ~1e-3, but it needs an occluder model to test its refined chords against, so it
-    runs when one is available: **`medium_tags=...`** (interface mode — the solid polygons), or
-    **`occlude=False`** (you asserting nothing blocks any ray, e.g. a convex cavity). Plain boundary mode
-    with occlusion on keeps the uniform rule plus the `r_min` floor and a closure error around 1e-1, and
-    logs a warning saying so. Its occlusion is also a *meridian-only* test reused at every azimuth, which
-    is wrong for a general solid of revolution — interface mode checks the true 3-D chord per azimuth.
-    Always call `gap.check()`.
+??? note "Axisymmetric near field"
+    The ring kernel's azimuthal integrand peaks at `φ = 0` with width `d/r`, so a uniform `n_phi` rule
+    overshoots every near-touching pair (two surfaces meeting in a wedge, and every face's own ring
+    self-view) by roughly `dφ/(d/r)`. A graded azimuthal rule fixes it and restores closure to ~1e-3; its
+    occlusion test is the true 3-D chord per azimuth, against the solid polygons.
 
-Write the **full grey-body radiosity** (reflections included) and couple it to the conduction FEM by
-adding the net flux as a consistent surface load to the residual:
+### Radiation written as the equation — `d.irradiation(T)`
+
+Mark the regions radiation crosses with `kappa = 0`, give the surfaces their emissivity `eps` (a number or a law of
+T), and write the radiation term as on paper:
 
 ```python
-SIGMA, KELVIN = 5.670374419e-8, 273.15
-
-def q_rad(u):                        # net radiative flux per element:  q = σ·G·T⁴
-    Ts = gap.field(u)                # nonlocal gather: per-element temperature from the solution
-    J  = jno.np.linalg.solve(jno.np.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
-    return J - F @ J                 # (I − F)(I − diag(ρ)F)⁻¹ diag(ε) σ T⁴
-
-# −k ∂T/∂n = q_rad  enters the residual as a consistent load:  A u = b − gap.load(q_rad(u))
+d = (... .attach(k=..., eps=0.8)                       # opaque parts
+     + gas.name("Gas").attach(k=0.19, eps=1.0, kappa=0.0)   # a medium radiation crosses
+     ).sized(h).domain(axisymmetric=True)               # (r, z) meridian plane: the enclosure revolves it
+T, v = d.fem_symbols(names=("T", "v"))
+dS = 2 * np.pi * r                                      # ring measure on a face (r of the interior variables)
+fem = jno.fem([d.k(T) * (Ti.r * vi.r + Ti.z * vi.z) * dV - d.q * vi * dV,
+               d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS,     # ∫ ε(σT⁴ − G) v dS
+               ...])
 ```
 
-`gap.field(u)` gathers the per-element temperature; `gap.load(q)` scatters a per-element flux back to
-the FEM nodes as `∫_Γ q·v ds`. The radiosity `(I − ρF)⁻¹` solve is `jno.np` — it is **traced**, so a
-trainable `jno.np.parameter` emissivity flows through it for inverse problems.
+`d.irradiation(T)` is the incident radiation G on every radiating face: the faces between a connected region with
+`kappa == 0` and its neighbours, one diffuse-grey enclosure per connected medium (J = (I − diag(1 − ε) F)⁻¹ εσT⁴,
+G = F J; Modest, *Radiative Heat Transfer*, Ch. 5). `eps` and `kappa` are this operator's documented property
+names. A term that contains `d.irradiation` is integrated over the radiating faces: every factor is evaluated per
+face (the field and G at the face's mean temperature, a coordinate at two Gauss points along it, so `dS = 2πr` is
+integrated exactly against each node's hat function) and the term enters with an exact dense tangent on the
+radiating nodes. That tangent is formed analytically, without differentiating through the radiosity solve:
+with M = I − diag(1 − ε) F, dG/dT = F M⁻¹ diag(h), h = d(εσT⁴)/dT − ε′(T) G, and the term's own partials in T and G
+(it is pointwise per face). It equals forward-mode autodiff of the residual to round-off (the test below, with an
+ε(T) law). `F` and the radiosity solve are dense (the tangent block on the radiating nodes is dense anyway). Write it
+with the field and test function themselves (`T`, `v`), not their bound views, and without derivatives; it must be
+linear in `v`.
 
-**Solver note (BYO, jax-native).** The Dirichlet conditions are penalty-enforced, so the conduction `A`
-is ill-conditioned — use a **direct** linear solve (a *matrix-free iterative* solver such as the
-built-in `newton_krylov` may stall). The whole coupled solve stays jax-native and **differentiable**
-(so `jax.grad`/`crux` recover an emissivity *through* the radiation) with a short direct-solve Newton
-wrapped in `jax.lax.custom_root`. Validated on two concentric cylinders against the closed-form
-two-surface series to <1%, including `jax.grad` w.r.t. emissivity vs finite differences
-(`tests/test_fem_enclosure_radiation.py`).
+Pinned in `tests/test_fem_radiation_term.py`: two concentric cylinders and two concentric spheres (axisymmetric)
+against the analytic exchange and the energy balance, a coupled conduction-radiation solve against its series
+solution, and the analytic tangent against `jax.jacfwd`. A radiation term cannot hold a trainable parameter yet
+(an emissivity to calibrate): `jno.fem` refuses it with a message.
 
-### In-residual coupling (`jno.Coupling`) — implicit, trainable, transient
-
-To instead solve conduction **and** radiation as one implicit system, pass the nonlocal residual **in
-the `jno.fem([...])` list**. A plain function `f(u) -> (n_dofs,)` there is taken as a nonlocal
-*coupling*: `jno.fem` adds it to the assembled residual `R(u) = R_local(u) + Σ_k coupling_k(u)`,
-promoting a linear form to a nonlinear one, and `fem.solve()` drives the whole thing with the
-matrix-free, `custom_root`-differentiable `newton_krylov`:
+**Semi-transparent and optically thick media need no operator.** P1 for κ > 0 is one more field with local terms
+(measured: P1 approaches the Rosseland limit, 189 → 45 → 1.7 K as τ = 1 → 10 → 100):
 
 ```python
-def radiation(u):                         # the same radiosity, now a residual contribution
-    Ts = gap.field(u)
-    J  = jnp.linalg.solve(jnp.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
-    return gap.load(J - F @ J)             # net flux scattered to nodes
-
-fem  = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])    # radiation is the bare function
-Tsol = fem.solve(u0=T_guess)                                   # conduction + radiation, one implicit solve
+G, g = d.fem_symbols(names=("G", "g"))
+p1 = [(Gi.x * gi.x + Gi.y * gi.y) / (3 * d.kappa) + d.kappa * (Gi - 4 * d.n**2 * SIGMA * Ti**4) * gi,
+      d.eps / (2 * (2 - d.eps)) * (G - 4 * d.n**2 * SIGMA * T**4) * g]      # Marshak, on the medium's walls
+heat += [d.kappa * (4 * d.n**2 * SIGMA * Ti**4 - Gi) * vi]
 ```
 
-A jitted residual / callable *object* isn't a plain function — wrap it as `jno.Coupling(fn)`, which is
-also how you reach the options below:
+and Rosseland for τ ≫ 1 is a conductivity law, `.attach(k=lambda T: k0 + 16 * n**2 * SIGMA * T**3 / (3 * kappa))`.
 
-- **Trainable coupling parameters.** A coupling is opaque to the trace walk — a `jno.np.parameter`
-  inside it is never found, so declare it. The residual then takes a second argument, the
-  `{name: value}` dict:
-
-    ```python
-    eps = jno.np.parameter((1,), name="eps")           # emissivity, calibrated from data
-    eps.initialize(jax.nn.initializers.constant(0.8))
-
-    def radiation(w, p):                                # p -> {"eps": value}
-        e = p["eps"].reshape(())
-        J = jnp.linalg.solve(eye - (1.0 - e) * F, e * SIGMA * gap.field(w) ** 4)
-        return gap.load(s_row * J - F @ J)
-
-    fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
-    ```
-
-    The gradient reaches `eps` *through* the radiosity solve, so `jno.core` recovers it from
-    temperature observations like any other parameter (checked against finite differences to 3% in
-    `tests/test_fem_enclosure_radiation.py`).
-- **Multifield.** `jno.Coupling(fn, field_key=T_key)` acts on one field's DOF block (e.g. radiation on
-  `T` in a heat+flow / thermo-mechanical solve).
-- **Transient.** The coupling enters each implicit step, so enclosure radiation over a heating cycle
-  solves in-residual. (Not combined with periodic ties.)
-- **Essential rows.** The contribution is zeroed on every Dirichlet row -- constant, time- or
-  τ-dependent, or parameter/net-valued -- so it never moves a prescribed value. A coupling on a linear
-  form promotes it to a residual operator that still declares those rows, so
-  `jno.solve.staggered(over_relax>1)` leaves them alone.
-
-All four (bare function, `params`, `field_key`, transient) are covered in
-`tests/test_fem_enclosure_radiation.py`. Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed.,
-Ch. 4–5 (view factors; the net-radiation / radiosity method for diffuse-grey enclosures).
-
----
-
-## Nonlocal coupling, in general — `jno.Coupling` and `jno.derived`
+## Nonlocal values — `jno.derived`
 
 Enclosure radiation is one instance of a shape that recurs: **gather → operate → scatter**, where the
-"operate" is not a local integrand. jNO has two mechanisms for it, and which one you want is decided by
-*what the nonlocal quantity is*, not by the physics.
-
-| | `jno.Coupling(fn)` | `jno.derived(fn, inputs=[...], on=u)` |
-|---|---|---|
-| produces | a **residual vector** `R(u) += c(u)` | a **nodal field** `d = f(u)` |
-| used as | a term in the `jno.fem([...])` list | a value **inside** any term |
-| tangent | carries the coupling **exactly** | **lagged** (Picard); stays local and sparse |
-| solver | matrix-free Newton–Krylov only | assembled tangent, so `newton(direct=True)` works |
-| converges | quadratically | linearly, and can stall on a strong coupling |
+"operate" is not a local integrand. `d.irradiation` is the *residual* side of it: its term adds a nonlocal
+residual `R(u) += c(u)` whose tangent `jno.fem` assembles exactly. `jno.derived(fn, inputs=[...], on=u)` is the
+*value* side: a nodal field `d = f(u)` usable **inside** any term, with a **lagged** (Picard) tangent that stays
+local and sparse, so it converges linearly and can stall on a strong coupling.
 
 **Reach for `derived` when the nonlocal quantity is needed inside a term**, which is the case a residual
 vector simply cannot express. A laser's Beer–Lambert attenuation is the clean example: the depth
@@ -1071,7 +1105,7 @@ loop — no extra solver slot, no outer driver.
   residual, so a fixed point that does not converge **raises** rather than returning a plausible field.
 - Convergence is **linear**, at a rate set by the coupling strength. Past a critical strength it does not
   converge at all; `fem.solve(nonlinear=jno.solve.picard(damping=...))` or `newton(line_search=True)` is
-  the remedy, and `jno.Coupling` is the alternative when you want the coupling in the tangent.
+  the remedy.
 - Gradients are the **Picard adjoint** — descent-worthy and trainable through `jno.core`, but not exact;
   a finite-difference check will not agree to machine precision. A `params=[...]` value inside the rule is
   *not* lagged, so the direct sensitivity through it is exact.
@@ -1085,25 +1119,6 @@ residual check can see, because the step converges, just to a slightly different
     Ray tables and view factors closed over by the rule are fixed for the life of the `jno.fem`. On a
     **moving mesh they go stale silently** — a rebuild means a new `jno.fem`. This is the same caveat the
     enclosure carries, and it is the open edge of droplet-plus-laser work.
-
-### The same enclosure, written as a derived field
-
-`gap.load(q)` returns an *integrated* load, so it becomes a nodal field by dividing out the consistent
-weights `W_j = ∫φ_j ds` — which is `gap.load` of a unit flux, no new API:
-
-```python
-W  = gap.load(jnp.ones(gap.size), size=nd)               # the consistent nodal weight
-qn = jno.derived(lambda T: gap.load(q_elem(T), size=nd) / jnp.where(W > 0, W, 1.0), inputs=[u], on=u)
-fem = jno.fem([conduction, qn * v.bind(x=xg1, y=yg1), qn * v.bind(x=xg2, y=yg2), *bcs])
-```
-
-Because `Σ_i (M_∂)_ij = W_j`, the **total radiative power is conserved exactly**; the difference is one P1
-boundary-mass smoothing of its distribution, consistent at `O(h²)` — measured at a thousandth of a kelvin
-on the concentric-cylinder case in `tests/test_fem_enclosure_radiation.py`. What it buys is the tangent:
-the derived form has an assembled sparse Jacobian, so `newton(direct=True)` solves it, where the
-`Coupling` path is matrix-free only because its tangent couples every enclosure element to every other.
-What it costs is robustness on a radiation-dominated enclosure, per above. **Both spellings are supported;
-the `Coupling` one remains the default in the examples.**
 
 ### What stays on its own path — contact
 

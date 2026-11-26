@@ -28,8 +28,6 @@ defaults (Jacobi-BiCGStab / Newton on the assembled tangent / backward-Euler) yo
 from __future__ import annotations
 
 import contextlib
-import functools
-import inspect
 import warnings
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -302,7 +300,7 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
     the general spelling for nonlocal coupling that enters as a *value*.
 
     A weak term is *local*: an integrand evaluated at one quadrature point. Some physics is not. Where
-    :class:`jno.Coupling` carries a nonlocal *residual* ``R(u) += c(u)``, ``derived`` carries a nonlocal
+    a nonlocal residual term (``d.irradiation``) adds ``R(u) += c(u)``, ``derived`` carries a nonlocal
     *value* ``d = f(u)`` on the nodes, usable **anywhere a field is** -- a coefficient, a source, a
     material property. The distinction is not cosmetic: a beam's attenuation ``exp(-tau(u))``
     *multiplies* a source, so it cannot be written as a load; and a quantity needed inside a term has
@@ -332,10 +330,9 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
       rather than returning a plausible wrong field;
     * convergence is **linear, not quadratic**, at a rate set by the coupling strength. For a strongly
       coupled nonlocality -- radiation-dominated enclosure, optically thick beam -- it can stall or
-      diverge, where an in-residual :class:`jno.Coupling` would have kept the coupling in its tangent.
+      diverge, where a nonlocal residual term (``d.irradiation``) keeps the coupling in its tangent.
       ``fem.solve(nonlinear=jno.solve.picard(damping=...))`` or ``newton(line_search=True)`` is the
-      remedy. Reach for ``Coupling`` when you need the exact tangent, ``derived`` when you need the
-      value inside a term or the cheap tangent.
+      remedy.
 
     ``every`` sets the cadence. ``"residual"`` (default) re-evaluates ``fn`` at every residual
     evaluation, so a transient step is fully implicit in the coupling; ``"step"`` evaluates it once per
@@ -345,7 +342,7 @@ def derived(fn: Callable, *, inputs, on, every: str = "residual", params=None):
 
     ``params=[...]`` declares ``jno.np.parameter`` nodes used only inside ``fn`` (the trace walk that
     finds weak-form parameters cannot see into an opaque function); ``fn`` then takes a trailing
-    ``{name: value}`` dict, as a :class:`jno.Coupling`'s residual does.
+    ``{name: value}`` dict.
 
     **Inverse-problem caveat**: parameters inside ``fn`` are not lagged, so the direct sensitivity
     through them is exact, but the path through ``u`` uses the lagged Jacobian -- the standard "Picard
@@ -849,6 +846,21 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     pts = _np.asarray(domain.mesh.points)[:, :dim]
     corner = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex...
     d2 = ((pts - corner) ** 2).sum(axis=1)
+    corner_nid = int(d2.argmin())
+    region = getattr(field, "field_region", None)
+    if region is not None:
+        # ...of the field's REGION (`d.unknown(..., region=R)`): every vertex outside it is already held at 0,
+        # and a pin there leaves the constant free -- a singular system that SuperLU still factorises into a
+        # finite, wrong answer.
+        from .utils.solver.fem_utils import _cell_region_mask
+
+        cells = _np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+        m = _np.asarray(_cell_region_mask(domain, region)).reshape(-1)
+        if m.shape[0] != cells.shape[0] or not m.any():
+            raise ValueError(f"jno.fem: p.pin() on a field of region={region!r} found no cell of that region.")
+        outside = _np.ones(len(pts), dtype=bool)
+        outside[_np.unique(cells[m > 0])] = False
+        d2 = _np.where(outside, _np.inf, d2)
     nid = int(d2.argmin())
     if ties:
         # ...or, with ties, the vertex nearest it that no tie touches (either side of any tie: the
@@ -875,7 +887,7 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
     # A vertex other than the min-corner is named in the tag too: the same field pinned with and without
     # ties on one domain must not share a region that sits at the wrong node for one of them.
     tag = f"_gauge_pin_{getattr(field, 'name', None) or field.field_key}"
-    if nid != int(d2.argmin()):
+    if nid != corner_nid:
         tag = f"{tag}_v{nid}"
     cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
     if tag not in cache:
@@ -1054,16 +1066,25 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
         return False
     if _trial_spaces(constraints) - _NATIVE_SPACES:
         return False
-    # complex=True fields: the real-equivalent form couples re/im test functions within one term,
-    # which the native one-test-field-per-term classifier rejects -> route to the complex branch.
-    if any(
-        getattr(n, "_complex_field_member", False)
-        for c in constraints
-        for n in _walk(_bare(c))
-        if isinstance(n, (TrialFunction, TestFunction))
-    ):
+    # complex=True fields: a term coupling the re/im test functions is rejected by the native
+    # one-test-field-per-term classifier -> route to the complex branch. Terms lowered by
+    # lower_complex_terms are already split per test function and stay native.
+    if _couples_complex_tests(constraints):
         return False
     return True
+
+
+def _couples_complex_tests(constraints: List[Any]) -> bool:
+    """Whether a term holds two different test functions of complex=True fields."""
+    for c in constraints:
+        keys = {
+            getattr(n, "field_key", id(n))
+            for n in _walk(_bare(c))
+            if isinstance(n, TestFunction) and getattr(n, "_complex_field_member", False)
+        }
+        if len(keys) > 1:
+            return True
+    return False
 
 
 def _element_for(dimension: int, order: int) -> str:
@@ -1107,6 +1128,114 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
                     seen.add(k)
                     keys.append(k)
     return keys
+
+
+@jax.tree_util.register_pytree_node_class
+class Solution:
+    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name.
+
+        u = fem.solve()
+        u.T, u.A, u.I          # nodal T, complex nodal A (from its two real halves), a constant unknown's value
+        u["T"], u.fields       # the same by key; the field names
+        u[0], u @ u, 2 * u, jnp.linalg.norm(u), np.asarray(u), fem.solve(x0=u)   # still the flat vector
+
+    A scalar field gives ``(n,)``, a vector field ``(n, k)``, a constant unknown its value; a trajectory
+    (transient) keeps its leading time axis on every field. A field's name wins over the array attribute of
+    the same name: ``u.T`` is the field ``T``, not the transpose (``u.flat.T`` is). The fields are slices of
+    the vector, so they are differentiable. It is a pytree of the one vector, so it passes through ``jit``,
+    ``grad`` and ``vmap``.
+    """
+
+    __slots__ = ("flat", "_layout", "__weakref__")
+    __array_priority__ = 1000  # numpy defers mixed arithmetic to us
+
+    def __init__(self, flat, layout):
+        object.__setattr__(self, "flat", flat)
+        object.__setattr__(self, "_layout", layout)
+
+    # -- pytree
+    def tree_flatten(self):
+        return (self.flat,), self._layout
+
+    @classmethod
+    def tree_unflatten(cls, layout, children):
+        return cls(children[0], layout)
+
+    # -- fields
+    @property
+    def fields(self):
+        """The field names, in the solution's order."""
+        return tuple(name for name, *_ in self._layout)
+
+    def _field(self, name):
+        for nm, parts, shape in self._layout:
+            if nm == name:
+                u = self.flat
+                lead = tuple(u.shape[:-1])
+                blocks = [u[..., a:b] for a, b in parts]
+                blk = blocks[0] if len(blocks) == 1 else blocks[0] + 1j * blocks[1]
+                return blk.reshape(lead + shape) if shape == () else blk.reshape(lead + (-1,) + shape[1:])
+        raise AttributeError(
+            f"the solution has no field {name!r}; its fields are {', '.join(map(repr, sorted(self.fields)))}."
+        )
+
+    def __getattr__(self, name):
+        if name.startswith("__") or name in ("flat", "_layout"):
+            raise AttributeError(name)
+        if any(nm == name for nm, *_ in self._layout):
+            return self._field(name)
+        try:
+            return getattr(self.flat, name)
+        except AttributeError:
+            raise AttributeError(
+                f"the solution has no field or array attribute {name!r}; its fields are "
+                f"{', '.join(map(repr, sorted(self.fields)))}."
+            ) from None
+
+    def __setattr__(self, name, value):
+        raise AttributeError("a Solution is read-only")
+
+    def __dir__(self):
+        return sorted(set(object.__dir__(self)) | {n for n in self.fields if n.isidentifier()})
+
+    def __getitem__(self, key):
+        return self._field(key) if isinstance(key, str) else self.flat[key]
+
+    # -- the array
+    def __jax_array__(self):
+        return jnp.asarray(self.flat)
+
+    def __array__(self, dtype=None, copy=None):
+        a = np.asarray(self.flat)
+        return a if dtype is None else a.astype(dtype)
+
+    def __len__(self):
+        return len(self.flat)
+
+    def __iter__(self):
+        return iter(self.flat)
+
+    def __float__(self):
+        return float(self.flat)
+
+    def __repr__(self):
+        return f"Solution(fields={list(self.fields)}, flat={self.flat!r})"
+
+
+def _solution_op(name):
+    def op(self, *other):
+        return getattr(self.flat, name)(*[o.flat if isinstance(o, Solution) else o for o in other])
+
+    op.__name__ = name
+    return op
+
+
+for _name in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow", "matmul"):
+    for _n in (f"__{_name}__", f"__r{_name}__"):
+        setattr(Solution, _n, _solution_op(_n))
+for _n in ("__neg__", "__pos__", "__abs__", "__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"):
+    setattr(Solution, _n, _solution_op(_n))
+Solution.__hash__ = None
 
 
 def _field_names(constraints: List[Any]) -> Dict[Any, str]:
@@ -1649,7 +1778,15 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
         inner = _nm(nonlinear, _newton) if not fem_obj.is_linear else _lin()
         return f"solve: transient · {step} · per step {inner}"
     if mode == "nonlinear":
-        default_inner = "bicgstab (assembled)" if _assembled and nonlinear is None else "bicgstab (matrix-free)"
+        # What the Newton slot does with the tangent decides the inner solve: direct=True factorises it (or, with
+        # none assembled, a dense one it materialises), direct=None iterates on it, direct=False ignores it.
+        _direct = getattr(nonlinear, "direct", None) if nonlinear is not None else None
+        if _direct is True:
+            default_inner = "lu (assembled tangent)" if _assembled else "dense (materialised Jacobian)"
+        elif _assembled and _direct is None:
+            default_inner = "bicgstab (assembled)"
+        else:
+            default_inner = "bicgstab (matrix-free)"
         return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
     if isinstance(getattr(fem_obj, "_op", None), FemLinearSystem) and precond is None:
         # a runtime-parametric form solves on a sparse-direct factorisation unless told otherwise
@@ -1772,7 +1909,7 @@ def _check_constant_field_scope(domain: Any, constraints: List[Any], is_vpinn: b
         where = "a VPINN (network trial)"
     elif _trial_spaces(constraints) - {"Lagrange"}:
         where = "a form mixing in a non-nodal element family"
-    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+    elif _couples_complex_tests(constraints):
         where = "a complex form"
     if where is not None:
         raise NotImplementedError(
@@ -1939,7 +2076,7 @@ def _check_symmetric_field_scope(domain: Any, constraints: List[Any], periodic_t
         where = "a form with periodic ties"
     elif _trial_spaces(constraints) - {"Lagrange"}:
         where = "a form mixing in a non-nodal element family"
-    elif any(getattr(n, "__dict__", {}).get("_complex_field_member", False) for c in constraints for n in _walk(_bare(c))):
+    elif _couples_complex_tests(constraints):
         where = "a complex form"
     if where is not None:
         raise NotImplementedError(
@@ -2824,7 +2961,7 @@ class FEM:
             raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
         return keys.index(fk)
 
-    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond):
+    def _warn_if_saddle_solved_by_the_default(self, solve_fn, linear, precond, nonlinear=None):
         """Say so when the matrix-free default is about to be pointed at a saddle system.
 
         The default is Jacobi-preconditioned BiCGStab, and a saddle block has a ZERO diagonal -- the
@@ -2835,10 +2972,13 @@ class FEM:
 
         Warn rather than refuse, on purpose: a 2-D saddle of moderate size does solve acceptably this
         way, and refusing would break working code. Only when no solver was chosen -- passing
-        `linear=` or `precond=` means the choice was made deliberately and needs no advice.
+        `linear=` or `precond=` means the choice was made deliberately and needs no advice, and a
+        sparse-direct Newton (`nonlinear=jno.solve.newton(direct=True)`) factorizes its tangent.
         """
         blocks = getattr(self, "_saddle_blocks", ())
         if not blocks or solve_fn is not None or linear is not None or precond is not None:
+            return
+        if getattr(nonlinear, "direct", None) is True:
             return
         if getattr(self, "_saddle_warned", False):
             return
@@ -3068,6 +3208,10 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
 
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), from inside the compiled program without stopping it. A deferred
+        solve reports when it is evaluated. Off by default, and then nothing is added to the program.
+
         A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
         (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
         ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
@@ -3103,6 +3247,19 @@ class FEM:
             mesh).
         """
         self._refresh_attachments()
+        for _u, _ver in getattr(self, "_initial_used", ()):
+            if _u.__dict__.get("_initial_version", 0) != _ver:
+                raise ValueError(
+                    f"fem.solve: {_u.name}.initialize(...) changed after jno.fem was built; the initial state of a "
+                    "time-dependent problem is read when the form is built. Call jno.fem(...) again."
+                )
+        if x0 is None:
+            x0 = self._initialized_x0()
+            if x0 is not None and adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=...): a field's .initialize(...) start does not survive the change of mesh "
+                    "(the DOF layout changes across it). Solve without adapt= from that start, or drop the start."
+                )
         import time as _time
 
         from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
@@ -3139,22 +3296,28 @@ class FEM:
                     "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
                 )
             out = coupled(_em, self).solve(**kwargs)
-            return jnp.asarray(out.field) if isinstance(out, ElectroThermalSolution) else out
+            return self._as_solution(jnp.asarray(out.field)) if isinstance(out, ElectroThermalSolution) else out
 
+        from .utils import beacon
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
 
+        # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
+        log = kwargs.pop("log", False)
         _t0 = _time.perf_counter()
         # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
         # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
         prev_linear = _nk._LINEAR_FORM[0]
         _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
         try:
-            out = self._solve_inner(*args, **given, **kwargs)
+            with beacon.session(log, "fem.solve"):
+                out = self._solve_inner(*args, **given, **kwargs)
         finally:
             _nk._LINEAR_FORM[0] = prev_linear
+        if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
+            out.fn = beacon.logged(out.fn, log, "fem.solve")
         get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
-        return out
+        return self._as_solution(out)
 
     def _march_phrase(self, since: float) -> str:
         """The march headline for the log line, from THIS solve's stats only (a path that does not
@@ -3453,7 +3616,7 @@ class FEM:
                 else:
                     self._periodic = reduction
             try:
-                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond)
+                self._warn_if_saddle_solved_by_the_default(solve_fn, linear, precond, nonlinear)
                 # A steady NONLINEAR solve has no assembled operator to partition, so its CELLS are split
                 # instead: the residual (and so every Jacobian-free J.v) is evaluated per device on a share
                 # of the elements, one all-reduce per evaluation. Read while the solve traces; a deferred
@@ -4682,6 +4845,7 @@ class FEM:
         maxiter=None,
         X0=None,
         contour=None,
+        log=False,
         deflate=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
@@ -4718,7 +4882,43 @@ class FEM:
         eigenvalues and the solve returns the first ``k`` elastic modes::
 
             lam, X = K.eigs(mass=[rho * ui @ vi], k=6, precond=jno.precond.amg(), deflate=[(1, 0), (0, 1), (-y, x)])
+
+        ``log=True`` prints each iteration of LOBPCG (``precond=``) or of the shift-invert iteration (``sigma=``)
+        while it runs (``log=N``: every N-th and the last); the dense reduction and ARPACK have no loop to report.
         """
+        from .utils import beacon
+
+        with beacon.session(log, "fem.eigs"):
+            return self._eigs_inner(
+                mass=mass,
+                k=k,
+                which=which,
+                sigma=sigma,
+                linear=linear,
+                precond=precond,
+                tol=tol,
+                maxiter=maxiter,
+                X0=X0,
+                contour=contour,
+                deflate=deflate,
+            )
+
+    def _eigs_inner(
+        self,
+        *,
+        mass,
+        k: int = 6,
+        which: str = "smallest",
+        sigma=None,
+        linear=None,
+        precond=None,
+        tol=None,
+        maxiter=None,
+        X0=None,
+        contour=None,
+        deflate=None,
+    ):
+        """The body of :meth:`eigs` (which documents it), run inside its ``log=`` session."""
         self._refresh_attachments()
         if self._mode != "linear":
             raise AttributeError(f"FEM.eigs needs a steady-linear (source-less) bilinear form; this fem is {self._mode}.")
@@ -5339,6 +5539,97 @@ class FEM:
         (2, 3): "triangle", (2, 6): "triangle6", (2, 4): "quad", (2, 8): "quad8", (2, 9): "quad9",
         (3, 4): "tetra", (3, 10): "tetra10", (3, 8): "hexahedron", (3, 20): "hexahedron20", (3, 27): "hexahedron27",
     }  # fmt: skip
+
+    def _solution_layout(self):
+        """``((name, ((start, stop), ...), shape), ...)``: each field's slice(s) of the DOF vector (two for a complex
+        field's real halves) and its shape per node (``()`` for a constant unknown's value)."""
+        offs = list(self.offsets) if self.offsets is not None else None
+        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        if offs is None or not keys:
+            return None
+        names = _field_names(self._constraints or [])
+        trials = {}
+        for c in self._constraints or []:
+            for n in _walk(_bare(c)):
+                if isinstance(n, TrialFunction):
+                    trials.setdefault(getattr(n, "field_key", n.op_id), n)
+        out = {}
+        for i, k in enumerate(keys[: len(offs) - 1]):
+            t = trials.get(k)
+            vs = tuple(getattr(t, "value_shape", ()) or ())
+            shape = vs if getattr(t, "_is_constant", False) else (-1,) + vs
+            out[names.get(k, str(k))] = ([(int(offs[i]), int(offs[i + 1]))], shape)
+        for nm in [n for n in out if n.endswith("_re") and n[:-3] + "_im" in out]:
+            (re, shape), (im, _) = out.pop(nm), out.pop(nm[:-3] + "_im")
+            out[nm[:-3]] = (re + im, shape)
+        return tuple((nm, tuple(parts), shape) for nm, (parts, shape) in out.items()), int(offs[-1])
+
+    def _as_solution(self, out):
+        """``out`` as a :class:`Solution` when it is this problem's DOF vector (or a trajectory of them); anything
+        else (a deferred trace node, an adaptive trajectory, a coupled solve's own object) is returned as it is."""
+        if isinstance(out, Solution) or not (isinstance(out, (jax.Array, np.ndarray)) and out.ndim >= 1):
+            return out
+        lay = self._solution_layout()
+        if lay is None or int(out.shape[-1]) != lay[1]:
+            return out
+        return Solution(out, lay[0])
+
+    def _initialized_x0(self):
+        """The starting point from the fields' ``.initialize(value)`` (zero where a field has none), or None when no
+        field of a steady problem is initialized. A number fills its field (or one value per component), a nodal
+        array is taken as it is, and a formula of the coordinates is evaluated at the field's DOF nodes."""
+        if self._mode not in ("linear", "nonlinear", "complex") or getattr(self.domain, "_is_time_dependent", False):
+            return None  # a time-dependent form: initialize is its initial state, built in by jno.fem
+        trials = {}
+        for c in self._constraints or []:
+            for nd in _walk(_bare(c)):
+                if isinstance(nd, TrialFunction) and "_initial" in nd.__dict__:
+                    trials.setdefault(getattr(nd, "field_key", nd.op_id), nd)
+        if not trials:
+            return None
+        offs = list(self.offsets) if self.offsets is not None else None
+        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        if offs is None or len(keys) < len(offs) - 1:
+            raise ValueError(
+                "u.initialize: this problem's DOF layout per field is not known; pass the start to the solver."
+            )
+        points = None
+        x = jnp.zeros((int(offs[-1]),))
+        for i, k in enumerate(keys[: len(offs) - 1]):
+            u = trials.get(k)
+            if u is None:
+                continue
+            size, val = int(offs[i + 1] - offs[i]), u.__dict__["_initial"]
+            ncomp = int(np.prod(getattr(u, "value_shape", ()) or (1,)))
+            if isinstance(_bare(val), Placeholder):
+                if getattr(u, "_is_constant", False):
+                    raise ValueError(f"{u.name}.initialize: a constant unknown starts at a number, not a formula.")
+                points = self.field_points if points is None else points
+                if i >= len(points) or int(np.asarray(points[i]).shape[0]) * ncomp != size:
+                    raise ValueError(
+                        f"{u.name}.initialize: the DOF nodes of this field are not known here; give a nodal array."
+                    )
+                vals = jnp.asarray(_eval_value_node_at(_bare(val), jnp.asarray(points[i]))).reshape(-1)
+            else:
+                vals = jnp.asarray(val).reshape(-1)
+            if jnp.iscomplexobj(vals):
+                raise ValueError(f"{u.name}.initialize: a real field takes a real value (a complex field splits its own).")
+            n_nodes = size // ncomp
+            if vals.size == size:
+                blk = vals
+            elif vals.size == 1:
+                blk = jnp.full((size,), vals[0])
+            elif ncomp > 1 and vals.size == ncomp:
+                blk = jnp.tile(vals, n_nodes)
+            elif ncomp > 1 and vals.size == n_nodes:
+                blk = jnp.repeat(vals, ncomp)
+            else:
+                raise ValueError(
+                    f"{u.name}.initialize: {vals.size} values for a field of {size} DOFs; give a number, one value per "
+                    "component, or one per DOF."
+                )
+            x = x.at[offs[i] : offs[i + 1]].set(blk.astype(x.dtype))
+        return x
 
     def export(self, solution, save_path: str, *, file_format=None):
         """Write a solution to VTK (or any meshio format) — **one file per field**.
@@ -7381,60 +7672,17 @@ def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
 
 
 class Coupling:
-    """A **nonlocal** residual term passed in the ``jno.fem([...])`` list.
+    """INTERNAL: a **nonlocal** residual term, what ``jno.fem`` lowers a nonlocal term written as math to
+    (``d.irradiation(T)``, see :mod:`jno.domain.radiation`; the equation of a constant unknown). Not public API:
+    the user writes the term, never the residual function.
 
-    A weak term is *local* (a per-quadrature-point integrand, assembled element-by-element). Some physics
-    is irreducibly *nonlocal* — enclosure radiation (every surface sees every other through the radiosity
-    solve), integral / non-reflecting BCs, contact, peridynamics — and cannot be written as a local
-    integrand. A ``Coupling`` carries a pure-JAX residual contribution ``residual_fn(u) -> (n_dofs,)`` that
-    ``jno.fem`` **adds to the assembled residual**: ``R(u) = R_local(u) + sum_k coupling_k(u)``.
-
-    This composes generally: a linear local form is *promoted* to a nonlinear residual operator
-    (``R(u)=A u - b + sum_k coupling_k(u)``), a nonlinear one just gains the extra term; either way
-    ``fem.solve()`` drives it with the matrix-free, ``custom_root``-differentiable ``newton_krylov`` (so it
-    stays differentiable in any ``jno.np.parameter`` in the form, and trains through ``jno.core``). The
-    contribution is zeroed on Dirichlet-pinned DOFs so it never corrupts a prescribed value.
-
-    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and just **put the function
-    in the** ``jno.fem([...])`` **list** -- no wrapper needed (a plain function/lambda is unambiguous next
-    to the trace-node weak/Dirichlet terms). Grey-body enclosure radiation, for instance, is the radiosity
-    solve on top of the enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the
-    geometry only; ``jno.fem`` never writes the physics for you)::
-
-        F, eps = gap.view_factor, gap.emissivity({"hot": 0.8, "cold": 0.5})
-        rho, eye, s_row = 1 - eps, jnp.eye(gap.size), F.sum(axis=1)
-
-        def radiation(u):                                    # net grey-body surface load (n_dofs,)
-            Tk = gap.field(u) + 273.15                       # absolute per-element temperature
-            J = jnp.linalg.solve(eye - rho[:, None] * F, eps * SIGMA * Tk**4)   # radiosity
-            return gap.load(s_row * J - F @ J)               # net flux -> consistent nodal load
-
-        fem = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])   # radiation is the bare function
-        Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
-
-    Wrapping it in ``jno.Coupling(fn, name=...)`` explicitly is still accepted -- needed only for a
-    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips),
-    to give it a label, or to declare **trainable parameters** that live only inside the coupling. A
-    ``jno.np.parameter`` in a *weak* term is found by walking the trace, but a coupling is an opaque
-    pure-JAX function, so name its parameters explicitly with ``params=[...]``; the residual then takes a
-    second argument, the ``{name: value}`` dict, so ``fem.solve()`` threads the trained values in and
-    ``jno.core`` recovers them (e.g. a calibrated emissivity)::
-
-        eps = jno.np.parameter((1,), name="eps")
-        def radiation(u, p):                                 # p -> {"eps": value}
-            J = jnp.linalg.solve(eye - (1 - p["eps"])[:, None] * F, p["eps"] * SIGMA * (gap.field(u) + 273.15)**4)
-            return gap.load(s_row * J - F @ J)
-        fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
-
-    In a **multifield** system, pass ``field_key=`` to act on one field's DOF sub-block: the residual then
-    receives and returns *that field's* sub-vector (so the same ``gap.field``/``load`` scalar-T code works
-    whether T stands alone or is one field of a heat+flow / thermo-mechanical system), and ``jno.fem``
-    scatters it into the field's global block. Without ``field_key`` the coupling spans the whole vector
-    (single field). The ``field_key`` is the trial field's key (its ``value_shape``/name, as elsewhere).
-
-    Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
-    and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
-    coupling. The targeted field must be scalar P1 (its block is node-indexed, as ``gap.load`` assumes)."""
+    ``residual_fn(u) -> (n_dofs,)`` is pure JAX and is ADDED to the assembled residual,
+    ``R(u) = R_local(u) + sum_k coupling_k(u)``: a linear local form is promoted to a nonlinear residual operator,
+    a nonlinear one gains the term. The contribution is zeroed on Dirichlet-pinned DOFs. ``field_key=`` makes it
+    act on one field's DOF sub-block (it receives and returns that field's sub-vector; scalar P1 only).
+    ``params=[...]`` names trainable parameters read only inside the residual, which then takes a second argument,
+    the ``{name: value}`` dict. ``_support`` (the DOFs it reads and writes, exactly) gives it an assembled tangent
+    block; ``_tangent_block`` (optional) forms that block itself instead of by JVPs."""
 
     def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None, params=None):
         # residual_fn: (u_flat,) -> (n_dofs,), or (u_flat, {name: value}) -> (n_dofs,) when params are declared
@@ -7442,9 +7690,97 @@ class Coupling:
         self.name = str(name)
         self.field_key = field_key
         self.params = list(params or [])  # jno.np.parameter nodes used only inside this coupling
+        # The DOFs (of its field block) this coupling reads and writes, when known EXACTLY -- set by
+        # `enclosure.load`. With it, jno.fem assembles the coupling's Jacobian as a dense block on those
+        # DOFs next to the sparse local tangent; without it the solve stays matrix-free (see _wrap_couplings).
+        self._support = None
+        # Optional exact tangent: `_tangent_block(u_field) -> (k, k)`, d residual[support] / d u[support] in the
+        # field's own indexing (set with `_support`; used in place of the k JVPs, see _with_coupling_block).
+        self._tangent_block = None
 
     def __repr__(self):
         return f"Coupling({self.name!r})"
+
+
+#: Above this many bytes the dense coupling block of an assembled tangent is logged as a WARNING, not as
+#: info: it is still built (there is no cap -- what fits depends on the machine), but the user should know.
+_COUPLING_BLOCK_WARN_BYTES = 256 * 2**20
+
+
+def _coupling_support(couplings, slices):
+    """The global DOFs every coupling reads and writes, sorted -- or None when one did not declare its support."""
+    parts = []
+    for c, (lo, _hi) in zip(couplings, slices):
+        sup = getattr(c, "_support", None)
+        if sup is None:
+            return None
+        parts.append(lo + np.asarray(sup, dtype=np.int64).reshape(-1))
+    return np.unique(np.concatenate(parts)) if parts else None
+
+
+def _analytic_blocks(couplings, slices, pick=lambda args: args):
+    """``[(lo, hi, dofs, block_fn)]`` for :func:`_with_coupling_block` when EVERY coupling states its own tangent
+    block (``_tangent_block`` and ``_support``), else None (the block then comes from JVPs). ``block_fn(u_slice,
+    args)`` calls the coupling's block, with its runtime parameters ``pick(args)`` (the ``{name: value}`` dict) when
+    it declared ``params``."""
+    out = []
+    for c, (lo, hi) in zip(couplings, slices):
+        fn = getattr(c, "_tangent_block", None)
+        if fn is None or getattr(c, "_support", None) is None:
+            return None
+        call = (lambda us, args, f=fn: f(us, pick(args) or {})) if c.params else (lambda us, args, f=fn: f(us))
+        out.append((lo, hi, np.asarray(c._support), call))
+    return out
+
+
+def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, log, analytic=None, pinned=None):
+    """``J(u, args) = J_local(u, args) + B(u, args)``: the assembled local tangent plus the couplings' Jacobian
+    as a dense ``k x k`` block on their declared ``support`` (k DOFs), in ONE BCOO.
+
+    ``B`` comes from forward-mode AD of the coupling residual restricted to the support: k JVPs per call,
+    exact, and differentiable like everything else. When every coupling supplies its own tangent block
+    (``analytic``: ``[(lo, hi, dofs, block_fn)]``, ``block_fn(u[lo:hi], args)`` the block on its ``dofs`` of the
+    field slice ``[lo:hi]``, as ``Coupling._tangent_block`` gives it -- the radiation term does; see
+    :func:`_analytic_blocks`), those are summed instead: no JVPs, and
+    the rows in ``pinned`` are zeroed as the residual's are. It is exact only because the support is: every coupling
+    reads and writes nothing outside it (``enclosure.load`` declares the nodes its gathers read and its
+    scatter writes). Entries that coincide with the local tangent's are summed by the solvers
+    (``sum_duplicates``), so the two need not be merged here."""
+    S = np.asarray(support, dtype=np.int64)
+    k = int(S.size)
+    nbytes = 8 * k * k
+    msg = (
+        f"jno.fem: the coupling(s) {names} get an assembled tangent: a dense {k} x {k} block on the DOFs they "
+        f"couple ({nbytes / 2**20:.1f} MB) next to the sparse local tangent, "
+        + ("recomputed analytically per Newton step." if analytic else f"recomputed by {k} JVPs per Newton step.")
+    )
+    if nbytes > _COUPLING_BLOCK_WARN_BYTES:
+        log.warning(msg + " It is large; if it does not fit, the allocation will fail where it is built.")
+    else:
+        log.info(msg)
+    S_j = jnp.asarray(S, dtype=jnp.int32)
+    block_idx = np.stack([np.repeat(S, k), np.tile(S, k)], axis=1)  # row-major, matching B.reshape(-1)
+    # each analytic block's rows/columns within the support
+    blocks = [(lo, hi, jnp.asarray(np.searchsorted(S, lo + np.asarray(dofs))), fn) for lo, hi, dofs, fn in analytic or ()]
+
+    def jacobian(u, args=None):
+        import jax.experimental.sparse as jsparse
+
+        u = jnp.asarray(u).reshape(-1)
+        J_loc = local_jacobian(u, args)
+        if blocks:
+            B = jnp.zeros((k, k), dtype=u.dtype)
+            for lo, hi, pos, block_fn in blocks:
+                B = B.at[pos[:, None], pos[None, :]].add(block_fn(u[lo:hi], args))
+            if pinned is not None:
+                B = jnp.where(jnp.isin(S_j, pinned)[:, None], 0.0, B)
+        else:
+            B = jax.jacfwd(lambda us: coupling_residual(u.at[S_j].set(us), args)[S_j])(u[S_j])  # B[i, j] = dc_Si/du_Sj
+        data = jnp.concatenate([J_loc.data, B.reshape(-1).astype(J_loc.data.dtype)])
+        idx = jnp.concatenate([J_loc.indices, jnp.asarray(block_idx, dtype=J_loc.indices.dtype)])
+        return jsparse.BCOO((data, idx), shape=(n, n))
+
+    return jacobian
 
 
 def _check_movable_bc_nodes(domain: Any, dirichlet_raw: Any, boundary_terms: Any) -> None:
@@ -7620,6 +7956,30 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 return jnp.asarray(_b(u, t, args)).reshape(-1) + coupling_residual(u, args)
 
             block.residual = _t_residual
+            # The step tangent gains the coupling's block too, as on a steady form: left as the local tangent
+            # alone, the per-step Newton ran on a Jacobian without the coupling and diverged (an enclosure-
+            # radiation march grew its residual to NaN in the first step from a steady start). Without a
+            # declared support there is no assembled block, so the step goes matrix-free.
+            _jloc = getattr(block, "jacobian", None)
+            if _jloc is not None:
+                support = _coupling_support(couplings, slices)
+                if support is None:
+                    block.jacobian = None
+                else:
+                    _an = _analytic_blocks(couplings, slices, lambda ta: ta[1])  # the step's args are (t, args)
+                    from .utils.logger import get_logger
+
+                    _jw = _with_coupling_block(
+                        lambda u, ta, _j=_jloc: _j(u, ta[0], ta[1]),
+                        lambda u, ta: coupling_residual(u, ta[1]),
+                        support, n, [c.name for c in couplings], get_logger(),
+                        _an, d_dofs,
+                    )  # fmt: skip
+
+                    def _t_jacobian(u, t, args=None, _jw=_jw):
+                        return _jw(u, (t, args))
+
+                    block.jacobian = _t_jacobian
         else:  # promote the linear payload -> nonlinear so the coupling enters the backward-Euler step
             _M, _A, _opfn = block.M, block.A, block.operator_fn
             _fvfn, _cbias = block.forcing_vector_fn, block.affine_bias
@@ -7642,6 +8002,16 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 
     op = fem_obj._op
     rpe = _merge_coupling_params(getattr(op, "runtime_parameter_exprs", {}))
+    # An ASSEMBLED tangent for the coupled residual, when every coupling declared exactly which DOFs it
+    # touches: the local tangent plus a dense block on those DOFs. Without it the solve stays matrix-free
+    # (Newton-Krylov), and `newton(direct=True)` materialises the whole Jacobian densely instead.
+    support = _coupling_support(couplings, slices)
+    _names = [c.name for c in couplings]
+    # every coupling that can state its own tangent block does (no JVPs); one that cannot sends all to autodiff
+    _analytic = _analytic_blocks(couplings, slices)
+    from .utils.logger import get_logger
+
+    _log = get_logger()
     if fem_obj._mode == "linear":
         # local residual R_local(u, args) = A(args) u - b(args)
         def residual(u, args=None, _op=op):
@@ -7652,7 +8022,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 A, b = _op
             return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
 
-        fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
+        def local_jacobian(u, args=None, _op=op):
+            return _op.evaluate(args)[0] if isinstance(_op, FemLinearSystem) else _op[0]
+
+        jac = None
+        _A = op.A if isinstance(op, FemLinearSystem) else op[0]  # None: formed per call by a parametric operator_fn
+        if support is not None and (_A is None or hasattr(_A, "indices")):
+            jac = _with_coupling_block(local_jacobian, coupling_residual, support, n, _names, _log, _analytic, d_dofs)
+        fem_obj._op = FemResidualOperator(residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe)
         # The promoted operator states its essential rows like every other residual operator does, so an
         # extrapolating driver (`staggered(over_relax>1)`) leaves them on their prescribed values.
         fem_obj._op.dirichlet_dofs = d_dofs
@@ -7666,16 +8043,21 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         def residual(u, args=None, *rest, _base=base_residual):
             return jnp.asarray(_base(u, args, *rest)).reshape(-1) + coupling_residual(u, args)
 
+        base_jac = getattr(op, "jacobian", None)
+        jac = None
+        if support is not None and base_jac is not None:
+            jac = _with_coupling_block(base_jac, coupling_residual, support, n, _names, _log, _analytic, d_dofs)
         wrapped = FemResidualOperator(
-            residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
+            residual, jacobian_fn=jac, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
         )
         # Everything else the assembler hung on the operator describes the SAME problem and must survive
         # the wrap: the step-history layout and state readout that make `fem.solve()` march a
         # `domain(tau=...)` grid (dropped, the march never started and the first residual raised on an
         # unbuffered `u.i(-1)`), the load-path fields, the derived-field rules, the contact search and
         # the Dirichlet DOF set. Only what the wrap changes is not copied: the residual; the tangent,
-        # which cannot see the opaque coupling (the solve goes matrix-free, as for every Coupling); and
-        # the runtime parameters, now merged with the coupling's.
+        # which gains the coupling block above when the couplings declared their support and is dropped
+        # otherwise (the solve then goes matrix-free); and the runtime parameters, now merged with the
+        # coupling's.
         for _k, _v in vars(op).items():
             if _k not in ("residual", "jacobian", "runtime_parameter_exprs"):
                 setattr(wrapped, _k, _v)
@@ -7833,12 +8215,21 @@ def fem(
         return out
     try:
         with _host_assembly_scope():
+            from .domain.equations import lower_complex_terms, lower_initial_values, lower_integral_equations
+            from .domain.mapping import lower_mapped_regions
+            from .domain.radiation import lower_radiation_terms
+
+            # `d.unknown()` fields became their trial symbols above: every lowering below sees TrialFunctions
+            _terms = lowered
+            _terms, _initial_used = lower_initial_values(lower_complex_terms(_terms))
+            _terms = lower_integral_equations(_terms)
             out = _fem_impl(
-                lowered,
+                _lower_unknowns(lower_mapped_regions(lower_radiation_terms(_terms))),
                 quad_degree=quad_degree,
                 _dd_overlap=_dd_overlap,
             )
         out._attach_watch = _attach_watch(constraints)
+        out._initial_used = _initial_used  # the initial states baked into a transient form (initialize)
         out._rebuild_kwargs = {"quad_degree": quad_degree, "chunk": chunk, "_dd_overlap": _dd_overlap}
         if chunk is not None and not _fn._CHUNK_CONSUMED[0]:
             # Refuse rather than ignore: the 1-D and non-nodal assemblers have their own element
@@ -7971,26 +8362,20 @@ def _fem_impl(
     couplings: List[Coupling] = []
     _rest: List[Any] = []
     for c in constraints:
-        if isinstance(c, Coupling):
+        if isinstance(c, Coupling):  # made by a lowering (d.irradiation, an integral equation), never by the user
             couplings.append(c)
-        elif inspect.isfunction(c) or inspect.ismethod(c) or isinstance(c, functools.partial):
-            couplings.append(Coupling(c, name=getattr(c, "__name__", "coupling")))
         else:
             _rest.append(c)
     constraints = _rest
 
-    # The bare-function shorthand only catches a *plain* function/lambda/partial -- it deliberately skips
-    # callable trace nodes (a bare symbol, `jno.fn(...)`) so it can never swallow a real term. The flip side
-    # is it also can't see a callable *object* meant as a coupling -- a `jax.jit(residual)` or an instance
-    # with `__call__`. Rather than let that fall through to weak/Dirichlet classification and fail with an
-    # opaque error, point the user at the explicit wrapper. (Trace expressions are not callable; the only
-    # callable list-items are Placeholders, which keep their own handling.)
+    # A function in the term list is not a term: a nonlocal term is written as math (d.irradiation(T) for
+    # radiation, (expr * dV).integrate() - P for an integral equation) and lowered by jno.fem itself.
     for c in constraints:
         if callable(c) and not isinstance(c, Placeholder):
             raise TypeError(
-                f"jno.fem: got a callable {type(c).__name__!s} in the constraint list. A *plain* function "
-                "is taken as a nonlocal coupling residual automatically, but a jitted/object callable is "
-                "not -- wrap it explicitly as jno.Coupling(fn) to use it as a coupling term."
+                f"jno.fem: got a callable {type(c).__name__!s} in the term list. Terms are written as math, not as "
+                "residual functions: radiation is d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS, an integral "
+                "equation (expr * dV).integrate() - P."
             )
 
     domain = _discover_domain(constraints)
@@ -8735,10 +9120,10 @@ def _fem_impl(
             # Coupling is folded in -- so the coupling was DROPPED, silently: a `1e6 * u` coupling left
             # the trajectory bit-identical to the uncoupled one.
             raise NotImplementedError(
-                "jno.fem: a nonlocal `jno.Coupling` on a second-order-in-time (u_tt) form is not wired -- "
+                "jno.fem: a nonlocal term (d.irradiation) on a second-order-in-time (u_tt) form is not wired -- "
                 "the augmented [u; v] block has no slot for it, and it would be dropped. Write the problem "
-                "first order in time with an explicit velocity field (a first-order transient takes a "
-                "Coupling), or express the term locally in the weak form."
+                "first order in time with an explicit velocity field (a first-order transient takes the "
+                "term), or express the term locally in the weak form."
             )
         # Coupled second-order-in-time is the SAME augmented formula with the coupled M2/C/K blocks —
         # one assembler serves both, so damping, a nonlinear spatial operator and driven boundaries
@@ -8807,6 +9192,21 @@ def _fem_impl(
     # A 1D Hermite field is NOT routed here: its element is the classical cubic beam, which the 1D
     # assembler builds directly (no push-forward — a straight interval has a constant Jacobian).
     _hermite_1d = getattr(domain, "dimension", None) == 1 and _nonnodal_families == {"Hermite"}
+    _cd = getattr(getattr(domain, "mesh", None), "cells_dict", None) or {}
+    if _nonnodal_families and ("quad" in _cd or "hexahedron" in _cd):
+        # The non-nodal (push-forward) assembler is built on simplices; on a tensor-product mesh it failed with a bare
+        # KeyError 'triangle'. Name what routed the form there instead.
+        _why = (
+            f"a term on a tag inside the mesh ({', '.join(sorted(r for r in boundary_terms if r in _iface))}: d.tag(..., region=...) "
+            "over an interface)"
+            if _nonnodal_families == {"Lagrange (interior faces)"}
+            else f"the element famil{'y' if len(_nonnodal_families) == 1 else 'ies'} {sorted(_nonnodal_families)}"
+        )
+        raise NotImplementedError(
+            f"jno.fem: {_why} is assembled by the non-nodal path, which works on triangles and tetrahedra only; this mesh "
+            "has quadrilaterals or hexahedra. Mesh with triangles (no .quad()), or write the condition on the domain "
+            "boundary."
+        )
     if _nonnodal_families and not _hermite_1d:
         # The push-forward assembler is built on triangles/tets, so a non-nodal family on a LINE mesh
         # died with a bare ``KeyError: 'triangle'`` from the topology lookup — a cryptic failure for a

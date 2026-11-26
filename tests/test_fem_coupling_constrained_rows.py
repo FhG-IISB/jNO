@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 
 import jno
+from jno._fem import Coupling
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +84,7 @@ def _steady(right, nonlinear, coupled=True):
     c = (1 + ub * ub) if nonlinear else 1.0
     terms = [c * (ub.x * vb.x + ub.y * vb.y), u(xl, yl) - 0.25, u(xr, yr) - right]
     if coupled:
-        terms.append(jno.Coupling(_load, name="load"))
+        terms.append(Coupling(_load, name="load"))
     return jno.fem(terms)
 
 
@@ -117,7 +118,7 @@ def test_a_tau_ramped_wall_holds_under_a_coupling_on_the_load_path():
             (1 + ub * ub) * (ub.x * vb.x + ub.y * vb.y) + 1e-3 * (ub - ub.i(-1)) * vb,
             u(xl, yl) - 0.25,
             u(xr, yr) - (0.5 + tr),
-            jno.Coupling(_load, name="load"),
+            Coupling(_load, name="load"),
         ]
     )
     ys = _array(fem.solve())
@@ -146,7 +147,7 @@ def _transient(right, nonlinear):
             u(xl, yl) - 0.25,
             u(xr, yr) - g,
             u(*ci) - 0.0 * ci[0],
-            jno.Coupling(_load, name="load"),
+            Coupling(_load, name="load"),
         ]
     )
 

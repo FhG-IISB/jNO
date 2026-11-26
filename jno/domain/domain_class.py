@@ -332,6 +332,8 @@ def _is_lazy_source(obj: Any) -> bool:
     ``np.ndarray`` / ``jnp.ndarray`` satisfies it too, so callers must test those first: they are
     cheaper handled eagerly and some downstream paths rely on their concreteness.
     """
+    if isinstance(obj, np.memmap):  # an np.ndarray subclass, but a file the batches are read from
+        return True
     if isinstance(obj, (np.ndarray, jnp.ndarray, tuple, list, str, bytes)):
         return False
     return hasattr(obj, "shape") and hasattr(type(obj), "__getitem__")
@@ -355,6 +357,40 @@ def _is_plain_value(v) -> bool:
     if isinstance(v, (int, float, complex, np.number, np.ndarray)):
         return True
     return isinstance(v, jax.Array) and not isinstance(v, jax.core.Tracer)
+
+
+class _LawProperty:
+    """``d.<name>`` when a region attached a **material law** (a function of fields): not a coefficient yet.
+
+    Call it with the fields the laws depend on -- ``d.k(T)`` -- to get the coefficient, with numbers passed
+    through and each law evaluated at the arguments. Used bare in arithmetic it raises, naming the regions and
+    the fix: a law silently treated as a number or as a function of position would be wrong physics."""
+
+    __slots__ = ("_domain", "_name", "_regions", "_refusal")
+
+    def __init__(self, domain, name, regions, refusal=None):
+        self._domain, self._name, self._regions = domain, name, list(regions)
+        self._refusal = refusal  # an incomplete property: the error to raise where it is used
+
+    def __call__(self, *args):
+        if not args:
+            raise TypeError(f"domain.{self._name}(): give the field(s) the law depends on, e.g. d.{self._name}(T).")
+        return self._domain._attached_coefficient(self._name, args)
+
+    def _refuse(self, *_a, **_k):
+        if self._refusal:
+            raise AttributeError(self._refusal)
+        raise TypeError(
+            f"domain.{self._name} is a material law in region(s) {self._regions}: a function of a field, so it "
+            f"has no value until it is evaluated. Write d.{self._name}(T) (with the field it depends on) where "
+            f"it is used, e.g. d.{self._name}(T) * (T.x * v.x + T.y * v.y)."
+        )
+
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _refuse
+    __truediv__ = __rtruediv__ = __pow__ = __rpow__ = __matmul__ = __rmatmul__ = __neg__ = _refuse
+
+    def __repr__(self):
+        return f"<material law d.{self._name} in {self._regions}: call it, d.{self._name}(T)>"
 
 
 def _masked_sum(values, mask_cls, default, *, what: str, key: str):
@@ -675,7 +711,16 @@ class _UnknownNamespace:
         self._domain = domain
 
     def __call__(
-        self, value_shape=(), name="u", *, order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+        self,
+        value_shape=(),
+        name="u",
+        *,
+        order=1,
+        space="Lagrange",
+        complex=False,
+        symmetric=False,
+        constant=False,
+        region=None,
     ) -> "Unknown":
         return self._domain._make_unknown(
             value_shape=value_shape,
@@ -685,22 +730,31 @@ class _UnknownNamespace:
             complex=complex,
             symmetric=symmetric,
             constant=constant,
+            region=region,
         )
 
-    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
+    def scalar(self, name="u", *, order=1, space="Lagrange", complex=False, constant=False, region=None) -> "Unknown":
         """A scalar unknown, ``value_shape=()``. ``constant=True``: ONE value over the whole domain."""
-        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant)
+        return self(value_shape=(), name=name, order=order, space=space, complex=complex, constant=constant, region=region)
 
-    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False) -> "Unknown":
+    def vector(self, n, name="u", *, order=1, space="Lagrange", complex=False, constant=False, region=None) -> "Unknown":
         """A vector unknown with ``n`` components, ``value_shape=(n,)``. ``constant=True``: one vector."""
-        return self(value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant)
+        return self(
+            value_shape=(int(n),), name=name, order=order, space=space, complex=complex, constant=constant, region=region
+        )
 
-    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False) -> "Unknown":
+    def matrix(self, n, m, *, symmetric=False, name="u", order=1, complex=False, constant=False, region=None) -> "Unknown":
         """An ``n x m`` matrix unknown. ``symmetric=True`` (square only) stores the ``n(n+1)/2`` upper-triangle
         values per node while the symbol behaves as the full matrix in every expression. ``constant=True``:
         one matrix over the whole domain."""
         return self(
-            value_shape=(int(n), int(m)), name=name, order=order, complex=complex, symmetric=symmetric, constant=constant
+            value_shape=(int(n), int(m)),
+            name=name,
+            order=order,
+            complex=complex,
+            symmetric=symmetric,
+            constant=constant,
+            region=region,
         )
 
 
@@ -858,8 +912,12 @@ class domain(MeshIOMixin):
         tau: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
         keep_orphan_nodes: bool = False,
+        axisymmetric: bool = False,
         **_ignored_kwargs,
     ):
+        # The (x, y) plane is a meridian (r, z) half-plane of a body of revolution. jNO still applies no ring
+        # measure for you; operators that integrate over the revolved geometry (d.irradiation) read this.
+        self.__dict__["axisymmetric"] = bool(axisymmetric)
         if "mesh_size" in _ignored_kwargs:
             raise ValueError(
                 "jno.domain(<shape or callable>, mesh_size=...) does not read `mesh_size`. It is only "
@@ -2037,7 +2095,7 @@ class domain(MeshIOMixin):
         return [loc_fns, vec_ids, val_fns]
 
     def variational_symbols(
-        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False, region=None
     ):
         """Return generic variational symbols.
 
@@ -2054,6 +2112,13 @@ class domain(MeshIOMixin):
                 the upper triangle, ``n(n+1)/2`` values per node (``xx, xy, yy`` in 2-D). The symbol still
                 behaves as the full ``n x n`` matrix in every expression, and its test function is the
                 symmetric one.
+            region (str | None, default=None): The named region (a ``shape`` part, a mesh-file volume) the
+                field lives on. Every DOF on a node outside it is held at 0 -- an identity row with no
+                off-diagonal entry, so the factorisation is the region's own -- while the nodes on the
+                region's boundary stay free and take the problem's conditions there. For a field governed
+                on one part of a multi-material domain: the velocity and pressure of a fluid inside a
+                solid body whose temperature lives everywhere. ``p.pin()`` on such a field gauges at a vertex
+                of the region. Not for ``space`` other than ``"Lagrange"``.
 
         Returns:
             (trial, test): Symbolic variational placeholders carrying shape metadata.
@@ -2080,6 +2145,11 @@ class domain(MeshIOMixin):
             raise NotImplementedError(f"symmetric=True is wired for nodal Lagrange fields only, not space={space!r}.")
         if symmetric and complex:
             raise NotImplementedError("symmetric=True is not wired for a complex field; declare it real, or full.")
+        if region is not None and space != "Lagrange":
+            raise NotImplementedError(
+                f"region={region!r} is wired for nodal Lagrange fields only, not space={space!r}: the DOFs held at 0 "
+                "outside the region are picked per node."
+            )
         if complex:
             # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
             # representation. The user writes the weak form with ordinary complex algebra
@@ -2097,6 +2167,7 @@ class domain(MeshIOMixin):
             re_tr._test, im_tr._test = re_te, im_te  # so `u.test()` returns this very pair
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
+                _s.field_region = region
                 # Mark these as members of a complex (re, im) pair. The real-equivalent weak form
                 # couples re/im test functions within a single additive term, which the native
                 # assembler's one-test-field-per-term classifier rejects; jno.fem routes any form
@@ -2112,9 +2183,13 @@ class domain(MeshIOMixin):
         # space (mirrors how Variable carries its _domain).
         trial._domain = self
         test._domain = self
+        trial.field_region = test.field_region = region  # the field's DOFs outside it are held at 0 (fem_native)
+        self.__dict__.setdefault("_field_names", set()).add(str(trial_name))  # for telling laws of fields apart
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False):
+    def fem_symbols(
+        self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange", symmetric=False, region=None
+    ):
         """Backward-compatible alias for variational_symbols().
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
@@ -2150,7 +2225,13 @@ class domain(MeshIOMixin):
                 fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
         return self.variational_symbols(
-            value_shape=value_shape, names=names, order=order, complex=complex, space=space, symmetric=symmetric
+            value_shape=value_shape,
+            names=names,
+            order=order,
+            complex=complex,
+            space=space,
+            symmetric=symmetric,
+            region=region,
         )
 
     def test_function(self, value_shape=(), name="phi", order=1):
@@ -2202,6 +2283,10 @@ class domain(MeshIOMixin):
             u = d.unknown(); v = u.test()
             jno.fem([inner(grad(u), grad(v)) - f * v, u(xb, yb) - 0.0]).solve()
 
+        ``region="fluid"`` makes it live on that named region only: its DOFs outside are held at 0 (identity
+        rows, no fill-in), the region's boundary nodes stay free (see :meth:`variational_symbols`). A
+        region unknown is FEM-only.
+
         ``constant=True`` makes it ONE value (vector, matrix) over the whole domain, solved for with the
         fields: ``U = d.unknown.scalar(constant=True)``; ``u(xr, yr) - U`` ties a field to it on a region
         exactly, ``U - g`` pins it, and a weak term carrying ``U.test()`` is an integral row (``jno.fem`` only).
@@ -2213,11 +2298,24 @@ class domain(MeshIOMixin):
         return _UnknownNamespace(self)
 
     def _make_unknown(
-        self, value_shape=(), name="u", order=1, space="Lagrange", complex=False, symmetric=False, constant=False
+        self,
+        value_shape=(),
+        name="u",
+        order=1,
+        space="Lagrange",
+        complex=False,
+        symmetric=False,
+        constant=False,
+        region=None,
     ) -> "Unknown":
         """Build an unknown -- see :attr:`unknown`."""
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
+        if constant and region is not None:
+            raise ValueError(
+                f"domain.unknown(..., constant=True, region={region!r}): a constant is one value over the whole "
+                "domain and has no nodes to restrict; drop region=."
+            )
         if constant:
             # ONE value (vector, matrix) over the whole domain, solved for with the fields. It has no element,
             # so `order`/`space` do not apply; it is an FEM unknown (jno.fdm has no global unknowns).
@@ -2238,8 +2336,9 @@ class domain(MeshIOMixin):
             complex=complex,
             space=space,
             symmetric=symmetric,
+            region=region,
         )
-        nodal_p1 = int(order) == 1 and str(space) == "Lagrange" and not complex and not symmetric
+        nodal_p1 = int(order) == 1 and region is None and str(space) == "Lagrange" and not complex and not symmetric
         if not nodal_p1:
             # FEM-only: there is no valued P1 nodal field behind it. Mark it so jno.fdm can say why it
             # cannot solve for it, instead of reporting that it found no unknown at all.
@@ -2593,6 +2692,13 @@ class domain(MeshIOMixin):
         It is equally the answer to "the part of the outer boundary belonging to *this* body", which a
         coordinate predicate also cannot express once two bodies touch.
 
+        With ``region=`` the predicate may also pick part of the body's surface INSIDE a conforming mesh
+        (a piece of an interface): surface terms integrate over those facets and ``u(name) - g`` pins
+        their nodes::
+
+            d.tag("seg", lambda x, y: (abs(y - 1) < 1e-9) & (x < 0.5), region="a")
+            T(*d.variable("seg", split=True)[:2]) - 1.0     # T = 1 on that piece of a's top
+
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
         sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
@@ -2615,6 +2721,14 @@ class domain(MeshIOMixin):
             dom.tag("cylinder", lambda x, y: (x-0.8)**2 + (y-0.5)**2 < 0.21**2)
             # an untagged outlet edge is left as a natural (do-nothing) outflow
         """
+        if isinstance(where, (bool, np.bool_)):
+            raise TypeError(
+                f"tag({name!r}, {where!r}): got a plain bool. A comparison like `d.kappa == 0` is identity in "
+                "jNO (expressions must stay hashable), so it never compares the values. Select regions by a "
+                "property with a predicate over it: d.tag(name, lambda kappa: kappa == 0)."
+            )
+        if self._is_property_predicate(where):
+            return self._tag_by_property(name, where)
         self._tag_predicates = getattr(self, "_tag_predicates", {})
         # A geometry name already means a FACE of the shape. Re-tagging one is an ordinary idiom --
         # `d.tag("left", lambda x, y: x < 1e-9)` restates where `left` already is, harmlessly. But the
@@ -3046,80 +3160,212 @@ class domain(MeshIOMixin):
         # touching another missing attribute would recurse forever.
         attached = self.__dict__.get("_region_attachments") or {}
         if name in attached:
-            values = dict(attached[name])
-            # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
-            # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
-            has_default = self._DEFAULT_TARGET in values
-            default = values.pop(self._DEFAULT_TARGET, None)
-            kinds = self.__dict__.get("_attachment_kind") or {}
-            declared = {kinds.get(t, "volume") for t in values}
-            if len(declared) > 1:
-                raise AttributeError(
-                    f"domain.{name}: declared on both a volume region and a boundary tag "
-                    f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
-                    f"over cells or over facets, not both. Give the two halves different property "
-                    f"names, or split the tag."
-                )
-            resolved = {t: self._resolve_attached(v) for t, v in values.items()}
-            # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
-            # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
-            # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
-            # so the fem can refuse to solve with it once the property is re-attached.
-            live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
-            snapshot = not all(_is_plain_value(v) for v in resolved.values())
-            if has_default:
-                snapshot = snapshot or not _is_plain_value(self._resolve_attached(default))
-
-            def mark(e):
-                if snapshot:
-                    e._attached_snapshot = (self, name)
-                e._attached_name = name  # what jno.info prints for it (jno.trace.pretty)
-                return e
-
-            if declared == {"surface"}:
-                # No completeness rule on the boundary: tags are not a partition of it, and untagged
-                # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
-                # contribute nothing to this coefficient -- documented, not silently patched. A
-                # default has nothing to mean here, so asking for one is a mistake worth naming.
-                if has_default:
-                    raise AttributeError(
-                        f"domain.{name}: a bare .attach({name}=...) default was declared, but "
-                        f"'{name}' lives on boundary tag(s) {sorted(values)}. Tags are not a "
-                        f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
-                        f"so a surface default has no meaning. Attach it to each tag instead."
-                    )
-                return mark(self._by_tag(live))
-            known = set(self.__dict__.get("_shape_regions") or {})
-            missing = sorted(known - set(values))
-            if missing and not has_default:
-                raise AttributeError(
-                    f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
-                    f"declare it -- add .attach({name}=...) to each, or declare a default for the rest "
-                    f"with a bare .attach({name}=...)."
-                )
-            # The explicit targets already won: `default` only fills what they left, so the two
-            # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
-            if has_default:
-                dv = self._resolve_attached(default)
-                default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
-                if not live:
-                    # Only a default was declared: the coefficient is that value everywhere -- there is
-                    # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
-                    return mark(default_live)
-            return mark(self._by_region(live, default=default_live if has_default else None))
+            try:
+                return self._attached_coefficient(name)
+            except AttributeError as e:
+                if "never attached" not in str(e):
+                    raise
+                # Some regions lack the property: defer the error to its use (reading d.<name> must not raise).
+                return _LawProperty(self, name, [], refusal=str(e))
         raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def _attached_coefficient(self, name, args=None):
+        """The coefficient ``d.<name>`` (``args is None``), or ``d.<name>(*args)``: the same coefficient with every
+        material law evaluated at ``args`` (see :meth:`_is_law`). A property that holds a law cannot be used
+        bare -- it returns a :class:`_LawProperty`, which refuses arithmetic and says to call it."""
+        attached = self.__dict__.get("_region_attachments") or {}
+        values = dict(attached[name])
+        # A bare `attach(**props)` is the DEFAULT, not a target. Pull it out before anything reads
+        # the target set, so it can never be mistaken for a region or decide the volume/surface kind.
+        has_default = self._DEFAULT_TARGET in values
+        default = values.pop(self._DEFAULT_TARGET, None)
+        kinds = self.__dict__.get("_attachment_kind") or {}
+        declared = {kinds.get(t, "volume") for t in values}
+        if len(declared) > 1:
+            raise AttributeError(
+                f"domain.{name}: declared on both a volume region and a boundary tag "
+                f"({sorted(values)}), so it has no single meaning -- a coefficient is integrated "
+                f"over cells or over facets, not both. Give the two halves different property "
+                f"names, or split the tag."
+            )
+        if args is None:
+            laws = sorted(str(t) for t, v in attached[name].items() if self._is_law(v))
+            if laws:
+                return _LawProperty(self, name, laws)
+        resolved = {t: self._evaluate_attached(v, args, name, t) for t, v in values.items()}
+        # Plain numbers are emitted as AttachedLiteral leaves, read from the domain whenever the term
+        # is lowered, so a built `jno.fem` re-assembles with a value attached after it was written.
+        # An expression value is captured as written; the expression is marked (`_attached_snapshot`)
+        # so the fem can refuse to solve with it once the property is re-attached.
+        live = {t: AttachedLiteral(self, name, t) if _is_plain_value(v) else v for t, v in resolved.items()}
+        snapshot = not all(_is_plain_value(v) for v in resolved.values())
+        if has_default:
+            snapshot = snapshot or not _is_plain_value(self._evaluate_attached(default, args, name, "default"))
+
+        def mark(e):
+            if snapshot:
+                e._attached_snapshot = (self, name)
+            e._attached_name = name  # what jno.info prints for it (jno.trace.pretty)
+            if args is None:
+                e._jno_property = (self, name)  # so `d.<name>(T)` re-reads it with laws evaluated at T
+            return e
+
+        if declared == {"surface"}:
+            # No completeness rule on the boundary: tags are not a partition of it, and untagged
+            # boundary is deliberately natural (do-nothing) in jNO. Facets no tag claims simply
+            # contribute nothing to this coefficient -- documented, not silently patched. A
+            # default has nothing to mean here, so asking for one is a mistake worth naming.
+            if has_default:
+                raise AttributeError(
+                    f"domain.{name}: a bare .attach({name}=...) default was declared, but "
+                    f"'{name}' lives on boundary tag(s) {sorted(values)}. Tags are not a "
+                    f"partition of the boundary -- untagged boundary is natural (do-nothing) -- "
+                    f"so a surface default has no meaning. Attach it to each tag instead."
+                )
+            return mark(self._by_tag(live))
+        known = set(self.__dict__.get("_shape_regions") or {})
+        missing = sorted(known - set(values))
+        if missing and not has_default:
+            raise AttributeError(
+                f"domain.{name}: region(s) {missing} never attached a '{name}'. Every region must "
+                f"declare it -- add .attach({name}=...) to each, or declare a default for the rest "
+                f"with a bare .attach({name}=...)."
+            )
+        # The explicit targets already won: `default` only fills what they left, so the two
+        # orderings `attach(Q=0).attach("hot", Q=1)` and its reverse agree.
+        if has_default:
+            dv = self._evaluate_attached(default, args, name, "default")
+            default_live = AttachedLiteral(self, name, self._DEFAULT_TARGET) if _is_plain_value(dv) else dv
+            if not live:
+                # Only a default was declared: the coefficient is that value everywhere -- there is
+                # no region to mask, and `_by_region` of an empty mapping is (rightly) an error.
+                return mark(default_live)
+        return mark(self._by_region(live, default=default_live if has_default else None))
+
+    def irradiation(self, T):
+        """The incident thermal radiation G on every radiating face, for the temperature field ``T``.
+
+        Radiating faces are those between a region with attached ``kappa == 0`` (a transparent medium) and its
+        neighbours; each connected medium is one diffuse-grey enclosure; each face's emissivity is its region's
+        attached ``eps`` (a number or a law of T). Use it in the radiation term as written on paper::
+
+            heat += [d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v * dS]     # dS = 2 pi r (axisymmetric)
+
+        ``jno.fem`` integrates such a term over the radiating faces with an exact tangent; see
+        :mod:`jno.domain.radiation` for the scope. Axisymmetry is read from ``.domain(axisymmetric=True)``."""
+        from .radiation import Irradiation
+
+        return Irradiation(self, T)
+
+    def _is_property_predicate(self, where) -> bool:
+        """A plain function whose parameters are all names of attached properties selects REGIONS by their
+        property values (``lambda kappa: kappa == 0``), rather than points by coordinates."""
+        if not inspect.isroutine(where):
+            return False
+        props = set(self.__dict__.get("_region_attachments") or {})
+        try:
+            names = [p.name for p in inspect.signature(where).parameters.values()]
+        except (TypeError, ValueError):
+            return False
+        return bool(names) and all(n in props for n in names)
+
+    def _tag_by_property(self, name, where):
+        """Tag the volume regions whose attached properties satisfy ``where`` (called with each region's values,
+        by parameter name). A region without one of the properties is not selected; a law (a function of a
+        field) or an expression as value cannot be compared and raises. The tag is a region selection: its
+        cells are those regions' cells (a nearest-cell-centroid membership, exact at cell centroids, which is
+        how jno.fem assigns cells to regions)."""
+        from scipy.spatial import cKDTree
+
+        from .mesh_utils import mesh_cell_region_membership, p1_cells_dict
+
+        attached = self.__dict__.get("_region_attachments") or {}
+        params = list(inspect.signature(where).parameters)
+        regions = mesh_cell_region_membership(self.mesh, int(self.dimension))
+        chosen = []
+        for r in regions:
+            vals = []
+            for p in params:
+                v = attached[p].get(r, attached[p].get(self._DEFAULT_TARGET))
+                if v is None:
+                    break
+                if not _is_plain_value(v):
+                    raise TypeError(
+                        f"tag({name!r}): property {p!r} of region {r!r} is {v!r}, not a number, so a region "
+                        "selection cannot compare it. Give that region a number for it, or tag it by name."
+                    )
+                vals.append(v)
+            else:
+                if bool(np.asarray(where(*vals))):
+                    chosen.append(r)
+        if not chosen:
+            raise ValueError(f"tag({name!r}): no region's properties {params} satisfy the predicate.")
+        self.__dict__.setdefault("_property_tag_regions", {})[name] = chosen
+        tri = np.asarray(p1_cells_dict(self.mesh)["triangle" if int(self.dimension) == 2 else "tetra"])
+        pts = np.asarray(self.mesh.points)[:, : int(self.dimension)]
+        inside = np.zeros(len(tri), bool)
+        for r in chosen:
+            inside |= np.asarray(regions[r])
+        tree = cKDTree(pts[tri].mean(axis=1))
+
+        def membership(*xs):
+            q = np.stack([np.asarray(x, float).reshape(-1) for x in xs[: int(self.dimension)]], axis=1)
+            return inside[tree.query(q)[1]].reshape(np.shape(xs[0]))
+
+        get_logger().info(f"tag {name!r}: regions {chosen} (by {params})")
+        return self.tag(name, membership)
+
+    def _is_law(self, value) -> bool:
+        """Is an attached value a **material law** -- a function of fields, evaluated where it is called,
+        ``d.k(T)`` -- rather than a number, an expression, or a function of position?
+
+        A law is any callable that is not a jNO expression, except a plain function that takes exactly the
+        coordinates (one parameter per dimension) and is not named after a declared field: that stays a
+        function of position, called with the coordinates when ``d.k`` is read, as before. So
+        ``lambda T: ...`` (one argument on a 2-D domain), a datasheet object with ``__call__``, and
+        ``lambda T, c: ...`` once fields ``T`` and ``c`` are declared are laws; ``lambda r, z: ...`` is not."""
+        from ..trace import Placeholder
+        from ..trace.views import _VIEW_TYPES
+
+        if not callable(value) or isinstance(value, (Placeholder, *_VIEW_TYPES)) or isinstance(value, type):
+            return False
+        if not inspect.isroutine(value):
+            return True  # a callable object: a datasheet table, a fitted law
+        try:
+            params = [
+                p
+                for p in inspect.signature(value).parameters.values()
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
+            ]
+        except (TypeError, ValueError):
+            return False
+        fields = self.__dict__.get("_field_names") or set()
+        if any(p.name in fields for p in params):
+            return True
+        return len(params) != int(self.dimension)
+
+    def _evaluate_attached(self, value, args, name, target):
+        """One attached value inside the coefficient: a law evaluated at ``args``, a function of position
+        resolved with the coordinates, anything else as it is."""
+        if not self._is_law(value):
+            return self._resolve_attached(value)
+        if args is None:  # unreachable from d.<name>: a law there returns a _LawProperty first
+            raise TypeError(f"domain.{name}: the law in {target!r} needs its arguments: write d.{name}(T).")
+        try:
+            return value(*args)
+        except TypeError as e:
+            raise TypeError(
+                f"domain.{name}({', '.join('<expr>' for _ in args)}): the law attached to {target!r} could not "
+                f"be called with {len(args)} argument(s): {e}. A law takes the fields it depends on, e.g. "
+                f".attach({name}=lambda T: ...) and d.{name}(T)."
+            ) from e
 
     def attached(self, name: str) -> dict:
         """The raw ``{region: value}`` mapping for a property declared with :meth:`shape.attach`.
 
         ``d.<name>`` gives the per-region *coefficient*, ready for a weak form. This gives the values
-        themselves, for the consumers that need a mapping rather than an expression -- most notably
-        ``enclosure.emissivity({tag: eps})``, since enclosure element tags are region names::
-
-            eps = gap.emissivity(d.attached("eps"))
-
-        Unlike ``d.<name>`` this does not require every region to have declared the property: an
-        enclosure only spans some of them, and a mapping is allowed to be partial.
+        themselves, for the consumers that need a mapping rather than an expression. Unlike ``d.<name>`` this
+        does not require every region to have declared the property: a mapping is allowed to be partial.
         """
         attached = self.__dict__.get("_region_attachments") or {}
         if name not in attached:
@@ -3189,12 +3435,21 @@ class domain(MeshIOMixin):
         memb = mesh_cell_region_membership(mesh, dim).get(str(region))
         if memb is None:
             return None
-        cells = np.asarray(p1_cells_dict(mesh)[volume_cell_type(mesh, dim)], dtype=np.int64)
+        kind = volume_cell_type(mesh, dim)
+        cells = np.asarray(p1_cells_dict(mesh)[kind], dtype=np.int64)
         memb = np.asarray(memb, dtype=bool)
         k = cells.shape[1]
-        loc = [tuple(j for j in range(k) if j != i) for i in range(k)]  # local facet = all vertices but one
+        # the local facets in meshio's vertex order: a simplex's are all its vertices but one; a quadrilateral's its four
+        # sides; a hexahedron's its six quadrilaterals. ("All but one" on a quad gave three-vertex rows that are no facet,
+        # so no interior facet was ever found and a term on such a tag integrated over nothing.)
+        if kind == "quad":
+            loc = [(0, 1), (1, 2), (2, 3), (3, 0)]
+        elif kind == "hexahedron":
+            loc = [(0, 1, 2, 3), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+        else:
+            loc = [tuple(j for j in range(k) if j != i) for i in range(k)]
         fac = np.sort(np.concatenate([cells[:, list(lf)] for lf in loc]), axis=1)
-        owner = np.tile(np.arange(len(cells)), k)
+        owner = np.tile(np.arange(len(cells)), len(loc))
         _u, inv, cnt = np.unique(fac, axis=0, return_inverse=True, return_counts=True)
         inv = inv.reshape(-1)
         n_in = np.bincount(inv, weights=memb[owner].astype(float), minlength=len(_u))
@@ -3278,15 +3533,20 @@ class domain(MeshIOMixin):
             # squares a predicate true everywhere gave `sA` and `sB` the SAME 40 facets, the whole
             # boundary, of which only 16 and 24 respectively were their own. A tag naming one body's
             # surface is what `u.gap` needs to say which side of a contact it means.
+            # A named block (an interface side) is decided by its NAME, which is exact even where the two
+            # sides' facets coincide. The unnamed blocks (the exterior boundary, interface blocks without
+            # an owner) fall back to cell topology -- safe there, since two bodies' exterior faces cannot
+            # coincide -- in ONE call: the region's cell mask behind it classifies every cell of the mesh,
+            # so a call per block repeated that work once per block (dozens per tag on a many-region mesh).
             own = np.zeros(len(ents), dtype=bool)
-            _i = 0
-            for _b, _o in zip(blocks, owners):
-                _n = len(_b)
-                # A named block (an interface side) is decided by its NAME, which is exact even where
-                # the two sides' facets coincide. The exterior boundary carries no owner, so it falls
-                # back to cell topology -- safe there, since two bodies' exterior faces cannot coincide.
-                own[_i : _i + _n] = (_o == region) if _o is not None else self._facets_owned_by(_b, region, dim)
-                _i += _n
+            starts = np.cumsum([0] + [len(b) for b in blocks])
+            unnamed = [i for i, o in enumerate(owners) if o is None]
+            for i, o in enumerate(owners):
+                if o is not None:
+                    own[starts[i] : starts[i + 1]] = o == region
+            if unnamed:
+                rows = np.concatenate([np.arange(starts[i], starts[i + 1]) for i in unnamed])
+                own[rows] = self._facets_owned_by(ents[rows], region, dim)
             keep &= own
         if not keep.any():
             return
@@ -3450,7 +3710,9 @@ class domain(MeshIOMixin):
         what makes a boundary tag silently unsamplable, so it is settled here rather than left to
         an empty rejection loop to discover.
         """
-        plan, dim = self._lazy_plan, int(self.dimension)
+        # once the mesh is built the mesh-free plan is consumed; the shape it came from is kept
+        plan = self.__dict__.get("_lazy_plan") or self.__dict__.get("_shape_plan")
+        dim = int(self.dimension)
         rng = np.random.default_rng(0)
         inner = plan.sample_interior(self._GEOMETRY_PILOT, rng)
         edge, _nrm = plan.sample_boundary(self._GEOMETRY_PILOT, rng)
@@ -3468,7 +3730,9 @@ class domain(MeshIOMixin):
         """
         from ..geometry.naming import _classify
 
-        plan, dim = self._lazy_plan, int(self.dimension)
+        # once the mesh is built the mesh-free plan is consumed; the shape it came from is kept
+        plan = self.__dict__.get("_lazy_plan") or self.__dict__.get("_shape_plan")
+        dim = int(self.dimension)
         pts_out, nrm_out, have = [], [], 0
         for _ in range(10_000):
             batch = max(4 * (n - have), 256)
@@ -5505,7 +5769,9 @@ class domain(MeshIOMixin):
                 if point_data:
                     self.context[tag] = sample
                 else:
-                    tensor = jnp.asarray(sample)
+                    # a host array is used as it is (no second copy in RAM: jnp.asarray would make one); it goes to
+                    # the device per batch, or whole on the on-device path, when the solve places the context
+                    tensor = np.asarray(sample) if isinstance(sample, np.ndarray) else jnp.asarray(sample)
                     if tensor.ndim < 1:
                         tensor = tensor.reshape(1, 1)
                     self.context[tag] = self._normalize_tensor_time_axis(tag, tensor)
@@ -5967,68 +6233,6 @@ class domain(MeshIOMixin):
         centroid = pts.mean(axis=0)
         angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
         return np.argsort(angles)
-
-    def enclosure(
-        self,
-        tags,
-        *,
-        axisymmetric=False,
-        n_quad=6,  # see build_enclosure: the closed-form azimuth has no near-field refinement
-        n_phi=16,
-        opaque_tags=None,
-        medium_tags=None,
-        enforce_closure=False,
-        closure_iters=200,
-        occlude=True,
-        inward=False,
-        r_min=None,
-        near_field=True,
-    ):
-        """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
-
-        Discretises the listed boundary surfaces into mesh-edge **elements** (aligned to FEM nodes) and
-        returns a handle exposing the element-to-element view factor ``enclosure.view_factor`` (fully
-        geometry-determined — self-view included), per-element ``areas``/``normals``, the global node
-        ``elements``, and an F-quality gate (``.check()`` / ``.quality()``). Write the grey-body
-        radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem/geometry.md``.
-
-        Args:
-            tags: Boundary tags forming the enclosure (each a radiating surface; tags only group
-                elements for per-surface emissivity — they never block exchange).
-            axisymmetric: Treat the 2D mesh as a meridional ``(r, z)`` half-plane (bodies of revolution).
-            n_quad: Gauss points per element for the double-area view-factor quadrature.
-            opaque_tags: Optional boundary tags that block rays (occluders) without radiating.
-            medium_tags: Optional transparent (meshed) medium regions, by geometry-part name. When given,
-                ``tags`` are solid geometry-part names and the radiating elements are the internal
-                solid|medium **interface** edges (the common furnace case where the gas/air gap is meshed),
-                with normals pointing out of the solid into the medium. When ``None`` (default), the
-                radiating elements are domain **boundary** edges on ``tags`` (an un-meshed/vacuum gap).
-            inward: Boundary mode only. When ``True``, element normals point *into* the meshed domain —
-                use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
-                furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
-                the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
-            r_min: Axisymmetric only. Near-field FLOOR for the ring kernel (``R^2 -> R^2 + r_min^2``) — a
-                fudge that caps the kernel for near-coincident rings rather than integrating them properly.
-                Defaults to half the median element length. Note that this default is itself a ~12%
-                systematic error on the analytic concentric-cylinder view factors; pass a value to override.
-        """
-        from .enclosure import build_enclosure
-
-        return build_enclosure(
-            self,
-            tags,
-            axisymmetric=axisymmetric,
-            n_quad=n_quad,
-            n_phi=n_phi,
-            opaque_tags=opaque_tags,
-            medium_tags=medium_tags,
-            enforce_closure=enforce_closure,
-            closure_iters=closure_iters,
-            occlude=occlude,
-            inward=inward,
-            r_min=r_min,
-            near_field=near_field,
-        )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
         """Compute view factors over a combined radiation enclosure.

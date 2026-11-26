@@ -181,6 +181,66 @@ def test_nonlinear_mass_vector_field():
     assert e0 < 0.08 and e1 < 0.08, f"vector nonlinear-mass wrong: rel L2 comp0={e0:.3f}, comp1={e1:.3f}"
 
 
+def test_nonlinear_mass_on_a_p2_field():
+    """c(u)=1+u on a P2 scalar: the previous-step field of a P2 unknown must be read from the per-step
+    table like a P1 one, not looked up as a coefficient on its own element space (it was refused)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, T_END, NT))
+    u, v = d.fem_symbols(order=2)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    weak = (1.0 + ui) * ui.t * vi + KAPPA * (ui.x * vi.x + ui.y * vi.y) - jno.fn(_f_src, [xi, yi, ti]) * vi
+    fem = jno.fem([weak, u(xb, yb) - 0.0, u(xi0, yi0) - jno.fn(_phi, [xi0, yi0])])
+    final = np.asarray(fem.solve().fn())[-1].reshape(-1)
+    pts = np.asarray(fem.field_points[0])
+    exact = np.asarray(jax.vmap(lambda p: _u_star(p[0], p[1], T_END))(jnp.asarray(pts)))
+    err = np.linalg.norm(final - exact) / np.linalg.norm(exact)
+    assert err < 0.08, f"P2 nonlinear-mass trajectory wrong: rel L2 = {err:.3f}"
+
+
+def test_nonlinear_mass_next_to_a_p2_vector_field():
+    """Taylor-Hood-like layout: a P2 vector field with a plain mass beside a P1 scalar whose mass is
+    state-dependent (an apparent heat capacity next to a velocity). Every temporal term is put in
+    residual form, the P2 one included, so the P2 previous state must be threaded too."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, T_END, NT))
+    w, z = d.fem_symbols(value_shape=(2,), names=("w", "z"), order=2)
+    b, pb = d.fem_symbols(names=("b", "pb"), order=1)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    wi, zi = w.bind(x=xi, y=yi, t=ti), z.bind(x=xi, y=yi, t=ti)
+    bi, pbi = b.bind(x=xi, y=yi, t=ti), pb.bind(x=xi, y=yi, t=ti)
+
+    def f_w(x, y, t):  # plain mass: w*_t - kappa lap w* for w* = (1+At) phi
+        phi = _phi(x, y)
+        return A * phi + 2.0 * PI**2 * KAPPA * (1.0 + A * t) * phi
+
+    fw, fb = jno.fn(f_w, [xi, yi, ti]), jno.fn(_f_src, [xi, yi, ti])
+    w_eq = (
+        wi.t[0] * zi[0]
+        + wi.t[1] * zi[1]
+        + KAPPA * (wi.x[0] * zi.x[0] + wi.y[0] * zi.y[0] + wi.x[1] * zi.x[1] + wi.y[1] * zi.y[1])
+        - fw * (zi[0] + zi[1])
+    )
+    b_eq = (1.0 + bi) * bi.t * pbi + KAPPA * (bi.x * pbi.x + bi.y * pbi.y) - fb * pbi
+    ic = jno.fn(_phi, [xi0, yi0])
+    fem = jno.fem(
+        [w_eq, b_eq, w(xb, yb) - (0.0, 0.0), b(xb, yb) - 0.0, w(xi0, yi0)[0] - ic, w(xi0, yi0)[1] - ic, b(xi0, yi0) - ic]
+    )
+    final = np.asarray(fem.solve().fn())[-1].reshape(-1)
+    off = [int(o) for o in fem.offsets]
+    star = lambda pts: np.asarray(jax.vmap(lambda p: _u_star(p[0], p[1], T_END))(jnp.asarray(pts)))  # noqa: E731
+    ww = final[off[0] : off[1]].reshape(-1, 2)
+    ew = np.linalg.norm(ww - star(np.asarray(fem.field_points[0]))[:, None]) / (
+        np.sqrt(2.0) * np.linalg.norm(star(np.asarray(fem.field_points[0])))
+    )
+    eb = np.linalg.norm(final[off[1] : off[2]] - star(np.asarray(fem.field_points[1]))) / np.linalg.norm(
+        star(np.asarray(fem.field_points[1]))
+    )
+    assert ew < 0.08 and eb < 0.08, f"P2-vector + P1 nonlinear-mass wrong: rel L2 w={ew:.3f}, b={eb:.3f}"
+
+
 def _heat_nlmass(coeff, mesh_size=0.25, time=(0.0, 0.2, 11)):
     """Transient heat whose u_t coefficient is 1 + coeff·u (state-dependent mass), sine-bump IC."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)

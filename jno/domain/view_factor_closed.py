@@ -82,10 +82,31 @@ def segments_from_polygons(geoms: Sequence) -> np.ndarray:
             if ext is None:
                 continue
             for ring in [ext, *list(getattr(g, "interiors", []))]:
-                xy = np.asarray(ring.coords, dtype=float)
+                xy = _merge_collinear(np.asarray(ring.coords, dtype=float))
                 for k in range(len(xy) - 1):
                     out.append((xy[k, 0], xy[k, 1], xy[k + 1, 0], xy[k + 1, 1]))
     return np.asarray(out, dtype=float) if out else np.zeros((0, 4))
+
+
+def _merge_collinear(xy, rtol=1e-12):
+    """A closed ring without its collinear interior vertices: the same outline as fewer, longer sides. A solid
+    outlined by the union of its mesh cells arrives as hundreds of mesh-edge pieces per straight wall, and the
+    visibility test loops over sides, so this alone takes the occluder count from thousands to the outline's
+    real corners. A vertex is dropped when its two sides are parallel and point the same way (|cross| <=
+    rtol |a| |b|, dot > 0): the outline is unchanged up to round-off."""
+    pts = xy[:-1] if len(xy) > 1 and np.allclose(xy[0], xy[-1]) else xy
+    n = len(pts)
+    if n < 4:
+        return xy
+    a = pts - np.roll(pts, 1, axis=0)  # side into each vertex
+    b = np.roll(pts, -1, axis=0) - pts  # side out of it
+    cross = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    dot = (a * b).sum(1)
+    keep = ~((np.abs(cross) <= rtol * np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)) & (dot > 0))
+    if keep.sum() < 3:
+        return xy
+    kept = pts[keep]
+    return np.vstack([kept, kept[:1]])
 
 
 # ---------------------------------------------------------------------------------------
@@ -251,6 +272,21 @@ def _visible_gaps(mids, sides, max_gaps=6, chunk=64):
     G0 = np.zeros((m, m, max_gaps))
     G1 = np.zeros((m, m, max_gaps))
     n_over = 0
+    # A side can block a chord only inside the box every chord of this enclosure stays in (the same
+    # one-sided, tolerant bounds as the per-pair prune below): z within the elements' range, r below
+    # their largest. The others would only add empty intervals -- dropping them changes nothing, and
+    # keeping them made the stacked (rows x m x sides) arrays scale with every solid of the domain.
+    if len(sides):
+        sides = np.asarray(sides, dtype=float)
+        tol = 1e-7 * np.maximum(np.abs(sides).max(1), 1e-7)
+        reach = (
+            (np.maximum(sides[:, 1], sides[:, 3]) + tol >= z_.min())
+            & (np.minimum(sides[:, 1], sides[:, 3]) - tol <= z_.max())
+            & (np.minimum(sides[:, 0], sides[:, 2]) - tol <= r_.max())
+        )
+        sides = sides[reach]
+    # rows per block: about 12 arrays of (rows, m, sides) floats are alive at once; keep each near 2e7 entries
+    chunk = max(1, min(int(chunk), int(2e7 // max(m * max(len(sides), 1), 1))))
     for a in range(0, m, chunk):
         b = min(a + chunk, m)
         R, Z = r_[a:b, None], z_[a:b, None]
@@ -277,14 +313,15 @@ def _visible_gaps(mids, sides, max_gaps=6, chunk=64):
             rj, zj, rk, zk = side
             tol = 1e-7 * max(abs(rj), abs(zj), abs(rk), abs(zk), 1e-7)
             cand = (max(zj, zk) + tol >= z_lo) & (min(zj, zk) - tol <= z_hi) & (min(rj, rk) - tol <= r_hi)
+            idx = np.nonzero(cand)
+            if not idx[0].size:
+                continue  # blocks no pair of this block: it would add only empty intervals
             tl = np.zeros(cand.shape)
             th = np.zeros(cand.shape)
-            idx = np.nonzero(cand)
-            if idx[0].size:
-                # _blocked_interval broadcasts, so the candidate subset goes through as 1-D
-                sl, sh = _blocked_interval(R[idx[0], 0], Z[idx[0], 0], RP[0, idx[1]], ZP[0, idx[1]], side)
-                tl[idx] = sl
-                th[idx] = sh
+            # _blocked_interval broadcasts, so the candidate subset goes through as 1-D
+            sl, sh = _blocked_interval(R[idx[0], 0], Z[idx[0], 0], RP[0, idx[1]], ZP[0, idx[1]], side)
+            tl[idx] = sl
+            th[idx] = sh
             starts.append(tl)
             ends.append(th)
         if starts:
