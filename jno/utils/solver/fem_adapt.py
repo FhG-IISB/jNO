@@ -3441,7 +3441,14 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.adapt_history = history
     # A higher-order Lagrange field has more DOFs than vertices: return the whole field (the vector
     # `fem.dofs` counts and `fem.eval` reads), not the vertex view the estimator worked on.
-    if u is not None and _cover_block_stride(cur) == 1 and np.size(u) != _full.size:
+    if u is None:
+        # A criterion run kept the vertex view lazy inside the loop. The caller still gets the solution on
+        # the final mesh: its vertex view, or the whole vector where the view is refused (multifield).
+        try:
+            u = _vertex_view(_full, cur, allow_vector=True)
+        except NotImplementedError:
+            return _full
+    if _cover_block_stride(cur) == 1 and np.size(u) != _full.size:
         return _full
     return u
 

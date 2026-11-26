@@ -112,3 +112,13 @@ def test_a_multicomponent_geometry_criterion_is_refused_by_name():
     d, fem = _poisson()
     with pytest.raises(ValueError, match="one value per cell"):
         fem.solve(adapt=jno.solve.remesh(criterion=lambda dm: dm.cell_angles(), max_iters=1))
+
+
+def test_a_criterion_run_returns_the_solution_on_the_final_mesh():
+    """The vertex view is lazy inside the loop; the call still returns the field, sized to the final mesh."""
+    d, fem = _poisson(skew=0.45)
+    out = fem.solve(adapt=jno.solve.remesh(criterion=lambda dm: jno.le(dm.cell_aspect(), 2.0), max_iters=2))
+    assert out is not None
+    assert np.asarray(out).size == int(fem.dofs) == int(np.asarray(fem.domain.mesh.points).shape[0])
+    assert np.all(np.isfinite(out))
+
