@@ -1520,6 +1520,24 @@ def where(condition, x, y) -> FunctionCall:
     return FunctionCall(jnp.where, [_u(condition), _u(x), _u(y)])
 
 
+def _smooth_max(x, margin: float) -> FunctionCall:
+    """The Kreisselmeier-Steinhauser smooth maximum of every entry of ``x``, a scalar in ``[max x, max x + margin]``:
+    ``log(sum_i exp(rho x_i)) / rho`` with ``rho = log(n) / margin`` [Kreisselmeier & Steinhauser 1979]. The bound
+    a ``jno.le(x, b, margin=...)`` row holds (see :func:`jno.le`); one entry is returned as it is."""
+    import math
+
+    def ks(v, _m=float(margin)):
+        if jnp.iscomplexobj(v):
+            raise TypeError("jno.le/jno.ge(margin=...): a bound on every entry needs real values, got a complex array.")
+        v = jnp.ravel(v)
+        if v.size == 1:
+            return v[0]
+        rho = math.log(v.size) / _m
+        return jax.nn.logsumexp(rho * v) / rho
+
+    return FunctionCall(ks, [_u(x)], name="smooth_max")
+
+
 # ============================================================================
 # Linear algebra
 # ============================================================================

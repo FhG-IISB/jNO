@@ -53,6 +53,7 @@ from .trace import (
     TunableModule,
     TunableModuleCall,
     Variable,
+    _iter_placeholder_children,
     collect_operations,
     collect_tags,
     cse,
@@ -615,6 +616,23 @@ def _extract_user_name(orig_expr) -> str | None:
     elif isinstance(orig_expr, Tracker):
         return getattr(orig_expr.expr, "_user_name", None)
     return None
+
+
+def _one_value(residual, sense: str) -> FunctionCall:
+    """``residual`` as a constraint row, refused when traced if it holds more than one value: a row is reduced by
+    its mean, so an array-valued ``jno.le(v, b)`` would bound the average of ``v``, not every entry."""
+
+    def check(v):
+        if jnp.size(v) != 1:
+            raise ValueError(
+                f"jno.core: the constraint jno.{sense}(...) evaluates to {tuple(jnp.shape(v))} values, and a row "
+                "bounds ONE value (it would otherwise bound their mean). For a bound on every entry give "
+                f"jno.{sense}(expr, bound, margin=...): a smooth maximum that lies at most `margin` above the "
+                "largest entry. For a bound on a total or an average, reduce it yourself (`.sum`, `.mean`)."
+            )
+        return v
+
+    return FunctionCall(check, [residual], name="row")
 
 
 class _RebuildWatch(_CallbackBase):
@@ -2490,10 +2508,10 @@ class core:
                 inner = expr.expr
             elif isinstance(expr, OperationDef) and isinstance(expr.expr, Constraint):
                 inequality_sense = expr.expr.sense
-                inner = OperationDef(expr.expr.residual)
+                inner = OperationDef(_one_value(expr.expr.residual, expr.expr.sense))
             elif isinstance(expr, Constraint):
                 inequality_sense = expr.sense
-                inner = expr.residual
+                inner = _one_value(expr.residual, expr.sense)
 
             if inequality_sense is not None:
                 if isinstance(_bare, AugLagConstraint):
@@ -2697,6 +2715,7 @@ class core:
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        self._resolve_starts()  # every `expr.start` of the entries: their values now, before the first step
         watched = self._rebuild_watch()
         if watched and not self.__dict__.get("_in_rebuild_segment", False):
             return self._solve_rebuilding(
@@ -6001,6 +6020,55 @@ class core:
                 self._opt_states = None
         return out
 
+    def _resolve_starts(self, extra=()):
+        """Set the value of every unset ``expr.start`` in the entries (and in ``extra``): ``expr`` evaluated now, all
+        of them in one :meth:`eval`. Called at the first ``solve`` / ``eval``, so "the start" is the design the
+        optimisation starts from; a value once set stays (also across a remesh: the start does not move). A
+        ``.start`` inside another's expression is set first."""
+        if getattr(self, "_resolving_starts", False):
+            return
+        found, seen = [], set()
+
+        def walk(n):
+            if id(n) in seen:
+                return
+            seen.add(id(n))
+            if getattr(n, "_start_holder", None) is not None:
+                if "value" not in n._start_holder:
+                    found.append(n)
+                return
+            bound = getattr(n, "bound", None) if isinstance(n, Constraint) else None
+            if isinstance(bound, Placeholder):  # a constraint's bound is no child: `jno.ge(fx, fx.min.start - tol)`
+                walk(bound)
+            for kind, _attr, val in _iter_placeholder_children(n):
+                for c in val if kind == "list" else (val,):
+                    if isinstance(c, Placeholder) or hasattr(c, "_start_holder"):
+                        walk(c)
+
+        for e in list(self.constraints) + list(extra):
+            walk(e)
+        pending = list(found)
+        while pending:
+            inner = []
+            for n in pending:  # the starts inside a pending start's expression
+                found.clear()
+                seen.clear()
+                walk(n._start_of)
+                inner.append(bool(found))
+            ready = [n for n, nested in zip(pending, inner) if not nested]
+            if not ready:
+                raise ValueError("jno.core: the `.start` values refer to each other in a cycle; none can be evaluated.")
+            self._resolving_starts = True
+            try:
+                vals = self.eval([n._start_of for n in ready])
+            finally:
+                self._resolving_starts = False
+            vals = vals if isinstance(vals, (list, tuple)) else [vals]
+            for n, v in zip(ready, vals):
+                v = jnp.asarray(v)
+                n._start_holder["value"] = v.reshape(()) if v.size == 1 else v
+            pending = [n for n in pending if "value" not in n._start_holder]
+
     def eval(
         self,
         operation: Union[List[BinaryOp], BinaryOp],
@@ -6048,6 +6116,7 @@ class core:
             operation = [_unwrap_view(operation)]
         else:
             operation = [_unwrap_view(op) for op in operation]
+        self._resolve_starts(operation)  # an `expr.start` in what is evaluated, or in the entries
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
