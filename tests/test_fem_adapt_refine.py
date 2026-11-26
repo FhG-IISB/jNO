@@ -183,3 +183,74 @@ def test_the_spec_carries_the_split_flag_and_no_refine_factor():
     assert jno.solve.remesh().split is False
     assert jno.solve.refine(criterion=42).criterion == 42
     assert jno.solve.refine(theta=0.3).theta == 0.3
+
+
+# ------------------------------------------------------------------------------ multi-box lattice
+
+
+def _two_box_lattice():
+    """Two unit boxes a|b side by side, different conductivity in each (1 and 2), and the manufactured
+    solution sin(pi x/2) sin(pi y): its x-derivative vanishes at the interface x = 1, so the flux is
+    continuous there for ANY piecewise-constant coefficient and the oracle is exact for both regions."""
+    R = jno.shape.rect
+    plan = (R(0, 0, 1, 1).name("a") + R(1, 0, 2, 1).name("b")).sized(0.25).structured().quad()
+    d = plan.domain(compute_mesh_connectivity=False)
+    u, v = d.fem_symbols()
+    xa, ya, _ = d.variable("a", split=True)
+    xb, yb, _ = d.variable("b", split=True)
+    xw, yw, _ = d.variable("boundary", split=True)
+    ua, va = u.bind(x=xa, y=ya), v.bind(x=xa, y=ya)
+    ub, vb = u.bind(x=xb, y=yb), v.bind(x=xb, y=yb)
+    w = 1.25 * np.pi**2
+
+    def exact(x, y):
+        return jno.np.sin(np.pi * x / 2) * jno.np.sin(np.pi * y)
+
+    fem = jno.fem(
+        [
+            ua.x * va.x + ua.y * va.y - w * exact(xa, ya) * va,
+            2.0 * (ub.x * vb.x + ub.y * vb.y) - 2.0 * w * exact(xb, yb) * vb,
+            u(xw, yw) - 0.0,
+        ]
+    )
+    return d, fem
+
+
+def _max_error(dom, sol):
+    p = np.asarray(dom.mesh.points)[:, :2]
+    return float(np.abs(sol[: len(p)] - np.sin(np.pi * p[:, 0] / 2) * np.sin(np.pi * p[:, 1])).max())
+
+
+def test_hanging_node_refinement_on_a_multi_box_lattice_keeps_regions_tags_and_converges(x64):
+    """#267: `refine` on a `.structured().quad()` lattice of two named boxes. Each region's cells must follow
+    the split (a child belongs to the region of its parent: both stay on their own side, covering their own
+    area), the interface and outer tags must be re-derived on the refined mesh, and the solution must
+    converge to the analytic one."""
+    d, fem = _two_box_lattice()
+    n0 = len(d.mesh.points)
+    err0 = _max_error(d, np.asarray(fem.solve()).reshape(-1))
+    sol = np.asarray(fem.solve(adapt=jno.solve.refine(theta=0.9, max_iters=3))).reshape(-1)
+    dom = fem.domain
+    assert len(dom.mesh.points) > n0 and dom._fem_hanging_nodes, "the lattice was not refined with hanging nodes"
+
+    p = np.asarray(dom.mesh.points)[:, :2]
+    cells = np.asarray(dom.mesh.cells_dict["quad"])
+    sets = dom.mesh.cell_sets_dict
+    lo, hi = p[cells].min(axis=1), p[cells].max(axis=1)
+    area = np.prod(hi - lo, axis=1)
+    a, b = np.asarray(sets["a"]["quad"]), np.asarray(sets["b"]["quad"])
+    assert len(np.intersect1d(a, b)) == 0 and len(a) + len(b) == len(cells), "regions overlap or miss cells"
+    assert hi[a, 0].max() <= 1.0 + 1e-12 and lo[b, 0].min() >= 1.0 - 1e-12, "a child left its parent's box"
+    np.testing.assert_allclose([area[a].sum(), area[b].sum()], [1.0, 1.0], rtol=1e-12)
+
+    # tags re-derived on the new mesh: each tag's points are exactly the refined mesh's nodes on its line
+    # (so the interface carries the NEW nodes on x = 1, not the stale coarse ones)
+    for name, x_at in (("a|b", 1.0), ("left", 0.0), ("right", 2.0)):
+        xt, yt, _ = dom.variable(name, split=True)
+        xs, ys = np.asarray(xt.eval()).reshape(-1), np.asarray(yt.eval()).reshape(-1)
+        assert np.allclose(xs, x_at), f"tag {name!r} is not on x = {x_at}"
+        on_line = np.unique(np.round(p[np.isclose(p[:, 0], x_at), 1], 12))
+        np.testing.assert_allclose(np.unique(np.round(ys, 12)), on_line, err_msg=f"tag {name!r}")
+
+    err = _max_error(dom, sol)
+    assert err < 0.5 * err0, f"no convergence against the analytic oracle: {err0:.3e} -> {err:.3e}"
