@@ -848,7 +848,7 @@ def newton(
     from where it starts (a buoyant flow from rest, a stiff source): each step solves
     ``(V / dtau_k + J) delta = -r`` with ``V = |diag J|``, starting at ``dtau_0 = dtau0``. An accepted step grows
     ``dtau`` by the factor the residual fell (switched evolution relaxation; Kelley & Keyes, SIAM J. Numer. Anal.
-    35(2), 1998, Sec. 2; Mulder & van Leer, J. Comput. Phys. 59, 1985), at most 4x per step; a step that does not
+    35(2), 1998, Sec. 2; Mulder & van Leer, J. Comput. Phys. 59, 1985), at least 2x and at most 4x per step; a step that does not
     lower the residual is REJECTED (the iterate stays) and ``dtau`` shrinks 4x -- except the first step, which
     is always taken: it satisfies the linear constraints (continuity), which a small ``dtau`` cannot relax. The safeguard is there because
     uncapped growth reached full Newton too early on a buoyant flow, at a residual where full Newton still

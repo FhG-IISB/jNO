@@ -54,7 +54,10 @@ STALL_DROP = 0.01
 
 # Pseudo-transient continuation's safeguard (Kelley & Keyes 1998 use SER uncapped; uncapped, a flow that converged far
 # from the root reached full Newton at a residual where full Newton still diverges): an accepted step grows dtau by the
-# residual's fall, at most PTC_GROW; a step that raises the residual is rejected and dtau shrinks by PTC_SHRINK.
+# residual's fall, at least PTC_GROW_MIN and at most PTC_GROW; a step that raises the residual is rejected and dtau
+# shrinks by PTC_SHRINK (a trust-region update of dtau). Without the floor, dtau after a few rejections grew only by the
+# residual's fall (x1.003 per step on a melt + gas flow) and the solve crept for a hundred steps.
+PTC_GROW_MIN = 2.0
 PTC_GROW = 4.0
 PTC_SHRINK = 4.0
 
@@ -1040,7 +1043,7 @@ def newton_direct(
     ``ptc=dtau0`` (> 0) is **pseudo-transient continuation**: each step solves ``(V / dtau_k + J) delta = -r``
     with ``V = |diag J|``, starting at ``dtau0``; an accepted step grows ``dtau`` by the residual's fall (switched
     evolution relaxation; Kelley & Keyes, SIAM J. Numer. Anal. 35(2), 1998, Sec. 2; Mulder & van Leer 1985), at
-    most ``PTC_GROW``, and a step that does not lower the residual is rejected with ``dtau / PTC_SHRINK``. See
+    least ``PTC_GROW_MIN`` and at most ``PTC_GROW``, and a step that does not lower the residual is rejected with ``dtau / PTC_SHRINK``. See
     :func:`jno.solve.newton`.
     Not with ``reuse=True`` (the shifted tangent changes every step)."""
     stall = _stall_check(stall)
@@ -1135,7 +1138,7 @@ def newton_direct(
                 rn_try = jnp.linalg.norm(r_try)
                 accept = (rn_try < rn) | ((k == 0) & jnp.isfinite(rn_try))  # False for a NaN norm
                 u_new, r_new = jnp.where(accept, u_try, u), jnp.where(accept, r_try, r)
-                grow = jnp.clip(rn / jnp.maximum(rn_try, jnp.finfo(rn.dtype).tiny), 1.0, PTC_GROW)
+                grow = jnp.clip(rn / jnp.maximum(rn_try, jnp.finfo(rn.dtype).tiny), PTC_GROW_MIN, PTC_GROW)
                 dtau = jnp.where(accept, dtau * grow, dtau / PTC_SHRINK)
             if beacon.active():  # nothing is traced unless the solve has log=
                 rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
