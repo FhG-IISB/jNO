@@ -340,3 +340,19 @@ def test_a_hex_mesh_refuses_with_the_real_reason():
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - 1.0 * vi, u(*cb[:3]) - 0.0])
     with pytest.raises(NotImplementedError, match="no general all-hex mesher exists"):
         fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2))
+
+
+def test_a_structured_multi_box_plan_names_the_regions_size_not_cell_counts():
+    """A rectilinear lattice of several boxes takes its spacing from the regions' `size=` (and `grading=`) and
+    refuses `n=`; the refusal named cell COUNTS, the knob it does not have."""
+    R = jno.shape.rect
+    plan = (R(0, 0, 1, 1).name("a") + R(1, 0, 2, 1).name("b")).sized(0.25).structured().quad()
+    d = plan.domain()
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match=r"several boxes takes its spacing from the regions' size=") as e:
+        fem.solve(adapt=jno.solve.remesh(max_iters=2))
+    assert "cell COUNTS" not in str(e.value)

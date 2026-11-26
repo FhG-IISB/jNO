@@ -535,11 +535,17 @@ def _rebuilt_remeshed(domain: Any, vertex_size: np.ndarray) -> _Remeshed:
             "built from a jno.shape). Adapt a shape-built domain, or refine the file's mesh outside jNO."
         )
     if getattr(plan, "_structured", None) is not None:
+        if len(plan.leaves()) > 1:  # a rectilinear lattice of several boxes: n= is refused there, size= decides
+            resolution, knob = (
+                "a lattice of several boxes takes its spacing from the regions' size= (and grading=)",
+                "lower the regions' size= and rebuild the lattice yourself",
+            )
+        else:
+            resolution, knob = "a lattice's resolution is its cell COUNTS", "rebuild the lattice yourself at a larger n"
         raise NotImplementedError(
-            "h-adaptive remeshing cannot refine a shape.structured() plan: a lattice's resolution is its "
-            "cell COUNTS, so rebuilding it against a marked size field returns the same mesh -- a silent "
-            "no-op. Drop .structured() to let gmsh mesh (and recombine) the geometry at a graded size, "
-            "or rebuild the lattice yourself at a larger n."
+            f"h-adaptive remeshing cannot refine a shape.structured() plan: {resolution}, so rebuilding it "
+            "against a marked size field returns the same mesh -- a silent no-op. Drop .structured() to let gmsh "
+            f"mesh (and recombine) the geometry at a graded size, or {knob}."
         )
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
