@@ -443,10 +443,27 @@ def _lower_unknowns(obj: Any) -> Any:
     bare = _bare(obj)
     if not isinstance(bare, Placeholder):
         return obj
-    from .trace import Jacobian, TemporalDerivative
+    from .trace import HistoryRef, Jacobian, StateUpdate, TemporalDerivative
+
+    if isinstance(bare, HistoryRef):
+        # `u.i(k)` on an unknown reads the history of its trial symbol: the buffer is keyed by the field's
+        # identity, so the read and the `.evolves` update (lowered below) must name the same symbol.
+        sym = _unknown_symbol_of(bare.target)
+        return obj if sym is None else HistoryRef(sym, bare.offset)
+
+    if isinstance(bare, StateUpdate):
+        # `_walk` does not descend into a state update (it is pulled out of the weak-form classification),
+        # so its state field and formula are lowered here, each like a term of its own.
+        target, formula = _lower_unknowns(bare.target), _lower_unknowns(bare.expr)
+        if target is bare.target and formula is bare.expr:
+            return obj
+        return StateUpdate(target, formula, region=bare.region)
 
     nodes = list(_walk(bare))
     mapping = {n: _unknown_symbol_of(n) for n in nodes if _unknown_symbol_of(n) is not None}
+    for n in nodes:
+        if isinstance(n, HistoryRef) and _unknown_symbol_of(n.target) is not None:
+            mapping[n] = HistoryRef(_unknown_symbol_of(n.target), n.offset)
     if not mapping:
         return obj
     for n in nodes:
@@ -4027,6 +4044,18 @@ class FEM:
         # drivers, whose tolerances the verdict knows. A user `solve_fn=` carries its own tolerances, and a
         # box-constrained solve root-finds the min-map, not the residual the verdict re-evaluates.
         _jno_driver = (solve_fn is None or from_slots) and not getattr(self, "_bound_specs", None)
+        # The per-step solver's value identity, for the history march's compiled-program cache: jNO's own
+        # drivers have one (the default, or one composed from the slots), under the same rule the steady
+        # nonlinear path uses -- a `precond=` holding state built from concrete values does not compile and
+        # is not cached. A user `solve_fn=` has none. Read BEFORE the box wrapper below, which hides it.
+        from .utils.solver.solver_api import precond_compiles
+
+        if solve_fn is None:
+            _march_key = ("default",)
+        elif getattr(solve_fn, "cache_key", None) is not None and precond_compiles(precond):
+            _march_key = solve_fn.cache_key
+        else:
+            _march_key = None
         if getattr(self, "_bound_specs", None):
             solve_fn = self._bounded_solve_fn(solve_fn)
 
@@ -4059,6 +4088,7 @@ class FEM:
                 contact=contact,
                 values=kwargs.get("values"),
                 checkpoint=checkpoint,
+                cache_key=_march_key,
             )
         if tau is not None:
             raise ValueError(

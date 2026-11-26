@@ -35,6 +35,7 @@ jNO gains a finite-volume method. `jno.fvm` solves the same constraint list as `
 - `jno.fvm`: a diffusive term inside `jnn.stack` in a vector equation (`jnn.stack([0, k*(T.xx + T.yy)], axis=-1)`) is a face flux of its row; it was evaluated cell by cell, a stencil twice as wide and not conservative. First-order terms (a pressure gradient `jnn.stack([p.x, p.y])`) stay volume terms.
 - `jno.fvm`: a nodal data field is read at a site through the mesh's P1/Q1 interpolant (vertex-centred sites were 0.4 % off); the `u.t` coefficient probe reads only the time-derivative terms (an axisymmetric gas's source made it NaN).
 - A window copy of a transient block shares the block's compiled marches (the march cache keys scalars by value and leaves out the start state).
+- `jno.fem`: a phase-field (history) march written with `domain.unknown()` builds and solves like one written with `fem_symbols()`: `.bounds()` on an unknown, a state update or history read `H.i(-1)` of an unknown, and a history seeded from a coordinate formula `H0(x)` all failed. A repeated march of the same problem reuses its compiled scan and adaptive pilot step, and a staggered sweep is keyed by its fields' order and names, so `[u, d]` and `[d, u]` are different solvers.
 
 ### Changed
 - `jno.fdm` and `jno.fvm` share their constraint classification, DOF layout and parameter machinery in `jno._strong_form.StrongFormProblem`. `jno.fdm` behaves as before.

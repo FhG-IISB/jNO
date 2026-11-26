@@ -3188,7 +3188,7 @@ def assemble_fem_native(
         Reverse-mode differentiable in ``local_all`` (the solved DOFs) and the history buffers. ``pts``
         is the moved geometry under coordinate parameters (the caller scatters it once per call)."""
         loc, _meas = _vol_readout_loc(c, local_all, t, args, pts)
-        return _eval_integrand(domain, formula, loc)
+        return _eval_integrand(domain, formula, {**loc, "__state_readout__": True})
 
     def _vol_elem_functional(c, local_all, formula, rnames=(), t=0.0, args=None, pts=None):
         """``∫_K F dΩ`` over cell ``c`` -> ``(1,)``, for a test-free ``formula``.
@@ -3582,7 +3582,7 @@ def assemble_fem_native(
         The formula carries no test function, so it is *evaluated*, not integrated -- the advance for a
         surface state (a slip). ``pts`` / ``normals``: the moved geometry under coordinate parameters."""
         loc, _w = _surf_readout_loc(fi, local_all, region, t, args, pts, normals, gaps=gaps)
-        return _eval_integrand(domain, formula, loc)
+        return _eval_integrand(domain, formula, {**loc, "__state_readout__": True})
 
     def _surf_elem_functional(fi, local_all, formula, region, t=0.0, args=None, pts=None, normals=None, gaps=None):
         """``∫_F F ds`` over boundary face ``fi`` -> ``(1,)``, for a test-free ``formula``.
