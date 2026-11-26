@@ -3611,11 +3611,20 @@ class FEM:
             linear = _default_saddle_step_solve(self)
         if (
             linear is None
-            and getattr(nonlinear, "name", None) == "staggered"
             and getattr(nonlinear, "direct", None) is True
+            and (
+                getattr(nonlinear, "name", None) == "staggered"
+                # newton(direct=True) factorizes the ASSEMBLED tangent; a materialised dense one keeps its dense LU
+                or (
+                    getattr(nonlinear, "name", None) == "newton"
+                    and precond is None
+                    and getattr(getattr(self, "_op", None), "jacobian", None) is not None
+                )
+            )
         ):
-            # staggered(direct=True) factorizes each field's block: with no linear slot that is what lu() resolves to
-            # (cuDSS where it runs, else JAX's spsolve), not an unconditional spsolve -- on a GPU, cuSolver's sparse QR.
+            # staggered(direct=True) factorizes each field's block, newton(direct=True) the assembled tangent: with no
+            # linear slot that is what lu() resolves to (cuDSS where it runs, else JAX's spsolve), not an unconditional
+            # spsolve -- on a GPU, cuSolver's sparse QR.
             from .solve import lu
 
             linear = lu()
