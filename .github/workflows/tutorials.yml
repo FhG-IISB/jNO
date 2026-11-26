@@ -1,0 +1,26 @@
+name: Tutorials (manual)
+
+# Runs every script under docs/tutorial_examples through tests/test_tutorial_examples.py (each is a
+# subprocess with its own 180 s limit). They are slow-marked, so neither ci.yml nor the nightly
+# runs them; run this by hand before a release or after touching the tutorials or their API.
+# Manual only on purpose: no schedule, no push trigger.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tutorials:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          cache: true
+
+      - name: Run the tutorials
+        run: pixi run -- env MPLBACKEND=Agg pytest tests/test_tutorial_examples.py -m slow --durations=20 --tb=short -q
