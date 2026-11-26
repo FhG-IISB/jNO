@@ -274,18 +274,33 @@ def _schwarz_custom_root(solve0, solve1, mask0, c0, c1, n, *, tol, max_iter):
 def _schwarz_forward_eager(solve0, solve1, mask0, c0, c1, overlap, n, *, tol, max_iter):
     """Host-controlled multiplicative Schwarz for the plain (no trainable parameter) forward solve —
     the JAX counterpart of the old numpy loop: JAX subdomain solves + array ops, a Python convergence
-    check (the iteration control is not differentiated). Returns ``(U, iters, overlap_jump)``."""
+    check (the iteration control is not differentiated). Stops on the change of the combined iterate between
+    two sweeps, ``max|U_new - U|``, like :func:`_schwarz_custom_root`: the overlap jump of two different
+    discretisations settles at their discretisation gap and would never reach ``tol``. A run that reaches
+    ``max_iter`` with the change still above ``tol`` warns. Returns ``(U, iters, overlap_jump, change)``
+    (the jump and the last change are reported, the jump does not decide the stop)."""
+    import warnings
+
     import jax.numpy as jnp
 
     mask0j, c0j, c1j, ovj = jnp.asarray(mask0), jnp.asarray(c0), jnp.asarray(c1), jnp.asarray(overlap)
     U = jnp.zeros(n)
-    jump, it = float("inf"), 0
+    change, it = float("inf"), 0
+    u0 = u1 = U
     for it in range(1, max_iter + 1):
-        u0, u1, U = _schwarz_multiplicative(solve0, solve1, mask0j, c0j, c1j, U)
-        jump = float(jnp.max(jnp.abs(u0[ovj] - u1[ovj]))) if overlap.any() else 0.0
-        if jump < tol:
+        u0, u1, U_new = _schwarz_multiplicative(solve0, solve1, mask0j, c0j, c1j, U)
+        change = float(jnp.max(jnp.abs(U_new - U)))
+        U = U_new
+        if change < tol:
             break
-    return U, it, jump
+    else:
+        warnings.warn(
+            f"couple(...).solve: the Schwarz iteration did not reach tol={tol:g} in max_iter={max_iter} sweeps "
+            f"(the iterate still changes by {change:.3e} per sweep). Raise max_iter or loosen tol.",
+            stacklevel=3,
+        )
+    jump = float(jnp.max(jnp.abs(u0[ovj] - u1[ovj]))) if overlap.any() else 0.0
+    return U, it, jump, change
 
 
 # ---------------------------------------------------------------------------
@@ -611,13 +626,14 @@ class _Coupled:
         import jax
 
         s0, s1 = (jax.jit(s) for s in _solvers([]))
-        combined, iters, jump = _schwarz_forward_eager(
+        combined, iters, jump, change = _schwarz_forward_eager(
             s0, s1, mask0, complements[0], complements[1], overlap, n, tol=tol, max_iter=max_iter
         )
         if return_info:
             return combined, {
                 "iterations": iters,
                 "overlap_jump": jump,
+                "iterate_change": change,
                 "mode": "overlap-Schwarz",
                 "interfaces": self._interfaces,
             }
