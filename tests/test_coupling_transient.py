@@ -195,6 +195,53 @@ def test_a_substepping_sender_passes_its_window_mean_flux_and_heat_is_conserved(
     assert coarse < 0.03 and fine < 0.5 * coarse, (coarse, fine)
 
 
+def _two_fem_bars(h=0.03, time=None):
+    """Two insulated fem bars brought into contact, [-1, 0] at 0 (k 1) and [0, 1] at 1 (k 4), on their own meshes: one
+    of them takes the interface value and sends a flux, and both are transient."""
+
+    def bar(x0, x1, k, t0):
+        d = jno.shape.rect(x0, 0.0, x1, 0.1, size=h).domain(time=(0.0, T_END, N_TIME))
+        u, v = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+        ci = d.variable("initial", split=True)
+        return jno.fem([ub.t * vb + k * (ub.x * vb.x + ub.y * vb.y), u(*ci) - t0 * (1.0 + 0.0 * ci[0])]), u, d
+
+    pa, ua, da = bar(-1.0, 0.0, K1, 0.0)
+    pb, ub, db = bar(0.0, 1.0, K2, 1.0)
+    xa, ya, _ = da.variable("right", split=True)
+    xb, yb, _ = db.variable("left", split=True)
+    a, b = ua.bind(x=xa, y=ya), ub.bind(x=xb, y=yb)
+    flux = [K1 * a.d(da.variable("right", normals=True)) + K2 * b.d(db.variable("left", normals=True))]
+    c = couple([pa, pb], [a - b, *flux], CouplingSpec(tol=1e-10, max_iter=60, time=time and {pa: time(0), pb: time(1)}))
+    return c, (da, db), (pa, pb)
+
+
+def test_a_transient_fem_side_sends_the_flux_of_its_step_and_heat_is_conserved():
+    # Name the break: the flux a transient jno.fem problem sends was read from its stiffness alone (the u.t part of
+    # the residual was dropped), so the receiver took in a fraction of the heat the sender gave out. The reaction of
+    # a backward Euler step is M (u_n - u_{n-1})/dt + K u_n, with M before any essential row is eliminated.
+    # Oracles: the heat of the two bars (insulated: constant, to round-off, whichever side sends) and the
+    # contact solution (erf profiles about T_c, valid while neither bar feels its far end), whose discretisation
+    # error here is 5e-3 (measured; 1.1e-2 and 7 % of the heat moved lost without the mass term).
+    c, (da, db), _ = _two_fem_bars(h=0.02)
+    ta, tb = c.solve()
+    assert [p.kind for p in c.parts] == ["fem", "fem"]
+    ha, hb = _heat_of_fem(da, ta), _heat_of_fem(db, tb)
+    moved = abs(hb[-1] - hb[0])
+    assert moved > 5e-3
+    np.testing.assert_allclose(ha + hb, (ha + hb)[0], atol=1e-9 * moved)
+    for d, t in ((da, ta), (db, tb)):
+        x = np.asarray(d.mesh_connectivity["points"])[:, 0]
+        np.testing.assert_allclose(np.asarray(t)[-1], exact(x, T_END), atol=7e-3)
+
+
+def test_a_transient_fem_side_that_steps_by_crank_nicolson_cannot_send_a_flux_and_says_so():
+    # The reaction of a Crank-Nicolson step is not that of the end state: refuse, naming the scheme and the way out.
+    with pytest.raises(NotImplementedError, match="backward Euler"):
+        _two_fem_bars(time=lambda i: jno.solve.theta(0.5))[0].solve()
+
+
 @pytest.mark.parametrize("implicit", [True, False], ids=["one-way", "loose"])
 def test_a_window_of_one_sweep_runs_as_one_compiled_program(implicit):
     # Name the break: a window that takes one sweep (a one-way coupling, or a loose one) is one compiled program,

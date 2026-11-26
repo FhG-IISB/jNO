@@ -612,7 +612,8 @@ class FEMParticipant(Participant):
             ys = time.integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
         else:
             ys = _default_transient_integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
-        return jnp.asarray(ys)[-1].reshape(-1), None  # its flux is read from the end state
+        ys = jnp.asarray(ys)
+        return self._frames(ys.reshape(ys.shape[0], -1))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -643,12 +644,55 @@ class FEMParticipant(Participant):
 
         return [c for c in self.constraints() if has_test(c)]
 
-    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+    def split_terms(self, problem):
+        """``(stiffness, mass)``: the weak terms without their ``u.t`` parts, and those parts with ``u.t`` read as
+        ``u``. The free residual of the first at ``u`` is ``K u``, of the second at ``w`` the mass action ``M w`` (``M``
+        before any essential row is eliminated, which the block's own is not). ``fem.eval`` on the weak terms as
+        they are does not read ``u.t`` as zero but as a small spurious value, so a transient flux needs the split."""
+        from ..utils.solver.time_route import _strip_temporal_trial_derivative
+        from ..utils.solver.weak_form import _apply_sign, _contains_temporal_derivative, _split_additive_terms
+
+        stiff, mass = [], []
+        for c in self.weak_terms(problem):
+            for sign, sub in _split_additive_terms(problem.domain, getattr(c, "expr", c)):
+                term = _apply_sign(problem.domain, sign, sub)
+                if _contains_temporal_derivative(sub):
+                    mass.append(_strip_temporal_trial_derivative(term))
+                else:
+                    stiff.append(term)
+        return stiff, mass
+
+    def check_step_flux(self, problem, time):
+        """Raise unless a flux read from this problem's steps is exact: backward Euler (the default step, or
+        ``jno.solve.theta(1)``) on a mass that does not depend on the state."""
+        from ..utils.solver.timeschemes import _ThetaScheme
+
+        block = problem._op
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+        if time is not None:
+            theta = time.theta if isinstance(time, _ThetaScheme) else None
+        if theta != 1.0 or getattr(block, "mass_residual", None) is not None or getattr(block, "time_order", 1) == 2:
+            raise NotImplementedError(
+                "coupling: a transient jno.fem problem sends a flux read from its backward Euler steps "
+                "(M (u_n - u_{n-1})/dt + K u_n at the interface rows); this one steps with "
+                f"{time if time is not None else 'its assembled scheme'} or has a state-dependent mass. Use "
+                "backward Euler (jno.solve.theta(1.0)) and a mass without the unknown, or give the flux side "
+                "to the other problem (dirichlet=...)."
+            )
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None, prev=None):
+        """As :meth:`Participant.sample`. A flux of a transient problem is the reaction of its backward Euler step
+        and needs the state ``prev = (u_{n-1}, dt)`` that step started from: it is ``M (u_n - u_{n-1})/dt + K u_n``
+        (the mass action is the ``u.t`` part of the residual). Without ``prev`` only the ``K u_n`` part is read
+        (the flux at a start state, whose time derivative is not known)."""
         import jax.numpy as jnp
+
+        from ..utils.solver.backend_blocks import _algebraic_rows
 
         if has_derivative(expr, self.owns):
             # the natural flux, read as the consistent reaction ∫ N φ_i over the interface, per unit weight
-            terms = self.weak_terms(problem)
+            transient = self.transient(problem)
+            terms, mass = self.split_terms(problem) if transient else (self.weak_terms(problem), [])
             total = terms[0]
             for c in terms[1:]:
                 total = total + c
@@ -656,6 +700,18 @@ class FEMParticipant(Participant):
             # only the parameters are arguments (read as 0 when missing: a trainable conductivity's reaction was 0)
             args = self._args(problem, {}, params, with_data=False)
             r = jnp.asarray(problem.eval(total, jnp.asarray(state), args=args or None))
+            if prev is not None and transient and mass:
+                before, dt = prev
+                rate = (jnp.asarray(state).reshape(-1) - jnp.asarray(before).reshape(-1)) / dt
+                r = r + jnp.asarray(problem.eval(mass, rate, args=args or None))
+                # The step's own equations drop the mass rows and columns of the essential nodes (they carry no
+                # time derivative): the free rows beside such a node never see its change. The heat that goes
+                # into them is the node's, so it is counted with the reaction: the total over the interface is
+                # then exactly the heat the problem took in, and a receiver that gives it back conserves it.
+                block = problem._op
+                M = block.M if block.M is not None else block.mass(block.t0, args or {})
+                free = jnp.where(_algebraic_rows(M, M.shape[0], r.dtype), 0.0, 1.0)
+                r = r + jnp.asarray(problem.eval(mass, free, args=args or None)) * rate * (1.0 - free)
             field = self._flux_field(expr)
             sl = problem.blocks[problem.block_index(field)]
             # loads ∫ N φ_i -> the density whose loads they are (the interface mass, not the lumped weights,

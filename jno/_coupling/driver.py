@@ -413,10 +413,14 @@ class Coupled:
                     extra.update(d.setter(part.nodal(face, lv), prob))
             if windowed:
                 window, t0, _ = self._window
-                state, _ = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i), params=mine)
+                state, fr = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i), params=mine)
+                if part.kind == "fem" and fr is not None:  # its flux is the reaction of its last step
+                    kw = self._step(i, prob, fr, fr.shape[0] - 1)
+                else:
+                    kw = {}
             else:
-                state = part.solve(prob, extra, x0=self._guess.get(i), params=mine)
-            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra, params=mine)))
+                state, kw = part.solve(prob, extra, x0=self._guess.get(i), params=mine), {}
+            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra, params=mine, **kw)))
         self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / (step * iface.total)
         return self.stiffness[key]
 
@@ -753,11 +757,23 @@ class Coupled:
         else:
             w = self._window_weights(d.sender, fr.shape[0] - 1)
             vals = sum(
-                wk * jnp.asarray(s.sample(prob, fr[k], d.expr, d.sender_tag, src, data, params=mine))
+                wk
+                * jnp.asarray(
+                    s.sample(prob, fr[k], d.expr, d.sender_tag, src, data, params=mine, **self._step(d.sender, prob, fr, k))
+                )
                 for k, wk in enumerate(w)
                 if wk != 0.0
             )
         return self._map_jnp(d, dst, src) @ vals
+
+    def _step(self, i, prob, fr, k):
+        """``sample`` keywords of frame ``k`` of a window's march: a transient ``jno.fem`` reads a flux from the step
+        that ended there, so it needs the frame before it and its step."""
+        part = self.parts[i]
+        if part.kind != "fem" or not part.transient(prob) or k < 1:
+            return {}
+        part.check_step_flux(prob, self._time_of(i))
+        return {"prev": (fr[k - 1], float(prob._op.dt))}
 
     def _window_weights(self, i, m):
         """Weights of a window's ``m + 1`` frames in its mean: the trapezoid rule for an explicit (or IMEX) march,

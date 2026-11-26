@@ -153,8 +153,10 @@ resistance of two slabs (dT/dk to 1e-8) and against a central difference of a tr
 
 - A differentiated or compiled coupling relaxes with Aitken or a fixed factor; `accel="iqn-ils"` runs step by step
   only.
-- A `u.tt` problem cannot take part in a transient coupling, and a transient `jno.fem` side cannot send a flux (it
-  takes the flux side of a pair).
+- A `u.tt` problem cannot take part in a transient coupling.
+- A transient `jno.fem` side sends the flux of its backward Euler steps (`M (u_n - u_{n-1})/dt + K u_n` at the
+  interface rows, plus the mass of the free nodes beside the interface, which a step leaves out of its own equations
+  when the interface value changes); a Crank-Nicolson or other scheme, and a mass that depends on the state, raise.
 - A vector load on a `jno.fem` side must be a coefficient times the boundary normal (`p * n`).
 - A vertex-centred fvm side sends a Dirichlet interface's flux from its least-squares gradient (exact for linear
   fields, not conservative).
