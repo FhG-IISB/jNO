@@ -1315,12 +1315,22 @@ def _extract_volume_source(volume_term):
     return None
 
 
+def _cell_centres(length, n):
+    """The ``n`` sample positions of one period ``[0, length)``: the CENTRES of its ``n`` equal cells.
+
+    This is the convention of the Fourier transform the layers go through (fmmax places array element
+    ``j`` at ``(j + 1/2) * length / n``), so the Fourier coefficients carry the right phase and a material
+    edge at a simple fraction of the period (``y < 0.5 * period``) never lands exactly on a sample, where
+    floating-point rounding would decide its side and move the edge by half a cell (a first-order error)."""
+    return (np.arange(n) + 0.5) * (length / n)
+
+
 def _localize_source(src_node, is_vector, period, z_range, grid, nz, params):
     """Locate an internal source by its ``|·|²`` distribution on the cell volume: the centroid ``(x₀,y₀,z₀)``
     and lateral width → **point** (``dirac_delta_source``) vs **Gaussian** (``gaussian_source`` with a fwhm).
     Returns ``dict(x0, y0, z0, kind, fwhm)`` (all static geometry; the amplitude flows separately)."""
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = _cell_centres(period[0], grid)
+    ys = _cell_centres(period[1], grid)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
@@ -1465,8 +1475,8 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=
     values, e.g. a K0 parameter). ``sub`` supersamples each pixel ``sub×sub`` and averages (subpixel
     smoothing)."""
     g = grid * sub
-    xs = np.linspace(0, period[0], g, endpoint=False)
-    ys = np.linspace(0, period[1], g, endpoint=False)
+    xs = _cell_centres(period[0], g)
+    ys = _cell_centres(period[1], g)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
@@ -1572,8 +1582,8 @@ def _sample_grid(domain, eps_nodes, grid, nz, period, z_range, sub=1):
 
     g = grid * sub
     pts = np.asarray(domain.points)
-    xs = np.linspace(0, period[0], g, endpoint=False)
-    ys = np.linspace(0, period[1], g, endpoint=False)
+    xs = _cell_centres(period[0], g)
+    ys = _cell_centres(period[1], g)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY = np.meshgrid(xs, ys, indexing="ij")
     E = np.empty((nz, grid, grid), complex)
@@ -1661,8 +1671,8 @@ def _source_kin(femobj, domain, params=None):
 
 
 def _cell_grid_at_z(period, grid, z):
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = _cell_centres(period[0], grid)
+    ys = _cell_centres(period[1], grid)
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
     return np.stack([gx.ravel(), gy.ravel(), np.full(grid * grid, z)], 1)
 
@@ -1997,8 +2007,8 @@ def _build_emitter_problem(
         )
 
     # static volume grid for the DIFFERENTIABLE re-derivation of the source's centroid / width from params
-    _xs = np.linspace(0, period[0], grid, endpoint=False)
-    _ys = np.linspace(0, period[1], grid, endpoint=False)
+    _xs = _cell_centres(period[0], grid)
+    _ys = _cell_centres(period[1], grid)
     _zs = np.linspace(z_range[0], z_range[1], nz)
     _GX, _GY, _GZ = np.meshgrid(_xs, _ys, _zs, indexing="ij")
     _pts = np.stack([_GX.ravel(), _GY.ravel(), _GZ.ravel()], 1)

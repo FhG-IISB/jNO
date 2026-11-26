@@ -224,3 +224,13 @@ def test_a_polarization_that_is_not_one_raises():
     for bad in ("z", (0.0, 0.0), (1.0,), "circular"):
         with pytest.raises(RcwaError, match="polarization"):
             _as_jones(bad)
+
+
+@needs_fmmax
+def test_an_edge_on_a_grid_sample_converges_at_second_order():
+    """#207: a ridge edge written ``x < 0.5 * period`` used to land on a sample, so rounding put it half a cell
+    off and the reflectance converged at first order (error 1.4e-3 at grid 256 for a thick ridge). Samples sit
+    at cell centres now; against the exact-coefficient reference the error falls by ~4 per grid doubling."""
+    err = {g: abs(_R(jno.rcwa(_scalar("y"), orders=ORDERS, grid=g)) - R_TE) for g in (16, 32, 64)}
+    assert err[64] < 3e-4, err
+    assert err[16] / err[32] > 3.0 and err[32] / err[64] > 3.0, err
