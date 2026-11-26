@@ -171,11 +171,23 @@ def test_transient_record_is_deferred_until_evaluated(nonlinear):
 
 
 def test_evaluating_a_linear_transient_stays_asynchronous(monkeypatch):
-    """Recording must never add a device sync: `.fn()` returns before the march has finished."""
+    """Recording must never add a device sync: `.fn()` returns before the march has finished.
+
+    The CSR-or-COO timing syncs, so `fem.solve()` decides it when it builds, not during the evaluation. The one
+    sync allowed is the placement of the program's host constants on a GPU (`placement.shard_const_args`: one
+    synced upload each, to hold a single staging buffer at a time), which is not the recording's."""
+    import sys
+
     fem = _heat(False, nt=11)
     node = fem.solve()
     calls = []
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: calls.append(1) or x)
+
+    def sync(x):
+        if not sys._getframe(1).f_code.co_filename.endswith("placement.py"):
+            calls.append(sys._getframe(1).f_code.co_filename)
+        return x
+
+    monkeypatch.setattr(jax, "block_until_ready", sync)
     node.fn()
     assert calls == []
 

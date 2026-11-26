@@ -3912,6 +3912,12 @@ class FEM:
             # nonlinear one splits its cells only when it is a plain march (`_element_split_devices`)
             self._op.metadata["shard"] = shard
             self._op.metadata["split_cells"] = adapt is None and not getattr(self, "_geometry", None)
+        if self._mode == "transient":
+            # The CSR-or-COO choice is measured (two timed programs, each synced), so it is decided HERE, on the
+            # built operators, and not when the march is evaluated: a deferred march must stay asynchronous.
+            from .utils.solver.matvec_format import prime
+
+            prime(getattr(self._op, "M", None), getattr(self._op, "A", None))
         if contact is None and not getattr(self, "_in_contact_loop", False):
             # ... and NOT when the contact driver is re-entering this method for one of its own rounds:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very

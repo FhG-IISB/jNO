@@ -194,7 +194,7 @@ class TestSymbolicNode:
         assert isinstance(v.flow(jno.noise.gaussian(std=1.0, ndim=2), time=(0.0, 1.0, 3)), Flow)
         assert not isinstance(v.flow(x0, time=(0.0, 1.0, 3)), Flow)
 
-    def test_eager_and_symbolic_marches_agree(self):
+    def test_eager_and_symbolic_marches_agree(self, bitwise_backend):
         # The same weights, the same grid, the two routes: they must be the same computation, not
         # merely close. The core must carry the model in a constraint for its weights to exist.
         net, node, target = _point_cloud_setup()
