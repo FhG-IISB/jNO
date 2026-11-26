@@ -11,7 +11,7 @@ an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfu
 Step **size** is a separate axis from which step to take, so it composes rather than being its own scheme:
 ``.adaptive(...)`` on any scheme chooses the step size from a **step-doubling** local-error estimate of
 *that* scheme's step, working for every transient case (real/complex, scalar/vector, plain/periodic) and
-staying reverse-mode differentiable (a fixed-budget ``lax.scan`` with the controller ``stop_gradient``-ed —
+staying reverse-mode differentiable (a bounded, chunked ``lax.scan`` with the controller ``stop_gradient``-ed —
 the state differentiates at the realized step schedule)::
 
     fem.solve(time=jno.solve.theta(0.5))                       # 2nd-order, fixed grid
@@ -23,6 +23,8 @@ to a second-order step is far cheaper per digit than the first-order default —
 """
 
 from __future__ import annotations
+
+import math
 
 import jax
 import jax.numpy as jnp
@@ -1028,6 +1030,38 @@ def _extrapolation_weights(x, tau):
     return out
 
 
+def _budgeted_scan(body, init, max_steps, *, settled, emit):
+    """Run ``body`` for at most ``max_steps`` attempts, paying only for the attempts the march needs.
+
+    ``body(carry, i) -> (carry, y)`` is one attempt (``i`` its index: ``i >= max_steps`` must count as settled).
+    The attempts run as an outer ``lax.scan`` over chunks of ``isqrt(max_steps)``; a chunk that starts settled
+    (``settled(carry)``: the march has reached ``t1``) takes a ``lax.cond`` branch that does nothing (its
+    outputs repeat ``emit(carry)``), so the idle tail of the budget costs one cheap branch per chunk instead of
+    one body evaluation per attempt. Each chunk is ``jax.checkpoint``-ed: reverse mode keeps the carry at the
+    chunk boundaries and recomputes one chunk at a time, instead of storing the intermediates of every attempt
+    of the budget. The trip count stays static, so it is ``jit`` / ``grad`` compatible; under ``vmap`` the
+    ``cond`` becomes a ``select`` that runs both branches, so a batch pays the whole budget as before.
+
+    Returns ``(final carry, outputs stacked over the max_steps attempts)``."""
+    n = int(max_steps)
+    c = max(1, math.isqrt(n))
+    nch = -(-n // c)
+    idx = jnp.arange(nch * c, dtype=jnp.int32).reshape(nch, c)
+
+    @jax.checkpoint
+    def chunk(carry, ix):
+        def run(cr):
+            return jax.lax.scan(body, cr, ix)
+
+        def skip(cr):
+            return cr, jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (c,) + x.shape), emit(cr))
+
+        return jax.lax.cond(settled(carry), skip, run, carry)
+
+    carry, ys = jax.lax.scan(chunk, init, idx)
+    return carry, jax.tree_util.tree_map(lambda y: y.reshape((nch * c,) + y.shape[2:])[:n], ys)
+
+
 def bdf_march(
     be_step,
     u0,
@@ -1068,8 +1102,9 @@ def bdf_march(
 
     **Step.** Factor ``safety * err^(-1/(k+1))`` clipped to ``[min_factor, max_factor]``; a factor in
     ``[1, deadband]`` keeps the step (variable-coefficient BDF is zero-stable under bounded step ratios, and an
-    unchanged step keeps the step operator). Fixed-length ``lax.scan`` of ``max_steps`` attempts; an exhausted
-    budget NaN-poisons the result. Output at ``save_ts``: degree-``max_order`` interpolation through the
+    unchanged step keeps the step operator). At most ``max_steps`` attempts, run by :func:`_budgeted_scan` (chunks
+    of a ``lax.scan``; cost and reverse-mode memory follow the attempts used); an exhausted budget NaN-poisons the
+    result. Output at ``save_ts``: degree-``max_order`` interpolation through the
     accepted states (:func:`_dense_sample`)."""
     u0 = jnp.asarray(u0).reshape(-1)
     rt = jnp.real(u0).dtype
@@ -1154,12 +1189,12 @@ def bdf_march(
 
         return jax.lax.switch(k - 1, [lambda kk=kk: _one(kk) for kk in range(1, K + 1)])
 
-    def body(carry, _):
+    def body(carry, i):
         t, hist_t, hist_u, n_hist, k, n_at_k, dt, grow_ok = carry
         u = hist_u[0]
         n_prev = n_hist  # past states this attempt's formula and estimate could read
         remaining = t1 - t
-        done = remaining <= dt_min
+        done = (remaining <= dt_min) | (i >= max_steps)
         dt_step = jnp.clip(jnp.minimum(jnp.clip(dt, dt_min, dt_max), remaining), dt_min, dt_max)
         _t, _h = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
         _ht = jax.lax.stop_gradient(hist_t)
@@ -1204,7 +1239,9 @@ def bdf_march(
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
     with _step_solve_tolerance(rtol):
-        (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+        (t_end, *_), (ts, us) = _budgeted_scan(
+            body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[2][0])
+        )
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))
     us = jnp.concatenate([u0[None, :], us], axis=0)
     out = _dense_sample(jnp.asarray(save_ts, rt), ts, us, K)
@@ -1312,9 +1349,9 @@ def adaptive_march(
     ``error_rows`` marks (all rows when ``None``; the caller leaves out index-2 rows such as the
     incompressibility row, see ``_error_rows``). An attempt with error
     above 1 is REJECTED -- the state and time stay, the step shrinks -- unless it is already at the floor
-    ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march is a fixed-length
-    ``lax.scan`` of ``max_steps`` attempts (rejections count) -- a static trip count, so it stays reverse
-    differentiable -- where the settled tail consumes attempts without solving. The trajectory is sampled at
+    ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march takes at most ``max_steps`` attempts (rejections count), run by
+    :func:`_budgeted_scan`: a static trip count, so it stays reverse differentiable, but a settled chunk is
+    skipped and each chunk is checkpointed, so time and gradient memory follow the attempts used. The trajectory is sampled at
     ``save_ts`` by a degree-``dense_degree`` interpolant through the accepted states (:func:`_dense_sample`;
     the caller passes the base step's order, so output between steps keeps it); an exhausted budget
     NaN-poisons the result (raise ``max_steps``).
@@ -1362,10 +1399,10 @@ def adaptive_march(
 
     k = int(order) + 1  # the estimate's local error is O(dt^k)
 
-    def body(carry, _):
+    def body(carry, i):
         t, u, dt, grow_ok = carry  # t, dt are the step SCHEDULE (control); the gradient flows through u only
         remaining = t1 - t
-        done = remaining <= dt_min
+        done = (remaining <= dt_min) | (i >= max_steps)
         dt_ctrl = jnp.clip(dt, dt_min, dt_max)
         dt_step = jnp.clip(jnp.minimum(dt_ctrl, remaining), dt_min, dt_max)  # land on t1; never a degenerate dt
         # Differentiate the numerical state at the REALIZED (t, dt) schedule; the controller is a discrete
@@ -1389,7 +1426,9 @@ def adaptive_march(
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
     with _step_solve_tolerance(rtol):
-        (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+        (t_end, *_), (ts, us) = _budgeted_scan(
+            body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[1])
+        )
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)

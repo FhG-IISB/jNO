@@ -246,3 +246,75 @@ def test_step_solve_tolerance_follows_the_march_tolerance(monkeypatch, make, rto
     seen.clear()
     _run(jno.solve.sdirk(3), fem, SAVE)
     assert seen and all(v == 1e-10 for v in seen), seen
+
+
+def _count_solves(scheme, fem, args=None):
+    """Run ``scheme`` with a counting ``linear=`` slot: how many step solves were EXECUTED (a skipped branch of
+    a ``lax.cond`` does not fire the callback)."""
+    from jno.utils.solver.backend_blocks import _default_step_solve
+
+    n = []
+
+    def counting(matvec, rhs, x0, diag_fn):
+        jax.debug.callback(lambda: n.append(1))
+        return _default_step_solve(matvec, rhs, x0, diag_fn())
+
+    out = scheme.integrate(fem.operator, args or {}, SAVE, linear_solve=counting, nonlinear_solve=None)
+    jax.block_until_ready(out)
+    jax.effects_barrier()
+    return len(n), np.asarray(out)
+
+
+@pytest.mark.parametrize("make", [lambda ms: jno.solve.bdf().adaptive(rtol=1e-5, atol=1e-8, max_steps=ms),
+                                  lambda ms: jno.solve.sdirk(3).adaptive(rtol=1e-5, atol=1e-8, max_steps=ms)],
+                         ids=["bdf", "sdirk3"])  # fmt: skip
+def test_the_unused_part_of_the_step_budget_costs_nothing(make):
+    """An error-controlled march pays for the attempts it needs, not for ``max_steps``: the executed step solves
+    and the result are the same for a budget of 150 and of 4000 attempts (the settled tail is skipped a chunk at
+    a time instead of running one idle iteration per attempt)."""
+    fem = _form(6)
+    n_small, out_small = _count_solves(make(150), fem)
+    n_big, out_big = _count_solves(make(4000), fem)
+    assert 0 < n_small
+    assert n_big == n_small, (n_small, n_big)
+    np.testing.assert_array_equal(out_small, out_big)
+
+
+@pytest.mark.parametrize("make", [lambda ms: jno.solve.bdf().adaptive(rtol=1e-5, atol=1e-8, max_steps=ms),
+                                  lambda ms: jno.solve.sdirk(3).adaptive(rtol=1e-5, atol=1e-8, max_steps=ms)],
+                         ids=["bdf", "sdirk3"])  # fmt: skip
+def test_adaptive_gradient_is_the_same_for_any_budget_and_matches_finite_differences(make):
+    """Reverse mode runs through the checkpointed chunks: the gradient does not depend on how large the budget is
+    (the skipped chunks send nothing back) and matches a central finite difference; ``jit`` and ``vmap`` agree."""
+    fem = _form(6, param=True, mesh_size=0.3)
+    (name,) = fem.operator.runtime_parameter_exprs
+
+    def loss(ms):
+        sch = make(ms)
+        return lambda kv: jnp.sum(_run(sch, fem, SAVE[::10], {name: jnp.asarray([kv])}) ** 2)
+
+    g_small = float(jax.grad(loss(150))(0.8))
+    g_big = float(jax.jit(jax.grad(loss(2500)))(0.8))
+    fd = float((loss(150)(0.8 + 1e-5) - loss(150)(0.8 - 1e-5)) / 2e-5)
+    assert np.isfinite(g_small)
+    assert abs(g_small - g_big) <= 1e-9 * max(abs(g_small), 1.0), (g_small, g_big)
+    assert abs(g_small - fd) <= 1e-2 * max(abs(fd), 1.0), f"AD {g_small} vs FD {fd}"
+    ks = jnp.asarray([0.7, 0.8, 0.9])
+    batched = jax.vmap(jax.grad(loss(150)))(ks)
+    looped = jnp.stack([jax.grad(loss(150))(k) for k in ks])
+    np.testing.assert_allclose(np.asarray(batched), np.asarray(looped), rtol=1e-8)
+
+
+def test_reverse_mode_memory_does_not_grow_with_the_step_budget():
+    """The reverse pass keeps the chunk-boundary carries and one chunk's intermediates, not those of every attempt
+    of the budget: the compiled gradient's temporary buffers grow much slower than ``max_steps``."""
+    fem = _form(6, param=True, mesh_size=0.3)
+    (name,) = fem.operator.runtime_parameter_exprs
+
+    def temp_bytes(ms):
+        sch = jno.solve.bdf().adaptive(rtol=1e-5, atol=1e-8, max_steps=ms)
+        g = jax.jit(jax.grad(lambda kv: jnp.sum(_run(sch, fem, SAVE[::10], {name: jnp.asarray([kv])}) ** 2)))
+        return g.lower(jnp.asarray(0.8)).compile().memory_analysis().temp_size_in_bytes
+
+    small, big = temp_bytes(250), temp_bytes(4000)
+    assert big < 8 * small, f"temp {small} -> {big} bytes for a 16x budget"  # was 16x (10.7 MB -> 171 MB) before
