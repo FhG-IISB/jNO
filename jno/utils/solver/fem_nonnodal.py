@@ -218,6 +218,19 @@ def assemble_fem_nonnodal(
                 raise ValueError(f"jno.fem: order={_o} on the {_sp} field; the lowest order is 1.")
         _orders.append(_o)
     _EDGE_FAMILIES = ("RT", "N1E", "N2E")
+    # Components per scalar DOF: a vector (or tensor) Lagrange field is stored component-wise, DOF
+    # ``node * n_comp + comp`` -- the layout the native assembler uses -- so the one scalar P_k dof map
+    # serves every component. The other point-value families here are scalar by construction.
+    _ncomp = []
+    for _i, _f in enumerate(fields):
+        _nc = int(_f.get("vec", 1) or 1)
+        if _nc > 1 and spaces[_i] in ("P0", "DG", "Hermite", "Argyris", "Morley"):
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): a {spaces[_i]} field with {_nc} components is not supported next to a "
+                f"non-nodal field; only Lagrange takes a vector value_shape here. Declare one scalar "
+                f"{spaces[_i]} unknown per component."
+            )
+        _ncomp.append(_nc if spaces[_i] == "Lagrange" else 1)
     has_edge = any(s in _EDGE_FAMILIES for s in spaces)
     has_hermite = "Hermite" in spaces
     has_argyris = "Argyris" in spaces
@@ -824,7 +837,7 @@ def assemble_fem_nonnodal(
     def _field_ndof(i):
         s = spaces[i]
         if i in dofmaps:  # edge families (any degree) and Lagrange P_k, k >= 2: entity DOF map
-            return int(dofmaps[i].n_dofs)
+            return int(dofmaps[i].n_dofs) * _ncomp[i]
         if s == "Hermite":
             return 3 * n_verts + n_cells
         if s == "Argyris":
@@ -832,7 +845,7 @@ def assemble_fem_nonnodal(
         if s == "Morley":
             return n_verts + n_edges
         if s == "Lagrange":
-            return n_verts
+            return n_verts * _ncomp[i]
         return n_cells
 
     ndof = [_field_ndof(i) for i in range(len(spaces))]
@@ -842,6 +855,9 @@ def assemble_fem_nonnodal(
     total = offs[-1]
 
     def _field_cdofs(i):
+        if _ncomp[i] > 1:  # component-wise: scalar node ids -> (node * n_comp + comp), node-major per cell
+            _sc = jnp.asarray(dofmaps[i].cell_dofs, dtype=jnp.int32) if i in dofmaps else cells_j
+            return offs[i] + (_sc[:, :, None] * _ncomp[i] + jnp.arange(_ncomp[i], dtype=jnp.int32)).reshape(n_cells, -1)
         if i in dofmaps:  # (n_cells, n_local) -- equals the edge ids `ce` for degree-1 N1E / 2-D RT
             return offs[i] + jnp.asarray(dofmaps[i].cell_dofs, dtype=jnp.int32)
         if spaces[i] == "Hermite":
@@ -909,7 +925,7 @@ def assemble_fem_nonnodal(
                     {
                         "shape_vals": lv,
                         "shape_grads": lg @ jnp.linalg.inv(J),
-                        "cell_sol": cell_sols[i][:, None],
+                        "cell_sol": cell_sols[i].reshape(-1, _ncomp[i]),
                         "space": "Lagrange",
                     }
                 )
@@ -926,7 +942,7 @@ def assemble_fem_nonnodal(
                     {
                         "shape_vals": T["p1"],  # (n_quad, dim+1)
                         "shape_grads": jnp.broadcast_to(g, (T["n"], dim + 1, dim)),
-                        "cell_sol": cell_sols[i][:, None],
+                        "cell_sol": cell_sols[i].reshape(-1, _ncomp[i]),
                         "space": "Lagrange",
                     }
                 )
@@ -1708,7 +1724,7 @@ def assemble_fem_nonnodal(
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
         pins = pins + _lagrange_dirichlet_pins(
-            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, dofmaps=dofmaps, cells=cells
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, dofmaps=dofmaps, cells=cells, ncomp=_ncomp
         )
     extra = getattr(domain, "_extra_dof_pins", None)
     if extra:  # caller-supplied (dof, value) pins — e.g. a tree-cotree gauge + air-V restriction,
@@ -3599,7 +3615,9 @@ def _region_field_pins(fields, spaces, cdofs, offs, domain):
     return out
 
 
-def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None):
+def _lagrange_dirichlet_pins(
+    dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None, ncomp=None
+):
     """Value-Dirichlet ``(dof, value)`` pins for a P1 Lagrange field on the non-nodal path: one DOF per
     mesh vertex, so ``u = g`` on a region pins DOF ``offs[fidx] + v`` to ``g(vertex v)`` for every vertex
     the region's location predicate selects. This is the scalar-potential half of the A-V (N1E x Lagrange)
@@ -3621,6 +3639,13 @@ def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np,
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Lagrange":
             continue
+        nc = 1 if ncomp is None else int(ncomp[fidx])
+        if nc > 1 and dofmaps is not None and fidx in dofmaps:
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): an essential condition on the vector Lagrange field of degree >= 2 "
+                f"(region {region!r}) is not wired next to a non-nodal field -- only degree 1 is. Use "
+                "degree 1, or declare one scalar unknown per component."
+            )
         if dofmaps is not None and fidx in dofmaps:  # P_k, k >= 2: every DOF on the region, by interpolation
             pins.extend(_general_trace_pins(dofmaps[fidx], "value", region, value_node, domain, pts_np, cells, offs[fidx]))
             continue
@@ -3642,6 +3667,21 @@ def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np,
                     "the source) or split the constraint yourself."
                 )
             g = g.real
+        if nc > 1:  # vector field, DOF ``v * nc + comp``: one component (u[c](region) - g) or all of them
+            comps = [int(_comp)] if _comp is not None else list(range(nc))
+            if _comp is not None and not 0 <= comps[0] < nc:
+                raise ValueError(f"jno.fem (non-nodal): Dirichlet component {_comp} of a {nc}-component field.")
+            g = g.reshape(-1) if g.size in (1, vs.size) else g.reshape(vs.size, -1)
+            if g.ndim == 1:  # a scalar per vertex (or one constant) applies to every selected component
+                g = np.broadcast_to(g if g.size == vs.size else np.full(vs.size, float(g[0])), (len(comps), vs.size)).T
+            elif g.shape[1] != len(comps):
+                raise ValueError(
+                    f"jno.fem (non-nodal): the Dirichlet value on region {region!r} has {g.shape[1]} components "
+                    f"per vertex for {len(comps)} constrained component(s) of the field."
+                )
+            base = int(offs[fidx])
+            pins.extend((base + int(v) * nc + c, float(gv)) for v, row in zip(vs, g) for c, gv in zip(comps, row))
+            continue
         g = g.reshape(-1)
         if g.shape[0] == 1 and vs.size > 1:  # a constant value node evaluates once; broadcast it
             g = np.full(vs.size, float(g[0]))
