@@ -1585,3 +1585,14 @@ def test_integer_index_of_a_per_point_vector_variable_is_a_component():
     np.testing.assert_allclose(np.asarray(_eval(w[1], ctx)), np.asarray(_eval(w[..., 1], ctx)))
     np.testing.assert_allclose(np.asarray(_eval(w[1:], ctx)), np.asarray(pts[1:]))  # a slice still slices the points
     assert np.asarray(_eval(w[(1,)], ctx)).shape != ()  # a tuple key is the array's own, not a component
+
+
+def test_numpy_conversion_of_a_traced_node_raises_and_arithmetic_defers():
+    """``np.asarray(node)`` used to give a 0-d object array (and arithmetic on it built more nodes); it raises and
+    names ``.eval()``. NumPy scalars and arrays on either side of an operator still build a node."""
+    d, x, y = _domain_xy()
+    node = x * 2.0
+    with pytest.raises(TypeError, match=r"\.eval\(\)"):
+        np.asarray(node)
+    for built in (np.float64(2.0) * node, node * np.float64(2.0), np.ones(1) * node, node + np.ones(1)):
+        assert isinstance(built, Placeholder)

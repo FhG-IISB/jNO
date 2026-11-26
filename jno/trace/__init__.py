@@ -526,6 +526,23 @@ class Placeholder:
             return NotImplemented
         return BinaryOp("**", w, self)
 
+    # NumPy hands every binary operation with a node to the node's own (reflected) operator instead of
+    # converting it: ``np.float64(2) * node`` and ``array * node`` build a node, as ``2.0 * node`` does.
+    __array_ufunc__ = None
+
+    def __array__(self, dtype=None, copy=None):
+        """A traced expression has no values until it is evaluated: ``np.asarray(node)`` used to give a 0-d object
+        array holding the node, and arithmetic on that built more trace nodes. It raises and names the fix."""
+        if dtype is not None and np.dtype(dtype) == np.dtype(object):
+            out = np.empty((), dtype=object)  # an explicit object array (a container of nodes) stays possible
+            out[()] = self
+            return out
+        raise TypeError(
+            f"np.asarray({type(self).__name__}): a traced expression is a node, not an array of values, so there "
+            "is nothing to convert yet (a transient `fem.solve()` and any other `jno.np` expression are deferred). "
+            "Evaluate it first: `node.eval()` (the domain is taken from the graph), or `jno.core([node]).eval(node)`."
+        )
+
     def __getitem__(self, key) -> FunctionCall:
         if not isinstance(key, tuple):
             key = (key,)
