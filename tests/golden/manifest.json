@@ -1,0 +1,37 @@
+{
+  "aniso5": {
+    "description": "uniform biaxial 5-component anisotropic slab diag(8,4,6)",
+    "dtype": "complex128",
+    "sha256": "27e99e683dd0b58ce9b47d5f57959868b4e40b9e0442ab8354ed0b1b659b5100"
+  },
+  "asi_disk": {
+    "description": "a-Si pillar slab (high-contrast eps) \u2014 convergence stress",
+    "dtype": "complex128",
+    "sha256": "11b2d1629f71053177fe951541e1bc735fd609630cf9e25c430ec014f746cad1"
+  },
+  "disk_160": {
+    "description": "crossed-grating disk, orders 160 (high-order stress)",
+    "dtype": "complex128",
+    "sha256": "fbcc42949213c622c91faeb8095e7c2941363b49ecb17899ab997e43c7cd896b"
+  },
+  "disk_40": {
+    "description": "crossed-grating disk, orders 40",
+    "dtype": "complex128",
+    "sha256": "92acdb41c57fef2f17ab1150c0d59893665fc656de41852bc216b597d77a70e2"
+  },
+  "emitter": {
+    "description": "internal delta x-dipole in a vacuum film over a higher-index substrate",
+    "dtype": "complex128",
+    "sha256": "1312b40e456f930b48cb0d6f9b070cb25567405069fef4ab2d3af7fe1b8cb027"
+  },
+  "pml10": {
+    "description": "uniform uniaxial 10-component frame (diagonal eps & mu), the PML material",
+    "dtype": "complex128",
+    "sha256": "5d61504d1d2ac9229a39c6f60026c3d051dc63922e6ebf5170ccc7b4a22fb0fc"
+  },
+  "slab_airy": {
+    "description": "uniform n=2 slab in vacuum \u2014 order-0 Fresnel/Airy T/R",
+    "dtype": "complex128",
+    "sha256": "3cd4a20ed097b9cf2e572b47f08a62bc462a238a6b1e76868a87cc426079f5f2"
+  }
+}

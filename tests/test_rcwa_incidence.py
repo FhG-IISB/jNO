@@ -7,7 +7,6 @@ order. This test uses period > λ (multiple orders) and checks the uniform slab 
 Airy formula at NORMAL incidence -- which the old code got wrong (it gave the oblique-angle transmission).
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -33,8 +32,6 @@ def _x64():
 import jno  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -109,7 +106,6 @@ def _airy_T(n, d, cos_theta=1.0):
     return float(1 - abs(rho) ** 2)
 
 
-@needs_fmmax
 def test_multi_order_slab_matches_normal_incidence_airy():
     """Period 1.6 > λ=1 -> the (±1,0),(0,±1) ambient orders propagate. The uniform slab must still transmit
     per the exact Airy formula at NORMAL incidence (matched at the slab's inferred thickness). The old
@@ -121,7 +117,6 @@ def test_multi_order_slab_matches_normal_incidence_airy():
     assert T == pytest.approx(_airy_T(n_eff, d_eff, cos_theta=1.0), abs=2e-3)  # normal-incidence Airy
 
 
-@needs_fmmax
 def test_subwavelength_slab_still_matches_airy():
     """Control: a subwavelength cell (single order) also matches normal Airy -- the fix leaves the case the
     old code already handled unchanged."""
@@ -131,7 +126,6 @@ def test_subwavelength_slab_still_matches_airy():
     assert float(rc.solve().efficiency("T")) == pytest.approx(_airy_T(n_eff, d_eff), abs=2e-3)
 
 
-@needs_fmmax
 def test_the_slab_is_as_thick_as_it_is_written():
     """A layer is as thick as the permittivity says, not as the z-sampling happens to cover it.
 

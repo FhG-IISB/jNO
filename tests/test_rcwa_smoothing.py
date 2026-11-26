@@ -7,10 +7,9 @@ w.r.t. a boundary-moving parameter jumpy; area-averaging makes the fill — and 
 Default is off (``smoothing=1``) so existing results are unchanged; it is differentiable and opt-in.
 """
 
-import importlib.util
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -36,8 +35,6 @@ from jno.rcwa import RcwaError, _sample_grid_direct  # noqa: E402
 from jno.trace import FunctionCall  # noqa: E402
 from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -86,7 +83,6 @@ def _dom():
     return d
 
 
-@needs_fmmax
 def test_smoothing_off_is_default():
     """smoothing=1 (the default) must give EXACTLY the same result as omitting it — subpixel smoothing is
     strictly opt-in and never silently changes an existing problem."""
@@ -118,14 +114,12 @@ def test_smoothing_reduces_rasterization_staircasing():
     assert jump4 < 0.6 * jump1  # subpixel averaging markedly reduces the worst staircase jump
 
 
-@needs_fmmax
 def test_smoothing_solve_conserves_energy():
     """A smoothed solve is still physical: a lossless pillar conserves energy (T + R ≈ 1)."""
     sol = jno.rcwa(_pillar_cons(_dom()), orders=80, grid=48, smoothing=2).solve()
     assert float(sol.efficiency("T")) + float(sol.efficiency("R")) == pytest.approx(1.0, abs=5e-3)
 
 
-@needs_fmmax
 def test_smoothing_preserves_differentiability():
     """A design parameter still flows through a smoothed solve: rc.solve() is a trace node and jax.grad of T
     w.r.t. the scatterer ε matches a finite difference (subpixel averaging is a plain mean — differentiable)."""
@@ -173,7 +167,6 @@ def test_smoothing_preserves_differentiability():
     assert g == pytest.approx(fd, rel=5e-2)
 
 
-@needs_fmmax
 def test_smoothing_invalid_raises():
     """smoothing must be a positive integer."""
     with pytest.raises(RcwaError, match="smoothing must be a positive integer"):

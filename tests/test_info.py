@@ -394,10 +394,7 @@ def test_every_solver_spec_reports_something(spec):
 # every one of its assumptions turned out wrong (see the commit). Hence a test.
 # ---------------------------------------------------------------------------
 
-_HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
 
-
-@pytest.mark.skipif(not _HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 def test_rcwa_info_before_and_after_solving():
     import jax.numpy as jnp
 

@@ -6,10 +6,9 @@ convergence sweep or profiling at scale. ``profile=True`` runs the solve eagerly
 ``jno.core.solve(profile=True)``.
 """
 
-import importlib.util
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -30,8 +29,6 @@ def _x64():
 
 import jno  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -75,7 +72,6 @@ def _slab_cons():
     ]
 
 
-@needs_fmmax
 def test_solve_orders_override_matches_construction():
     """rc.solve(orders=N) re-solves at truncation N and matches an engine built at N — the construction
     orders is just a default, overridable per solve (for a convergence sweep or profiling)."""
@@ -88,7 +84,6 @@ def test_solve_orders_override_matches_construction():
     assert float(rc.solve().efficiency("T")) == pytest.approx(float(rc.solve(orders=20).efficiency("T")), abs=1e-9)
 
 
-@needs_fmmax
 def test_solve_orders_sweep_converges():
     """A uniform slab is truncation-insensitive: T at orders 8, 16, 32 agree — the sweep the caller uses to
     check convergence (Richardson: compare N vs ~1.5N)."""
@@ -97,7 +92,6 @@ def test_solve_orders_sweep_converges():
     assert max(ts) - min(ts) < 1e-3
 
 
-@needs_fmmax
 def test_solve_profile_runs_and_writes_trace(tmp_path, monkeypatch, capsys):
     """profile=True runs an eager solve inside a JAX Perfetto trace, returns a valid solution, prints a
     size/time summary, and writes the trace to ./rcwa_traces."""

@@ -3,11 +3,11 @@
 The same ``jno.fem``-style list that authors a time-harmonic Maxwell problem (``inner(curl u, curl v)
 − K0²·eps·inner(u, v)`` + impedance/absorbing faces + incident wave + Floquet ties) is inferred by
 ``jno.rcwa``: the permittivity is pulled from the vector mass term, the incident polarization/angle from
-the vector source, and the solve runs on fmmax (which always solves vector Maxwell). Because it feeds the
-same ε to the same solver, a scalar-Helmholtz and a vector-Maxwell list of the SAME structure agree.
+the vector source, and the solve runs on jNO's eig-free state-space backend (which solves full vector
+Maxwell, exactly as fmmax did). Because it feeds the same ε to the same solver, a scalar-Helmholtz and
+a vector-Maxwell list of the SAME structure agree.
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the parametric complex solve's dense assembly OOMs a small GPU
@@ -32,8 +32,6 @@ def _x64():
 
 import jno  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 inner, vec = jno.np.inner, jno.np.vector
@@ -116,7 +114,6 @@ def _vector_constraints():
     ]
 
 
-@needs_fmmax
 def test_vector_front_door_infers_and_solves():
     """A vector curl-curl Maxwell list is inferred + solved by jno.rcwa: correct period/wavelength, normal
     incidence read from the vector source (k_in≈0, not corrupted by the N1E edge signs), and T+R≈1."""
@@ -130,7 +127,6 @@ def test_vector_front_door_infers_and_solves():
     assert T + R == pytest.approx(1.0, abs=5e-3)  # energy conserved
 
 
-@needs_fmmax
 def test_vector_matches_scalar_front_door():
     """The decisive check: a vector-Maxwell list and a scalar-Helmholtz list of the SAME structure (period,
     pillar ε, wavelength) feed the same ε to the same fmmax solve, so their transmission must agree."""
@@ -213,7 +209,6 @@ def _vector_inverse_rc():
     )
 
 
-@needs_fmmax
 def test_vector_complex_parametric_inverse_matches_scalar_and_fd():
     """A COMPLEX vector (N1E) form with a **runtime parameter** (a lossy pillar εᵢ knob) assembles, solves, and
     is differentiable: dT/dk agrees with the scalar (nodal) complex inverse — the same ε feeds the same fmmax
@@ -231,7 +226,6 @@ def test_vector_complex_parametric_inverse_matches_scalar_and_fd():
     assert gv == pytest.approx((tp - tm) / (2 * h), rel=3e-2, abs=1e-4), "vector dT/dk disagrees with finite difference"
 
 
-@needs_fmmax
 def test_internal_interfaces_are_not_mistaken_for_ambient_faces():
     """A layered cell built from named regions carries interface tags (``"film|skin"``) between them. They are
     internal, never ambient faces, so the z-ambient search must skip them -- it raised for want of their
@@ -272,7 +266,6 @@ def test_internal_interfaces_are_not_mistaken_for_ambient_faces():
     assert float(sol.efficiency("T")) == pytest.approx(1.0, abs=1e-6)
 
 
-@needs_fmmax
 def test_a_region_attached_permittivity_matches_the_same_coordinate_function():
     """``.attach(eps=...)`` on named regions gives RCWA the permittivity by geometric membership of its
     sample points -- the rule jno.fem applies to cell centroids. A film with a square hole, eps = 4 by

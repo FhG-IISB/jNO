@@ -205,9 +205,7 @@ def test_smoothness_schemes_run(disk_grid, expansion, lattice):
 
 
 def _fmmax():
-    import fmmax
-
-    return fmmax
+    return pytest.importorskip("fmmax", reason="fmmax oracle not installed")
 
 
 def test_fft_convolution_matrix_matches_fmmax(disk_grid, expansion, lattice):

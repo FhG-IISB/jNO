@@ -124,10 +124,18 @@ iree = [
     "iree-base-compiler",
     "iree-base-runtime"
 ]
-# RCWA (Fourier Modal Method) backend for jno.rcwa. fmmax is imported lazily
-# inside jno/rcwa.py, so the core install stays lean and only needs this extra
-# when the periodic-layered RCWA solver is actually used.
+# RCWA (Fourier Modal Method) backend for jno.rcwa. The eig-free state-space
+# solver lives in jno/_rcwa and imports NO fmmax and no runtime dependencies —
+# this extra is intentionally EMPTY (the solver ships in the core; the pixi
+# `rcwa` feature carries matplotlib for the imaging/plotting helpers). fmmax is
+# NEVER a runtime or install dependency of jno: it is the test-only oracle that
+# regenerates the committed golden references (tests/golden/*.npz) via
+# tests/golden/regen_goldens.py, under the `rcwa-oracle` extra below.
 rcwa = [
+]
+# Test-only oracle: fmmax 1.7.1 reproduces the golden references. Only
+# tests/golden/regen_goldens.py and the oracle-skip test files import it.
+rcwa-oracle = [
     "fmmax",
 ]
 

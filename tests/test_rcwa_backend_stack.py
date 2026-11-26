@@ -493,9 +493,7 @@ def test_bad_formulation_name_raises_loud():
 
 
 def _fmmax():
-    import fmmax
-
-    return fmmax
+    return pytest.importorskip("fmmax", reason="fmmax oracle not installed")
 
 
 def _fmmax_disk_reference(fmmax, dg, h=0.35, orders=160, formulation="fft", period=(0.6, 0.6)):

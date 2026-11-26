@@ -1406,7 +1406,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/6b/c3/0e45ff4dce8401f6ea7c25d80d75738813a47f5ae2691e2478f2fd1e5e93/nvidia_nccl_cu12-2.30.4-py3-none-manylinux_2_18_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/6e/67/9d4ac4b0d683aaa4170da59a1980740b281fd38fc253e1830fde4dac3d4f/pygmsh-7.1.17-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/86/4d/3ff82b88c7195ee9fccc27a506e9d365490e95ae996a54f377ae91bed69f/jax_cuda12_plugin-0.10.1-cp313-cp313-manylinux_2_27_x86_64.whl
-      - pypi: https://files.pythonhosted.org/packages/86/58/1b7d6077edbd13fd5447279c5fc41b1920bd602a52a3c5cd0f4e0a8a058b/fmmax-1.7.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/88/60/829ed84939aaa8c7d4693e255b9b9d9a61d14c3426d45ab05218b1f49d3b/orbax_checkpoint-0.11.40-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/89/5f/39cbadc320cd78f4834b0a9f7a2fa3c980dca942bf193f315837eacb8870/meshio-5.3.5-py3-none-any.whl
@@ -5665,7 +5664,7 @@ packages:
   - pyfiglet ; extra == 'dev'
   - iree-base-compiler ; extra == 'iree'
   - iree-base-runtime ; extra == 'iree'
-  - fmmax ; extra == 'rcwa'
+  - fmmax ; extra == 'rcwa-oracle'
   requires_python: '>=3.11,<3.15'
 - pypi: https://files.pythonhosted.org/packages/0e/a7/83b321492fe7e5d0af07f484ec0100bb6ca561aa64cad1d34fc58a015d0f/blackjax-1.5-py3-none-any.whl
   name: blackjax
@@ -6066,33 +6065,6 @@ packages:
   - nvidia-cuda-nvrtc-cu12>=12.1.55 ; sys_platform == 'linux' and extra == 'with-cuda'
   - nvidia-nvshmem-cu12>=3.2.5 ; sys_platform == 'linux' and extra == 'with-cuda'
   requires_python: '>=3.11'
-- pypi: https://files.pythonhosted.org/packages/86/58/1b7d6077edbd13fd5447279c5fc41b1920bd602a52a3c5cd0f4e0a8a058b/fmmax-1.7.1-py3-none-any.whl
-  name: fmmax
-  version: 1.7.1
-  sha256: 537ccd7ceeb517107fe0404a2dc7d2d27562690505a5b698c9e3b118e90fda3a
-  requires_dist:
-  - jax>=0.4.36
-  - jaxlib
-  - numpy
-  - matplotlib ; extra == 'docs'
-  - jupyter-book==1.0.4.post1 ; extra == 'docs'
-  - sphinx-autodoc-typehints ; extra == 'docs'
-  - sphinx-click ; extra == 'docs'
-  - matplotlib ; extra == 'examples'
-  - scikit-image ; extra == 'examples'
-  - scipy ; extra == 'examples'
-  - jeig ; extra == 'jeig'
-  - grcwa ; extra == 'tests'
-  - parameterized ; extra == 'tests'
-  - pytest ; extra == 'tests'
-  - pytest-subtests ; extra == 'tests'
-  - bump-my-version ; extra == 'dev'
-  - darglint ; extra == 'dev'
-  - fmmax[docs,examples,tests] ; extra == 'dev'
-  - isort ; extra == 'dev'
-  - mypy ; extra == 'dev'
-  - pre-commit ; extra == 'dev'
-  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl
   name: cloudpickle
   version: 3.1.2

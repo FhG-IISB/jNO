@@ -37,15 +37,15 @@ backend raises a clear `ImportError` naming the extra that provides it. Install 
 | `[pardiso]` | `jno.solve.lu(backend="pardiso")` — Intel MKL PARDISO, multithreaded CPU sparse-direct. The fastest factorization measured here, and the answer when a factorization exceeds GPU memory. x86-64 only. | `pypardiso` |
 | `[cudss]` | `jno.solve.lu(backend="cudss")` — NVIDIA cuDSS, the fastest **repeated solve** (shift-invert eigensolves, constant-operator transients). Linux x86-64. | `nvmath-python`, `nvidia-cudss-cu12`, `cupy` |
 | `[metis]` | The graph partition behind `jno.precond.schwarz()` (METIS) | `pymetis` |
-| `[rcwa]` | The [RCWA solver](rcwa.md) (`jno.rcwa`, periodic-layered electromagnetics) | `fmmax` |
+| `[rcwa]` | The [RCWA solver](rcwa.md) (`jno.rcwa`, periodic-layered electromagnetics) — the eig-free state-space engine ships in the **core**; this extra is currently empty | — |
+| `[rcwa-oracle]` | Test-only: `fmmax` 1.7.1, the reference RCWA used to regenerate the committed golden references and cross-check parity | `fmmax` |
 | `[amg]` | GPU algebraic multigrid — `jno.solve.amg` / `jno.precond.ams` | `jaxamg` (builds a CUDA extension against a prebuilt AmgX 2.5+; needs that toolchain) |
 | `[iree]` | `model.to_iree(...)` export | `iree-base-compiler`, `iree-base-runtime` |
 | `[dev]` | Test/lint tooling for working on jNO itself | pytest, ruff-era tooling, … |
 
 ```bash
 pip install "jax-numerical-operators[fem]"        # FEM with remeshing + both direct backends
-pip install "jax-numerical-operators[rcwa]"       # + the Fourier-modal EM solver
-pip install "jax-numerical-operators[fem,rcwa]"   # combine freely
+pip install "jax-numerical-operators[fem,rcwa]"   # combine freely (the RCWA solver itself is core)
 ```
 
 Finite differences ship in the core install; `[fdm]` only adds the solver back-ends an FDM solve can use
@@ -116,7 +116,7 @@ OPTIONAL = [
     ("pypardiso",    "[fem]",  'sparse-direct on CPU — jno.solve.lu(backend="pardiso")'),
     ("nvmath",       "[fem]",  'sparse-direct on GPU — jno.solve.lu(backend="cudss")'),
     ("jaxamg",       "[amg]",  "GPU algebraic multigrid — jno.solve.amg()"),
-    ("fmmax",        "[rcwa]", "anisotropic RCWA layers"),
+    ("fmmax",        "[rcwa-oracle]", "test-only fmmax oracle — golden .npz regen / parity cross-checks"),
     ("iree.runtime", "[iree]", "ahead-of-time export — model.to_iree(...)"),
     ("pymetis",      "[metis]", "graph partition — jno.precond.schwarz()  ([fem] and [fdm] pull it in)"),
     ("matfree",      "",       "matrix functions — jno.solve.logdet / applyfun"),
@@ -139,7 +139,7 @@ devices: ['cpu:0']
    no  pypardiso     [fem]   sparse-direct on CPU — jno.solve.lu(backend="pardiso")
    no  nvmath        [fem]   sparse-direct on GPU — jno.solve.lu(backend="cudss")
    no  jaxamg        [amg]   GPU algebraic multigrid — jno.solve.amg()
-   no  fmmax         [rcwa]  anisotropic RCWA layers
+   no  fmmax         [rcwa-oracle]  test-only fmmax oracle — golden .npz regen / parity cross-checks
    no  iree.runtime  [iree]  ahead-of-time export — model.to_iree(...)
   yes  pymetis       [metis] graph partition — jno.precond.schwarz()  ([fem] and [fdm] pull it in)
   yes  matfree               matrix functions — jno.solve.logdet / applyfun
@@ -188,7 +188,7 @@ docker run --rm --gpus all jno:latest
     Container Toolkit, no CUDA base image.
 
     It does **not** carry the optional extras: no `mmgpy` (adaptive remeshing), no `pypardiso` /
-    `nvmath` (accelerated direct solvers), no `fmmax` (anisotropic RCWA), no `iree`. Run the
+    `nvmath` (accelerated direct solvers), no `fmmax` (test-only RCWA oracle), no `iree`. Run the
     [verification snippet](#check-what-you-actually-got) inside the container if you are unsure what
     you have. Tags are published per release (`{{version}}` and `latest`), so `latest` tracks the most
     recent **release**, not `main`.

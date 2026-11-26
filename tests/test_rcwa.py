@@ -2,19 +2,16 @@
 
 Two layers:
 * the FROM-FEM inference (jno.rcwa(constraints, eps, ...)) is pure trace-walking + geometry and runs
-  WITHOUT the optional fmmax backend — these assert the inferred RcwaSpec;
-* the forward engine (Rcwa, and .solve()) needs fmmax and is guarded per-test."""
-
-import importlib.util
+  with no solver dependency — these assert the inferred RcwaSpec;
+* the forward engine (Rcwa, and .solve()) runs on jNO's own eig-free state-space backend
+  (``jno/_rcwa``) — tested directly here; fmmax appears only in the test-only oracle files
+  (backend matrices/stack, source, fields, golden)."""
 
 import jax
 import numpy as np
 import pytest
 
 import jno
-
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 
 WL = 1.0
 INF = np.inf
@@ -179,7 +176,6 @@ def _substrate_interface_problem(n_sub, z_if=1.2, dx=0.4):
     ]
 
 
-@needs_fmmax
 def test_wavelength_is_the_vacuum_one_when_light_enters_from_a_substrate():
     """#246: the source on a substrate of index n must not make the reported wavelength lambda/n.
 
@@ -250,7 +246,7 @@ def test_detect_layers_continuous_raises():
 
 
 # ------------------------------------------------------------------------------------
-# Forward engine + analytic Fresnel (needs fmmax)
+# Forward engine + analytic Fresnel (eig-free state-space backend)
 # ------------------------------------------------------------------------------------
 def tmm_slab(nn, h, lam):
     def iface(a, b):
@@ -263,7 +259,6 @@ def tmm_slab(nn, h, lam):
     return abs(1 / M[0, 0]) ** 2
 
 
-@needs_fmmax
 @pytest.mark.parametrize("nn,h", [(1.45, 0.5), (2.0, 0.4), (3.317, 0.3)])
 def test_engine_fresnel_matches_analytic(nn, h):
     from jno.rcwa import Rcwa
@@ -277,7 +272,6 @@ def test_engine_fresnel_matches_analytic(nn, h):
     assert abs(T + R - 1) < 1e-3
 
 
-@needs_fmmax
 def test_engine_requires_assume_periodic():
     from jno.rcwa import Rcwa
 
@@ -304,7 +298,6 @@ def _count_patterned_solves(fn):
     return count_patterned_solves(fn)
 
 
-@needs_fmmax
 def test_uniform_grid_layers_take_the_analytic_eigensolve():
     """Only the genuinely patterned layer may pay a dense eigendecomposition."""
     from jno.rcwa import Rcwa
@@ -327,7 +320,6 @@ def test_uniform_grid_layers_take_the_analytic_eigensolve():
     assert np.isfinite(T)
 
 
-@needs_fmmax
 def test_a_repeat_solve_runs_the_compiled_core():
     """The eigensolves and S-matrix compile once per stack STRUCTURE. A repeat solve -- at a new wavelength,
     or with a new design of the same shape -- runs that program instead of dispatching fmmax op by op
@@ -359,7 +351,6 @@ def test_a_repeat_solve_runs_the_compiled_core():
     assert np.isfinite(float(g(10.0)))
 
 
-@needs_fmmax
 def test_uniform_layer_as_grid_matches_scalar_and_analytic_slab():
     """Collapsing a constant grid is exact: same answer as the scalar form, and as the TMM slab."""
     from jno.rcwa import Rcwa
@@ -497,6 +488,50 @@ def test_uniform_aniso_constant_ambient_raises_not_a_silent_slab():
     assert np.isfinite(float(sol.efficiency("T")))
 
 
+def test_magnetic_10comp_ambient_raises_not_silently_folded():
+    """A genuinely magnetic 10-component ambient (mu NOT a coordinate stretch: three different
+    eps_ii/mu_ii ratios) must raise loudly -- the isolated-scatterer fold is only for PML
+    coordinate-stretch frames. Regression for iss_mwxlt11p230wpg (a magnetic substrate used to
+    become a silent 1-wavelength slab over vacuum)."""
+    from jno.rcwa import Rcwa
+
+    # the golden pml10 material as a SUBSTRATE: eps=(6,0,0,4,5), mu=(1,0,0,2,1.5) --
+    # eps_ii/mu_ii = 6, 2, 3.33 across the axes: a real magnetic medium, not a stretch frame
+    with pytest.raises(jno.RcwaError, match="10-component"):
+        Rcwa(
+            [(None, np.full((8, 8), 4.0)), (0.3, 11.0), (None, (6.0, 0.0, 0.0, 4.0, 5.0, 1.0, 0.0, 0.0, 2.0, 1.5))],
+            period=(0.85, 0.85),
+            orders=5,
+            wavelength=WL,
+            assume_periodic=True,
+        )
+
+
+def test_traced_per_solve_thickness_raises_loudly():
+    """A traced (JAX) thickness on solve(layers=...) must raise a clear RcwaError -- not a raw
+    TracerBoolConversionError -- because the eig-free backend fixes thickness at build (chunking
+    depends on it). Regression for iss_mwxlsuz80ba3rp."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa, RcwaError
+
+    P, ng, h = 0.85, 16, 0.4
+    rc = Rcwa(
+        [(INF, 1.0), (h, jnp.ones((ng, ng))), (INF, 1.0)],
+        period=(P, P),
+        orders=5,
+        wavelength=WL,
+        assume_periodic=True,
+    )
+
+    def T(thick):  # traced thickness flowing through the per-solve layer stack
+        return rc.solve(layers=[(INF, 1.0), (thick, jnp.ones((ng, ng))), (INF, 1.0)]).efficiency("T")
+
+    with pytest.raises(RcwaError, match="traced"):
+        jax.jit(T)(0.4)
+
+
 def test_order_evanescent_gate_reports_exact_zero():
     """A sub-wavelength binary grating's evanescent orders report EXACTLY 0 (the
     fmmax `is_propagating` convention), not the ~1e-17 Poynting-noise readout --
@@ -602,7 +637,6 @@ def test_bad_formulation_name_raises_loud():
         )
 
 
-@needs_fmmax
 def test_traced_uniform_layer_is_not_collapsed():
     """A design grid that merely STARTS flat (a topology-optimisation ρ) must keep the patterned path --
     collapsing a tracer would freeze the design's structure out of the solve."""
@@ -624,7 +658,6 @@ def test_traced_uniform_layer_is_not_collapsed():
     assert g == g and abs(g) > 1e-6, "gradient must be finite and non-zero"
 
 
-@needs_fmmax
 def test_efficiency_is_differentiable_in_the_design():
     """jax.grad of transmission w.r.t. the permittivity flows through the modal solve (matches FD)."""
     import jax
@@ -651,7 +684,6 @@ def test_efficiency_is_differentiable_in_the_design():
     assert abs(grad - fd) < 5e-3, f"autodiff {grad} vs finite-diff {fd}"  # FD is the approximation here
 
 
-@needs_fmmax
 def test_parameter_anywhere_wavelength_and_eps_flow():
     """A jno.np.parameter used as the wavelength (K0) — anywhere in the graph — is a differentiable knob:
     jno.rcwa re-derives eps AND k0 from the parameterized coefficient, and jax.grad flows (matches FD)."""
@@ -710,7 +742,6 @@ def test_parameter_anywhere_wavelength_and_eps_flow():
     assert g == g and abs(g - fd) < 5e-2, f"dT/dK0 autodiff {g} vs finite-diff {fd}"
 
 
-@needs_fmmax
 def test_incidence_angle_source_parameter_is_differentiable():
     """An incidence ANGLE written as a jno.np.parameter in the source (its transverse phase) flows:
     rc.solve() is a trace node over it, and jax.grad matches finite-difference -- read from the graph, no
@@ -778,7 +809,6 @@ def test_incidence_angle_source_parameter_is_differentiable():
     assert abs(g - fd) < 5e-3, f"dT/dkx autodiff {g} vs finite-diff {fd}"
 
 
-@needs_fmmax
 def test_free_form_nodal_density_is_differentiable():
     """A per-node (topology-optimisation) density — jno.np.parameter(<symbol>) — flows: solve() is a trace
     node over the whole nodal field, and jax.grad w.r.t. it matches a directional finite-difference."""
@@ -810,7 +840,6 @@ def test_free_form_nodal_density_is_differentiable():
     assert abs(float(g @ d) - fd) < 2e-2, f"directional grad {float(g @ d)} vs finite-diff {fd}"
 
 
-@needs_fmmax
 def test_parameter_is_traced_no_solve_args():
     """The jNO way: a jno.np.parameter in the constraint list makes rc.solve().efficiency() a TRACE NODE
     over that parameter -- differentiable through crux with NO solve arguments, exactly like jno.fem."""
@@ -876,7 +905,6 @@ def test_parameter_is_traced_no_solve_args():
     assert abs(g - fd) < 5e-3, f"autodiff {g} vs finite-diff {fd}"
 
 
-@needs_fmmax
 def test_broadband_spectrum_and_wavelength_gradient():
     """Sweeping wavelength gives a dispersion curve; T is differentiable in wavelength (matches FD)."""
     import jax
@@ -909,7 +937,6 @@ def test_broadband_spectrum_and_wavelength_gradient():
     assert abs(ga - fda) < 5e-2, f"dT/dk_in autodiff {ga} vs finite-diff {fda}"
 
 
-@needs_fmmax
 def test_infer_and_solve_end_to_end():
     """The full path: infer from the periodic problem, then solve — energy must be conserved."""
     constraints, _ = _build_periodic_problem()
@@ -919,7 +946,6 @@ def test_infer_and_solve_end_to_end():
     assert T + R <= 1.0 + 5e-3 and T >= 0 and R >= 0
 
 
-@needs_fmmax
 def test_parametric_solve_is_jit_differentiable():
     """The parametric RCWA solve is ``jax.jit``-able: the design-INDEPENDENT Fourier expansion is cached
     eagerly (in the engine, warmed when the trace node is built), not recomputed inside the traced solve —
@@ -977,7 +1003,6 @@ def _absorbed_fraction(sol, im_eps, nx=8, density=200.0):
     return 0.5 * k0 * jnp.trapezoid(prof, jnp.asarray(z[zin])) / sol._Pin
 
 
-@needs_fmmax
 def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
     """Energy balance through the interior field: the power absorbed in a uniform lossy slab,
     (1/2) k0 Im eps integral |E|^2 dV per unit incident power, equals 1 - R - T of the same solve."""
@@ -992,7 +1017,6 @@ def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
     assert absorbed == pytest.approx(balance, rel=1e-3)
 
 
-@needs_fmmax
 @pytest.mark.skip(reason="field/field3d are stage 2 (task T40) on the state-space backend")
 @pytest.mark.parametrize("readout", ["field", "field3d"])
 def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
@@ -1017,7 +1041,6 @@ def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
     assert np.isfinite(np.asarray(out[0])).all()
 
 
-@needs_fmmax
 def test_field3d_is_differentiable_in_the_design():
     """field3d returns a JAX |E|^2: jax.grad of the absorbed power in a patterned lossy layer w.r.t. the
     layer's loss matches a central finite difference."""

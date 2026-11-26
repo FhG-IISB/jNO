@@ -6,10 +6,9 @@ the imaging limits (open frame → uniform; partial coherence reduces contrast) 
 design (ILT) — jax.grad of an image functional matches finite difference.
 """
 
-import importlib.util
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -35,8 +34,6 @@ from jno.trace import FunctionCall  # noqa: E402
 from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -116,14 +113,12 @@ def _contrast(img):
     return (prof.max() - prof.min()) / (prof.max() + prof.min())
 
 
-@needs_fmmax
 def test_open_frame_gives_uniform_image():
     """A clear (open-frame) mask images to a UNIFORM aerial image — no structure to diffract."""
     img = np.asarray(jno.rcwa(_cons(_open), orders=40, grid=48).solve().aerial(NA=0.6, source=0.5))
     assert (img.max() - img.min()) / (img.mean() + 1e-12) < 1e-3
 
 
-@needs_fmmax
 def test_partial_coherence_reduces_contrast():
     """Increasing the partial-coherence factor σ (a larger conventional source) reduces the image contrast of
     this mask under x-polarized (TM) light. Not a law of imaging: this is a weak phase grating, and under
@@ -135,7 +130,6 @@ def test_partial_coherence_reduces_contrast():
     assert c_lo > c_hi > 0.0  # contrast drops with σ, but the grating is still resolved
 
 
-@needs_fmmax
 def test_source_shapes_run():
     """Conventional (float), annular (tuple), and a raw pupil-weight array all form a valid image."""
     sol = jno.rcwa(_cons(_line), orders=40, grid=48).solve()
@@ -152,7 +146,6 @@ def _nrm(img):  # image normalised to unit mean, to compare shape/contrast indep
     return a / (a.mean() + 1e-12)
 
 
-@needs_fmmax
 def test_vector_reduces_to_scalar_as_na_drops():
     """The vector (high-NA) image must reduce to the scalar one as NA→0: the pupil becomes the identity and
     E_z→0. So the (energy-normalised) x-polarised vector image departs from the scalar image LESS at low NA
@@ -166,7 +159,6 @@ def test_vector_reduces_to_scalar_as_na_drops():
     assert dev(0.4) < dev(0.75)  # closer to scalar at lower NA (smaller ray angles)
 
 
-@needs_fmmax
 def test_vector_tm_te_contrast_split():
     """The vector signature at high NA: for a grating periodic in x (orders spread in the x–z plane), x-pol is
     TM (E tilts with the ray → the interfering beams lose projection → lower contrast) and y-pol is TE (E stays
@@ -177,7 +169,6 @@ def test_vector_tm_te_contrast_split():
     assert c_te > c_tm > 0.0
 
 
-@needs_fmmax
 def test_vector_pol_shapes_run():
     """'x', 'y' and 'unpolarized' all form a valid image, and the unpolarized image is exactly the mean of the
     two linear-polarization images (incoherent averaging)."""
@@ -234,7 +225,6 @@ def _grad_vs_fd(node, ep):
     return float(jax.grad(loss)(2.0)), (float(loss(2.0 + h)) - float(loss(2.0 - h))) / (2 * h)
 
 
-@needs_fmmax
 def test_aerial_is_differentiable_ilt():
     """The aerial image is differentiable in the mask design (inverse lithography): rc.solve().aerial() is a
     trace node, and jax.grad of an image functional w.r.t. a mask parameter matches a finite difference —
@@ -263,7 +253,6 @@ def _aerial_band_exp(exp):  # same band, read from an exposure object's intensit
     return lo, hi, max(hi - lo, 1e-9)
 
 
-@needs_fmmax
 def test_develop_matches_printed_shortcut():
     """The exposure/develop seam and the printed() shortcut are the same computation: exposing then
     developing with a Threshold resist equals printed(resist=that Threshold)."""
@@ -276,7 +265,6 @@ def test_develop_matches_printed_shortcut():
     assert np.allclose(np.asarray(exp.intensity()), np.asarray(sol.aerial(NA=0.6, source=0.4)))  # optics = aerial
 
 
-@needs_fmmax
 def test_printed_is_in_range_and_structured():
     """The developed resist image (via a Threshold resist) is a soft mask in [0, 1] and thresholds the line
     grating into a printed feature — both cleared (≈0) and remaining (≈1) resist are present."""
@@ -288,7 +276,6 @@ def test_printed_is_in_range_and_structured():
     assert img.min() < 0.05 and img.max() > 0.95  # a real bilevel pattern, not a flat grey
 
 
-@needs_fmmax
 def test_threshold_sets_linewidth():
     """Raising the dose-to-clear threshold shrinks the printed feature — the CD knob is monotone."""
     exp = jno.rcwa(_cons(_line), orders=60, grid=56).solve().expose(NA=0.6, source=0.4)
@@ -299,7 +286,6 @@ def test_threshold_sets_linewidth():
     assert w_lo > w_hi  # higher threshold -> narrower printed feature
 
 
-@needs_fmmax
 def test_peb_diffusion_smooths():
     """A larger PEB diffusion length blurs the aerial image before development, so its modulation shrinks and
     the printed pattern loses contrast (max−min) — the defining effect of acid diffusion."""
@@ -316,7 +302,6 @@ def test_peb_diffusion_smooths():
     assert c1 < c0
 
 
-@needs_fmmax
 def test_printed_is_differentiable_ilt():
     """The full computational-lithography chain is differentiable: jax.grad of a printed-resist functional
     w.r.t. the mask permittivity matches finite difference — the gradient flows through development, imaging
@@ -333,7 +318,6 @@ def test_printed_is_differentiable_ilt():
     assert abs(g) > 1e-3
 
 
-@needs_fmmax
 def test_vector_printed_is_differentiable_ilt():
     """**Vector high-NA** imaging is differentiable inside the parametric ILT node: jax.grad of an
     unpolarized (TE+TM) printed-resist functional w.r.t. the mask permittivity matches finite difference —
@@ -393,7 +377,6 @@ def test_caresist_develops_exposed_band():
     assert mid > edge + 0.2  # exposed band clears clearly more (strong, not the 0.02 the DOF scramble faked)
 
 
-@needs_fmmax
 def test_caresist_is_differentiable_ilt():
     """ILT through the RIGOROUS resist: jax.grad of a developed-pattern loss w.r.t. the mask permittivity
     matches finite difference through the WHOLE chain — RCWA mask solve → aerial image → Dill latent acid →
@@ -408,7 +391,6 @@ def test_caresist_is_differentiable_ilt():
     assert abs(g) > 1e-4
 
 
-@needs_fmmax
 def test_bulk_reduces_to_aerial_at_top():
     """The standing-wave bulk image reduces to the aerial image at the top of a vacuum film (z=0, no substrate
     reflection): exposure.bulk(vacuum)[:, :, 0] == exposure.intensity()."""
@@ -419,7 +401,6 @@ def test_bulk_reduces_to_aerial_at_top():
     assert np.allclose(vol[:, :, 0], aer, rtol=1e-6, atol=1e-9)
 
 
-@needs_fmmax
 def test_bulk_standing_wave_period():
     """A reflective substrate makes each order interfere with its reflection → a vertical STANDING WAVE of
     period λ/(2·n_resist). Open frame (single order), n_resist=1.7, wl=1 (K0=2π) → period ≈ 0.294."""
@@ -436,7 +417,6 @@ def test_bulk_standing_wave_period():
     assert period == pytest.approx(1.0 / (2 * nr), rel=0.15)
 
 
-@needs_fmmax
 def test_bulk_absorption_decays():
     """An absorbing resist (complex n_resist), index-matched to the substrate (no reflection), attenuates the
     field with depth: the depth-averaged intensity at the film bottom is below the top."""
@@ -479,7 +459,6 @@ def test_caresist_3d_develops_exposed_stripe():
     assert mid > edge + 0.3  # exposed stripe clears clearly more (strong, not the 0.02 the DOF scramble faked)
 
 
-@needs_fmmax
 def test_caresist_3d_end_to_end():
     """The 3-D PEB wires end to end through the real optics: exp.develop(CAResist(film=...)) reads the
     standing-wave bulk image, solves the 3-D reaction-diffusion PEB on a jno.shape box (periodic x,y via a
@@ -492,7 +471,6 @@ def test_caresist_3d_end_to_end():
     assert dev.min() >= -1e-3 and dev.max() <= 1.0 + 1e-3
 
 
-@needs_fmmax
 def test_caresist_3d_is_differentiable_ilt():
     """ILT through the 3-D PEB: jax.grad of a developed-volume loss w.r.t. the mask permittivity matches
     finite difference through the WHOLE chain — RCWA solve → standing-wave bulk image → 3-D reaction-diffusion

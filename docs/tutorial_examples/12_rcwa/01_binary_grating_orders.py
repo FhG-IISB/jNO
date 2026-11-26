@@ -37,17 +37,17 @@ What is verified (no analytic field solution needed -- these are exact statement
   1. energy conservation, R + T = 1, on a lossless structure;
   2. the grating-equation cutoff -- orders outside |m·λ/Λ| ≤ 1 carry exactly zero power;
   3. mirror symmetry -- T(+1) = T(−1) for a symmetric grating at normal incidence (to ~1e-10: the
-     ±1 pair is degenerate here, and the modal eigensolve splits it at a floor that more Fourier
-     orders do not lower -- unlike the energy balance, which holds to machine precision);
+     ±1 pair is degenerate here, and the eig-free state-space solver splits it at a floor that more
+     Fourier orders do not lower -- unlike the energy balance, which holds to machine precision);
   4. completeness -- the propagating order efficiencies sum to the total transmission.
 
 Λ = m·λ is excluded throughout: there order m is exactly grazing (a Wood-Rayleigh anomaly), the
-modal problem is singular, and ``jno.rcwa`` raises rather than handing back a NaN efficiency.
+problem is singular, and ``jno.rcwa`` raises rather than handing back a NaN efficiency.
 """
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # modal eigen-decomposition of a high-contrast stack
+jax.config.update("jax_enable_x64", True)  # exact zero-flux gate for the evanescent orders needs float64
 
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
@@ -131,7 +131,7 @@ for P, r in res.items():
     for m in o:
         if m not in prop:
             assert o[m] < 1e-9, f"order {m} is evanescent at Λ={P} but carries {o[m]:.2e}"
-    # The ±1 pair is degenerate at normal incidence, so the modal eigensolve splits it at its own
+    # The ±1 pair is degenerate at normal incidence, so the solver splits it at its own
     # floor: measured |T(+1) − T(−1)| ≈ 7e-11, and it does NOT shrink with `orders` (7.5e-11 at 160,
     # 6.9e-11 at 320) — it is not Fourier truncation. Energy conservation, by contrast, holds to 1e-15.
     assert abs(o[+1] - o[-1]) < 1e-6, f"symmetric grating at normal incidence: T(+1) must equal T(-1) (Λ={P})"
@@ -144,7 +144,7 @@ assert res[DIF]["orders"][+1] + res[DIF]["orders"][-1] > 0.8 * res[DIF]["T"], (
 )
 
 # --- sweep the period across the Rayleigh anomaly at Λ = λ ---------------------------------------
-# Λ = m·λ puts order m exactly grazing (a Wood-Rayleigh anomaly): the modal problem is singular
+# Λ = m·λ puts order m exactly grazing (a Wood-Rayleigh anomaly): the problem is singular
 # there and `jno.rcwa` raises rather than returning a NaN efficiency. Step around Λ = 1 and Λ = 2.
 periods = np.concatenate([np.linspace(0.55, 0.95, 5), np.linspace(1.05, 1.95, 8)])
 sweep = [grating(float(P)) for P in periods]

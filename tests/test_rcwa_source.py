@@ -2,16 +2,16 @@
 
 An emitter is authored exactly as in the FEM/PINN world — a forcing term in the residual: ``- src·v``
 (scalar monopole) or ``- inner(J, v)`` (vector dipole). The front door detects it (trial-free, test-present
-volume summand), localizes it (centroid → point vs Gaussian; which z-layer), and routes it to fmmax's
-``amplitudes_for_source`` (splitting the stack at the source plane). Readouts: power radiated up / down and
-the extraction fraction — the LED / Purcell / emitter observables. Differentiable in the source amplitude
-and the design permittivity.
+volume summand), localizes it (centroid → point vs Gaussian; which z-layer), and routes it to the eig-free
+backend's ``jno._rcwa.sources.emission_solve`` (Maxwell jump conditions, splitting the stack at the source
+plane). Readouts: power radiated up / down and the extraction fraction — the LED / Purcell / emitter
+observables. Differentiable in the source amplitude and the design permittivity.
 """
 
 import importlib.util
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -39,7 +39,7 @@ from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
 HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
+needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax oracle not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi

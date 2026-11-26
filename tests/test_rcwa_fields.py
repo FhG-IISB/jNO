@@ -34,13 +34,12 @@ from jno.rcwa import Rcwa, RcwaError
 WL = 1.0
 K0 = 2.0 * math.pi / WL
 
-HAS_FMMAX = True
 try:  # fmmax is a test-only oracle for field-parity checks
     import fmmax  # noqa: F401
 
     needs_fmmax = lambda fn: fn  # noqa: E731
 except Exception:  # pragma: no cover
-    needs_fmmax = pytest.mark.skipif(True, reason="fmmax not installed")
+    needs_fmmax = pytest.mark.skipif(True, reason="fmmax oracle not installed")
 
 
 def _disk_grid(period, ng, radius, eps_in, eps_out=1.0, center_frac=0.5):

@@ -12,7 +12,7 @@ Two entry points, both on `jno.rcwa`:
 
       rc  = jno.rcwa(constraints, orders=300)
       sol = rc.solve()                     # everything inferred from the traced problem
-      rc.spec                              # the inferred RcwaSpec (available without fmmax)
+      rc.spec                              # the inferred RcwaSpec (no RCWA backend pulled in)
 
   Inferred from the problem: **periodicity + period** (from the Floquet ties — absent ⇒ raise, never
   assumed), the **super/substrate ambients** (the z-normal radiation faces), the **permittivity**
@@ -60,8 +60,8 @@ References:
  * Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, "A perfectly matched anisotropic absorber for use
    as an absorbing boundary condition", IEEE Trans. Antennas Propag. 43, 1460 (1995) — the uniaxial ε̂/μ̂ PML.
  * A. Taflove et al. (eds.), "Advances in FDTD Computational Electrodynamics", Artech House (2013), ch. on
-   modal dipole sources in periodic media — the internal-source (``amplitudes_for_source``) formulation.
- * fmmax: https://github.com/facebookresearch/fmmax
+   modal dipole sources in periodic media — the internal-source (jump-condition) formulation.
+ * The fmmax test-only oracle (the reference for the committed golden parity): https://github.com/facebookresearch/fmmax
 """
 
 from dataclasses import dataclass, field
@@ -404,7 +404,7 @@ class _Sol:
 
         A JAX array, differentiable in the design (the layers' permittivity grids): ``jax.grad`` of a
         functional of it (e.g. the absorbed power ``½ ω ε₀ Im ε |E|²`` heating a coupled thermal solve) flows
-        back through the interior-field reconstruction and the modal solve. The grid sizes (``nx``, the
+        back through the interior-field reconstruction and the eig-free state-space solve. The grid sizes (``nx``, the
         per-layer ``nz`` from ``density``) and the layer thicknesses are static.
 
         Caveat (documented + pinned in ``tests/test_rcwa_fields.py``): at OBLIQUE incidence the
@@ -835,6 +835,44 @@ class Rcwa:
             return complex(g.reshape(-1)[0])
         return None
 
+    @staticmethod
+    def _is_pml_frame(e):
+        """True when a 10-component tuple is a coordinate-stretch PML frame -- the ONLY 10-tuple the
+        isolated-scatterer fold may absorb (see ``_build_stack``). ``None`` when a component is traced
+        (cannot inspect; the front door only builds stretch frames, so the fold stays). ``False`` for
+        any other 10-tuple.
+
+        The front door builds the frame as ``eps^ = eps_rel·Λ``, ``mu^ = Λ`` (``Λ`` the diagonal
+        coordinate-stretch tensor, ``eps_rel`` the physical permittivity, per pixel for a graded
+        sigma): so a frame is exactly a DIAGONAL pair of tensors whose per-pixel ratio
+        ``eps_ii/mu_ii`` is the SAME scalar across the three axes (the stretch enters both). A
+        genuinely magnetic 10-tuple substrate (e.g. eps = (6,0,0,4,5), mu = (1,0,0,2,1.5)) has
+        three different ratios (6, 2, 3.33) and is rejected here instead of silently becoming a
+        unit slab over vacuum. Note: the in-plane ``mu_zz == mu_xx·mu_yy`` identity holds only at
+        σ=0 (``Λ = diag(Sy/Sx, Sx/Sy, Sx·Sy)`` with ``Λ_xx·Λ_yy = 1``), so a real absorber frame
+        does NOT satisfy it -- the common-ratio test above is the honest structural invariant."""
+        if not isinstance(e, tuple) or len(e) != 10:
+            return False
+        if not all(_concrete(c) for c in e):
+            return None  # traced: cannot inspect (documented seam limitation, like the other traced ambients)
+        comps = [np.asarray(jnp.asarray(c)).reshape(-1) for c in e]
+        exx, exy, eyx, eyy, ezz = comps[:5]
+        mxx, mxy, myx, myy, mzz = comps[5:]
+        scale = max(float(np.abs(np.concatenate([exx, eyy, ezz, mxx, myy, mzz])).max()), 1.0)
+        tol = 1e-8 * scale
+        # diagonal: off-diagonals ~ 0 relative to the frame scale
+        for off in (exy, eyx, mxy, myx):
+            if np.abs(off).max() > tol:
+                return False
+        # the stretch enters both: a common per-pixel ratio eps_ii/mu_ii across the three axes
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = [exx / mxx, eyy / myy, ezz / mzz]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                if not np.allclose(r[i], r[j], rtol=1e-6, atol=tol):
+                    return False
+        return True
+
     def _build_stack(self, wavelength):
         """Build the backend :class:`StateStack` from the CONSTRUCTION stack: the expansion, per-layer
         chunk counts, uniform/patterned flags and expm squaring guards are all decided here, eagerly,
@@ -872,7 +910,19 @@ class Rcwa:
                 continue
             spec = self.layers_spec[side][1]
             if isinstance(spec, tuple) and len(spec) == 10:
-                continue  # a PML coordinate-stretch frame (eps^ + mu^) -- stays folded
+                frame = self._is_pml_frame(spec)
+                if frame is False:
+                    raise RcwaError(
+                        "a 10-component ambient is folded as an in-plane PML coordinate-stretch "
+                        "frame ONLY when eps^ and mu^ are diagonal with the stretch entering both "
+                        "(a common per-pixel ratio eps_ii/mu_ii across the axes -- the physical "
+                        "permittivity). This 10-tuple is NOT a stretch frame (a genuine magnetic / "
+                        "non-PML anisotropic substrate): folding it would silently model a "
+                        "semi-infinite medium as one wavelength of slab over air. Use scalar/"
+                        "constant-grid ambients on both sides, or replace the semi-infinite "
+                        "ambient with a finite supercell."
+                    )
+                continue  # a validated PML coordinate-stretch frame (or a traced one) -- stays folded
             if isinstance(spec, tuple):
                 # a 5-component eps-only uniform-anisotropic constant ambient
                 raise RcwaError(
@@ -893,6 +943,12 @@ class Rcwa:
         films = []
         for k, (_t, e) in enumerate(self.layers_spec[1:-1]):
             t = _t
+            if t is not None and not _concrete(t):
+                raise RcwaError(
+                    f"layer {k + 1} thickness is a traced JAX value: the eig-free state-space "
+                    "backend fixes thickness at build (chunking depends on it), so a traced "
+                    "thickness is not supported. Pass a concrete thickness."
+                )
             if t is None or t == np.inf:  # jNO's historical mapping for a missing/ambient thickness
                 t = 1.0
             if not (np.isreal(t) and t > 0):
@@ -977,6 +1033,19 @@ class Rcwa:
             return _collapse(_grid(e))
 
         grids = [prepare(e) for _, e in layers_spec]
+        for k, (t, _) in enumerate(layers_spec):
+            # A TRACED per-solve thickness hits `t == np.inf` below and raises a raw
+            # TracerBoolConversionError. The eig-free backend fixes thickness at build
+            # (chunking and the expm squaring guards depend on it), so a traced thickness
+            # is an API regression vs main -- raise the same loud RcwaError as the
+            # concrete-mismatch branch instead of a confusing tracer crash.
+            if t is not None and not _concrete(t):
+                raise RcwaError(
+                    f"per-solve thickness for layer {k} is a traced JAX value: the eig-free "
+                    "state-space backend fixes thickness at build (chunking depends on it), so a "
+                    "traced thickness is not supported. Pass a concrete thickness, or create a "
+                    "fresh Rcwa for a new thickness."
+                )
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
         return grids, thick
 
@@ -1147,6 +1216,12 @@ class Rcwa:
         solve time -- pass JAX permittivity grids here to differentiate the solve in the design (the
         construction-time shape guards run once, eagerly, so the solve itself stays trace-clean).
 
+        Thickness is STRUCTURAL: the eig-free backend fixes each layer's thickness at build (the chunked
+        R-matrix recursion and its expm squaring guards depend on it), so per-solve thicknesses must be
+        CONCRETE and equal to the built ones. A traced thickness on ``solve(layers=...)`` raises
+        ``RcwaError`` (differentiable thickness is not supported by the eig-free backend; create a fresh
+        ``Rcwa`` for a new thickness).
+
         ``source`` (a dict built by the front door) drives an **internal-source** emission solve instead of
         plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`.
 
@@ -1266,7 +1341,8 @@ class Rcwa:
 # =====================================================================================
 @dataclass
 class RcwaSpec:
-    """Everything the RCWA engine needs, inferred from a jNO problem. Inspectable without fmmax.
+    """Everything the RCWA engine needs, inferred from a jNO problem. Inspectable with no RCWA
+    backend pulled in.
 
     Attributes:
         period: lattice periods ``(Lx, Ly)``.
@@ -1906,7 +1982,7 @@ def _coeff_is_tensor(coeff_node, period, z_range, params):
 
 
 def _tensor_components(coeff_node, period, grid, zmid, params, k0sq, sub=1):
-    """The 5 relative-permittivity component grids (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) fmmax needs, sampled on the
+    """The 5 relative-permittivity component grids (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) the backend needs, sampled on the
     unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²). ``sub`` = subpixel
     smoothing factor."""
     g = grid * sub
@@ -2171,7 +2247,8 @@ class _ParametricSol:
 def _profile_solve(run, eng):
     """The profiling path of ``rc.solve(profile=True)`` -- an eager, per-stage-annotated RCWA solve inside a
     JAX Perfetto trace (shared with ``jno.fem``/``jno.fdm``). The eager solve self-blocks (its energy guard
-    reads ``efficiency`` concretely), so the shared timer sees the real O((2·n_t)³) eigensolve work."""
+    reads ``efficiency`` concretely), so the shared timer sees the real per-layer state-space transfer work
+    (chunked, eig-free)."""
     from jno.utils.profiling import profile_solve
 
     nt = eng._nt
@@ -2236,7 +2313,7 @@ class _RcwaProblem:
         scale. ``profile=True`` runs the solve eagerly (at the current parameter values) inside a JAX
         Perfetto trace with per-stage annotations, like ``jno.core.solve(profile=True)`` -- it prints the
         problem size and wall time and writes the trace to ``./rcwa_traces`` (RCWA time is dominated by the
-        per-layer eigensolves, which the trace makes explicit)."""
+        per-layer state-space transfers -- chunked, eig-free -- which the trace makes explicit)."""
         forward = params is not None or wavelength is not None or k_in is not None or orders is not None or profile
         if not forward:
             if self._rpe and self._resample is not None:
@@ -2294,7 +2371,8 @@ def _build_emitter_problem(
     sub=1,
 ):
     """Build an internal-source (dipole / Gaussian) emission problem: localize the traced ``- f·v`` /
-    ``- inner(J, v)`` forcing, split its layer, and route it to fmmax's ``amplitudes_for_source``.
+    ``- inner(J, v)`` forcing, split its layer, and route it to the eig-free backend's
+    ``jno._rcwa.sources.emission_solve`` (Maxwell jump conditions).
 
     The Floquet-periodic supercell + absorbing z-ambients behaves as an emitter in a layered environment.
     Scope: scalar Helmholtz layers (no tensor ε̂ / PML yet). The amplitude, orientation, lateral location,
@@ -2505,7 +2583,7 @@ def rcwa(
     Args:
         problem: The same constraint list you would pass to :func:`jno.fem`, or an already-built
             ``FEM``.
-        orders: Fourier truncation for the modal solve.
+        orders: Fourier truncation for the state-space solve.
         wavelength: Free-space wavelength (same length unit as the geometry). Optional — inferred from
             the superstrate (assumed vacuum) when omitted. Pass it to override or if no ambient is
             vacuum.

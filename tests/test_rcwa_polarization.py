@@ -11,7 +11,6 @@ exactly for the field component along the lines. jno.rcwa used to solve every li
 for lines along y is TM -- a reflectance of 0.107 where the written equation (and jno.fem) says 0.617.
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -35,8 +34,6 @@ def _x64():
 import jno  # noqa: E402
 from jno.rcwa import RcwaError, _scalar_polarization  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 inner, vec = jno.np.inner, jno.np.vector
@@ -166,7 +163,6 @@ def _R(rc):
 # ---------------------------------------------------------------------------------------------------
 # a scalar list is solved in the polarization it describes
 # ---------------------------------------------------------------------------------------------------
-@needs_fmmax
 @pytest.mark.parametrize("along", ["y", "x"])
 def test_a_scalar_grating_is_solved_in_the_polarization_it_describes(along):
     """E along the lines, whichever way the lines run -- the TE answer, as jno.fem would give."""
@@ -176,21 +172,18 @@ def test_a_scalar_grating_is_solved_in_the_polarization_it_describes(along):
     assert _R(rc) == pytest.approx(R_TE, abs=TOL)
 
 
-@needs_fmmax
 def test_the_other_polarization_is_one_argument_away():
     rc = jno.rcwa(_scalar("y"), orders=ORDERS, grid=GRID, polarization="x")
     assert rc.spec.polarization_from == "given"
     assert _R(rc) == pytest.approx(R_TM, abs=TOL)
 
 
-@needs_fmmax
 def test_circular_light_sees_the_mean_of_te_and_tm():
     """A 1-D grating in the classical mount does not mix TE and TM, so circular light reflects their mean."""
     rc = jno.rcwa(_scalar("y"), orders=ORDERS, grid=GRID, polarization=(1.0, 1j))
     assert _R(rc) == pytest.approx(0.5 * (R_TE + R_TM), abs=TOL)
 
 
-@needs_fmmax
 def test_a_two_dimensional_pattern_falls_back_to_x_and_says_so():
     pillar = lambda x, y, z: jnp.where((Z0 < z) & (z < Z1) & ((x - 0.3) ** 2 + (y - 0.15) ** 2 < 0.1**2), 1.0, 0.0)  # noqa: E731
     rc = jno.rcwa(_scalar("y", pattern=pillar), orders=ORDERS, grid=64)
@@ -209,7 +202,6 @@ def test_a_uniform_stack_lit_obliquely_is_s_polarized():
 # ---------------------------------------------------------------------------------------------------
 # a vector list carries its polarization in the incident field
 # ---------------------------------------------------------------------------------------------------
-@needs_fmmax
 @pytest.mark.parametrize(("e_inc", "expected"), [((0.0, 1.0), "TE"), ((1.0, 0.0), "TM")])
 def test_a_vector_list_is_solved_in_the_polarization_of_its_incident_field(e_inc, expected):
     """It used to be solved x-polarized whatever E_inc said."""

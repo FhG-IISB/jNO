@@ -6,18 +6,17 @@ volume term as anisotropic stiffness coefficients::
     (Sy/Sx)·∂ₓu∂ₓv + (Sx/Sy)·∂ᵧu∂ᵧv + (Sx·Sy)·∂_zu∂_zv − k0²·(Sx·Sy)·ε·(u·v)
 
 The front door reads the stretch Λ = diag(Sy/Sx, Sx/Sy, Sx·Sy) off the stiffness, forms the Maxwell
-uniaxial PML (ε̂ = ε·Λ, μ̂ = Λ), and routes it to fmmax's general anisotropic eigensolve. The Floquet
-ties stay (fmmax is periodic); the PML frame just makes the supercell walls non-coupling, so the cell
-behaves like an isolated scatterer.
+uniaxial PML (ε̂ = ε·Λ, μ̂ = Λ), and routes it to the eig-free backend's general-anisotropic
+10-component layer path. The Floquet ties stay; the PML frame just makes the supercell walls
+non-coupling, so the cell behaves like an isolated scatterer.
 
 Checks: (A) a trivial stretch (σ=0 ⇒ Λ=I) reduces EXACTLY to the scalar no-PML result; (B) a real
 absorber laterally absorbs light diffracted by a scatterer, so T+R drops below 1 while σ=0 conserves it.
 """
 
-import importlib.util
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the fmmax solve OOMs on a small GPU at these orders
+os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
 
 import equinox as eqx  # noqa: E402
 import jax  # noqa: E402
@@ -44,8 +43,6 @@ from jno.trace import FunctionCall  # noqa: E402
 from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -133,7 +130,6 @@ def _TR(cons, orders=80, grid=32):
     return float(sol.efficiency("T")), float(sol.efficiency("R"))
 
 
-@needs_fmmax
 def test_zero_sigma_pml_reduces_to_scalar():
     """A PML with σ=0 (S=1 ⇒ Λ=I, μ̂=I, ε̂=ε·I) must give EXACTLY the plain scalar-ε result — the PML
     detection + general-anisotropic routing reduces correctly when the stretch is trivial."""
@@ -165,7 +161,6 @@ def _scalar_slab(Lx):
     return [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt - 2j * K0) * vbt, ul - ur, uf - ub]
 
 
-@needs_fmmax
 def test_pml_absorbs_laterally_scattered_light():
     """The decisive PML check: for a scatterer that diffracts light into the plane, a real absorber
     (σ>0) removes the laterally-scattered power, so T+R < 1; with σ=0 the same cell conserves energy
@@ -178,7 +173,6 @@ def test_pml_absorbs_laterally_scattered_light():
     assert Ta + Ra < 0.98  # the PML drained laterally-diffracted power
 
 
-@needs_fmmax
 def test_pml_scatterer_is_differentiable():
     """A design parameter on the SCATTERER inside a PML supercell flows through the solve: the PML layers are
     re-derived from the parameter (ε̂ = ε·Λ, μ̂ = Λ), rc.solve() is a trace node, and jax.grad of transmission
@@ -233,7 +227,6 @@ def test_pml_scatterer_is_differentiable():
     assert abs(g) > 1e-3
 
 
-@needs_fmmax
 def test_pml_raises_on_offdiagonal_stretch():
     """A cross ∂ₓu ∂ᵧv stiffness term (a non-diagonal stretch) is rejected — only uniaxial PML is supported."""
     d = _structured_box(1.2)
