@@ -1744,6 +1744,17 @@ def _default_direct(fem_obj):
     return lu(backend="cudss") if _preferred_direct_backend() == "cudss" else None
 
 
+def _preferred_direct_solve(A, b):
+    """``A x = b`` through the backend ``jno.solve.lu()`` resolves to where this solve runs (cuDSS on a float64 GPU
+    that has it, else JAX's ``spsolve``). The sparse-direct default of the steady branches that need one because a
+    Krylov iteration does not converge on them (periodic reduction, 1-D, complex, Hermite/Argyris/Morley), so there is
+    one definition of "the default direct solver" rather than a hard-wired ``spsolve`` per branch."""
+    from .solve import lu
+    from .utils.solver.solver_api import at_solve_spec
+
+    return at_solve_spec(lu())(A, b)
+
+
 def _default_saddle_step_solve(fem_obj):
     """``jno.solve.lu()`` for a linear transient whose step operator is a SADDLE (an index-2 row: zero mass and
     a zero diagonal, the incompressibility row), else ``None`` (the Krylov step default). Jacobi has nothing to
@@ -4028,8 +4039,9 @@ class FEM:
             # as their steady solve does: the Krylov default returned NaN on a u_tt beam, and its noise pins
             # an adaptive controller at its smallest step (see `compose_transient_step_solvers`).
             from . import solve as _solve_ns
+            from .utils.solver.solver_api import at_solve_spec
 
-            linear = _solve_ns.lu()
+            linear = at_solve_spec(_solve_ns.lu())  # what lu() resolves to where this solve runs
         has_slots = (
             (x0 is not None)
             or (span is not None)
@@ -4372,9 +4384,7 @@ class FEM:
                 elif hasattr(A_red, "todense"):
                     # sparse-direct on the reduced BCOO (robust on the indefinite/saddle reduced systems
                     # a coupled periodic problem can produce; never densifies the full operator)
-                    from .utils.solver.linear import sparse_lu_solve
-
-                    u_red = sparse_lu_solve(A_red, b_red)
+                    u_red = _preferred_direct_solve(A_red, b_red)
                 else:
                     u_red = jnp.linalg.solve(jnp.asarray(A_red), b_red)  # dense reduced (1D / dense fallback)
                 return _fin(prolong_periodic(_per, u_red))
@@ -4388,17 +4398,13 @@ class FEM:
                 # iterating — and exact to round-off, where Jacobi-BiCGStab converges only to its
                 # tolerance and its error GROWS with N (measured 8.9e-16 vs 2.7e-11 at n=101, and
                 # 4.6e-14 vs 2.6e-10 at n=1001). Iterating a tridiagonal system is strictly worse.
-                from .utils.solver.linear import sparse_lu_solve
-
-                return _fin(sparse_lu_solve(A, b))
+                return _fin(_preferred_direct_solve(A, b))
             if solve_fn is None and self._complex_n is not None and hasattr(A, "todense"):
                 # SPARSE-DIRECT is the complex default, and deliberately so: the real-equivalent block
                 # is **indefinite** for Helmholtz / PML, where the Jacobi-preconditioned BiCGStab that
                 # serves real elliptic systems does not converge at all (measured: relative residual
                 # 1.4 on the PML benchmark). Carry the choice over rather than inherit the real default.
-                from .utils.solver.linear import sparse_lu_solve
-
-                return _fin(sparse_lu_solve(A, b))
+                return _fin(_preferred_direct_solve(A, b))
             if solve_fn is None and getattr(self.domain, "_fem_prefer_direct", False) and hasattr(A, "todense"):
                 # SPARSE-DIRECT for the C0/C1 vertex families (Hermite/Argyris/Morley). They used to
                 # hand back a DENSE operator, so this landed on `jnp.linalg.solve` -- a direct solve.
@@ -4407,9 +4413,7 @@ class FEM:
                 # biharmonic operators (the Morley suite asserts the WELL-conditioned form is only
                 # cond < 1e12), where it does not converge. Carrying the choice over keeps the storage
                 # change from being a solver change. Same reasoning as the two branches above.
-                from .utils.solver.linear import sparse_lu_solve
-
-                return _fin(sparse_lu_solve(A, b))
+                return _fin(_preferred_direct_solve(A, b))
             if solve_fn is None and hasattr(A, "todense"):
                 return _fin(_solve_linear_matrix_free(A, b, shard=shard))
             if from_slots:
