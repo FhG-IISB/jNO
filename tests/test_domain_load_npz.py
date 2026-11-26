@@ -48,3 +48,11 @@ def test_missing_npz_file_raises(tmp_path):
     missing = tmp_path / "missing_points.npz"
     with pytest.raises(FileNotFoundError):
         jno.domain(constructor=str(missing), compute_mesh_connectivity=False)
+
+
+def test_more_than_three_coordinate_columns_raise_instead_of_truncating():
+    """`from_array({"d": a})` with `a` of shape (N, 66) kept 3 columns and dropped the other 63 with no message.
+    It raises and names the tensor route."""
+    with pytest.raises(ValueError, match="at most 3 coordinate columns.*as a tensor"):
+        jno.domain.from_array({"d": np.random.default_rng(0).random((10, 66))})
+    assert len(jno.domain.from_array({"d": np.random.default_rng(0).random((10, 3))}).variable("d")) == 4
