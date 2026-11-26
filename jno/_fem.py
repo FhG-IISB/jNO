@@ -535,6 +535,10 @@ def _spatial_coord_vars(constraint: Any) -> List[Variable]:
                 if isinstance(v, Variable) and getattr(v, "axis", None) != "temporal":
                     out[id(v)] = v
 
+    # `_coord_sets` keeps every binding a view's arithmetic combined (a boundary operand's coordinates
+    # that the sum's own `_coord_vars` cannot hold), so a mixed-region residual is seen as mixed.
+    for _cs in getattr(constraint, "_coord_sets", None) or ():
+        _add_coords(_cs)
     _add_coords(getattr(constraint, "_coord_vars", None))
     for n in _walk(_bare(constraint)):
         _add_coords(getattr(n, "_coord_vars", None))
@@ -1499,7 +1503,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
 
     if len(boundary_tags) > 1 or (boundary_tags and interiorish):
         raise ValueError(
-            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
+            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region. "
+            "Write the volume term and each boundary term as separate entries of the list, "
+            "e.g. jno.fem([volume_term, boundary_term, u(x, y) - g])."
         )
     if boundary_tags:
         # A gmsh physical VOLUME also registers a node set, so it can land in `_boundary_regions` and

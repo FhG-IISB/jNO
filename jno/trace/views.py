@@ -217,6 +217,18 @@ def _coord_sets_of(*operands) -> tuple:
     return tuple(out)
 
 
+def _carry_coord_sets(new, *operands):
+    """Record on ``new`` (a view with no binding of its own) the coordinate bindings of ``operands``.
+
+    ``u.x * v.x - 1.0 * v.bind(x=xr, y=yr)`` is a plain view whose tree holds the interior coordinates
+    but not the boundary ones: they live on the bound operand's view, which the arithmetic discards.
+    ``_coord_sets`` keeps them, so the region of a residual is read from every operand it combines."""
+    sets = _coord_sets_of(*operands)
+    if sets:
+        object.__setattr__(new, "_coord_sets", sets)
+    return new
+
+
 def _tag_of_coord_vars(cv) -> Optional[str]:
     """The single region tag shared by a bound view's coordinate Variables, or ``None``."""
     tags = {getattr(v, "tag", None) for v in (cv or {}).values()}
@@ -423,9 +435,10 @@ class ScalarView(_DelegatesToPlaceholder):
         the arithmetic / differential op, so subclasses with extra state
         (``Named*WithPartials``) can validate that the binding remains
         consistent — e.g. raising on a name collision with a different Variable.
-        Base view: ignores ``other``.
+        Base view: keeps no binding of its own, but records the coordinate bindings of ``other`` (see
+        :func:`_carry_coord_sets`) so a region named only by that operand is not lost.
         """
-        return ScalarView(new_expr)
+        return _carry_coord_sets(ScalarView(new_expr), self, other)
 
     def integrate(self, *args, **kwargs) -> "ScalarView":
         """Integrate the underlying field, keeping the view type.
@@ -759,7 +772,7 @@ class VectorView(_DelegatesToPlaceholder):
 
     def _rewrap(self, new_expr, other=None) -> "VectorView":
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
-        return VectorView(new_expr)
+        return _carry_coord_sets(VectorView(new_expr), self, other)
 
     @property
     def tt(self) -> "VectorView":
