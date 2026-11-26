@@ -1,1 +1,1 @@
-{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":5,"timestamp":1795714490,"nonce":"6ydI/RL8Da1hTtC4RVsgHlcv4PY=","added":["branch:fix/issues-medium"],"removed":null}]}
+{"author":{"id":"8d2e0405f08ac6c481f912544d6d5c0f58b2dc14a7e51ad4d499ee7a34567943"},"ops":[{"type":8,"timestamp":1795720047,"nonce":"+xYHD+OCPjBoulb6OA9qudParD8=","target":"eaa0b9ca4c94e23b13e21df397d4998563c20cf3c020561ce6595d652af18356","new_metadata":{"github-id":"I_kwDORPa0Bs8AAAABi2H-ew","github-url":"https://github.com/FhG-IISB/jNO/issues/405"}}]}
