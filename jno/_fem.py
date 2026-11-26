@@ -5560,7 +5560,7 @@ class FEM:
         """``((name, ((start, stop), ...), shape), ...)``: each field's slice(s) of the DOF vector (two for a complex
         field's real halves) and its shape per node (``()`` for a constant unknown's value)."""
         offs = list(self.offsets) if self.offsets is not None else None
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         if offs is None or not keys:
             return None
         names = _field_names(self._constraints or [])
@@ -5604,7 +5604,7 @@ class FEM:
         if not trials:
             return None
         offs = list(self.offsets) if self.offsets is not None else None
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         if offs is None or len(keys) < len(offs) - 1:
             raise ValueError(
                 "u.initialize: this problem's DOF layout per field is not known; pass the start to the solver."
@@ -5713,7 +5713,7 @@ class FEM:
         names = _field_names(self._constraints or [])
         # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
         # order and does not always agree (see `_finalize`).
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         dim = int(self.domain.dimension)
         root, ext = os.path.splitext(save_path)
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)

@@ -1318,6 +1318,26 @@ def test_second_order_coupled_driven_boundary_matches_dense_elimination():
     assert rel < 0.02, f"driven coupled u_tt vs dense elimination oracle: rel {rel:.2e}"
 
 
+def test_second_order_parametric_trajectory_is_returned_by_the_public_solve():
+    """#203: ``fem.solve(c2=value)`` on a parametric u_tt form returns the trajectory at that value
+    (it raised AttributeError after the solve), and equals the private block integrator's."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 1.0, 20))
+    u, phi = d.fem_symbols(names=("pw", "pwp"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, ti0 = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+    u0 = jno.np.sin(PI * xi0) * jno.np.sin(PI * yi0)
+    c2 = jno.np.parameter((1,), name="c2")
+    fem = jno.fem([ui.tt * vi + c2 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(xi0, yi0) - u0, ui0.t - 0.0])
+    traj = np.asarray(fem.solve(c2=jnp.array([2.0])))
+    blk = fem.operator
+    ref = np.asarray(_default_transient_integrate(blk, {"c2": 2.0}, np.asarray(_block_time_grid(blk))))
+    assert traj.shape == ref.shape and np.isfinite(traj).all()
+    np.testing.assert_allclose(traj, ref, rtol=0, atol=1e-6 * np.abs(ref).max())  # iterative-solver level
+
+
 def test_second_order_coupled_parametric_rejected():
     """Runtime parameters on a coupled second-order form: the parametric coupled STEADY assembly
     underneath does not exist, so this must refuse by name (previously it surfaced a confusing
