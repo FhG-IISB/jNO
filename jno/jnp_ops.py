@@ -720,7 +720,16 @@ def concat(items, axis: int = -1) -> FunctionCall:
     """
     items = _align_temporal(items)
 
+    # Components of an FE symbol (trial or test function) are bare, (n_q, n_dof): the components of one vector
+    # go on a NEW last axis, (n_q, n_dof, n_comp) as the symbol itself is. Joined along the last axis they came
+    # out as (n_q, n_comp * n_dof), and every product with a per-point vector then failed to broadcast.
+    from .trace import _component_keeps_axis
+
+    fe_components = not all(_component_keeps_axis(_u(i)) for i in items)
+
     def _fn(*args):
+        if fe_components:
+            return jnp.stack(jnp.broadcast_arrays(*[jnp.asarray(a) for a in args]), axis=-1)
         expanded = []
         for a in args:
             a = jnp.asarray(a)

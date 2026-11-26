@@ -656,3 +656,21 @@ def test_nonnodal_default_order_still_builds():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     fem = jno.fem([jno.np.inner(ui, vi) - jno.np.inner(jno.np.vector(1.0, 0.0), vi)])
     assert int(fem.operator[0].shape[0]) > 0
+
+
+def test_vector_of_test_function_components_on_a_face_is_the_test_vector():
+    """``jno.np.vector(v[0], v[1], v[2])`` of an N1E test function on a boundary face is ``v`` itself, so its
+    product with a per-point vector assembles the same load (it used to join the components along the dof axis
+    and fail to broadcast)."""
+    inner = jno.np.inner
+    d = jno.shape.box(0, 0, 0, 1, 1, 1, size=0.6).domain()
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E", order=1)
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    X = dict(zip("xyz", d.variable("interior", split=True)[:3]))
+    vol = inner(u.bind(**X), v.bind(**X))
+    Ft = v.bind(x=xb, y=yb, z=zb)
+    w = jno.np.vector(1.0 + 0.0 * xb, 2.0 + xb, 0.0 * xb)
+    b_vec = np.asarray(jno.fem([vol, inner(w, jno.np.vector(Ft[0], Ft[1], Ft[2]))]).b)
+    b_ref = np.asarray(jno.fem([vol, inner(w, Ft)]).b)
+    np.testing.assert_allclose(b_vec, b_ref, rtol=1e-10, atol=1e-12)
+    assert np.abs(b_ref).max() > 0.0
