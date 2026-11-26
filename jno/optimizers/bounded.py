@@ -32,11 +32,11 @@ class BoundedOptimizer:
     """
 
     def __init__(self, inner, lower, upper):
-        from .engd import ENGDOptimizer
+        from ._sentinel import ResidualOptimizer
         from .md_decouple import MDOptimizer
         from .mma import MMAOptimizer
 
-        if isinstance(inner, (MMAOptimizer, ENGDOptimizer, MDOptimizer, BoundedOptimizer)):
+        if isinstance(inner, (MMAOptimizer, ResidualOptimizer, MDOptimizer, BoundedOptimizer)):
             raise TypeError(
                 f"jno.optimizers.bounded wraps an optax optimiser, not {type(inner).__name__}. "
                 "mma/gcmma take lower=/upper= themselves."

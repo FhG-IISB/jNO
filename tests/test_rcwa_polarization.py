@@ -152,7 +152,8 @@ def _vector(along, e_inc):
     return [
         inner(cu, cv) - K0**2 * eps * inner(ui, vi),
         1j * K0 * inner(u.vector.cross(nt), v.vector.cross(nt)),
-        1j * K0 * inner(u.vector.cross(nb), v.vector.cross(nb)) + 2j * K0 * inner(einc, v.vector.cross(nb)),
+        1j * K0 * inner(u.vector.cross(nb), v.vector.cross(nb))
+        - 2j * K0 * inner(jno.np.cross(einc, nb), v.vector.cross(nb)),
         face("left") - face("right"),
         face("front") - face("back"),
     ]

@@ -241,7 +241,7 @@ def md_decouple(
 #   * Embedding / LM-head per-row unit-L2-norm special casing.
 #   * The Muon RMS-matching update-scale factor sqrt(max(d_out/d_in, d_in/d_out)).
 #   * Gain reparameterizations other than softplus (gain_map is a hook, only "softplus" wired up).
-#   * Line-search base optimizers (ssbroyden / ssbfgs / engd): their value_fn closes over the full
+#   * Line-search base optimizers (ssbroyden / ssbfgs / nncg / score / engd): their value_fn closes over the full
 #     fused W, not the direction Ŵ, so a line search on the sub-problem is semantically wrong —
 #     use a pure-gradient base (adam / sgd / soap / muon).
 #   * Driving the direction LR η_W from the model's .scale() schedule — in v1 η_W is carried by the
@@ -294,7 +294,8 @@ class MDOptimizer:
             raise TypeError(
                 "md(base, ...) needs an optax GradientTransformation as the direction optimizer "
                 f"(e.g. optax.adam(1e-3)); got {type(base).__name__}. Note: line-search optimizers "
-                "(jno.optimizers.ssbroyden/ssbfgs/engd) are not supported as the MD base."
+                "(jno.optimizers.ssbroyden/ssbfgs/nncg/score) and the residual sentinels (engd/lm/dngd/nystrom_ngd/"
+                "dsgnar) are not supported as the MD base."
             )
         _parse_gain_axis(gain_axis)  # validate eagerly
         self._base = base

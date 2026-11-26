@@ -227,7 +227,8 @@ def test_parametric_transient_inverse_through_slots():
 
 def test_transient_guards():
     fem = _heat()
-    with pytest.raises(ValueError, match="initial conditions"):
+    # x0= starts the march from a given state (a window of a coupled march); a state of the wrong size says so
+    with pytest.raises(ValueError, match="this march needs"):
         fem.solve(x0=jnp.zeros(4))
     with pytest.raises(ValueError, match="linear"):
         fem.solve(nonlinear=jno.solve.newton())

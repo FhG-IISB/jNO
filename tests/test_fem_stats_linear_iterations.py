@@ -9,8 +9,7 @@ Oracles:
   steps (the Krylov space is then invariant); the count must say so.
 * **same arithmetic** -- the counted loops return the upstream ``x`` (bit-identical on CPU).
 * **per Newton step** -- a matrix-free Newton reports one count per step, as many as ``nonlinear.steps``.
-* **honest gaps** -- upstream GMRES is listed as uncounted rather than dropped; a direct factorisation
-  reports ``None``; a march records nothing per step (``fem.stats["march"]`` is its record).
+* **honest gaps** -- a direct factorisation reports ``None``; a march records nothing per step (``fem.stats["march"]`` is its record).
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import numpy as np
 import pytest
 
 import jno
-from jno.utils.solver.krylov import bicgstab_counted, cg_counted, fgmres
+from jno.utils.solver.krylov import bicgstab_counted, cg_counted, fgmres, gmres_chunked
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +47,8 @@ def test_cg_and_fgmres_count_exactly_the_number_of_distinct_eigenvalues(k):
     assert int(its) == k
     assert float(jnp.max(jnp.abs(d * x - b))) < 1e-10
     x, its = fgmres(mv, b, tol=1e-12, restart=30, return_iters=True)
+    assert int(its) == k
+    x, its = gmres_chunked(mv, b, tol=1e-12, restart=30, check_every=1, return_iters=True)
     assert int(its) == k
 
 
@@ -83,6 +84,7 @@ def test_the_counted_loops_return_the_upstream_answer():
         ({"linear": "bicgstab", "precond": "jacobi"}, "jno.solve.bicgstab"),
         ({"linear": "minres"}, "jno.solve.minres"),
         ({"linear": "fgmres"}, "jno.solve.fgmres"),
+        ({"linear": "gmres"}, "jno.solve.gmres"),
     ],
 )
 def test_a_steady_linear_solve_reports_its_count(slot, who):
@@ -98,15 +100,6 @@ def test_a_steady_linear_solve_reports_its_count(slot, who):
     assert rec["by"] == [who]
     assert len(rec["iterations"]) == 1 and 0 < rec["iterations"][0] < 1000, rec
     assert rec["total"] == rec["max"] == rec["iterations"][0]
-
-
-def test_gmres_is_listed_as_uncounted_not_dropped():
-    _, u, vi, ui, (xb, yb) = _dirichlet_square()
-    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
-    fem.solve(linear=jno.solve.gmres())
-    rec = fem.stats["linear_iterations"]
-    assert rec["iterations"] == [] and rec["uncounted"][0]["who"] == "jno.solve.gmres"
-    assert len(rec["uncounted"]) == 1, "only the forward solve ran; a traced transpose is not a solve"
 
 
 def test_matrix_free_newton_reports_one_count_per_newton_step():

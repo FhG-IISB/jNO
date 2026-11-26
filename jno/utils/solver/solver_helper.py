@@ -12,6 +12,7 @@ from ...trace import (
     FunctionCall,
     GroupedAssembly,
     Hessian,
+    InsideValue,
     Jacobian,
     Literal,
     ModelCall,
@@ -105,6 +106,10 @@ def iter_children(node: Any):
 
     if isinstance(node, DiffSlot):
         # Leaf: a value injected at evaluation time, wraps no traced sub-expression.
+        return
+
+    if isinstance(node, InsideValue):  # read inside the domain at a boundary face: its target is the child
+        yield node.target
         return
 
     if isinstance(node, Cellwise):

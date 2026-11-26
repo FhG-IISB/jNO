@@ -56,10 +56,12 @@ __all__ = [
     "Hessian",
     "Integral",
     "IntegralTime",
+    "Norm",
     "Jacobian",
     "Diff",
     "DiffSlot",
     "Cellwise",
+    "InsideValue",
     "contains_cellwise",
     "BoundConstraint",
     "bound_constraints",
@@ -735,6 +737,59 @@ class Placeholder:
             FunctionCall: the scalar node.
         """
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
+
+    def norm(
+        self,
+        space: "str | None" = None,
+        *,
+        bc: str = "dirichlet",
+        scale: float = 1.0,
+        method=None,
+        solver=None,
+        precond=None,
+    ):
+        """A norm of this field: per point (``space=None``) or over its domain region (a function-space norm).
+
+        Without ``space`` this is the pointwise norm, ``|r(x)|`` (the absolute value of a scalar; vector and
+        matrix views keep their own pointwise ``.norm()``). With a ``space`` it is a scalar, the norm of the
+        whole field, so ``r.norm("H-1")**2`` is a loss term like ``r.mse``:
+
+        - ``"l2"``: the root mean square over the evaluated points and components; ``r.norm("l2")**2``
+          is ``r.mse`` exactly (for a vector field that is the mean of ``|r|^2`` divided by its size).
+        - ``"L2"``, ``"L1"``, ``"Linf"``: over the region with its measure (mesh nodal weights; boundary
+          tags use the boundary measure).
+        - ``"H1"``, ``"H-1"``, ``"H^s"``: the Sobolev norm ``<r, (scale - Laplace)^s r>^(1/2)``. ``H-1`` is
+          the Riesz-preconditioned residual loss (SV-PINNs, Marcondes 2026, arXiv:2605.03542): for a
+          second-order PDE it turns the |k|^4 curvature of the L2 residual loss into |k|^2.
+
+        The backend comes from the domain: a structured lattice uses per-axis sine/cosine transforms (any real
+        ``s``), a simplex mesh P1 mass and stiffness matrices (``s`` in {-1, 1}; ``H^-1`` costs one CG solve
+        per evaluation). A shape domain without a mesh is a point cloud: ``"L2"``, ``"L1"``, ``"Linf"`` by the point
+        rule on its sampled points, ``"H-1"`` by the Green's kernel of ``(scale - Laplace)`` in R^d (no boundary
+        condition, ``|Omega|`` from the geometry, O(N^2) per evaluation); no mesh is built. The
+        field is evaluated at all nodes of its region (as :meth:`integrate` does), not at sampled points.
+        ``norm(...)**2`` is fused into the squared norm, so its gradient has no square root.
+
+        Batched fields (``n * domain``, operator learning) and time-dependent ones are normed per batch sample
+        and per time level, like every constraint; the training loss averages them, as it does ``mse``.
+
+        Args:
+            space: ``None`` (pointwise) or a space name, see above.
+            bc: ``"dirichlet"`` (test functions vanish on the boundary, the dual of ``H^1_0``) or
+                ``"neumann"`` (the dual of ``H^1``); only negative orders use it.
+            scale: the ``scale`` in ``(scale - Laplace)^s``, 1 by default; 0 gives the seminorm.
+            method: force a backend, ``"grid"``, ``"mesh"`` (builds a mesh-free shape's mesh) or ``"points"``;
+                ``None`` picks it from the domain.
+            solver: the ``jno.solve`` linear solver of the mesh ``H^-1`` solve (default ``jno.solve.cg``).
+            precond: its ``jno.precond`` preconditioner, built once from the constant matrix
+                (``jno.precond.amg()``, ``fsai()``, ...; default Jacobi). Ignored by a direct solver.
+
+        Returns:
+            Placeholder: the pointwise field, or a scalar :class:`Norm` node.
+        """
+        if space is None:
+            return FunctionCall(jnp.abs, [self], "abs")
+        return Norm(self, space, bc=bc, scale=scale, method=method, solver=solver, precond=precond)
 
     @property
     def mse(self) -> FunctionCall:
@@ -2396,6 +2451,12 @@ class RegionMask(Placeholder):
 
     def __repr__(self):
         return f"RegionMask({self.region})"
+
+
+def region_mask_key(region: str) -> str:
+    """The context key under which a point sampler hands :class:`RegionMask` ``region``'s 0/1 membership
+    to the trace evaluator."""
+    return f"__region_mask__{region}"
 
 
 class TagMask(Placeholder):
@@ -5310,6 +5371,32 @@ class Cellwise(Placeholder):
         return f"Cellwise({self.target})"
 
 
+class InsideValue(Placeholder):
+    """``target`` read from inside the domain at a boundary face: in the cell (or control volume) next to the face,
+    not at the face itself. Created by ``q.bind(x=xb, y=yb).inside``.
+
+    A ``jno.fvm`` boundary condition ``qb - G(qb.inside)`` gives the face its outer state as a function of the inside
+    one, the state on the other side of its Riemann problem: an open outflow (``G`` the identity), an outlet held at a
+    back pressure, an inflow from a plenum at the inside pressure, a valve that closes into a mirror (a wall). In a
+    cell it is the cell's own value. Only finite volumes have an inside of a face; ``jno.fdm`` and ``jno.fem`` refuse
+    it.
+
+    Args:
+        target: the expression to read inside (a bound unknown, or any expression of the unknowns).
+    """
+
+    def __init__(self, target: "Placeholder"):
+        target = target._expr if hasattr(target, "_expr") else target
+        if not isinstance(target, Placeholder):
+            raise TypeError(f".inside: expected a trace expression, got {type(target).__name__}.")
+        self.target = target
+        self.value_shape = tuple(getattr(target, "value_shape", ()))
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"InsideValue({self.target})"
+
+
 def contains_cellwise(expr) -> bool:
     """True if ``expr`` contains a :class:`Cellwise` per-cell projection anywhere."""
     seen: set = set()
@@ -5333,14 +5420,15 @@ def contains_cellwise(expr) -> bool:
 
 
 def contains_integral(expr) -> bool:
-    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` reduction anywhere."""
+    """True if ``expr`` contains an :class:`Integral` / :class:`IntegralTime` / :class:`Norm` reduction anywhere
+    (a value over the whole region, not per point)."""
     seen: set = set()
 
     def walk(node) -> bool:
         if not isinstance(node, Placeholder) or id(node) in seen:
             return False
         seen.add(id(node))
-        if isinstance(node, (Integral, IntegralTime)):
+        if isinstance(node, (Integral, IntegralTime, Norm)):
             return True
         for _kind, _attr, val in _iter_placeholder_children(node):
             if isinstance(val, Placeholder):
@@ -5380,6 +5468,54 @@ class Integral(Placeholder):
         if self.integration_var is not None:
             return f"Integral({self.target}, outer={self.integration_var})"
         return f"Integral({self.target})"
+
+
+class Norm(Placeholder):
+    """A function-space norm of ``target`` over its domain region (a scalar). Created by :meth:`Placeholder.norm`.
+
+    ``squared=True`` is the squared norm; ``norm ** 2`` produces it, so the gradient has no square root. The
+    backend is chosen at evaluation from the domain (see :mod:`jno.residual_norms`) and recorded in
+    ``backend`` (``"points"``, ``"region"``, ``"grid"`` or ``"mesh"``).
+
+    Args:
+        target: the field whose norm is taken.
+        space: the space name (``"l2"``, ``"L2"``, ``"L1"``, ``"Linf"``, ``"H1"``, ``"H-1"``, ``"H^s"``).
+        bc: ``"dirichlet"`` or ``"neumann"``, the test space of a negative order.
+        scale: the ``scale`` in ``(scale - Laplace)^s``; 0 gives the seminorm.
+        method: force a backend (``"grid"``, ``"mesh"``, ``"points"``), or ``None`` to pick it from the domain.
+        solver: the ``jno.solve`` linear solver of the mesh ``H^-1`` solve.
+        precond: its ``jno.precond`` preconditioner.
+        squared: the squared norm (what ``norm ** 2`` gives).
+    """
+
+    def __init__(self, target, space, *, bc="dirichlet", scale=1.0, method=None, solver=None, precond=None, squared=False):
+        from ..residual_norms import check_options, parse_space
+
+        self.kind, self.s = parse_space(space)
+        check_options(self.kind, self.s, bc, scale, method)
+        self.target = target
+        self.space, self.bc, self.scale, self.method = space, bc, float(scale), method
+        self.solver, self.precond = solver, precond
+        self.squared = squared
+        self.backend = None
+        _propagate_weak(self, target)
+
+    def __pow__(self, other):
+        if not self.squared and isinstance(other, (int, float)) and other == 2:
+            return Norm(
+                self.target,
+                self.space,
+                bc=self.bc,
+                scale=self.scale,
+                method=self.method,
+                solver=self.solver,
+                precond=self.precond,
+                squared=True,
+            )
+        return super().__pow__(other)
+
+    def __repr__(self):
+        return f"Norm({self.target}, {self.space!r}{', squared' if self.squared else ''})"
 
 
 class IntegralTime(Placeholder):
@@ -7782,7 +7918,7 @@ def _child_placeholders(node):
         return [node.expr]
     if isinstance(node, (Hessian, Jacobian)):
         return [node.target]
-    if isinstance(node, (Integral, IntegralTime, NetworkGradient, TemporalDerivative)):
+    if isinstance(node, (Integral, IntegralTime, Norm, NetworkGradient, TemporalDerivative)):
         return [node.target]
     if isinstance(node, Tracker):
         return [node.expr]
@@ -8015,7 +8151,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, NetworkGradient):
             visit(node.target)
-        elif isinstance(node, (Integral, IntegralTime)):
+        elif isinstance(node, (Integral, IntegralTime, Norm)):
             visit(node.target)
         elif isinstance(node, TemporalDerivative):
             visit(node.target)
@@ -8085,7 +8221,7 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, NetworkGradient):
             visit(node.target)
-        elif isinstance(node, (Integral, IntegralTime)):
+        elif isinstance(node, (Integral, IntegralTime, Norm)):
             visit(node.target)
         elif isinstance(node, TemporalDerivative):
             visit(node.target)

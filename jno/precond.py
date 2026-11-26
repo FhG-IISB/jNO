@@ -2189,7 +2189,7 @@ class _Saddle(_Spec):
     def __init__(self, mass_weight, laplace_weight=None, schur="mass"):
         self.mass_weight = float(mass_weight)
         self.laplace_weight = None if laplace_weight is None else float(laplace_weight)
-        if not isinstance(schur, _Spec) and schur not in ("mass", "lsc"):
+        if not isinstance(schur, _Spec) and schur not in ("mass", "lsc", "simple"):
             raise ValueError(
                 f"jno.precond.saddle(schur={schur!r}): expected 'mass' (the pressure-mass recipe, the "
                 "default), 'lsc' (the least-squares commutator), or ANY preconditioner spec -- e.g. "
@@ -2267,15 +2267,77 @@ class _Saddle(_Spec):
         return self._resolved
 
     def prepare(self, fem):
+        if self.schur == "simple":
+            return
         self._compose(fem).prepare(fem)
 
     def materialize(self, ctx: PrecondContext):
+        if self.schur == "simple":
+            return _simple_saddle(ctx)
         return self._compose(ctx.fem).materialize(ctx)
 
     def __repr__(self):
         lw = "" if self.laplace_weight is None else f", laplace_weight={self.laplace_weight}"
         sc = "" if self.schur == "mass" else f", schur={self.schur!r}"
         return f"jno.precond.saddle(mass_weight={self.mass_weight}{lw}{sc})"
+
+
+def _simple_saddle(ctx):
+    """The ``schur="simple"`` saddle preconditioner, built from the assembled operator alone: block upper
+    triangular ``[[A, B], [0, S]]`` with ``S = D − C diag(A)⁻¹ B`` (the SIMPLE approximation of the Schur
+    complement), both diagonal blocks factorised exactly on the host. The constraint fields come from the
+    owning problem (``_saddle_block_indices`` and ``blocks``), so it serves any saddle system whose
+    constraint block is not empty -- a Rhie-Chow-stabilised one included, where the structural "no diagonal"
+    test finds nothing."""
+    import jax as _jax
+    import numpy as np
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+
+    from .utils.solver.amg import _to_scipy_csr
+
+    if ctx.A.bcoo is None:
+        raise ValueError("jno.precond.saddle(schur='simple') needs an assembled (sparse) operator.")
+    fem = ctx.fem
+    idx = tuple(getattr(fem, "_saddle_block_indices", ()) or ())
+    if not idx:
+        raise ValueError("jno.precond.saddle(schur='simple'): this system has no constraint (multiplier) field.")
+    csr = _to_scipy_csr(ctx.A.bcoo).tocsr()
+    n = csr.shape[0]
+    cons = np.zeros(n, dtype=bool)
+    for i in idx:
+        cons[fem.blocks[i]] = True
+    iu, ip = np.flatnonzero(~cons), np.flatnonzero(cons)
+    A, B, C, D = csr[iu][:, iu], csr[iu][:, ip], csr[ip][:, iu], csr[ip][:, ip]
+    dA = A.diagonal()
+    dA = np.where(dA != 0, dA, 1.0)
+    S = (D - C @ sp.diags(1.0 / dA) @ B).tocsc()
+    luA, luS = spla.splu(A.tocsc()), spla.splu(S)
+    dtype = csr.dtype
+
+    def fwd(r):
+        r = np.asarray(r, dtype=dtype)
+        out = np.empty_like(r)
+        p = luS.solve(r[ip])
+        out[ip] = p
+        out[iu] = luA.solve(r[iu] - B @ p)
+        return out
+
+    def bwd(r):  # the transpose: [[A^T, 0], [B^T, S^T]], lower triangular
+        r = np.asarray(r, dtype=dtype)
+        out = np.empty_like(r)
+        u = luA.solve(r[iu], trans="T")
+        out[iu] = u
+        out[ip] = luS.solve(r[ip] - B.T @ u, trans="T")
+        return out
+
+    def _wrap(fn):
+        def go(r):
+            return _jax.pure_callback(fn, _jax.ShapeDtypeStruct((n,), dtype), r, vmap_method="sequential")
+
+        return go
+
+    return PrecondApplier(_wrap(fwd), _wrap(bwd))
 
 
 @_reusable
@@ -2380,6 +2442,12 @@ def saddle(
 
     ``float32=True`` builds and applies this preconditioner in single precision while the solve stays in
     double -- see :func:`_materialize_in_float32`.
+
+
+    ``schur="simple"`` builds the Schur approximation from the assembled operator alone, ``S = D − C diag(A)⁻¹
+    B`` (the SIMPLE one), with both diagonal blocks factorised exactly; it needs no mass matrix or symbols, so
+    it serves a finite-volume saddle system (``jno.fvm``, whose Rhie-Chow constraint block is not empty) as
+    well as a finite-element one, with ``fgmres`` or ``gmres``.
     """
     return _precision(_Saddle(mass_weight, laplace_weight, schur), float32)
 

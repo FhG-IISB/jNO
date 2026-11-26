@@ -142,3 +142,17 @@ def test_following_needs_an_unambiguous_displacement_field():
     # the refusal may surface at build or at solve depending on the route; either is fine, both are loud
     with pytest.raises(ValueError, match="one component per dimension"):
         jno.fem([jno.np.inner(gu, gp, n_contract=1), nrm[0] * phi.bind(x=tp[0], y=tp[1]), u(bb[0], bb[1]) - 0.0]).solve()
+
+
+def test_a_shapely_domain_takes_the_same_variable_arguments():
+    """``PolygonDomain.variable`` overrides ``domain.variable`` and used to drop ``follow_normals=`` and
+    ``region=``: both raised TypeError on a shapely domain although its help listed them."""
+    pytest.importorskip("shapely")
+    from shapely.geometry import box
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    assert type(d).__name__ == "PolygonDomain"
+    *_, nx, ny = d.variable("boundary", normals=True, follow_normals=True, split=True)
+    assert nx is not None and ny is not None
+    with pytest.raises(TypeError, match="only with `where=`"):
+        d.variable("boundary", region="anything")

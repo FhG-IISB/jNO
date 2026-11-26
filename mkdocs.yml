@@ -2,7 +2,7 @@ site_name: jNO
 site_url: https://fhg-iisb.github.io/jNO/
 site_description: >-
   jNO (jax Numerical Operators) — a JAX-native library for differentiable numerical
-  methods. FEM, FDM and RCWA solvers and scientific machine learning on one
+  methods. FEM, FDM, FVM and RCWA solvers and scientific machine learning on one
   end-to-end differentiable, jit-compiled substrate.
 repo_url: https://github.com/FhG-IISB/jno
 repo_name: FhG-IISB/jno
@@ -138,6 +138,8 @@ nav:
       - Vector, coupled & nonlinear: fem/formulations.md
       - Limits & build time: fem/limitations.md
     - Finite Difference Method: fdm.md
+    - Finite Volume Method: fvm.md
+    - Coupling problems on their own meshes: coupling.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
     - Partial-Element Equivalent Circuits: peec.md
     - Solvers & preconditioners: solvers.md
@@ -177,6 +179,7 @@ nav:
     - FEM:
       - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
+      - "Residual norms: an H^-1 PINN loss": tutorials/08-fem-and-varpinns/h-minus-1-residual-loss.md
       - Deep Ritz (Energy Method): tutorials/08-fem-and-varpinns/deep-ritz-poisson-2d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
@@ -202,6 +205,7 @@ nav:
       - "Full-Waveform Inversion (recover a wave speed)": tutorials/08-fem-and-varpinns/inverse-wave-speed-2d.md
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Adaptivity — h, r and p on one problem: tutorials/08-fem-and-varpinns/adaptive-l-shape.md
+      - "Soft p-enrichment (differentiable order distribution)": tutorials/08-fem-and-varpinns/soft-enrichment-l-shape.md
       - "Topology Optimisation (deformable mesh)": tutorials/08-fem-and-varpinns/topology-optimisation-cantilever.md
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
     - FDM:
@@ -209,6 +213,15 @@ nav:
       - Heat 2D: tutorials/09-fdm/heat-2d-fdm.md
       - Mixed BC: tutorials/09-fdm/mixed-bc-fdm.md
       - Inverse Source: tutorials/09-fdm/inverse-source-fdm.md
+    - FVM:
+      - Poisson 2D: tutorials/14-fvm/poisson-2d-fvm.md
+      - Advection-diffusion: tutorials/14-fvm/advection-diffusion-fvm.md
+      - Burgers shock: tutorials/14-fvm/burgers-shock-fvm.md
+      - Sod shock tube: tutorials/14-fvm/sod-shock-tube-fvm.md
+      - Lid-driven cavity: tutorials/14-fvm/lid-driven-cavity-fvm.md
+    - Coupling:
+      - Rocket nozzle wall: tutorials/15-coupling/rocket-nozzle-wall.md
+      - Hot gas in a thick-walled vessel: tutorials/15-coupling/hot-gas-vessel.md
     - Bayesian:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md

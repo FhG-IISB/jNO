@@ -68,10 +68,17 @@ __all__ = [
     "diagonal",
     "svd",
     "lstsq",
+    "bdf",
     "bdf2",
     "sdirk",
     "rosenbrock",
     "theta",
+    "coupling",
+    "erk",
+    "imex",
+    "ptc",
+    "piso",
+    "simple",
     "exponential",
     "adaptive",
     "arclength",
@@ -166,7 +173,11 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
             factorization **298 ms**, and a Newton re-factorization **296 ms -- 220x**, where cuDSS
             reaches 115x. Being on the CPU it is also the answer when a factorization will not fit in
             device memory. Its adjoint is cheaper than cuDSS's too: ``A^T x = b`` comes from the SAME
-            factorization rather than a second one. Needs ``pypardiso`` (x86-64).
+            factorization rather than a second one. On a COMPLEX steady form it factors the ``n x n`` complex
+            operator ``A_r + i A_i`` itself (MKL's complex matrix types) instead of LU on the real ``2n``
+            block: measured on a periodic Maxwell cell with exact faces (degree-2 N1E, 24k DOFs), half the
+            factor memory and fewer host copies. A runtime-parameter override (``fem.solve(values=...)``)
+            is refused on that route. Needs ``pypardiso`` (x86-64).
 
             **Choosing between the last two: pick by the phase your problem repeats.** A Newton loop
             re-FACTORIZES, so PARDISO wins. A shift-invert eigensolve or a constant-operator transient
@@ -273,6 +284,10 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool = Tr
         "multi_rhs": backend == "cudss",
         "host_kernel": None if backend == "device" else backend,
         "solver_context": backend == "cudss",
+        # factors a COMPLEX form's n x n operator itself (MKL complex mtypes), so fem.solve hands it the
+        # complex operator rather than the real-equivalent 2n block: half the factor memory, and the
+        # periodic reduction and host copies run on the n-sized legs
+        "complex_native": backend in ("pardiso", "cudss"),
     }
     return LinearSolver(_fn, name=name, direct=True, traits=traits, settings={"reuse": reuse})
 
@@ -350,10 +365,20 @@ def _krylov(name: str, tol: float, atol: float, maxiter: Optional[int], **fixed)
                     M = _unit_scaled(M, rhs)
                 # `maxiter` counts restart cycles, as it does for jax's (whose default is 10 n of them)
                 cycles = maxiter if maxiter is not None else 10 * rhs.shape[0]
-                record_iterations(None, f"jno.solve.{name}", side=_side)
-                return gmres_chunked(
-                    mv, rhs, M=M, x0=x0, tol=tol_, atol=atol, restart=restart, maxiter=cycles * restart, side="left"
+                x, it = gmres_chunked(
+                    mv,
+                    rhs,
+                    M=M,
+                    x0=x0,
+                    tol=tol_,
+                    atol=atol,
+                    restart=restart,
+                    maxiter=cycles * restart,
+                    side="left",
+                    return_iters=True,
                 )
+                record_iterations(it, f"jno.solve.{name}", side=_side)
+                return x
         else:
             from .utils.solver.krylov import gmres as _scaled_gmres
             from .utils.solver.solver_api import record_iterations
@@ -2060,6 +2085,252 @@ def theta(theta: float = 1.0):
     return _ThetaScheme(theta)
 
 
+def imex(method="ars222", *, cfl=None, newton_tol=1e-12, newton_steps=30):
+    """IMEX Runge-Kutta (Ascher, Ruuth & Spiteri 1997): the transport explicit, the stiff cell-local terms implicit.
+
+    For a problem whose residual has terms that act on each cell alone -- a reaction, a drag, a relaxation, an
+    algebraic closure (the temperature of an energy) -- next to its fluxes: ``jno.fvm`` splits its volume terms
+    that differentiate no unknown in space from the rest. The local part is solved per cell by Newton on its
+    ``nf x nf`` block, so a stiff source costs no smaller step; the explicit part keeps its CFL limit.
+
+    Args:
+        method: ``"ars222"`` (second order, L-stable implicit part) or ``"ars443"`` (third order).
+        cfl: substeps per step from the transport's stable step, as ``jno.solve.erk(cfl=)``.
+        newton_tol: the per-cell Newton's step tolerance.
+        newton_steps: the per-cell Newton's most iterations.
+    """
+    from .utils.solver.imex import IMEXScheme
+
+    return IMEXScheme(method=method, cfl=cfl, newton_tol=newton_tol, newton_steps=newton_steps)
+
+
+def ptc(dtau0=1.0, *, dtau_max=1e12, max_steps=200, rtol=1e-10, atol=1e-12, positive=None, keep=0.2, ramp=1.2):
+    """Pseudo-transient continuation (Kelley & Keyes 1998), a steady solve for problems Newton cannot start:
+    ``nonlinear=jno.solve.ptc()`` on ``jno.fvm``, ``jno.fdm`` or ``jno.fem``.
+
+    Each step solves ``(J + D / Δτ) δ = -F(u)`` (a backward-Euler step in pseudo-time), ``D`` the row sums of
+    ``|J|``: on ``jno.fvm`` one value per cell, the largest of its unknowns', so a cell's unknowns advance together
+    as in a march. ``Δτ`` grows as the residual falls (switched evolution relaxation, Mulder & van Leer 1985), so it
+    follows the transient path where it must -- a shock or a front that has not formed in the start state -- and ends
+    as Newton. Every row is damped, a saddle point's constraint too (its row sum is not zero where its diagonal is).
+
+    Args:
+        dtau0: the first pseudo-time step, in units of ``D`` (smaller is more cautious).
+        dtau_max: the largest pseudo-time step.
+        max_steps: the most steps.
+        rtol: stop at ``‖F‖ <= atol + rtol ‖F(u0)‖``.
+        atol: see ``rtol``.
+        positive: expressions of the unknowns that must stay positive in every cell, e.g. ``[rho, p]`` of a gas
+            (``jno.fvm``). A step is cut to the largest of ``1, 1/2, 1/4, ...`` that keeps each of them positive and
+            at least ``keep`` of its value; without it a step into a state where the residual is still finite (a
+            negative density) is taken, and the march does not come back.
+        keep: the share of a positive quantity a step must leave (0.2: a step takes at most 80 % of it away).
+        ramp: the least growth of ``Δτ`` after a full step (1: switched evolution relaxation alone, which creeps
+            while a shock forms and the residual hardly falls: the Mach 3 wedge stalled at 200 steps with it).
+    """
+    from .utils.solver.ptc import PseudoTransient
+
+    return PseudoTransient(
+        dtau0=dtau0,
+        dtau_max=dtau_max,
+        max_steps=max_steps,
+        rtol=rtol,
+        atol=atol,
+        positive=positive,
+        keep=keep,
+        ramp=ramp,
+    )
+
+
+def coupling(
+    scheme="gauss-seidel",
+    *,
+    tol=1e-8,
+    max_iter=50,
+    accel="aitken",
+    dirichlet=None,
+    alpha=None,
+    measure=None,
+    implicit=True,
+    window=None,
+    time=None,
+    reuse=0,
+    x0=None,
+    compile=True,
+):
+    """How ``jno.core([p1, p2, ..., interface conditions]).solve(coupling=...)`` couples problems on their own
+    meshes (``jno.fem``, ``jno.fdm``, ``jno.fvm``, in any combination).
+
+    Every interface condition goes to one problem as its own boundary condition, the other side's part read
+    from that problem's current solution and carried across the interface (values by interpolation, fluxes by
+    an L2 projection that keeps their total). A value and a flux condition between two problems are a
+    Dirichlet-Neumann pair, the value going to the side with the smaller interface stiffness (Giles 1997).
+    The problems are then solved in turn until the interface data stop changing.
+
+    Args:
+        scheme: ``"gauss-seidel"`` (each problem reads what the ones before it in the sweep just produced) or
+            ``"jacobi"`` (all read the last sweep's data).
+        tol: the relative change of the interface data at which the iteration stops.
+        max_iter: the most sweeps.
+        accel: ``"aitken"`` (dynamic relaxation, Küttler & Wall 2008), ``"iqn-ils"`` (interface quasi-Newton,
+            Degroote, Bathe & Vierendeels 2009), ``None`` (none), or a fixed relaxation factor.
+        dirichlet: the problem that takes the value condition of a pair, in place of the stiffness probe.
+        alpha: Robin-Robin in place of Dirichlet-Neumann: each side of a pair takes ``flux + alpha * value``
+            (Quarteroni & Valli 1999); ``"auto"`` sets ``alpha = sqrt(S_a S_b)`` from the two interface
+            stiffnesses. Robust when neither side is much stiffer than the other.
+        measure: the interface measure: ``None`` (length or area), ``"axisymmetric"`` (``2π r ds``, ``r`` the
+            second coordinate, an ``(x, r)`` meridian), ``"axisymmetric:0"`` (``r`` the first, ``(r, z)``) or a callable
+            of the points. It must match the measure the problems' own forms integrate with: a finite-element
+            side's interface load is written with it (``2π r``).
+        implicit: iterate every window to ``tol`` (``True``), or one sweep per window (``False``, loose coupling:
+            cheaper, first order in the window, not energy-conserving).
+        window: the coupling window of a transient coupling, a whole number of every problem's step; default the
+            largest step. Each problem marches its own steps inside it, the interface data held over it.
+        time: the time scheme of the transient problems: one for all, or ``{problem: scheme}``; default each
+            problem's own default (backward Euler).
+        reuse: IQN-ILS keeps the columns of this many earlier windows.
+        x0: where steady ``jno.fvm`` / ``jno.fdm`` problems start, ``{problem: state}`` (a state as their
+            ``solve(x0=)`` takes): their first sweep and the stiffness probe. A steady gas needs one, as it has no
+            state at zero. The interface data then start from the starting states too (each sender's value there, or
+            the value that holds its condition at the receiver's start), not from zero.
+        compile: run a transient coupling's windows as one compiled program, traced once (``core.coupled.compiles``),
+            after a first window run step by step: a window of one sweep (data flowing one way, or ``implicit=False``),
+            or its interface fixed point with ``accel="aitken"`` or a fixed relaxation, when the problems' windows do
+            not depend on their start time. ``False`` runs every window step by step.
+
+    The coupled problem is kept as ``core.coupled`` (``.iterations``, ``.history``, ``.assign``).
+    """
+    from ._coupling.driver import CouplingSpec
+
+    return CouplingSpec(
+        scheme=scheme,
+        tol=tol,
+        max_iter=max_iter,
+        accel=accel,
+        dirichlet=dirichlet,
+        alpha=alpha,
+        measure=measure,
+        implicit=implicit,
+        window=window,
+        time=time,
+        reuse=reuse,
+        x0=x0,
+        compile=compile,
+    )
+
+
+def erk(method: str = "ssprk3", *, tableau=None, cfl: float | None = None):
+    """**Explicit Runge-Kutta** time scheme for ``fem.solve(time=...)``, ``fdm(...).solve(time=...)`` and
+    ``fvm(...).solve(time=...)``: no linear solve per step, so it is the scheme for hyperbolic problems at a
+    CFL-limited step.
+
+    ``method`` is ``"ssprk3"`` (default; the third-order strong-stability-preserving scheme of Shu and Osher,
+    which keeps a total-variation-diminishing spatial scheme TVD), ``"ssprk2"`` (Heun), ``"ssprk54"`` (the
+    five-stage fourth-order SSP scheme of Spiteri and Ruuth), ``"rk4"`` or ``"euler"``; or give any explicit
+    Butcher tableau as ``tableau=(A, b, c, order)`` with ``A`` strictly lower triangular. The march takes
+    the domain's step (``domain.time``); with ``cfl=`` a finite-volume problem picks the number of substeps
+    of every step from its CFL limit, ``Δt = 2·cfl/ρ(M⁻¹ ∂R/∂u)`` of its first-order operator (for upwinded
+    convection the classical Courant number ``a Δt/Δx``), at the state where the step starts. Under a
+    gradient trace the count is fixed, from the initial state.
+
+    Rows with zero mass (Dirichlet and flux rows of ``jno.fdm``, a pinned cell) are constraints, solved at
+    every stage. The march is a fixed-length ``lax.scan``, so it is reverse-mode differentiable.
+
+    References: Gottlieb, Shu & Tadmor, *SIAM Review* **43** (2001) 89-112; Spiteri & Ruuth, *SIAM J. Numer.
+    Anal.* **40** (2002) 469-491."""
+    from .utils.solver.timeschemes import _ERK_TABLEAUS, _ERKScheme
+
+    if tableau is not None:
+        A, b, c, order = tableau
+        return _ERKScheme(A, b, c, order, "tableau", cfl)
+    if method not in _ERK_TABLEAUS:
+        raise ValueError(f"jno.solve.erk: method={method!r} is not one of {sorted(_ERK_TABLEAUS)}; or pass tableau=.")
+    A, b, c, order = _ERK_TABLEAUS[method]
+    return _ERKScheme(A, b, c, order, method, cfl)
+
+
+def simple(
+    *,
+    alpha_u: float = 0.7,
+    alpha_p: float = 0.3,
+    max_iters: int = 500,
+    rtol: float = 1e-8,
+    atol: float = 1e-10,
+    linear=None,
+):
+    """**SIMPLE** segregated solve of a saddle system (incompressible flow, Darcy, any constraint pair that
+    ``jno.fvm`` detects), for ``.solve(nonlinear=jno.solve.simple())``: a momentum predictor with the multiplier
+    held, under-relaxed by ``alpha_u``, then one correction of the multiplier on the Schur complement
+    ``D − C diag(A)⁻¹ B`` of the assembled tangent, relaxed by ``alpha_p``; repeated until the residual falls
+    by ``rtol``. A fallback where Newton from a poor start diverges (a high Reynolds number). The outer
+    iteration decides convergence on values, so it runs eagerly; inside ``jno.core`` keep the default Newton.
+
+    Reference: Patankar & Spalding, *Int. J. Heat Mass Transfer* **15** (1972) 1787-1806."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "simple", alpha_u=alpha_u, alpha_p=alpha_p, corrections=1, max_iters=max_iters, rtol=rtol, atol=atol, linear=linear
+    )
+
+
+def piso(*, n_corr: int = 2, n_outer: int = 20, rtol: float = 1e-8, atol: float = 1e-8, linear=None):
+    """**PISO** for a transient saddle system, ``.solve(time=..., nonlinear=jno.solve.piso())``: each implicit
+    step is a momentum predictor and ``n_corr`` multiplier corrections on the Schur complement of the step's
+    assembled tangent (Issa 1986). One such sweep leaves the splitting error, so the sweep is repeated until the
+    step's residual falls by ``rtol`` (at most ``n_outer`` times; the PIMPLE form), and the march checks every
+    step as it does for Newton. A fixed-length loop, so the march stays traceable and differentiable.
+
+    Reference: Issa, *J. Comput. Phys.* **62** (1986) 40-65."""
+    from .utils.solver.segregated import _Segregated
+
+    return _Segregated(
+        "piso", alpha_u=1.0, alpha_p=1.0, corrections=n_corr, max_iters=n_outer, rtol=rtol, atol=atol, linear=linear
+    )
+
+
+def bdf(order: int | None = None, *, ndf: bool = True):
+    """**BDF / NDF** time scheme for ``fem.solve(time=...)``: backward differentiation formulas of order 1 to 5
+    on error-controlled variable steps, with the order chosen as the march goes -- the stiff integrator of
+    MATLAB's ``ode15s`` and of SUNDIALS CVODE / IDA. ONE implicit solve per step (SDIRK3 takes three), and the
+    local-error estimate comes free from the predictor, so no step is taken twice.
+
+    * ``order=None`` (default): orders 1-5, chosen per step to allow the largest step.
+    * ``order=k``: order ``k`` held (climbed to as the history fills). ``order=1`` and ``order=2`` without
+      ``.adaptive(...)`` march the domain's FIXED grid instead (backward Euler and :func:`bdf2`, which is this
+      scheme at ``order=2``); orders 3-5 need the error-controlled march, which starts at order 1 from a tiny step.
+    * ``ndf=True`` (default): the Klopfenstein-Shampine numerical differentiation formulas, BDF plus
+      ``kappa*gamma_k (u - u_predicted)``, the same stability with a smaller error constant (up to ~26% larger
+      steps at orders 1-4; NDF5 is BDF5). ``ndf=False``: plain BDF.
+
+    ``.adaptive(rtol=1e-4, atol=1e-6, max_steps=1000, dt0=None)`` sets the tolerances and the attempt budget
+    (the defaults apply without it). An exhausted budget returns NaN, never an under-resolved trajectory.
+    Output at ``save_ts`` is interpolated through the accepted states at the order of the method.
+
+    The step is a backward-Euler step from a shifted state, so everything a transient step carries composes:
+    linear or nonlinear blocks, ``linear=`` / ``precond=`` / ``nonlinear=`` slots, Dirichlet and algebraic
+    (index-1) rows, a state-dependent mass ``c(u) u_t`` (non-conservative form, as :func:`bdf2`), complex and
+    periodic fields, and reverse-mode gradients (the controller is ``stop_gradient``-ed; the gradient is the
+    derivative at the realized step schedule).
+
+    Scope: BDF3-5 are A(alpha)-stable, not A-stable (alpha 86, 73, 51 degrees): a lightly damped oscillation
+    -- eigenvalues near the imaginary axis -- loses accuracy at those orders; prefer :func:`sdirk` or
+    ``theta(0.5)`` there, or cap the order (``order=2``). Index-2 rows (incompressibility) are left out of the
+    error norm. A second-order-in-time (``u_tt``) block is refused, as by :func:`bdf2`.
+
+    References: Curtiss & Hirschfelder, PNAS 38 (1952); Byrne & Hindmarsh, ACM TOMS 1 (1975) (variable
+    coefficients); Shampine & Reichelt, SIAM J. Sci. Comput. 18 (1997) (NDF, the order and step control);
+    Hairer & Wanner, *Solving ODEs II*, Sec. III.5 and V.1."""
+    from .utils.solver.timeschemes import _BDF_MAX_ORDER, _BDFScheme
+
+    if order is not None and (isinstance(order, bool) or int(order) != order or not 1 <= int(order) <= _BDF_MAX_ORDER):
+        raise ValueError(
+            f"jno.solve.bdf(order={order!r}): order must be None (variable) or an integer 1..{_BDF_MAX_ORDER}."
+        )
+    if order is None or int(order) > 2:
+        return _BDFScheme(None if order is None else int(order), ndf).adaptive()
+    return _BDFScheme(int(order), ndf)
+
+
 def bdf2():
     """**BDF2** time scheme for ``fem.solve(time=...)``: the second-order backward differentiation
     formula ``(3u^{n+1} - 4u^n + u^{n-1})/(2 dt)``, and the workhorse for incompressible flow.
@@ -2101,7 +2372,9 @@ def sdirk(order: int = 3):
     ``M + gamma*dt*A`` -- so ``linear=``/``precond=`` slots, a sparse-direct factorisation and a constant
     preconditioner are built once. Stiffly accurate, so Dirichlet / algebraic (zero-mass) rows are exact
     at every step, and L-stable, so it damps stiff transients the way backward Euler does (unlike
-    Crank-Nicolson). Composes with ``.adaptive(...)`` (step doubling with exponent ``1/(order+1)``).
+    Crank-Nicolson). Composes with ``.adaptive(...)``, which estimates the error from an embedded
+    lower-order solution built from the same stages (no extra solve): order 2 for ``order=3``, order 1
+    for ``order=2``.
 
     Costs ``order`` implicit solves per step. A state-dependent mass ``c(u) u_t`` is integrated in its
     non-conservative form (as ``bdf2`` does). Refuses a second-order-in-time (``u_tt``) block: an L-stable
@@ -2126,7 +2399,9 @@ def rosenbrock(method: str = "ros34pw2"):
       stiffly accurate, so prefer ``ros34pw2`` with algebraic rows.
 
     Composes with ``linear=`` / ``precond=`` (the stage matrix is what they see; on a linear block with a
-    constant operator it is built once) and with ``.adaptive(...)``. Refuses what a linearly implicit form
+    constant operator it is built once) and with ``.adaptive(...)``: ``"ros34pw2"`` estimates the error
+    with its embedded order-2 solution (Rang & Angermann 2005, same stages, no extra solve), ``"ros2"``
+    has no embedded pair and uses step doubling. Refuses what a linearly implicit form
     cannot carry: a time-dependent or parameter-dependent mass, a state-dependent mass ``c(u) u_t``, and a
     second-order-in-time (``u_tt``) block -- use ``sdirk()`` / ``bdf2()`` for the first two.
     """
@@ -2143,16 +2418,21 @@ def exponential(*, order: int = 40, mass: str = "lumped", symmetric: bool = True
     **time-varying** source ``f(t)`` is integrated by **ETD2** (the exponential trapezoidal rule) — sampled
     at both step ends with a ``φ₂`` ramp weight, so it is **exact for a source affine in time** and
     second-order for a general one (Hochbruck & Ostermann, *Exponential integrators*, Acta Numerica 19
-    (2010) 209–286, §2.3). ``order`` is the Krylov size. ``mass='lumped'`` (default) is the row-sum diagonal
-    — cheapest, discrete maximum principle; ``mass='consistent'`` uses the full ``M`` (no lumping error) via
-    a matrix-free M-inner-product Lanczos.
+    (2010) 209–286, §2.3). ``order`` is the Krylov size (capped at the number of free unknowns).
+    ``mass='lumped'`` (default) is the row-sum diagonal — cheapest, but a different spatial discretisation
+    from the consistent one the other schemes integrate (4e-2 apart on P1 triangles, 8e-2 on Q1 hexes), and
+    refused where the row sums are not positive (P2 vertices, Hermite slopes, edge DOFs).
+    ``mass='consistent'`` uses the full ``M`` (no lumping error) via a matrix-free M-inner-product Lanczos.
 
-    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos. ``symmetric=False`` handles a **non-symmetric**
+    ``symmetric=True`` (default, ``A = Aᵀ``) uses Lanczos, and is refused on an operator that is not symmetric on
+    its free DOFs (checked eagerly). ``symmetric=False`` handles a **non-symmetric**
     operator (**advection–diffusion / transport**): it advances by Arnoldi + a differentiable **Padé**
     exponential, with forcing carried exactly through an augmented generator (a ramp row for ETD2) — still
-    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable; time-varying
-    **coefficients** ``M(t)``/``A(t)`` (a moving/parametric operator) or a nonlinear form → use
-    :func:`theta`.
+    matrix-free, GPU, and reverse-mode differentiable. All paths are differentiable, also in a trainable
+    coefficient, network or initial condition, as long as the operator does not read time; time-varying
+    **coefficients** ``M(t)``/``A(t)``, a trainable or moving mass, or a nonlinear form → use :func:`theta`.
+    The structural refusals run once at ``fem.solve`` time, on the operator at the stored values, so they also
+    hold inside ``jno.core``.
 
     **Walls must be homogeneous.** Every zero-mass DOF is held at 0, which is a Dirichlet row with
     ``g = 0`` and nothing else. A non-zero or time-varying wall value, or an algebraic row that reaches an
@@ -2175,39 +2455,44 @@ def adaptive(
     grow: float = 1.5,
 ):
     """**Adaptive step-size** time scheme for ``fem.solve(time=...)``: the step size is chosen per step
-    from a **step-doubling** (Richardson) local-error estimate — one full step compared with two
-    half-steps — so a stiff / sharp / multi-rate transient takes small steps only where it needs them and
-    large steps elsewhere, instead of the fixed ``dt`` from ``domain(time=(t0,t1,n))``.
+    from a local-error estimate, so a stiff / sharp / multi-rate transient takes small steps only where it
+    needs them and large steps elsewhere, instead of the fixed ``dt`` from ``domain(time=(t0,t1,n))``.
+    A base with an **embedded pair** — :func:`sdirk` and ``rosenbrock("ros34pw2")`` — compares its step
+    with the embedded lower-order solution of the same stages, so an attempt costs one step. Every other
+    base (the θ-steps, ``rosenbrock("ros2")``) uses **step doubling** (Richardson): one full step against
+    two half-steps, 3 steps per attempt. A step whose error exceeds the tolerance is **rejected** and
+    retried smaller, unless it is already at the smallest allowed step. The error norm leaves out the
+    rows of an index-2 variable (zero mass and a zero diagonal, as the incompressibility row of a saddle
+    problem): their error converges an order lower and would shrink the step without bound. Dirichlet
+    rows and pins stay in.
 
     Built on the block's own implicit θ-step, so it inherits the DAE (Dirichlet) handling and works for a
     **linear or nonlinear**, **scalar or vector**, **plain, periodic, or complex** transient. It is a
     **fixed-length** ``lax.scan`` of ``max_steps`` attempts (a static trip count — the settled tail just
-    consumes an attempt), which keeps it **reverse-mode differentiable** (the gradient flows through the
-    realized step sequence). ``rtol``/``atol`` set the mixed relative/absolute tolerance; ``max_steps`` is
+    consumes an attempt), which keeps it **reverse-mode differentiable**: the gradient flows through the
+    accepted steps, and the step sizes (chosen from ``stop_gradient`` error norms) are treated as
+    constants, as in the usual discretise-then-differentiate adaptive integrators. A rejected attempt
+    contributes nothing to the gradient. ``rtol``/``atol`` set the mixed relative/absolute tolerance; ``max_steps`` is
     the step **budget** — if it is exhausted before ``t1`` the trajectory is returned as ``NaN`` (raise it),
     never silently under-resolved. Composes with ``linear=``/``precond=`` (the per-step solve).
     Backward-Euler order (first-order in time); pair with a fine tolerance for accuracy.
 
-    ``dt0`` is the **first** step. It defaults to the smallest allowed step (``1e-4`` of the time span) so
-    the controller **approaches the right step size from below**. That default matters: there is no step
-    rejection (see :func:`jno.utils.solver.timeschemes.adaptive_march` — a discarded state would make the
-    per-step solve adjoint run at zero cotangent and return a ``NaN`` gradient), so an over-large step is
-    *committed*, not retried, and only the next one shrinks. Growing into the step size can never commit an
-    over-tolerance step — an under-sized step is wasteful, not inaccurate — whereas starting at the output
-    grid's ``dt`` bakes in the error of the first few steps permanently. On a 2-D heat benchmark, taking
-    ``dt0`` from the output grid left the result **4.2x** less accurate than growing from below, for the same
-    tolerance and ~18% fewer steps. Pass ``dt0`` explicitly only if you know the correct scale; the growth
-    cap is 5x per step, so the default reaches any scale in a handful of attempts.
+    ``dt0`` is the **first** step. It defaults to the smallest allowed step (``1e-4`` of the time span), and
+    the controller grows from there (at most 5x per step), reaching any scale in a handful of attempts. A
+    larger ``dt0`` is safe: an over-tolerance first step is rejected and retried, at the price of the
+    attempts the rejections use from ``max_steps``.
 
     This bare form sizes **whatever step the assembly picked** for the block — backward Euler for a
     parabolic block, which is **first order**. That is the single biggest accuracy lever here, and it is
     worth moving: step doubling costs 3 implicit solves per step, so spending them on a first-order base
-    cannot beat a first-order fixed march by much. Attach the controller to a **second-order** step instead
-    and the same tolerance is far cheaper per digit — the step-size exponent follows the base's order
-    automatically (``1/(p+1)``)::
+    cannot beat a first-order fixed march by much. Attach the controller to a **higher-order** step instead
+    and the same tolerance is far cheaper per digit — the step-size exponent follows the order of the
+    error estimate automatically (``1/(q+1)``, ``q`` the embedded order, or the base's order for step
+    doubling)::
 
         fem.solve(time=jno.solve.adaptive(rtol=1e-4))                    # 5.1e-3 for 162 solves
         fem.solve(time=jno.solve.theta(0.5).adaptive(rtol=1e-4))         # 2.2e-4 for  48 solves
+        fem.solve(time=jno.solve.sdirk(3).adaptive(rtol=1e-5))           # embedded pair, L-stable
 
     (~23x the accuracy on ~3x less work, measured on the 2-D heat benchmark of
     ``tests/test_fem_adaptive_timestep.py`` — ``mesh_size=0.15``, t=0.05, x64, against the semidiscrete
@@ -2222,7 +2507,8 @@ def adaptive(
 
     NOTE on what adaptivity does and does not buy: on the benchmarks measured here a *well-chosen fixed*
     dt matches or beats it at equal work, because the optimal step size is nearly constant and the error
-    estimate costs 3x. Reach for ``adaptive`` when you **cannot** pick dt in advance — unknown or
+    estimate costs extra (3x with step doubling; with an embedded pair, only the rejected attempts).
+    Reach for ``adaptive`` when you **cannot** pick dt in advance — unknown or
     parameter-dependent stiffness, sweeps, inverse problems whose fitted parameter moves the timescale —
     not as a speed optimization.
 

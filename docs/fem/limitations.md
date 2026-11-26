@@ -161,6 +161,19 @@ path is unaffected.
     32 → 64 → 128 → 256 steps fell from 1.81, 1.89, 1.94 to 1.77, 1.83, 1.82, with 19 % more interior error
     at 256 steps. Use the default `ros34pw2` when a time-varying wall value must hold exactly.
 
+??? measured "Output between steps keeps the scheme's order"
+    A `save_ts` time between two steps (always the case for an adaptive march, which picks its own steps)
+    is the degree-`p` Lagrange interpolant of the neighbouring states, `p` the scheme's order: 1 for
+    `theta(1.0)`, 2 for `theta(0.5)`, `bdf2()`, `exponential()`, 3 for `sdirk(3)` and `ros34pw2`
+    (Hairer, Nørsett & Wanner, *Solving ODEs I*, Sec. II.6). A linear blend would add an `O(dt²)` error
+    between steps, far above a third-order step's own. Measured on 2-D heat with two decay modes, against a
+    fine SDIRK3 reference whose grid contains every save time (`tests/test_fem_dense_output.py`): the worst
+    error over 81 save times is 1.1 to 2.2 times the error at the last step for `sdirk(3)`, `ros34pw2` and
+    `theta(0.5)` with `.adaptive(rtol=1e-4 … 1e-6)`; the linear blend gave 250 times (`sdirk(3)`,
+    `rtol=1e-6`). An eager march that keeps only the states its frames read (`_needed_steps`) keeps every
+    state of each frame's window, chunked or not, and samples exactly as the traced march; only a march
+    resumed from a checkpoint reads one-sided windows right after its resume point.
+
 ??? note "Plasticity — what runs today"
     Deformation theory (monotonic / proportional) and the path-dependent flow-theory **`tau=`
     load-path march** both run. The march assembles on the real, steady native-Lagrange path,

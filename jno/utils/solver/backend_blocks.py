@@ -48,6 +48,56 @@ def _algebraic_rows(M, n, dtype):
     return mass == 0
 
 
+def _index2_rows(M, A, n, dtype):
+    """``True`` on the rows with zero mass AND a zero diagonal in the operator ``A``: algebraic rows that do
+    not determine their own unknown, as the incompressibility row of a saddle problem (the pressure is an
+    index-2 variable). A Dirichlet row or a pressure pin has zero mass but fixes its own unknown, so it is
+    not one."""
+    import jax.numpy as jnp
+
+    if hasattr(A, "todense"):  # BCOO: duplicates are summed
+        i, j = A.indices[:, 0], A.indices[:, 1]
+        diag = jnp.zeros((n,), dtype).at[i].add(jnp.where(i == j, jnp.abs(A.data), 0).astype(dtype))
+    else:
+        diag = jnp.abs(jnp.diagonal(jnp.asarray(A))).astype(dtype)
+    return _algebraic_rows(M, n, dtype) & (diag == 0)
+
+
+def _block_index2_rows(block, args=None, state=None):
+    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
+    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+    import jax.numpy as jnp
+
+    args = {} if args is None else args
+    if getattr(block, "mass_fn", None) is not None:
+        M = block.mass_fn(block.t0, args)
+    elif getattr(block, "M", None) is not None:
+        M = block.M
+    elif getattr(block, "mass", None) is not None:  # a nonlinear block carries its mass as a callable
+        M = block.mass(block.t0, args)
+    else:
+        return None
+    if M is None or not hasattr(M, "shape") or len(M.shape) != 2:
+        return None
+    n = M.shape[0]
+    # the runtime operator when the arguments are at hand; else the assembled one (same sparsity and zero
+    # pattern -- the static placeholder of a parametric block)
+    if getattr(block, "operator_fn", None) is not None and args:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "A", None) is not None:
+        A = block.A
+    elif getattr(block, "operator_fn", None) is not None:
+        A = block.operator_fn(block.t0, args)
+    elif getattr(block, "jacobian", None) is not None:
+        u = state if state is not None else block.state0
+        if u is None:
+            return None
+        A = block.jacobian(jnp.asarray(u).reshape(-1), block.t0, args)
+    else:
+        return None
+    return _index2_rows(M, A, n, jnp.zeros((), M.dtype).real.dtype)
+
+
 def _row_scaled(A, w):
     """``diag(w) · A`` for a BCOO or dense ``A``."""
     import jax.numpy as jnp
@@ -87,10 +137,43 @@ def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
     import jax
     import jax.numpy as jnp
 
+    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
+
+    # The solve is linear in ``rhs``, so its derivative is another solve -- with the TRANSPOSED operator for
+    # reverse mode. Both go through `_krylov_step_solve` behind a guard that returns 0 for a zero right-hand
+    # side: JAX's BiCGStab divides 0/0 there (``omega``) and returns NaN, and a zero cotangent is exactly what
+    # a state the march discards (a rejected adaptive step) sends back. Measured before the guard: a rejected
+    # step turned a finite gradient (FD -16.52) into NaN. A zero system has the zero solution; nothing else
+    # changes (the guard is one norm, and the transpose has the same diagonal for the Jacobi scaling).
+    #
+    # The result of either side goes through the residual gate: a step solve that did not converge (a NaN
+    # from a BiCGStab breakdown the GMRES rescue could not repair, or a stalled residual) is recorded and
+    # raised at the end of the enclosing solve, instead of marching a NaN or a wrong state on in silence.
+    from .solver_api import residual_gate
+
+    def guarded(warm, side):
+        def solve(op, b):
+            x = jax.lax.cond(
+                jnp.any(b != 0), lambda: _krylov_step_solve(op, b, warm, inv, krylov), lambda: jnp.zeros_like(b)
+            )
+            return residual_gate(op, b, x, _STEP_SOLVE_NAME, side=side)
+
+        return solve
+
+    return jax.lax.custom_linear_solve(step_op, rhs, guarded(x0, "forward"), transpose_solve=guarded(None, "adjoint"))
+
+
+_STEP_SOLVE_NAME = "the default time-step solve (Jacobi BiCGStab with a GMRES rescue)"
+
+
+def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
+    """The Krylov solve behind :func:`_default_step_solve` (``inv`` is the Jacobi scaling)."""
+    import jax
+    import jax.numpy as jnp
+
     from .krylov import gmres as _scaled_gmres  # scale-invariant: JAX's Arnoldi zeroes a tiny ||b||
 
     n = rhs.shape[0]
-    inv = 1.0 / jnp.where(jnp.abs(diag) > 1e-30, diag, 1.0)
     # ``metadata["krylov"]`` lets an assembly pick the Krylov method its operator needs. BiCGStab is
     # the default and is right for the symmetric real blocks; the complex real-equivalent block
     # ``[[A_r,-A_i],[A_i,A_r]]`` is genuinely non-symmetric and asks for GMRES, which does not break
@@ -352,7 +435,10 @@ class SemidiscreteTimeBlock:
             self.mass_residual is not None and self.residual is not None
         )
 
-    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None):
+    def step(
+        self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False, tangent=None,
+        guess=None,
+    ):  # fmt: skip
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -389,11 +475,16 @@ class SemidiscreteTimeBlock:
         whose element integrand is long (a stabilised flow: 220 of ~300 ms per Newton iteration). The data
         rides the step-merge plan's fixed pattern (``step_merge_plan``); a path that has no such tangent (a
         user ``nonlinear=`` slot, a matrix-free residual, a linear block) hands ``tangent`` back unchanged.
-        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step."""
+        Without ``tangent`` the default Newton still keeps its tangent WITHIN the step.
+
+        ``guess`` is the initial iterate of the step's solve (the Krylov warm start of a linear step, Newton's
+        start of a nonlinear one); ``None`` starts from ``u``. It changes how fast the solve converges, not
+        what it converges to: a multistep scheme hands its predictor, which is ``O(dt^(k+1))`` from the answer
+        where ``u`` is ``O(dt)``."""
         box = {}
         out = self._step(
             u, t, dt, args, theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve, report=report,
-            tangent=tangent, _box=box,
+            tangent=tangent, _box=box, guess=guess,
         )  # fmt: skip
         if tangent is None:
             return out
@@ -455,13 +546,14 @@ class SemidiscreteTimeBlock:
         return wn
 
     def _step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None, report=False,
-              tangent=None, _box=None):  # fmt: skip
+              tangent=None, _box=None, guess=None):  # fmt: skip
         """The body of :meth:`step`; see there."""
         import jax.numpy as jnp
 
         args = args or {}
         u = jnp.asarray(u).reshape(-1)
         dtype = u.dtype
+        x0 = u if guess is None else jnp.asarray(guess, dtype).reshape(-1)  # the solve's initial iterate
         t_next = t + dt
 
         # A `jno.derived(..., every="step")` field is evaluated ONCE per step, from the state this step
@@ -533,9 +625,9 @@ class SemidiscreteTimeBlock:
                                 plan=_merge_plan,
                             )
 
-                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        wn = self._slot_newton(nonlinear_solve, G, x0, jac_step, tangent, _merge_plan, dtype, _box)
                         return _verdict(G, u, wn, report, _box.get("norms"))
-                    return _verdict(G, u, nonlinear_solve(G, u), report)
+                    return _verdict(G, u, nonlinear_solve(G, x0), report)
                 # default Newton: on the assembled step tangent when both Jacobians exist
                 if self.jacobian is not None and self.mass_residual_jac is not None:
                     from .solver_api import _add_step_operator
@@ -548,9 +640,9 @@ class SemidiscreteTimeBlock:
                             plan=_merge_plan,
                         )
 
-                    wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                    wn = self._default_newton(G, x0, jac_default, tangent, _merge_plan, dtype, _box)
                     return _verdict(G, u, wn, report, _box.get("norms"))
-                return _verdict(G, u, newton_krylov(G, u), report)
+                return _verdict(G, u, newton_krylov(G, x0), report)
 
             M_t = _operand(self.mass(t_next, args))
             # θ per row: the zero-mass (constraint) rows are imposed at t+dt; see `_theta_row_weights`.
@@ -580,9 +672,9 @@ class SemidiscreteTimeBlock:
 
                     # theta on the rows with mass; a zero-mass row (a prescribed one: outside every subdomain) takes 1
                     with step_form(1.0 / dt, thn, t_next):
-                        wn = self._slot_newton(nonlinear_solve, G, u, jac_step, tangent, _merge_plan, dtype, _box)
+                        wn = self._slot_newton(nonlinear_solve, G, x0, jac_step, tangent, _merge_plan, dtype, _box)
                     return _verdict(G, u, wn, report, _box.get("norms"))
-                return _verdict(G, u, nonlinear_solve(G, u), report)
+                return _verdict(G, u, nonlinear_solve(G, x0), report)
             # default Newton: on the assembled step tangent M/dt + J when the assembler provides J
             if self.jacobian is not None:
                 from .solver_api import _add_step_operator
@@ -591,9 +683,9 @@ class SemidiscreteTimeBlock:
                     J = self.jacobian(wn, t_next, args)
                     return _add_step_operator(J if w is None else _row_scaled(J, w), M_t, 1.0 / dt, plan=_merge_plan)
 
-                wn = self._default_newton(G, u, jac_default, tangent, _merge_plan, dtype, _box)
+                wn = self._default_newton(G, x0, jac_default, tangent, _merge_plan, dtype, _box)
                 return _verdict(G, u, wn, report, _box.get("norms"))
-            return _verdict(G, u, newton_krylov(G, u), report)
+            return _verdict(G, u, newton_krylov(G, x0), report)
 
         from .linear import matrix_diagonal, sparse_matvec
 
@@ -652,11 +744,11 @@ class SemidiscreteTimeBlock:
                         if jnp.ndim(a_scale) == 0
                         else _add_step_operator(M, _row_scaled(A, w), dt)
                     )
-                return linear_solve(step_op, rhs, u, _diag, scale=th * dt, **kw)
-            return linear_solve(step_op, rhs, u, _diag)
+                return linear_solve(step_op, rhs, x0, _diag, scale=th * dt, **kw)
+            return linear_solve(step_op, rhs, x0, _diag)
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + a_scale * matrix_diagonal(A)
-        return _default_step_solve(step_op, rhs, u, d, krylov=(self.metadata or {}).get("krylov"))
+        return _default_step_solve(step_op, rhs, x0, d, krylov=(self.metadata or {}).get("krylov"))
 
     def solve(self, solve_fn=None, *, save_ts=None, values=None, checkpoint=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
@@ -804,6 +896,65 @@ def _block_time_grid(block):
     return jnp.linspace(t0, t1, n_steps + 1)
 
 
+def window_block(block, span=None, state0=None, who="solve", substeps=None):
+    """``block`` marched over ``span = (t0, t1)`` from ``state0`` instead of its own window and initial state.
+
+    The step stays the block's own ``dt``, and the window must hold a whole number of them: the step solvers
+    composed for the block bake ``dt`` in, and two windows that tile the block's window then take exactly the
+    steps one march takes. ``state0`` replaces the initial
+    condition; a window that starts after the block's own start needs it, as nothing else says what the state
+    is there. The copy keeps the compiled time-scheme pieces the block holds (keyed on what they bake in) but
+    not its traced marches, which are keyed on the identity of the block's fields.
+
+    ``substeps`` divides the step (an explicit march whose stable step a coupling decided for this window; no
+    composed step solver bakes it in).
+
+    Returns ``block`` itself when none is given."""
+    import copy
+
+    import jax.numpy as jnp
+
+    if span is None and state0 is None and substeps is None:
+        return block
+    b0, b1, dt = float(block.t0), float(block.t1), float(block.dt)
+    if substeps is not None:
+        dt = dt / int(substeps)
+    t0, t1 = (b0, b1) if span is None else (float(span[0]), float(span[1]))
+    if not t1 > t0:
+        raise ValueError(f"{who}(span=({t0}, {t1})): a window ends after it starts.")
+    if state0 is None and abs(t0 - b0) > 1e-12 * max(1.0, abs(b0), abs(b1)):
+        raise ValueError(
+            f"{who}(span=({t0}, {t1})): the window starts after the initial time {b0}, so the state there is "
+            "unknown; pass it as x0= (the last frame of the window before, say)."
+        )
+    n = round((t1 - t0) / dt)
+    if n < 1 or abs(n * dt - (t1 - t0)) > 1e-9 * max(dt, abs(t1 - t0)):
+        raise ValueError(
+            f"{who}(span=({t0}, {t1})): the window is {(t1 - t0) / dt:.6g} steps of the problem's dt = {dt:g}; "
+            "it must be a whole number of them (set the step with domain.time)."
+        )
+    import collections
+
+    # the caches live on the ORIGINAL block, created before the copy, so every window shares them (a copy made
+    # first would start its own, and the next window, copied from the original, would miss)
+    block.__dict__.setdefault("_march_cache", collections.OrderedDict())
+    block.__dict__.setdefault("_device_consts", {})
+    block.__dict__.setdefault("_erk_compiled", {})
+    out = copy.copy(block)  # shares the compiled marches: they take the state as an input (`_block_fingerprint`)
+    out.t0, out.t1 = t0, t1
+    if substeps is not None:
+        out.dt = dt
+    if state0 is not None:
+        s0 = jnp.asarray(state0).reshape(-1)
+        n0 = int(jnp.asarray(block.state0).size)
+        if int(s0.size) != n0:
+            raise ValueError(f"{who}(x0=...): the state has {int(s0.size)} entries; this march needs {n0}.")
+        out.state0 = s0.astype(jnp.asarray(block.state0).dtype)
+        if getattr(out, "state0_fn", None) is not None:
+            out.state0_fn = None  # a parametric initial state is replaced too
+    return out
+
+
 def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, theta=None):
     """March in chunks of ``cadence`` steps, re-composing the per-step solvers between them.
 
@@ -854,11 +1005,17 @@ def _refreshing_transient_integrate(block, args, save_ts, *, cadence, compose, t
     return _np.concatenate(out, axis=0) if all(isinstance(o, _np.ndarray) for o in out) else jnp.concatenate(out, axis=0)
 
 
+def _theta_degree(theta):
+    """Order of the theta-step (``None`` = backward Euler): 2 at theta = 1/2 (Crank-Nicolson), else 1. The
+    interpolation degree of its off-grid output."""
+    return 2 if theta is not None and abs(float(theta) - 0.5) < 1e-12 else 1
+
+
 def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None, theta=None):
     """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
     advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by
-    linear interpolation, so the integration step is always the assembled ``dt`` and never an
-    accident of how the output is sampled.
+    interpolation of the step's order (linear for backward Euler, quadratic for Crank-Nicolson), so the
+    integration step is always the assembled ``dt`` and never an accident of how the output is sampled.
 
     * **Linear** block -- the implicit scheme the transient assembly is built for::
 
@@ -984,6 +1141,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
             prefix_states=[s0],
             judge=_verdict if _judge else None,
             skip_first_compare=True,  # the one-scan guard compared the produced states, not s0
+            degree=_theta_degree(theta),
         )
 
     # ``jax.checkpoint`` on the scan body: reverse-mode otherwise saves every step's *internal*
@@ -1013,7 +1171,7 @@ def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, non
         )
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
-    return _resample_trajectory(traj, grid_ts, save_ts, dtype)
+    return _resample_trajectory(traj, grid_ts, save_ts, dtype, _theta_degree(theta))
 
 
 _PER_STEP_CALLABLES = ("forcing_vector_fn", "operator_fn", "mass_fn", "mass")
@@ -1161,17 +1319,22 @@ def _trace_time_settings():
 
 
 def _block_fingerprint(block):
-    """Identity of every public field (dict fields one level deep). Private attributes are excluded:
-    the evaluation bookkeeping (``_n_evaluations``, ``_last_evaluation``) changes on every call."""
+    """Identity of every public field (dict fields one level deep); a plain scalar (a time, a step) by its value.
+    Private attributes are excluded: the evaluation bookkeeping (``_n_evaluations``, ``_last_evaluation``) changes
+    on every call. So is ``state0``: every march takes the initial state as an INPUT, never as a constant, so the
+    windows of a coupled march (``window_block``: the same block from another state) share one compiled march
+    (measured: a fresh trace per window, 0.5 s each, was 90 % of a two-problem contact coupling)."""
     import dataclasses
 
     fields = {f.name for f in dataclasses.fields(block)} if dataclasses.is_dataclass(block) else set()
     out = []
     for k, v in sorted(vars(block).items()):
-        if k.startswith("_") and k not in fields:
+        if (k.startswith("_") and k not in fields) or k == "state0":
             continue
         if isinstance(v, dict):
             out.append((k, tuple(sorted((str(kk), id(vv)) for kk, vv in v.items()))))
+        elif v is None or isinstance(v, (bool, int, float, str)):
+            out.append((k, ("value", v)))
         else:
             out.append((k, id(v)))
     return tuple(out)
@@ -1381,12 +1544,53 @@ def _march_eagerly(args, save_ts):
     return not any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((args, save_ts)))
 
 
-def _needed_steps(grid_np, save):
+def _lagrange_weights(tn, x):
+    """Lagrange basis weights ``w[:, j] = prod_{k != j} (x - t_k)/(t_j - t_k)`` of the nodes ``tn`` (S, q+1) at
+    ``x`` (S,); a zero node gap (never produced by the callers) gives weight factor 1 instead of 0/0. Works on
+    NumPy or JAX arrays (the operations are shared)."""
+    q1 = tn.shape[1]
+    cols = []
+    for j in range(q1):
+        wj = 1.0
+        for k in range(q1):
+            if k != j:
+                gap = tn[:, j] - tn[:, k]
+                safe = gap + (gap == 0)  # 1 where the gap is 0
+                wj = wj * (x - tn[:, k]) / safe
+        cols.append(wj * (x == x))  # broadcast a scalar 1.0 to (S,)
+    return cols
+
+
+def _lagrange_window(nodes, x, degree, xp):
+    """Indices ``(S, q+1)`` of the ``q + 1`` nodes around each of ``x`` and their Lagrange weights, for the
+    strictly increasing ``nodes`` (static length ``m``) and ``q = min(degree, m - 1)``. The window is centred
+    on the bracketing interval and shifted inside ``[0, m)`` at the ends; ``x`` is clamped to the node range
+    (the end state holds beyond it). ``xp`` is ``numpy`` or ``jax.numpy``."""
+    m = int(nodes.shape[0])
+    q = max(0, min(int(degree), m - 1))
+    x = xp.clip(x, nodes[0], nodes[-1])
+    left = xp.clip(xp.searchsorted(nodes, x, side="right") - 1, 0, max(m - 2, 0))
+    start = xp.clip(left - (q - 1) // 2, 0, m - 1 - q)
+    idx = start[:, None] + xp.arange(q + 1)[None, :]
+    return idx, _lagrange_weights(nodes[idx], x)
+
+
+def _sample_on_grid(traj, grid, save, degree, xp):
+    """``traj`` (rows at the strictly increasing ``grid``) at ``save`` by the degree-``degree`` interpolant."""
+    idx, w = _lagrange_window(grid, save, degree, xp)
+    out = 0.0
+    for j, wj in enumerate(w):
+        out = out + wj[:, None] * traj[idx[:, j]]
+    return out
+
+
+def _needed_steps(grid_np, save, degree=1):
     """The steps of a march over ``grid_np`` whose states the frames at ``save`` read.
 
     Index 0 is the march's start state, ``j >= 1`` the state after step ``j``. A save time on a grid point
-    reads that point; one between two reads both (the blend of :func:`_resample_trajectory`); one past the
-    end reads the last state. Save times at or before ``grid_np[0]`` belong to whatever came before."""
+    reads that point; one between two reads the ``degree + 1`` points of its interpolation window (the two
+    bracketing ones for ``degree = 1``; :func:`_resample_trajectory`); one past the end reads the last state.
+    Save times at or before ``grid_np[0]`` belong to whatever came before."""
     import numpy as np
 
     n = int(grid_np.size) - 1
@@ -1396,6 +1600,10 @@ def _needed_steps(grid_np, save):
     on_grid = grid_np[lo] == s
     past_end = s >= grid_np[n]
     need = np.concatenate([lo[on_grid & ~past_end], hi[~on_grid | past_end], lo[~on_grid & ~past_end]])
+    off = s[~on_grid & ~past_end]
+    if int(degree) > 1 and off.size:  # every node of the interpolation window of an off-grid frame
+        idx, _w = _lagrange_window(np.asarray(grid_np, dtype=float), off, degree, np)
+        need = np.concatenate([need, idx.reshape(-1)])
     return unique_values(need[need >= 1])
 
 
@@ -1433,6 +1641,7 @@ def _march_to_host(
     judge=None,
     skip_first_compare=False,
     cache=True,
+    degree=1,
 ):
     """Run a march and return its frames at ``save_ts`` as a HOST array; the device keeps no past steps.
 
@@ -1457,7 +1666,13 @@ def _march_to_host(
     one-scan guard compared).
 
     ``cache=False`` compiles the chunk afresh for this call instead of through :func:`_cached_march`, for a
-    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's)."""
+    ``make_step`` that closes over values derived from ``args`` (the cache would replay the first call's).
+
+    ``degree`` is the interpolation degree of off-grid frames (the scheme's order; see
+    :func:`_resample_trajectory`). Each frame is made in the chunk holding the last state its window reads,
+    with the ``degree`` states before that chunk kept on the device, so a chunked march samples exactly as
+    the one-scan path. Only a march resumed from a checkpoint reads one-sided windows just after its resume
+    point (the states before it are not stored)."""
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1465,7 +1680,22 @@ def _march_to_host(
     save = np.asarray(save_ts, dtype=float).reshape(-1)
     n = int(grid_np.size) - 1
     n_dofs = int(jnp.shape(state_of(carry0))[-1])
-    needed = _needed_steps(grid_np, save)
+    # Prefix states before grid_np[0] (BDF2's start-up state) join the window of the first frames, so the
+    # needed steps are found on the prefix + grid axis and shifted back to grid indices.
+    pre_ts = np.asarray(prefix_ts, dtype=float)[:-1]
+    npre = int(pre_ts.size)
+    needed = _needed_steps(np.concatenate([pre_ts, grid_np]) if npre else grid_np, save, degree) - npre
+    needed = needed[needed >= 1]
+    depth = int(degree) if int(degree) > 1 else 0  # states kept from before a chunk for its first windows
+    # Every frame is made in the chunk holding the LAST step its window reads (`owner`, a grid step index;
+    # <= 0 for a frame read from the prefix alone), so a window never misses a later state; the `depth`
+    # states kept from before the chunk cover its earlier ones. Degree 1: the step closing its interval.
+    ext = np.concatenate([pre_ts, grid_np]) if npre else grid_np
+    xs = np.clip(save, ext[0], ext[-1])
+    pos = np.searchsorted(ext, xs)
+    on = (pos < ext.size) & (ext[np.minimum(pos, ext.size - 1)] == xs)
+    win, _w = _lagrange_window(ext, xs, degree, np)
+    owner = np.where(on, pos, win.max(axis=1)) - npre
     # The device's budget in states (`_offload_chunk`: all of them where the device is the host memory).
     chunks, n_slots = _frame_chunks(n, needed, _offload_chunk(n, n_dofs, dtype))
     judged = judge is not None
@@ -1499,15 +1729,18 @@ def _march_to_host(
         fr.copy_to_host_async()
         landed.append((rows, (fr,), None))
 
-    def _ship_states(rows, prev, buf, k, ts_local):
+    def _ship_states(rows, head, buf, k, ts_local):
         """A chunk's frames, made on the HOST from its raw slot buffer: the device keeps no copy of them.
+        ``head`` are the states before the slots (the history kept for the first windows, then the chunk's
+        start state), at the first ``len(head)`` times of ``ts_local``.
 
         Sampling them on the device -- the start state concatenated before the slots, then gathered or
         blended -- held THREE copies of the frames there next to the march's own memory, and a 442k-DOF
         stabilised flow saving 81 frames ran the 8 GB card out of memory landing them."""
-        prev.copy_to_host_async()
+        for h in head:
+            h.copy_to_host_async()
         buf.copy_to_host_async()
-        landed.append((rows, (prev, buf), (k, ts_local)))
+        landed.append((rows, (head, buf), (k, ts_local)))
 
     def _land():
         for rows, arrs, how in landed:
@@ -1515,8 +1748,8 @@ def _march_to_host(
                 out[rows] = np.asarray(arrs[0])
                 continue
             k, ts_local = how
-            states = np.concatenate([np.asarray(arrs[0])[None, :], np.asarray(arrs[1])[:k]], axis=0)
-            out[rows] = _sample_host(states, ts_local, save[rows])
+            states = np.concatenate([np.stack([np.asarray(h) for h in arrs[0]]), np.asarray(arrs[1])[:k]], axis=0)
+            out[rows] = _sample_host(states, ts_local, save[rows], degree)
         landed.clear()
 
     def _sample(states, ts_local, rows):
@@ -1525,7 +1758,7 @@ def _march_to_host(
         hit = np.searchsorted(ts_local, ts)
         if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
             return states[jnp.asarray(hit)]
-        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype)
+        return _resample_trajectory(states, jnp.asarray(ts_local, dtype), ts, dtype, degree)
 
     t_prev = float(grid_np[0])
     res, res_dev, flags = [], None, []
@@ -1542,11 +1775,16 @@ def _march_to_host(
             res = [tuple(ck.resumed[f"res_{i}"] for i in range(int(ck.resumed["n_res"])))]
             flags = [bool(ck.resumed["same"])]
     else:
-        rows = np.flatnonzero(save <= t_prev)
+        rows = np.flatnonzero(owner <= 0)  # read from the prefix states alone
         if rows.size:
             pts = jnp.stack([jnp.asarray(p, dtype) for p in prefix_states])
             _ship(rows, _sample(pts, np.asarray(prefix_ts, dtype=float), rows))
         carry = carry0
+    if start:
+        hist_ts, hist = [], []  # a resumed chunk boundary: the windows before it are one-sided
+    else:
+        hist_ts = list(pre_ts[-depth:]) if depth else []
+        hist = [jnp.asarray(p, dtype) for p in prefix_states[:-1]][-depth:] if depth else []
     prev = state_of(carry) if start else jnp.asarray(prefix_states[-1], dtype)
     run = None if cache else jax.jit(lambda e, g, sl, cm: chunk_march(e, g, sl, cm, args))
     for ci, (a, b) in enumerate(chunks):
@@ -1567,9 +1805,15 @@ def _march_to_host(
         else:
             (carry, buf, same), r = run(ext, g, jnp.asarray(slots), jnp.asarray(compare))
         last = ci == len(chunks) - 1
-        rows = np.flatnonzero((save > t_prev) & ((save <= grid_np[b]) | last))
+        rows = np.flatnonzero((owner > max(a, start)) & ((owner <= b) | last))
+        ts_local = np.concatenate([np.asarray(hist_ts, dtype=float), [t_prev], grid_np[mine]])
         if rows.size:
-            _ship_states(rows, prev, buf, int(mine.size), np.concatenate([[t_prev], grid_np[mine]]))
+            _ship_states(rows, [*hist, prev], buf, int(mine.size), ts_local)
+        if depth:  # the last `depth` states before the next chunk's start, for its first windows
+            head = [*hist, prev]
+            pick = [i for i in range(ts_local.size) if ts_local[i] < grid_np[b]][-depth:]
+            hist_ts = [float(ts_local[i]) for i in pick]
+            hist = [head[i] if i < len(head) else buf[i - len(head)] for i in pick]  # slices only these rows
         if judged:
             for x in (*r, same):
                 x.copy_to_host_async()
@@ -1649,20 +1893,16 @@ def _open_transient_checkpoint(block, args, config, carry0, grid_np, save, n_dof
     return FixedMarchCheckpoint(spec, kind="transient", meta=meta, shape=(save.size, n_dofs), dtype=dtype)
 
 
-def _sample_host(states, ts_local, ts):
+def _sample_host(states, ts_local, ts, degree=1):
     """Rows of ``states`` (a trajectory on the grid times ``ts_local``) at the times ``ts``, on the host:
-    picked where a time is a grid point, else the linear blend of the two bracketing states with
-    :func:`_resample_trajectory`'s clamping."""
+    picked where a time is a grid point, else the degree-``degree`` interpolant of
+    :func:`_resample_trajectory` (same weights, same clamping)."""
     import numpy as np
 
     hit = np.searchsorted(ts_local, ts)
     if ((hit < ts_local.size) & (ts_local[np.minimum(hit, ts_local.size - 1)] == ts)).all():
         return states[hit]
-    hi = np.clip(np.searchsorted(ts_local, ts, side="right"), 1, ts_local.size - 1)
-    lo = hi - 1
-    span = ts_local[hi] - ts_local[lo]
-    w = np.clip(np.where(span > 0, (ts - ts_local[lo]) / np.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
-    return states[lo] * (1.0 - w[:, None]) + states[hi] * w[:, None]
+    return _sample_on_grid(states, np.asarray(ts_local, dtype=float), np.asarray(ts, dtype=float), degree, np)
 
 
 def _stack_residuals(res):
@@ -1672,9 +1912,13 @@ def _stack_residuals(res):
     return tuple(np.concatenate([r[i] for r in res], axis=0) for i in range(len(res[0])))
 
 
-def _resample_trajectory(traj, grid_ts, save_ts, dtype):
+def _resample_trajectory(traj, grid_ts, save_ts, dtype, degree=1):
     """Sample a march's own-grid trajectory at ``save_ts``. Shared by every scheme's ``integrate``,
-    so they cannot drift apart on the fast path or the clamping convention."""
+    so they cannot drift apart on the fast path or the clamping convention.
+
+    A save time between grid points is the degree-``degree`` Lagrange interpolant of the neighbouring
+    states (Hairer, Norsett & Wanner I, Sec. II.6). Each scheme passes its order, so output between its
+    steps keeps that order instead of the linear blend's second (``degree = 1``, backward Euler's choice)."""
     import jax.numpy as jnp
     import numpy as np
 
@@ -1693,10 +1937,6 @@ def _resample_trajectory(traj, grid_ts, save_ts, dtype):
         return traj
 
     # Otherwise interpolate ONCE for all DOFs rather than once per column: locate each save time in
-    # the grid, then blend the two bracketing states. Matches ``jnp.interp``'s clamping outside the
-    # grid (weight clipped to [0, 1] holds the endpoint state).
-    hi = jnp.clip(jnp.searchsorted(grid_ts, save_ts, side="right"), 1, grid_ts.size - 1)
-    lo = hi - 1
-    span = grid_ts[hi] - grid_ts[lo]
-    w = jnp.clip(jnp.where(span > 0, (save_ts - grid_ts[lo]) / jnp.where(span > 0, span, 1.0), 0.0), 0.0, 1.0)
-    return traj[lo] * (1.0 - w[:, None]) + traj[hi] * w[:, None]
+    # the grid and combine the ``degree + 1`` states of its window (degree 1: the two bracketing states).
+    # The end state holds outside the grid, as ``jnp.interp``'s clamping did.
+    return _sample_on_grid(traj, jnp.asarray(grid_ts), save_ts, degree, jnp)

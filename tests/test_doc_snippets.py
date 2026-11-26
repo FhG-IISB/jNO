@@ -114,7 +114,13 @@ def test_the_tie_snippet_in_boundary_conditions_runs_and_is_periodic():
     try:
         import numpy as np
 
-        block = next(b for b in _python_blocks(DOCS / "fem" / "boundary-conditions.md") if "u(xl, yl) - u(xr, yr)" in b)
+        # The tie block is the one that builds `jno.fem([weak_form, <tie>])`; other blocks on the page
+        # (the periodic `sqrtm` DtN example) carry the same tie inside a bigger fragment.
+        block = next(
+            b
+            for b in _python_blocks(DOCS / "fem" / "boundary-conditions.md")
+            if "jno.fem([weak_form, u(xl, yl) - u(xr, yr)])" in b
+        )
         d = jno.shape.rect(0.0, 0.0, 1.0, 1.0).structured(n=24).domain()
         u, phi = d.fem_symbols(order=2)
         xi, yi = d.variable("interior", split=True)[:2]

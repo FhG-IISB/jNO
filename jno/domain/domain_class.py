@@ -194,6 +194,29 @@ def _boundary_shells(facets: np.ndarray) -> np.ndarray:
 _CELL_DIM = {"vertex": 0, "line": 1, "triangle": 2, "quad": 2, "tetra": 3, "hexahedron": 3, "wedge": 3, "pyramid": 3}
 
 
+def _named_point_groups(mesh):
+    """``{name: (k, 3) coordinates}`` of every named group made of 0-D ``vertex`` cells (a gmsh physical
+    point). Read BEFORE `_drop_orphan_nodes`, which removes every vertex block (most are geometry
+    construction points); the named ones become node regions afterwards, see `_register_node_region`.
+    A cell set's indices are block-local, or global gmsh ids when they exceed the block (the rule
+    `_extract_points_from_mesh` uses)."""
+    pts = np.asarray(getattr(mesh, "points", np.zeros((0, 3))))
+    out = {}
+    for name, per_block in (getattr(mesh, "cell_sets", None) or {}).items():
+        if name.startswith("gmsh:") or isinstance(per_block, dict):
+            continue
+        ids = []
+        for b, idx in enumerate(per_block):
+            if idx is None or len(idx) == 0 or b >= len(mesh.cells) or mesh.cells[b].type not in ("vertex", "point"):
+                continue
+            data, idx = np.asarray(mesh.cells[b].data), np.asarray(idx, dtype=np.int64)
+            local = idx - (int(idx.min()) if idx.max() >= len(data) else 0)
+            ids.append(data[local[(local >= 0) & (local < len(data))]].reshape(-1))
+        if ids:
+            out[name] = pts[unique_values(np.concatenate(ids))]
+    return out
+
+
 def _derive_region_cell_sets(mesh, dim: int):
     """Give a loaded mesh the ``interior`` / ``boundary`` tags jNO's own constructors write.
 
@@ -2270,14 +2293,21 @@ class domain(MeshIOMixin):
             xy (array-like): Target coordinates; the nearest mesh vertex is pinned (vertices are shared by
                 P1 and P2 fields, so the pin lands on a node of either).
         """
-        from .boundary_region import BoundaryRegion
-
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before registering a point region.")
         pts = np.asarray(self.mesh.points)[:, : self.dimension]
         target = np.asarray(xy, dtype=float).reshape(-1)[: self.dimension]
         nid = int(((pts - target) ** 2).sum(axis=1).argmin())
-        coord = pts[nid : nid + 1].copy()  # (1, D)
+        return self._register_node_region(name, pts[nid : nid + 1].copy())
+
+    def _register_node_region(self, name: str, coord) -> "domain":
+        """Register the mesh nodes at ``coord`` (``(k, D)``, exact node coordinates) as the boundary
+        region ``name``: what `point_region` does for one node, and what a named gmsh physical point
+        of a loaded file becomes."""
+        from .boundary_region import BoundaryRegion
+
+        pts = np.asarray(self.mesh.points)[:, : self.dimension]
+        coord = np.asarray(coord, dtype=float)[:, : self.dimension]
         bbox = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         tol = 1e-6 * bbox if bbox > 0 else 1e-7
         # Time-dependent domains store pools as (n_time, n_pts, D); broadcast the pin node
@@ -2786,7 +2816,13 @@ class domain(MeshIOMixin):
                         "(and a `default` subtracted twice). A group that spans other groups cannot be "
                         "mixed with them in one call -- pass the parts, or pass the span, not both."
                     )
-        expr = _masked_sum(values, RegionMask, default, what="attach", key="region")
+
+        def _mask(region, _dom=self):  # the mask remembers its domain, so it can be read at any point
+            m = RegionMask(region)
+            m._domain = _dom
+            return m
+
+        expr = _masked_sum(values, _mask, default, what="attach", key="region")
         # NB: get_logger's first positional is a log *directory* -- get_logger(__name__) literally
         # creates a folder named `jno.domain.domain_class/` in the caller's cwd.
         get_logger().debug(f"attach: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}")
@@ -3564,6 +3600,8 @@ class domain(MeshIOMixin):
 
         node = getattr(shape, "_node", None)
         prim = node[1] if (isinstance(node, tuple) and node and node[0] == "leaf") else None
+        if prim is None and isinstance(node, tuple) and node and node[0] in ("regions", "cut", "fuse", "inter"):
+            return self._rectilinear_setup(shape)
         if not isinstance(prim, (Rect, Box)):
             _what = (
                 f"a {type(prim).__name__.lower()}"
@@ -3654,6 +3692,52 @@ class domain(MeshIOMixin):
 
         return constructor, grid_meta
 
+    def _rectilinear_setup(self, shape):
+        """A :meth:`jno.shape.structured` plan of several axis-aligned rects/boxes: a rectilinear lattice
+        (:mod:`jno.domain.lattice`). Every primitive face is a grid plane and each slab between two planes
+        is spaced at the finest region size it crosses, so interfaces are exact and opposite faces match.
+        Returns ``(constructor, None)``: the spacing is not uniform, so there is no ``domain.grid`` for the
+        finite-difference stencils (``jno.fdm`` assembles on the mesh instead)."""
+        from . import lattice
+
+        if int(getattr(shape, "_mesh_order", 1)) > 1:
+            raise NotImplementedError(
+                "shape.structured().curved() is not supported: a lattice of straight boxes has nothing to curve. "
+                "Raise the basis order instead (order=2 on the field)."
+            )
+        if getattr(shape, "_structured", ()):
+            raise ValueError(
+                f"shape.structured(n={shape._structured!r}) on a plan of several boxes: cell counts cannot say which "
+                "slab between two box faces gets how many cells. Set the spacing with each region's size= "
+                "(`.size(h)` / `.sized(h)`) and call .structured() without n."
+            )
+        lattice.check_plan(shape)
+        cells = shape.cell_choices()
+        if len(cells) > 1:
+            raise NotImplementedError(
+                f"shape.structured(): this plan asks for more than one cell type ({', '.join(sorted(cells))})."
+            )
+        tensor = "quad" in cells
+        if shape._node[0] == "regions" or getattr(shape, "_region_name", None) is not None:
+            items = tuple(shape._region_items())
+        else:
+            items = ((None, shape),)
+        default_h = 0.1
+        if not any(s is not None for _p, s, _k in shape.leaves()):
+            self.log.info(f"shape.structured(): no size= anywhere in the plan; defaulting to spacing h={default_h}.")
+        axes, _owner = lattice.lattice_axes(shape, items, default_h, getattr(shape, "_grading", None))
+        cell = ("hex" if tensor else "tetra") if int(shape.dim) == 3 else ("quad" if tensor else "triangle")
+        self.log.info(
+            "shape.structured(): rectilinear lattice "
+            + " x ".join(str(len(x) - 1) for x in axes)
+            + f" cells ({cell}), spacing {min(np.diff(x).min() for x in axes):.3g}..{max(np.diff(x).max() for x in axes):.3g}"
+        )
+
+        def constructor(geo, _axes=axes, _items=items, _cell=cell):
+            return lattice.lattice_mesh(_axes, _items, _cell)
+
+        return constructor, None
+
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
         import pygmsh
@@ -3742,6 +3826,7 @@ class domain(MeshIOMixin):
             boundary_indices = np.asarray([], dtype=np.int64)
         else:
             _refuse_empty_mesh(mesh, int(self.dimension))
+            named_points = _named_point_groups(mesh)
             if not getattr(self, "_keep_orphan_nodes", False):
                 mesh = self._drop_orphan_nodes(mesh)
             _refuse_mixed_cells(mesh, int(self.dimension))
@@ -3754,6 +3839,17 @@ class domain(MeshIOMixin):
                 self.log.info(f"Derived mesh regions {_added} (not defined by the file)")
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
+            for _name, _xyz in named_points.items():
+                # A physical point is a mesh node only when an element uses it; a named construction
+                # point that no element touches is no node, and says so rather than vanishing.
+                from scipy.spatial import cKDTree
+
+                _p = np.asarray(mesh.points)[:, : self.dimension]
+                _d, _ = cKDTree(_p).query(_xyz[:, : self.dimension])
+                if (_d > 1e-9 * max(1.0, float(np.linalg.norm(np.ptp(_p, axis=0))))).any():
+                    self.log.warning(f"Mesh point group {_name!r} names a point that no element uses; it is not a tag")
+                    continue
+                self._register_node_region(_name, _xyz)
             # Deferred: the pools are a precompute for in-JIT collocation sampling, and building them
             # was 0.45 s of a 4.1 s build at 4.2M nodes (measured) for a dict no caller reads yet.
             # `_simplex_pools` builds them on first access, so the capability costs nothing until used.
@@ -3834,6 +3930,11 @@ class domain(MeshIOMixin):
         want = frozenset(frozenset(p) for p in pairs)
         if want <= getattr(self, "_periodic_meshed", frozenset()):
             return False  # already conforming for these face pairs
+        if getattr(src, "_structured", None) is not None:
+            # A lattice already matches node for node across opposite faces (the same planes, the same
+            # diagonals); a gmsh re-mesh here would silently replace the structured mesh with a free one.
+            self._periodic_meshed = getattr(self, "_periodic_meshed", frozenset()) | want
+            return False
         from ..geometry.emit import build as _emit_build
 
         mesh, _dim, ds = _emit_build(src, periodic=list(pairs))
@@ -4049,17 +4150,18 @@ class domain(MeshIOMixin):
                 tag_edge_blocks: List[np.ndarray] = []
                 tag_tri_blocks: List[np.ndarray] = []
                 tag_quad_blocks: List[np.ndarray] = []  # a hexahedron's boundary face
-                # A tag backed by volume cells (block 0 = the spatial-fill element for this
-                # dimension) is a region/interior, never a boundary — so it must not pick up PCA
-                # "boundary" normals (that would mislabel an interior sub-region as a boundary tag).
-                # Boundary tags live in the facet block (block 1); point clouds (block 0 = vertex)
-                # are not volume-filling, so they still get PCA normals.
+                # A tag backed by volume cells (the spatial-fill element for this dimension) is a
+                # region/interior, never a boundary — so it must not pick up PCA "boundary" normals
+                # (that would mislabel an interior sub-region as a boundary tag). The test is on the
+                # TYPE of each block the tag selects, not on its position: gmsh writes the facet
+                # blocks before the volume blocks, so a material that does not touch the outer
+                # boundary was registered as a boundary when only block 0 was checked. Point clouds
+                # (vertex blocks) are not volume-filling, so they still get PCA normals.
                 # A dimension has more than one space-filling cell: 2-D is a triangle OR a quad,
                 # 3-D a tet OR a hexahedron. Testing against a single simplex name made every cell
                 # of a tensor-product mesh look like a facet, so its volume region was never
                 # recognised as one.
                 _vol_elems = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedron")}.get(self.dimension, ())
-                block0_is_volume = bool(mesh.cells) and _base_cell_type(mesh.cells[0].type) in _vol_elems
                 has_volume_cells = False
 
                 if isinstance(cell_data, dict):
@@ -4075,7 +4177,7 @@ class domain(MeshIOMixin):
                                     if len(sel):  # vertex data contains the point index
                                         tag_point_blocks.append(sel.reshape(len(sel), -1)[:, 0])
                         else:
-                            if block0_is_volume and _base_cell_type(cell_type) in _vol_elems and len(indices) > 0:
+                            if _base_cell_type(cell_type) in _vol_elems:
                                 has_volume_cells = True
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
@@ -4105,7 +4207,7 @@ class domain(MeshIOMixin):
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None or len(indices) == 0:
                             continue
-                        if block_idx == 0 and block0_is_volume:
+                        if block_idx < len(mesh.cells) and _base_cell_type(mesh.cells[block_idx].type) in _vol_elems:
                             has_volume_cells = True
                         if block_idx < len(mesh.cells):
                             cell_block = mesh.cells[block_idx]
@@ -4216,8 +4318,9 @@ class domain(MeshIOMixin):
                         # carried no entities and `contains` degraded to a point-distance test.
                         is_boundary_tag = True
                         entity_kind = "quad"
-                    elif name in self.normals_by_tag:
-                        # fallback: still treat as a boundary-like tag if normals exist
+                    elif name in self.normals_by_tag and not has_volume_cells:
+                        # fallback: still treat as a boundary-like tag if normals exist (never a
+                        # region of volume cells whose nodes happen to all lie on the boundary)
                         is_boundary_tag = True
                         entity_kind = "boundary_points"
 

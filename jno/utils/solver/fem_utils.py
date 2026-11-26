@@ -727,6 +727,53 @@ def _collect_tag_mask_names(node, out=None):
     return out
 
 
+def region_membership_at(domain, region, X):
+    """``(n,)`` bool: which of the points ``X`` (``(n, dim)``) lie in the named region, or ``None`` when the
+    region is a mesh-file volume region (known per CELL only, no point membership).
+
+    The geometric sources of a region, in the order :func:`_cell_region_mask` resolves them: a geometry
+    part (``domain._source_regions``), a ``domain.tag`` predicate, a ``shape.regions`` sub-region (analytic
+    CSG membership minus every higher-priority region). Used at cell centroids by the FEM assembly and at
+    arbitrary sample points by RCWA's permittivity grid -- one rule, so the two cannot disagree."""
+    X = np.asarray(X)
+    dim = int(domain.dimension)
+    src = getattr(domain, "_source_regions", {}) or {}
+    preds = getattr(domain, "_tag_predicates", {}) or {}
+    shape_regions = getattr(domain, "_shape_regions", {}) or {}
+    if region in src:
+        from shapely import contains_xy
+
+        return np.asarray(contains_xy(src[region], X[:, 0], X[:, 1]), dtype=bool)
+    elif region in preds:
+        return np.asarray(preds[region](*[X[:, i] for i in range(dim)]), dtype=bool)
+    elif region in shape_regions:
+        # A shape.regions sub-region: analytic CSG membership of the point (2-D and 3-D),
+        # MINUS every higher-priority region, because shape.regions lets regions overlap and resolves
+        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
+        # the mesh itself is labelled (`emit._to_meshio`).
+        #
+        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
+        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
+        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
+        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
+        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
+        # a 37% leak that pulled the whole crystal region 780 K cold.
+        names = list(shape_regions)
+        m = np.asarray(shape_regions[region].contains(X), dtype=bool)
+        for earlier in names[: names.index(region)]:
+            try:
+                m &= ~np.asarray(shape_regions[earlier].contains(X), dtype=bool)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
+                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
+                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
+                    f"shape."
+                ) from exc
+        return m
+    return None
+
+
 def _cell_region_mask(domain, region):
     """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
 
@@ -748,79 +795,48 @@ def _cell_region_mask(domain, region):
         pts = np.asarray(mesh.points)[:, :dim]
         cells = np.asarray(mesh.cells_dict["triangle" if dim == 2 else "tetra"])
     centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
-    src = getattr(domain, "_source_regions", {}) or {}
-    preds = getattr(domain, "_tag_predicates", {}) or {}
-    shape_regions = getattr(domain, "_shape_regions", {}) or {}
-    if region in src:
-        from shapely import contains_xy
+    m = region_membership_at(domain, region, centroids)
+    if m is not None:
+        return np.asarray(m, dtype=bool).astype(np.float64)
+    # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
+    # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
+    #
+    # Unlike the geometric sources (`region_membership_at`) this is exact membership, not centroid membership: the mesh
+    # already records which cell belongs to which material, so there is nothing to classify.
+    # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
+    # quadrature points for another disagrees on cells straddling a material boundary.
+    from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
 
-        m = np.asarray(contains_xy(src[region], centroids[:, 0], centroids[:, 1]))
-    elif region in preds:
-        m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
-    elif region in shape_regions:
-        # A shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
-        # MINUS every higher-priority region, because shape.regions lets regions overlap and resolves
-        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
-        # the mesh itself is labelled (`emit._to_meshio`).
-        #
-        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
-        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
-        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
-        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
-        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
-        # a 37% leak that pulled the whole crystal region 780 K cold.
-        names = list(shape_regions)
-        m = np.asarray(shape_regions[region].contains(centroids), dtype=bool)
-        for earlier in names[: names.index(region)]:
-            try:
-                m &= ~np.asarray(shape_regions[earlier].contains(centroids), dtype=bool)
-            except NotImplementedError as exc:
-                raise NotImplementedError(
-                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
-                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
-                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
-                    f"shape."
-                ) from exc
-    else:
-        # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
-        # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
-        #
-        # Unlike every branch above this is exact membership, not centroid membership: the mesh
-        # already records which cell belongs to which material, so there is nothing to classify.
-        # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
-        # quadrature points for another disagrees on cells straddling a material boundary.
-        from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
-
-        membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
-        if region not in membership:
+    membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+    if region not in membership:
+        raise ValueError(
+            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+            f"domain.tag(name, predicate), a shape.regions() sub-region, or a geometry part, "
+            f"or name a volume region of the mesh file. Mesh volume regions here: "
+            f"{sorted(membership)}."
+        )
+    m = membership[region]
+    if a_cells is not None:
+        # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
+        # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
+        # in a different order, and the coefficient would then be permuted per cell rather than
+        # wrong in a way anything notices. Compare the connectivity itself.
+        _want = volume_cell_type(domain.mesh, dim)
+        _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
+        if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
             raise ValueError(
-                f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-                f"domain.tag(name, predicate), a shape.regions() sub-region, or a geometry part, "
-                f"or name a volume region of the mesh file. Mesh volume regions here: "
-                f"{sorted(membership)}."
+                f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
+                f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
+                f"domain mesh it was read from "
+                f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
+                "mesh change so the two agree."
             )
-        m = membership[region]
-        if a_cells is not None:
-            # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
-            # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
-            # in a different order, and the coefficient would then be permuted per cell rather than
-            # wrong in a way anything notices. Compare the connectivity itself.
-            _want = volume_cell_type(domain.mesh, dim)
-            _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
-            if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
-                raise ValueError(
-                    f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
-                    f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
-                    f"domain mesh it was read from "
-                    f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
-                    "mesh change so the two agree."
-                )
-        if not m.any():
-            raise ValueError(
-                f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
-                "mesh, so its coefficient would contribute a silent zero. Check the region name "
-                "against domain.avaiable_mesh_tags."
-            )
+    if not m.any():
+        raise ValueError(
+            f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
+            "mesh, so its coefficient would contribute a silent zero. Check the region name "
+            "against domain.avaiable_mesh_tags."
+        )
     return np.asarray(m, dtype=bool).astype(np.float64)
 
 
@@ -6285,7 +6301,10 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
     transverse position; the tie weight is the Bloch phase times an orientation **sign** (+1 if the two
     edges point the same way along their lo→hi canonical direction, −1 if opposed — the tangential moment
     flips with the edge orientation). Corner edges shared by two periodic faces are tied twice; the chain is
-    resolved to a single retained main DOF. Returns a legacy single-field prolongation dict."""
+    resolved to a single retained main DOF. Returns a legacy single-field prolongation dict whose ``P`` is
+    a sparse signed selection (BCOO, one entry per row)."""
+    from scipy.spatial import cKDTree
+
     mid = np.asarray(edge_midpoints, dtype=np.float64)
     dirs = np.asarray(edge_dirs, dtype=np.float64)
     if phases is None:
@@ -6304,10 +6323,9 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
         mm, sm = mid[me], mid[se]
         axis = int(np.argmax(np.abs(mm.mean(axis=0) - sm.mean(axis=0))))  # periodic axis = largest mean gap
         tr = [d for d in range(mid.shape[1]) if d != axis]
-        mt, st = mm[:, tr], sm[:, tr]
-        d2 = np.sum((st[:, None, :] - mt[None, :, :]) ** 2, axis=-1)
-        nn = np.argmin(d2, axis=1)
-        dist = np.sqrt(d2[np.arange(len(se)), nn])
+        # nearest main edge per secondary edge in the transverse plane: a KD-tree, O(n log n) (a dense
+        # secondary x main distance matrix is O(n_face^2) memory)
+        dist, nn = cKDTree(mm[:, tr]).query(sm[:, tr])
         for k, s in enumerate(se):
             if dist[k] > tol:
                 raise ValueError(
@@ -6319,22 +6337,30 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
             s2m[int(s)], weight[int(s)] = m, sign * complex(ph)
 
     secondarys = set(s2m)
-    kept = np.array([e for e in range(n_edges) if e not in secondarys], dtype=int)
+    is_sec = np.zeros(n_edges, dtype=bool)
+    is_sec[list(secondarys)] = True
+    kept = np.flatnonzero(~is_sec)
     col = {int(e): j for j, e in enumerate(kept)}
-    P = np.zeros((n_edges, len(kept)), dtype=(np.complex128 if is_bloch else np.float64))
-    for j, e in enumerate(kept):
-        P[e, j] = 1.0
+    # ONE entry per row -- the kept identity, or the chained weight to the kept main -- so P is a sparse
+    # signed selection: the reductions remap A's triplets in O(nnz) with the weight on each (and its
+    # conjugate on the left for P^H A P). A dense P made every reduced operator dense.
+    main = np.empty(n_edges, dtype=np.int64)
+    w_all = np.ones(n_edges, dtype=np.complex128)
+    main[kept] = np.arange(len(kept))
     for s in secondarys:  # resolve a possibly-chained tie (corner edge tied via two faces) to a kept main
         m, w = s2m[s], weight[s]
         while m in s2m:
             w *= weight[m]
             m = s2m[m]
-        P[s, col[m]] = w if is_bloch else w.real  # non-Bloch weight is a real ±1 sign
+        main[s], w_all[s] = col[m], w
+    rows = np.arange(n_edges, dtype=np.int64)
+    data = w_all if is_bloch else w_all.real  # non-Bloch weight is a real ±1 sign
+    P = jsparse.BCOO((jnp.asarray(data), jnp.asarray(np.stack([rows, main], axis=1))), shape=(n_edges, len(kept)))
     return {
-        "P": jnp.asarray(P),
+        "P": P,
         "kept_nodes": kept,
         "vec": 1,
-        "is_selection": False,  # ±1 signs (and complex phases) → not a pure 0/1 selection
+        "is_selection": True,  # one entry per row; the ±1 sign / Bloch phase rides in the remap weight
         "is_bloch": is_bloch,
         "n_full": int(n_edges),
         "n_red": int(len(kept)),

@@ -504,3 +504,22 @@ def test_per_region_n1e_nested_regions_are_exactly_additive():
 
     assert np.max(np.abs(M["both"])) > 0.0, "the union region contributed nothing -- mask is empty"
     np.testing.assert_allclose(M["core"] + M["shell"], M["both"], atol=1e-10)
+
+
+def test_an_integral_of_a_region_attached_coefficient_integrates_by_region():
+    """``fem.eval`` of a test-free integrand that reads an ``.attach``-ed coefficient restricts each
+    region's value to its own cells, as the weak form does. The functional used to reach the
+    per-region integrand with no masks and raise. Oracles: the area-weighted constant, and the same
+    integral of ``k u`` with ``k`` written as a coordinate function (the mesh conforms at x = 0.4)."""
+    R = jno.shape.rect
+    d = (R(0, 0, 0.4, 1).name("a").attach(k=3.0) + R(0, 0, 1, 1).name("b").attach(k=1.0)).sized(0.2).domain()
+    u, v = d.fem_symbols(names=("u", "v"))
+    xi, yi = d.variable("interior", split=True)[:2]
+    ub, vb = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([d.k * (ub.x * vb.x + ub.y * vb.y) - vb, u(*d.variable("boundary", split=True)[:2]) - 0.0])
+    sol = np.asarray(fem.solve()).reshape(-1)
+    assert float(np.asarray(fem.eval(d.k + 0.0 * ub, sol)).reshape(-1)[0]) == pytest.approx(3 * 0.4 + 1 * 0.6, rel=1e-12)
+    k_fn = jno.fn(lambda x, y: jnp.where(x < 0.4, 3.0, 1.0), [xi, yi])
+    by_region = float(np.asarray(fem.eval(d.k * ub, sol)).reshape(-1)[0])
+    assert abs(by_region) > 1e-3
+    assert by_region == pytest.approx(float(np.asarray(fem.eval(k_fn * ub, sol)).reshape(-1)[0]), rel=1e-12)
