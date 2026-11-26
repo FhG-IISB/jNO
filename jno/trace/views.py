@@ -163,6 +163,16 @@ def _with_scheme(view, scheme):
     return view
 
 
+def _derivative_view(view, result):
+    """The plain view of kind ``view`` over a derivative ``result``, carrying the binding (``_coord_vars``,
+    ``_bind_scheme``) of the bound ``view`` it came from. It stays the plain kind -- a derivative of a derivative
+    is spelled with explicit names, not a second attribute -- but a component taken from it
+    (``ua.x[0]``) is bound like the one taken from the field itself (``ua[0]``), and reads the same region."""
+    out = type(view)._base_view(result)
+    object.__setattr__(out, "_coord_vars", dict(object.__getattribute__(view, "_coord_vars")))
+    return _with_scheme(out, getattr(view, "_bind_scheme", None))
+
+
 def _directional(view, components, scheme):
     """``Σ c_i ∂view/∂x_i`` over the spatial coordinates bound to ``view`` (in axis order)."""
     cv = getattr(view, "_coord_vars", None) or {}
@@ -339,7 +349,7 @@ class _SchemeProxy:
         result = view._expr
         for name in seq:
             result = result.d(cv[name], scheme=scheme)
-        return type(view)._base_view(result)
+        return _derivative_view(view, result)
 
 
 def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_factory=None):
@@ -3423,9 +3433,9 @@ def _make_named_with_partials_cls(view_cls):
                 if all(getattr(cv[name], "axis", None) == "temporal" for name in seq):
                     # A time derivative lives where the field is bound, so it keeps the binding (as the scalar
                     # field view's does): unbound, a vector equation `q.bind(...).t + ...` said nowhere where it
-                    # holds, and an algebraic row beside it read as a pin. A spatial partial stays the plain view.
+                    # holds, and an algebraic row beside it read as a pin.
                     return _with_scheme(type(self)(result, cv), getattr(self, "_bind_scheme", None))
-                return type(self)._base_view(result)
+                return _derivative_view(self, result)  # a spatial partial: the plain view, still bound
             return getattr(object.__getattribute__(self, "_expr"), key)
 
         @property

@@ -1542,3 +1542,32 @@ class TestRebind:
         u = (x * y).scalar.bind(x=x)
         with pytest.raises(TypeError, match="requires at least one argument"):
             u.bind()
+
+
+class TestDerivativeKeepsBinding:
+    """A derivative of a bound view, and its components, carry the binding (``_coord_vars``, ``_bind_scheme``)."""
+
+    @staticmethod
+    def _bound_vector():
+        d, x, y = _domain_xy()
+        u = jno.trace.TrialFunction("u", value_shape=(2,))
+        return u.vector.bind(x=x, y=y, scheme=jno.fd(order=4)), x, y
+
+    @staticmethod
+    def _cv(v):
+        return getattr(v, "_coord_vars", None)
+
+    def test_component_of_derivative_matches_derivative_of_component(self):
+        ua, x, y = self._bound_vector()
+        for comp in (ua.x[0], ua.y[1], ua[0].x, ua[1].y):
+            assert self._cv(comp) == {"x": x, "y": y}
+            assert getattr(comp, "_bind_scheme", None) is getattr(ua, "_bind_scheme")
+
+    def test_second_derivative_and_fd_namespace_keep_binding(self):
+        ua, x, y = self._bound_vector()
+        for v in (ua.xy, ua.xy[0], ua.fd.x, ua.fd.x[1], ua[0].xx):
+            assert self._cv(v) == {"x": x, "y": y}
+
+    def test_derivative_stays_the_plain_view(self):
+        ua, x, y = self._bound_vector()
+        assert type(ua.x) is type(ua).__mro__[1]
