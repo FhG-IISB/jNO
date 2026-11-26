@@ -1528,13 +1528,15 @@ def _eval_integrand(domain, node, local):
     if isinstance(node, Variable):
         dim_start, dim_end = node.dim
 
-        # Local quadrature coordinates. One direction (`x` of `variable(..., split=True)`) is a per-point
-        # scalar, ``(n_quad,)``: the slice would keep a phantom ``(n_quad, 1)`` axis, harmless in a weak
-        # term (the test function absorbs it) but rank-broadcasting against a scalar ``state.i(-1)`` slice
-        # in an ``.evolves`` readout -- the same convention a scalar trial follows (see below).
+        # Local quadrature coordinates. One direction (`x` of `variable(..., split=True)`) is ``(n_quad, 1)``
+        # in a weak term: the trailing axis is what lets `x * jnp.array([1., 2.])` and `where(x > a, ...)`
+        # broadcast against value and test-DOF axes (`_prefix_align` leaves equal ranks alone). In a STATE
+        # READOUT (an `.evolves` formula, no test function) it is a per-point scalar ``(n_quad,)``, like a
+        # scalar trial (see below): `(n_quad, 1)` would rank-broadcast against the scalar ``state.i(-1)``
+        # slice to ``(n_quad, n_quad)``.
         def _coords():
             q = local["physical_quad_points"][..., dim_start:dim_end]
-            return q[..., 0] if dim_end - dim_start == 1 else q
+            return q[..., 0] if dim_end - dim_start == 1 and local.get("__state_readout__") else q
 
         if local.get("surface", False):
             if isinstance(node.tag, str) and node.tag.startswith("gauss_"):
