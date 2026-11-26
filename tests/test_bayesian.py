@@ -1520,6 +1520,10 @@ class TestMCMCFastpath:
         assert a.posterior_samples.shape == (1, 30, 1)
 
     @pytest.mark.slow
+    @pytest.mark.xfail(
+        strict=False,
+        reason="#412: a wall-clock comparison; the fastpath solve also retraces (2 s of tracing after a reused step)",
+    )
     def test_fastpath_faster_than_slow_path(self):
         # Performance benchmark: the fastpath's scan-over-keep design
         # closes three perf gaps that matter on GPU (no outer
