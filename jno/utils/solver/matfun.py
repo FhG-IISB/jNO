@@ -97,14 +97,46 @@ def logdet(A, *, samples: int = 32, order: int = 25, key=None):
     return _finite(estimate(mv, _key(key)), "logdet", order, n)
 
 
-def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
+def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None, deflate=None):
     """Differentiable stochastic estimate of ``tr A`` (Hutchinson), or ``tr f(A)`` when ``fun`` is a
     scalar function (via stochastic Lanczos quadrature; ``A`` symmetric). ``fun=jnp.log`` reproduces
-    :func:`logdet`; ``fun=lambda z: 1/z`` gives ``tr(A⁻¹)``."""
+    :func:`logdet`; ``fun=lambda z: 1/z`` gives ``tr(A⁻¹)``.
+
+    ``deflate=Z`` (``(n, m)``, full column rank) splits the trace exactly: with ``Q`` an orthonormal basis of
+    ``span Z`` and ``P = I - Q Q^T``, ``tr A = tr(Q^T A Q) + tr(P A P)`` for any ``A``. The first term is computed
+    exactly (``m`` products), only the second is sampled -- so the variance the dominant directions would
+    contribute is gone when ``Z`` holds them (Gambhir, Stathopoulos & Orginos, SIAM J. Sci. Comput. 39(2), 2017;
+    with ``Z`` a sketch of ``A`` this is Hutch++, Meyer, Musco, Musco & Woodruff, SOSA 2021). Plain trace only:
+    ``f(A)`` does not split this way unless ``span Z`` is invariant, so ``fun=`` with ``deflate=`` raises."""
     _require_matfree()
     from matfree import decomp, funm, stochtrace
 
     mv, n, dtype = _operator(A)
+    exact = 0.0
+    if deflate is not None:
+        if fun is not None:
+            raise ValueError(
+                "jno.solve.trace(fun=..., deflate=...): tr f(A) splits over span Z only when Z is an invariant "
+                "subspace of A, which a deflation space need not be. Use deflate= with the plain trace (fun=None)."
+            )
+        Z = jnp.asarray(deflate, dtype)
+        Z = Z[:, None] if Z.ndim == 1 else Z
+        if Z.ndim != 2 or Z.shape[0] != n:
+            raise ValueError(f"jno.solve.trace(deflate=...): expected an ({n}, m) array, got shape {tuple(Z.shape)}.")
+        Q, Rq = jnp.linalg.qr(Z)
+        d = jnp.abs(jnp.diag(Rq))
+        if not isinstance(d, jax.core.Tracer) and bool(jnp.any(d <= 1e3 * jnp.finfo(d.dtype).eps * jnp.max(d))):
+            raise ValueError("jno.solve.trace(deflate=...): the columns are linearly dependent; give an independent set.")
+        AQ = jax.vmap(mv, in_axes=1, out_axes=1)(Q)
+        exact = jnp.sum(Q.conj() * AQ)
+        full = mv
+
+        def mv(v):  # P A P v
+            def p(w):
+                return w - Q @ (Q.conj().T @ w)
+
+            return p(full(p(v)))
+
     if fun is None:
         integrand = stochtrace.monte_carlo_trace()
     else:
@@ -112,7 +144,7 @@ def trace(A, *, fun=None, samples: int = 32, order: int = 25, key=None):
     estimate = stochtrace.estimator_monte_carlo(
         integrand, sampler=stochtrace.sampler_normal(jnp.zeros(n, dtype), num=samples)
     )
-    return _finite(estimate(mv, _key(key)), "trace", order, n)
+    return _finite(exact + estimate(mv, _key(key)), "trace", order, n)
 
 
 def _dense_funm_eig(fun):

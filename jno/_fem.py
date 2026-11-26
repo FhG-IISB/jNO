@@ -54,6 +54,7 @@ from .trace import (
     mesh_velocity,
     state_updates,
 )
+from .utils.sets import unique_values
 
 __all__ = ["fem", "FEM"]
 
@@ -126,8 +127,8 @@ def _residual_check(A, b, u, who):
     return u
 
 
-@partial(jax.jit, static_argnums=(2, 3))
-def _bicgstab_jacobi(A, b, tol, maxiter):
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def _bicgstab_jacobi(A, b, tol, maxiter, padded=True):
     """The default steady-linear iteration, compiled. Split out of :func:`_solve_linear_matrix_free`
     so the Krylov loop is one XLA program while the convergence check stays eager -- see there."""
     # `sparse_matvec`, not `lambda v: A @ v`: BCOO's matvec re-derives its row/column index arrays on
@@ -136,15 +137,15 @@ def _bicgstab_jacobi(A, b, tol, maxiter):
     from .utils.solver.krylov import bicgstab_counted
     from .utils.solver.linear import jacobi, sparse_matvec
 
-    x, k, broke = bicgstab_counted(sparse_matvec(A), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    x, k, broke = bicgstab_counted(sparse_matvec(A, padded=padded), b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
     return x, k, broke
 
 
-def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side):
+def _counted_bicgstab_jacobi(A, b, tol, maxiter, who, side, padded=True):
     """:func:`_bicgstab_jacobi` with its iteration count recorded for ``fem.stats``; returns ``x``."""
     from .utils.solver.solver_api import record_iterations
 
-    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter)
+    x, k, broke = _bicgstab_jacobi(A, b, tol, maxiter, padded)
     record_iterations(k, who, side=side, broke=broke)
     return x
 
@@ -227,11 +228,11 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
     from .utils.solver import matvec_format
 
     matvec_format.prime(A)  # CSR or COO, measured on THIS operator before it becomes a tracer
-    return _firewalled_bicgstab(A, b, float(tol), int(maxiter))
+    return _firewalled_bicgstab(A, b, float(tol), int(maxiter), matvec_format.has_padding(A))
 
 
-@partial(jax.jit, static_argnums=(2, 3))
-def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def _firewalled_bicgstab(A, b, tol: float, maxiter: int, padded: bool = True):
     """The default solve inside our OWN ``custom_linear_solve``, so its adjoint is ours to check.
 
     Called straight, ``jax.scipy.sparse.linalg.bicgstab`` supplies its own implicit-diff rule, and the
@@ -252,9 +253,9 @@ def _firewalled_bicgstab(A, b, tol: float, maxiter: int):
 
     who = "fem.solve default (Jacobi-preconditioned BiCGStab)"
     AT = A.T
-    mv, mvT = sparse_matvec(A), sparse_matvec(A, transpose=True)  # no re-conversion of A.T
+    mv, mvT = sparse_matvec(A, padded=padded), sparse_matvec(A, transpose=True, padded=padded)  # no re-conversion of A.T
     fwd = lambda _mv, rhs: residual_gate(
-        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward"), who, side="forward"
+        mv, rhs, _counted_bicgstab_jacobi(A, rhs, tol, maxiter, who, "forward", padded), who, side="forward"
     )  # noqa: E501
     rev = lambda _mv, rhs: residual_gate(
         mvT, rhs, _counted_bicgstab_jacobi(AT, rhs, tol, maxiter, who, "transpose"), who, side="transpose"
@@ -1309,7 +1310,7 @@ def _starved_dofs(fem_obj: Any, domain: Any, reach: List[Any], field_keys: List[
                     m = np.asarray(_cell_region_mask(domain, r)).reshape(-1)
                     if m.shape[0] != cells_i.shape[0]:
                         raise LookupError(r)
-                    reached[np.unique(cells_i[m > 0])] = True
+                    reached[unique_values(cells_i[m > 0])] = True
                 else:
                     # a surface term reaches its facet's nodes; `tag_node_mask` IS reliable for a
                     # boundary tag (it is what `FEM.region_dofs` resolves with)
@@ -1380,8 +1381,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
         return _normalize_quad_tag(tag, _bregions)
 
     def _is_across(tag) -> bool:
-        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on
-        return isinstance(tag, str) and tag.startswith("across_")
+        # `u.across(main)` reads ANOTHER face, but it belongs to the face the term is integrated on; a face
+        # operator's symbol `S(trace)` (`faceop_*`) belongs to the face its trace is bound to
+        return isinstance(tag, str) and tag.startswith(("across_", "faceop_"))
 
     def _effective_tag(v) -> str:
         # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
@@ -1544,7 +1546,7 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         if (
             isinstance(v.tag, str)
             and v.tag not in ("fem_gauss", "cell_size", "cell_metric")
-            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_"))
+            and not v.tag.startswith(("gauss_", "n_", "gap_", "slide_", "across_", "faceop_"))
         ):
             # Remember the region before rebinding to the quadrature pool. The retag must persist for
             # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
@@ -1697,6 +1699,39 @@ def _tie_phase(bare: Any) -> Optional[complex]:
     return None
 
 
+def _default_direct(fem_obj):
+    """The ``linear=`` of a runtime-parametric form solved with nothing asked of it, or ``None`` to keep JAX's
+    ``spsolve`` (``FemLinearSystem.solve``'s default): what ``jno.solve.lu()`` resolves to, when that is not spsolve."""
+    from .solve import _preferred_direct_backend, lu
+
+    if fem_obj._mode != "linear" or not isinstance(fem_obj._op, FemLinearSystem):
+        return None
+    periodic = fem_obj._periodic_2n if fem_obj._complex_n is not None else fem_obj._periodic
+    if getattr(fem_obj, "_geometry", None) or periodic is not None:
+        return None
+    return lu(backend="cudss") if _preferred_direct_backend() == "cudss" else None
+
+
+def _default_saddle_step_solve(fem_obj):
+    """``jno.solve.lu()`` for a linear transient whose step operator is a SADDLE (an index-2 row: zero mass and
+    a zero diagonal, the incompressibility row), else ``None`` (the Krylov step default). Jacobi has nothing to
+    scale on those rows and the Schur complement shrinks with dt, so the Krylov default broke down: measured
+    on unsteady Stokes (P2/P1), fine at dt = 1e-3 and NaN at dt = 1e-4 and below. A moving mesh and a periodic
+    reduction keep their own drivers."""
+    if fem_obj._mode != "transient" or not fem_obj.is_linear or getattr(fem_obj, "_geometry", None):
+        return None
+    periodic = fem_obj._periodic_2n if fem_obj._complex_n is not None else fem_obj._periodic
+    if periodic is not None:
+        return None
+    from .utils.solver.solver_api import _is_saddle_block
+
+    if not _is_saddle_block(fem_obj._op):
+        return None
+    from .solve import lu
+
+    return lu()
+
+
 def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None) -> str:
     """One line naming the route a ``solve()`` actually took.
 
@@ -1704,7 +1739,7 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
     elasto-plastic march measured 1194 s on the matrix-free Newton (then the default) and 14.6 s with a
     sparse-direct tangent. A user who cannot see which one ran cannot see that difference either.
     """
-    _DIRECT = {"lu", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
+    _DIRECT = {"lu", "lu-host", "lu-cudss", "lu-pardiso", "dense", "pardiso", "cudss", "sparse_lu", "direct"}
 
     def _nm(spec, default):
         return default if spec is None else (getattr(spec, "name", None) or type(spec).__name__.lower())
@@ -1736,6 +1771,9 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
         else:
             default_inner = "bicgstab (matrix-free)"
         return f"solve: nonlinear · {_nm(nonlinear, _newton)} · inner {_lin(default_inner)}"
+    if isinstance(getattr(fem_obj, "_op", None), FemLinearSystem) and precond is None:
+        # a runtime-parametric form solves on a sparse-direct factorisation unless told otherwise
+        return f"solve: {mode} · {_lin('lu (JAX spsolve)')}"
     return f"solve: {mode} · {_lin()}"
 
 
@@ -2145,7 +2183,9 @@ def _refuse_stale_position(variables, where="a condition's value"):
             )
 
 
-def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False) -> Any:
+def _eval_value_node_at(
+    value_node: Any, points: Any, params: Any = None, t: Any = None, pointwise: bool = False, normals: Any = None
+) -> Any:
     """Evaluate a coordinate value expression at ``points`` (1-D result).
 
     Reuses the existing :class:`~jno.trace_evaluator.TraceEvaluator` (the engine
@@ -2166,10 +2206,22 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
     column, which broadcasts correctly against a scalar or a vector but not against a matrix: ``g(z) * M``
     with ``M`` 3 x 3 fails for most ``n`` -- and for ``n = 3`` silently returns one 3 x 3 that then reads as
     a constant. A matrix-valued condition therefore needs this.
+
+    ``normals`` ``(n_points, gdim)`` is the outward unit normal at ``points``, read by a boundary-normal
+    Variable ``n_<region>`` (``domain.variable(region, normals=True)``) inside the value -- a source
+    ``cross(E_inc, n)`` on a face. Without it such a value raises: the normal is not a function of the
+    point, and handing it the coordinates (what every other tag reads) gives a silently wrong vector.
     """
     from .trace_evaluator import TraceEvaluator
 
     variables = [v for v in _walk(value_node) if isinstance(v, Variable)]
+    normal_tags = {v.tag for v in variables if _is_normal_variable(v)}
+    if normal_tags and normals is None:
+        raise ValueError(
+            f"jno.fem: a value or source reads the boundary normal ({sorted(normal_tags)}) where only the point "
+            "coordinates are known, so it cannot be evaluated. Write the value without the normal (for a flat "
+            "face, the constant normal vector), or as a boundary term the face assembly evaluates."
+        )
     _refuse_stale_position(variables)
     temporal = {v.tag for v in variables if getattr(v, "axis", None) == "temporal"}
     if temporal and t is None:
@@ -2179,8 +2231,9 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             "condition and in an initial condition (read at the start time); anywhere else write it without "
             "the time variable."
         )
-    tags = {v.tag for v in variables} - temporal
+    tags = {v.tag for v in variables} - temporal - normal_tags
     pts = jnp.atleast_2d(jnp.asarray(points))
+    nrm = None if normals is None else jnp.reshape(jnp.asarray(normals), (pts.shape[0], -1))
     # Register every ModelCall (parameter / network) so the evaluator resolves it. With ``params`` (the
     # runtime ``args``), substitute a trainable parameter's value OR a trainable network's live module from
     # it, so the coefficient stays differentiable in the design variable; else use the stored module
@@ -2205,18 +2258,32 @@ def _eval_value_node_at(value_node: Any, points: Any, params: Any = None, t: Any
             table[m.layer_id] = mod
     if pointwise:
 
-        def _at(p):
+        def _at(p, nv):
             ctx = {tag: p[None, :] for tag in tags}
             for tag in temporal:
                 ctx[tag] = jnp.full((1, 1), t, dtype=pts.dtype)
+            for tag in normal_tags:
+                ctx[tag] = nv[None, :]
             return jnp.asarray(TraceEvaluator(table).evaluate(value_node, context=ctx))
 
-        vals = jax.vmap(_at)(pts)
+        vals = jax.vmap(_at)(pts, pts if nrm is None else nrm)
         return jnp.reshape(vals, (-1,))
     context = {tag: pts for tag in tags}
+    for tag in normal_tags:
+        context[tag] = nrm
     for tag in temporal:
         context[tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype)
     return jnp.reshape(TraceEvaluator(table).evaluate(value_node, context=context), (-1,))
+
+
+def _is_normal_variable(v: Any) -> bool:
+    """Is ``v`` a boundary-normal Variable ``n_<region>`` (``domain.variable(region, normals=True)``)?"""
+    tag = getattr(v, "tag", None)
+    if not (isinstance(tag, str) and tag.startswith("n_")):
+        return False
+    dom = getattr(v, "_domain", None)
+    names = set(getattr(dom, "_boundary_regions", {}) or {}) | set(getattr(dom, "context", {}) or {})
+    return dom is None or tag[2:] in names
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
@@ -2424,7 +2491,9 @@ def _complex_operator(A_r: Any, A_i: Any) -> Any:
             idx, inverse, nse = plan
             data = jax.ops.segment_sum(data, inverse, num_segments=nse)
             return jsp.BCOO((data, idx), shape=A_r.shape, indices_sorted=True, unique_indices=True)
-        return jsp.BCOO((data, indices), shape=A_r.shape).sum_duplicates()
+        # traced indices (a parametric solve under jit): `sum_duplicates` would need a static nse, and the
+        # duplicates are harmless -- a BCOO matvec and every direct backend's COO -> CSR sum them
+        return jsp.BCOO((data, indices), shape=A_r.shape)
     Ar = A_r.todense() if hasattr(A_r, "todense") else A_r
     Ai = A_i.todense() if hasattr(A_i, "todense") else A_i
     return jnp.asarray(Ar) + 1j * jnp.asarray(Ai)
@@ -2473,7 +2542,14 @@ def _solve_complex_block(
         # For a Bloch tie the Hermitian-reduced legs are each already complex; A_r + i·A_i is still the
         # reduced complex operator (P^H A_r P + i·P^H A_i P), so the same fuse serves both cases.
         A_c = _complex_operator(A_r, A_i)
-        u = complex_solve(A_c, b_r + 1j * b_i)
+        b_c = b_r + 1j * b_i
+        if periodic is not None:
+            # the reduction summed a prescribed tie target's row into its partners: put it back, as every
+            # reduced-space solve does (the values are real: Re g, as on the fused path's first leg)
+            from .utils.solver.fem_utils import impose_reduced_dirichlet
+
+            A_c, b_c = impose_reduced_dirichlet(periodic, A_c, b_c)
+        u = complex_solve(A_c, b_c)
         if periodic is None:
             return u
         if periodic.get("is_bloch"):
@@ -2974,332 +3050,16 @@ class FEM:
         basis=None,
         shard=None,
         profile=False,
+        span=None,
         **kwargs,
     ) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
-        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
-        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
-        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
-        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
-        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
-        refinement step is non-differentiable (discrete remeshing); gradients are exact on
-        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
-        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
-        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
-        and needs no cross-mesh transfer.
-
-        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
-        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
-        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
-        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
-        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
-        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
-        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
-
-        Delegates to :meth:`FemLinearSystem.solve` (steady linear),
-        :meth:`FemResidualOperator.solve` (steady nonlinear), or
-        :meth:`SemidiscreteTimeBlock.solve` (transient). The result is a jNO field: compare it
-        to data and train any ``jno.np.parameter`` in the weak form through
-        ``crux.solve``::
-
-            alpha = jno.np.parameter((1,), name="alpha")
-            fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
-            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
-            crux.solve(n)                      # recovers alpha
-
-        ``solve_fn`` is **your** solver (jNO writes none):
-
-        * steady linear: ``(A, b) -> u``. The **default** is a matrix-free **Jacobi-preconditioned**
-          BiCGStab on the BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``),
-          GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
-          non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
-          **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
-          dependency, robust on CPU), or bring your own. It receives the operator **exactly as
-          assembled** — the BCOO, never a densified copy — so a sparse solver of your choosing
-          (scipy SuperLU, PETSc, anything taking triplets) can be dropped straight in. jNO does not
-          pick the representation for you: densifying is ``O(n^2)`` on an ``O(nnz)`` operator (20.5
-          GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
-          would reach for your own solver. A **dense** solver must densify itself:
-          ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
-        * steady nonlinear: ``(residual_fn, u0) -> u`` (default :func:`jno.solve.newton`: Newton on
-          the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where
-          there is no assembled tangent; implicit-diff, no optimistix; pass ``u0=`` for the guess);
-        * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
-          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
-          ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
-          the sample times, default the domain's time grid). For a custom integrator build it
-          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
-          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
-          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
-
-        Enable x64 — the assembly is float64.
-
-        For a **complex** steady linear problem (complex coefficients in the weak form),
-        ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
-        ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
-        to choose the real block solver.
-
-        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
-        override — passing both is an error). The solver space factorises into four orthogonal
-        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
-        own with the same contract, see those modules), and every ``None`` keeps today's
-        default::
-
-            fem.solve(
-                x0        = None,                   # warm start (initial guess / iterate)
-                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
-                linear    = jno.solve.gmres(),      # inner linear solve
-                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
-            )
-
-        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
-        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
-        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
-        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
-        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
-        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
-        diagonal) does not. On a **transient** problem the slots configure the *per-step*
-        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
-        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
-        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
-        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
-        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
-        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
-        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
-
-        ``basis=U`` solves in the span of an ``(n_dofs, k)`` **Galerkin basis** instead of the full space:
-        the reduced system ``UᵀA U x = Uᵀb`` is ``k×k``, and the answer is lifted back to ``u = U x`` so
-        nothing downstream changes. This is the reduced-order-model (POD) entry — build ``U`` from a few
-        full solves with :func:`jno.solve.svd`, then every later solve in the family costs ``k`` unknowns::
-
-            snapshots = jnp.stack([build(p).solve() for p in sweep])   # (n_snapshots, n_dofs)
-            _, s, Vt  = jno.solve.svd(snapshots, k=10)
-            u = build(p_new).solve(basis=Vt.T)                         # 10 unknowns, full field back
-
-        Unlike every other way of solving here, this returns an **approximation**, so the relative residual
-        of the FULL system at the lifted solution is measured (one matvec) and a basis that does not span
-        the solution fails loud rather than returning a plausible wrong field — the measured value stays on
-        ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
-        work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
-        operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
-        Steady and **first-order transient** (linear and nonlinear); a transient block is reduced once at
-        solve time and the marcher steps in the reduced space, returning the trajectory at full width —
-        certified there by the projection error of the initial state rather than a residual. Refused,
-        each with its own reason: second-order-in-time, complex, and periodic-tied problems. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
-        reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
-        step (no hyper-reduction).
-
-        ``shard=`` controls multi-device execution of the default steady-linear solve. The default
-        (``None``) is **automatic**: the operator's nonzero axis is partitioned across every visible
-        device and one ``all-reduce`` combines the partial scatter-adds. That is a placement decision,
-        not a different algorithm — the answer moves only by reduction order (~1e-14) — and it is on by
-        default because the alternative on a multi-device box is idle silicon. On a single-device host
-        it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
-        ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
-        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
-        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
-        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
-        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
-        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
-
-        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
-        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
-        Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
-        work to time.
-
-        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
-        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
-        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
-        accepted.
-
-        Args:
-            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
-            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
-            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
-                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
-                every=200))``.
-            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
-                deformed configuration until it settles; required when a gap lists several candidate surfaces.
-            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
-                solve warm-started from the last (``"all"`` as first argument returns the whole family).
-            x0: warm start for the iterative solve.
-            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
-            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
-            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
-            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
-                optionally ``.adaptive()``).
-            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
-                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
-            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
-            shard: multi-device execution (see above).
-            profile: run inside a JAX trace and report the time (see above).
-            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
-                make a parametric form concrete for this solve.
-
-        Returns:
-            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
-            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
-            mesh).
-        """
-        self._refresh_attachments()
-        for _u, _ver in getattr(self, "_initial_used", ()):
-            if _u.__dict__.get("_initial_version", 0) != _ver:
-                raise ValueError(
-                    f"fem.solve: {_u.name}.initialize(...) changed after jno.fem was built; the initial state of a "
-                    "time-dependent problem is read when the form is built. Call jno.fem(...) again."
-                )
-        if x0 is None:
-            x0 = self._initialized_x0()
-            if x0 is not None and adapt is not None:
-                raise NotImplementedError(
-                    "fem.solve(adapt=...): a field's .initialize(...) start does not survive the change of mesh "
-                    "(the DOF layout changes across it). Solve without adapt= from that start, or drop the start."
-                )
-        import time as _time
-
-        from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
-
-        # Forward only what was given: the defaults are `_solve_inner`'s own, and the coupled path below has
-        # to tell an argument the caller passed from one left at its default.
-        slots = dict(
-            adapt=adapt,
-            checkpoint=checkpoint,
-            contact=contact,
-            continuation=continuation,
-            x0=x0,
-            nonlinear=nonlinear,
-            linear=linear,
-            precond=precond,
-            time=time,
-            tau=tau,
-            basis=basis,
-            shard=shard,
-        )
-        given = {k: v for k, v in slots.items() if v is not None}
-        if profile:
-            given["profile"] = profile
-        args = () if solve_fn is None else (solve_fn,)
-
-        _em = peec_source_of(self)
-        if _em is not None:
-            extra = sorted((set(kwargs) - {"tol", "max_iter"}) | set(given))
-            if args or extra:
-                raise ValueError(
-                    "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
-                    f"coupled fixed point, which takes only tol= and max_iter= (got {extra or 'positional args'}). "
-                    "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
-                )
-            out = coupled(_em, self).solve(**kwargs)
-            return self._as_solution(jnp.asarray(out.field)) if isinstance(out, ElectroThermalSolution) else out
-
-        from .utils import beacon
-        from .utils.logger import get_logger
-        from .utils.solver import newton_krylov as _nk
-
-        # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
-        log = kwargs.pop("log", False)
-        _t0 = _time.perf_counter()
-        # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
-        # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
-        prev_linear = _nk._LINEAR_FORM[0]
-        _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
-        try:
-            with beacon.session(log, "fem.solve"):
-                out = self._solve_inner(*args, **given, **kwargs)
-        finally:
-            _nk._LINEAR_FORM[0] = prev_linear
-        if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
-            out.fn = beacon.logged(out.fn, log, "fem.solve")
-        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
-        return self._as_solution(out)
-
-    def _march_phrase(self, since: float) -> str:
-        """The march headline for the log line, from THIS solve's stats only (a path that does not
-        record them must not borrow an earlier solve's)."""
-        st = getattr(self, "_stats", None)
-        if not st or not st.get("march") or getattr(self, "_stats_at", -1.0) < since:
-            return ""
-        from .info import _march_rows
-
-        return _march_rows(st["march"], st.get("solve_index"))[0]
-
-    def _solved_line(self, out, wall: float, since: float = float("inf")) -> str:
-        """What the solve actually produced -- the line that says whether to trust it.
-
-        A solve that did not raise can still be wrong in two ways a user cannot see: it can return
-        all zeros (an empty load vector), and it can return a vector that does not solve the system
-        (a stalled Krylov run that squeaked under its gate). The first is caught here, from the
-        SOLUTION RANGE; the second by the solve's own residual gate, which raises -- and
-        ``jno.info(sol, context=fem)`` reports ||Au-b||/||b|| on request. Nothing here forces a lazy
-        result, which would defeat the point of returning a trace node.
-        """
-        import numpy as _np
-
-        if isinstance(out, Solution):
-            out = out.flat
-        try:
-            parts = [f"solved: {self._mode} · {wall:.3g} s"]
-            march = self._march_phrase(since)
-            if march:
-                parts.append(march)
-            if isinstance(out, jax.core.Tracer):
-                # Inside the caller's jit/grad/vmap: nothing has run, and nothing here may run it.
-                return f"solved: {self._mode} · traced (inside jit/grad/vmap) — reported when it runs"
-            if not isinstance(out, (jax.Array, _np.ndarray)) or out.dtype == object or out.ndim == 0:
-                # The work has NOT happened yet: this path returns a node and the march runs at
-                # evaluation. Reporting the elapsed time here as if it were the solve would say a
-                # 200-step transient finished in 6 ms.
-                march = self._march_phrase(since)
-                return (
-                    f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
-                    f"the solve runs when you evaluate it through jno.core" + (f" · {march}" if march else "")
-                )
-            # Reduced WHERE THE SOLUTION LIVES; four scalars cross to the host in one transfer.
-            # Measured at 73k dofs on an RTX 3070: 0.32 ms, against a 63 ms solve.
-            #
-            # No residual here, deliberately. ||Au - b|| costs a sparse matvec, and one matvec was
-            # 6.7 ms of that 63 ms solve (6.1 ms even jitted) -- 10 % of every solve, for a log
-            # line. It is also redundant: every linear solve already gates on its own residual and
-            # RAISES when it did not converge. It is computed on request instead, by
-            # `jno.info(sol, context=fem)`. (The first version also copied the whole vector to the
-            # host and back: three full-vector transfers per GPU solve.)
-            flat = jnp.asarray(out).reshape(-1)
-            cplx = bool(jnp.iscomplexobj(flat))
-            mag = jnp.abs(flat) if cplx else flat
-            vals = [jnp.sum(~jnp.isfinite(flat)), jnp.min(mag), jnp.max(mag), jnp.max(jnp.abs(flat))]
-            q = _np.asarray(jnp.stack([jnp.real(jnp.asarray(v)).astype(jnp.real(mag).dtype) for v in vals]))
-            n_bad, lo, hi, amax = int(q[0]), float(q[1]), float(q[2]), float(q[3])
-            if n_bad:
-                parts.append(f"**{n_bad} non-finite entries**")
-            else:
-                parts.append(f"{'|u|' if cplx else 'u'} in [{lo:.4g}, {hi:.4g}]")
-                if amax <= 1e-8:
-                    parts.append("ALL ZERO — is the load term present?")
-            return " · ".join(parts)
-        except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
-            return f"solved: {self._mode} · {wall:.3g} s"
-
-    def _solve_inner(
-        self,
-        solve_fn=None,
-        *,
-        adapt=None,
-        checkpoint=None,
-        contact=None,
-        continuation=None,
-        x0=None,
-        nonlinear=None,
-        linear=None,
-        precond=None,
-        time=None,
-        tau=None,
-        basis=None,
-        shard=None,
-        profile=False,
-        **kwargs,
-    ) -> Any:
-        """Differentiable forward solve as a trace node — the inverse-problem entry.
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
 
         Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
         (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
@@ -3461,7 +3221,335 @@ class FEM:
             basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
             shard: multi-device execution (see above).
             profile: run inside a JAX trace and report the time (see above).
-            log: ``True`` prints each Newton / time step while the solve runs, ``N`` every N-th and the last (see above).
+            **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
+                make a parametric form concrete for this solve.
+
+        Returns:
+            The solution: a DOF vector (steady), a ``(n_steps, n_dofs)`` trajectory (transient), a
+            deferred trace node (parametric or periodic nonlinear), or an ``AdaptiveTrajectory`` (moving
+            mesh).
+        """
+        self._refresh_attachments()
+        for _u, _ver in getattr(self, "_initial_used", ()):
+            if _u.__dict__.get("_initial_version", 0) != _ver:
+                raise ValueError(
+                    f"fem.solve: {_u.name}.initialize(...) changed after jno.fem was built; the initial state of a "
+                    "time-dependent problem is read when the form is built. Call jno.fem(...) again."
+                )
+        if x0 is None:
+            x0 = self._initialized_x0()
+            if x0 is not None and adapt is not None:
+                raise NotImplementedError(
+                    "fem.solve(adapt=...): a field's .initialize(...) start does not survive the change of mesh "
+                    "(the DOF layout changes across it). Solve without adapt= from that start, or drop the start."
+                )
+        import time as _time
+
+        from .utils.solver.electrothermal import ElectroThermalSolution, coupled, peec_source_of
+
+        # Forward only what was given: the defaults are `_solve_inner`'s own, and the coupled path below has
+        # to tell an argument the caller passed from one left at its default.
+        slots = dict(
+            adapt=adapt,
+            checkpoint=checkpoint,
+            contact=contact,
+            continuation=continuation,
+            x0=x0,
+            nonlinear=nonlinear,
+            linear=linear,
+            precond=precond,
+            time=time,
+            tau=tau,
+            basis=basis,
+            shard=shard,
+            span=span,
+        )
+        given = {k: v for k, v in slots.items() if v is not None}
+        if profile:
+            given["profile"] = profile
+        args = () if solve_fn is None else (solve_fn,)
+
+        _em = peec_source_of(self)
+        if _em is not None:
+            extra = sorted((set(kwargs) - {"tol", "max_iter"}) | set(given))
+            if args or extra:
+                raise ValueError(
+                    "jno.fem: this problem is heated by a jno.peec network's `em.loss`, so its solve is the "
+                    f"coupled fixed point, which takes only tol= and max_iter= (got {extra or 'positional args'}). "
+                    "The network's own solve settings go on jno.peec(..., operator=, restart=, matrix_free=)."
+                )
+            out = coupled(_em, self).solve(**kwargs)
+            return self._as_solution(jnp.asarray(out.field)) if isinstance(out, ElectroThermalSolution) else out
+
+        from .utils import beacon
+        from .utils.logger import get_logger
+        from .utils.solver import newton_krylov as _nk
+
+        # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
+        log = kwargs.pop("log", False)
+        _t0 = _time.perf_counter()
+        # A residual linear in the unknown (a linear form marched for its step history) is solved by ONE
+        # exact Newton step; the driver reads this while it is traced and then skips the forcing term.
+        prev_linear = _nk._LINEAR_FORM[0]
+        _nk._LINEAR_FORM[0] = bool(getattr(self._op, "linear_in_unknown", False))
+        try:
+            with beacon.session(log, "fem.solve"):
+                out = self._solve_inner(*args, **given, **kwargs)
+        finally:
+            _nk._LINEAR_FORM[0] = prev_linear
+        if callable(getattr(out, "fn", None)):  # a deferred solve: its loops are traced when it is evaluated
+            out.fn = beacon.logged(out.fn, log, "fem.solve")
+        get_logger().info(self._solved_line(out, _time.perf_counter() - _t0, since=_t0))
+        return self._as_solution(out)
+
+    def _march_phrase(self, since: float) -> str:
+        """The march headline for the log line, from THIS solve's stats only (a path that does not
+        record them must not borrow an earlier solve's)."""
+        st = getattr(self, "_stats", None)
+        if not st or not st.get("march") or getattr(self, "_stats_at", -1.0) < since:
+            return ""
+        from .info import _march_rows
+
+        return _march_rows(st["march"], st.get("solve_index"))[0]
+
+    def _solved_line(self, out, wall: float, since: float = float("inf")) -> str:
+        """What the solve actually produced -- the line that says whether to trust it.
+
+        A solve that did not raise can still be wrong in two ways a user cannot see: it can return
+        all zeros (an empty load vector), and it can return a vector that does not solve the system
+        (a stalled Krylov run that squeaked under its gate). The first is caught here, from the
+        SOLUTION RANGE; the second by the solve's own residual gate, which raises -- and
+        ``jno.info(sol, context=fem)`` reports ||Au-b||/||b|| on request. Nothing here forces a lazy
+        result, which would defeat the point of returning a trace node.
+        """
+        import numpy as _np
+
+        try:
+            parts = [f"solved: {self._mode} · {wall:.3g} s"]
+            march = self._march_phrase(since)
+            if march:
+                parts.append(march)
+            if isinstance(out, jax.core.Tracer):
+                # Inside the caller's jit/grad/vmap: nothing has run, and nothing here may run it.
+                return f"solved: {self._mode} · traced (inside jit/grad/vmap) — reported when it runs"
+            if not isinstance(out, (jax.Array, _np.ndarray)) or out.dtype == object or out.ndim == 0:
+                # The work has NOT happened yet: this path returns a node and the march runs at
+                # evaluation. Reporting the elapsed time here as if it were the solve would say a
+                # 200-step transient finished in 6 ms.
+                march = self._march_phrase(since)
+                return (
+                    f"solved: {self._mode} · deferred (trace node) — built in {wall:.3g} s, "
+                    f"the solve runs when you evaluate it through jno.core" + (f" · {march}" if march else "")
+                )
+            # Reduced WHERE THE SOLUTION LIVES; four scalars cross to the host in one transfer.
+            # Measured at 73k dofs on an RTX 3070: 0.32 ms, against a 63 ms solve.
+            #
+            # No residual here, deliberately. ||Au - b|| costs a sparse matvec, and one matvec was
+            # 6.7 ms of that 63 ms solve (6.1 ms even jitted) -- 10 % of every solve, for a log
+            # line. It is also redundant: every linear solve already gates on its own residual and
+            # RAISES when it did not converge. It is computed on request instead, by
+            # `jno.info(sol, context=fem)`. (The first version also copied the whole vector to the
+            # host and back: three full-vector transfers per GPU solve.)
+            flat = jnp.asarray(out).reshape(-1)
+            cplx = bool(jnp.iscomplexobj(flat))
+            mag = jnp.abs(flat) if cplx else flat
+            vals = [jnp.sum(~jnp.isfinite(flat)), jnp.min(mag), jnp.max(mag), jnp.max(jnp.abs(flat))]
+            q = _np.asarray(jnp.stack([jnp.real(jnp.asarray(v)).astype(jnp.real(mag).dtype) for v in vals]))
+            n_bad, lo, hi, amax = int(q[0]), float(q[1]), float(q[2]), float(q[3])
+            if n_bad:
+                parts.append(f"**{n_bad} non-finite entries**")
+            else:
+                parts.append(f"{'|u|' if cplx else 'u'} in [{lo:.4g}, {hi:.4g}]")
+                if amax <= 1e-8:
+                    parts.append("ALL ZERO — is the load term present?")
+            return " · ".join(parts)
+        except Exception:  # noqa: BLE001 - a log line must never be what fails a solve
+            return f"solved: {self._mode} · {wall:.3g} s"
+
+    def _solve_inner(
+        self,
+        solve_fn=None,
+        *,
+        adapt=None,
+        checkpoint=None,
+        contact=None,
+        continuation=None,
+        x0=None,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        tau=None,
+        basis=None,
+        shard=None,
+        profile=False,
+        span=None,
+        **kwargs,
+    ) -> Any:
+        """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        On a transient problem ``x0=`` is the state the march starts from, in place of the initial
+        conditions (a frame of an earlier trajectory), and ``span=(t0, t1)`` marches only that window of
+        ``domain.time`` (a whole number of its steps; a window after the start needs ``x0=``). The trajectory
+        then holds the frames of the window's grid, both ends included, so two windows, the second from the
+        first's last frame, are one march.
+
+        Pass ``adapt=jno.solve.remesh(...)`` to run the **adaptive** loop
+        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
+        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
+        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
+        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
+        refinement step is non-differentiable (discrete remeshing); gradients are exact on
+        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
+        See :func:`jno.solve.remesh` for h-adaptivity and :func:`jno.solve.relocate` for the
+        fixed-connectivity (r-adaptive) alternative, whose vertex map is differentiable in the monitor
+        and needs no cross-mesh transfer.
+
+        A **moving mesh** is not a solve argument: put a geometry term ``coord.d(t) - velocity`` in the
+        ``jno.fem([...])`` list and the mesh moves as it says. Returns an ``AdaptiveTrajectory`` (each
+        frame on its own moved mesh). See :func:`jno.trace.mesh_velocity` for what makes a term a geometry
+        term and :func:`jno.utils.solver.fem_adapt.run_mesh_motion` for the method and its scope
+        (operator-split ALE; nodal-Lagrange fields, real). A weak form may read the mesh velocity
+        ``xi.d(ti)`` (the nodal values then ride with the mesh), and
+        ``adapt=jno.solve.remesh(criterion=<mesh-geometry condition>)`` rebuilds a mesh that degrades.
+
+        Delegates to :meth:`FemLinearSystem.solve` (steady linear),
+        :meth:`FemResidualOperator.solve` (steady nonlinear), or
+        :meth:`SemidiscreteTimeBlock.solve` (transient). The result is a jNO field: compare it
+        to data and train any ``jno.np.parameter`` in the weak form through
+        ``crux.solve``::
+
+            alpha = jno.np.parameter((1,), name="alpha")
+            fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
+            crux.solve(n)                      # recovers alpha
+
+        ``solve_fn`` is **your** solver (jNO writes none):
+
+        * steady linear: ``(A, b) -> u``. The **default** is a matrix-free **Jacobi-preconditioned**
+          BiCGStab on the BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``),
+          GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
+          non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
+          **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
+          dependency, robust on CPU), or bring your own. It receives the operator **exactly as
+          assembled** — the BCOO, never a densified copy — so a sparse solver of your choosing
+          (scipy SuperLU, PETSc, anything taking triplets) can be dropped straight in. jNO does not
+          pick the representation for you: densifying is ``O(n^2)`` on an ``O(nnz)`` operator (20.5
+          GiB against 9.4 MiB at ``n=51843``), which would defeat the point at the sizes where you
+          would reach for your own solver. A **dense** solver must densify itself:
+          ``lambda A, b: jnp.linalg.solve(A.todense(), b)``;
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default :func:`jno.solve.newton`: Newton on
+          the assembled tangent with a Jacobi-BiCGStab inner solve, matrix-free Newton-Krylov where
+          there is no assembled tangent; implicit-diff, no optimistix; pass ``u0=`` for the guess);
+        * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
+          ``dt``, each step solved by the same default Newton; ``save_ts=`` overrides
+          the sample times, default the domain's time grid). For a custom integrator build it
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``. Evaluated eagerly,
+          the built-in schemes keep only the states the ``save_ts`` frames read and return a HOST NumPy
+          array; under ``jit``/``grad`` the march stays one scan (docs: solvers, "What a march keeps").
+
+        Enable x64 — the assembly is float64.
+
+        For a **complex** steady linear problem (complex coefficients in the weak form),
+        ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
+        ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
+        to choose the real block solver.
+
+        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
+        override — passing both is an error). The solver space factorises into four orthogonal
+        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
+        own with the same contract, see those modules), and every ``None`` keeps today's
+        default::
+
+            fem.solve(
+                x0        = None,                   # warm start (initial guess / iterate)
+                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
+                linear    = jno.solve.gmres(),      # inner linear solve
+                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
+            )
+
+        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
+        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
+        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
+        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
+        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
+        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
+        diagonal) does not. On a **transient** problem the slots configure the *per-step*
+        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
+        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
+        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
+        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
+        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
+        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
+        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
+
+        ``basis=U`` solves in the span of an ``(n_dofs, k)`` **Galerkin basis** instead of the full space:
+        the reduced system ``UᵀA U x = Uᵀb`` is ``k×k``, and the answer is lifted back to ``u = U x`` so
+        nothing downstream changes. This is the reduced-order-model (POD) entry — build ``U`` from a few
+        full solves with :func:`jno.solve.svd`, then every later solve in the family costs ``k`` unknowns::
+
+            snapshots = jnp.stack([build(p).solve() for p in sweep])   # (n_snapshots, n_dofs)
+            _, s, Vt  = jno.solve.svd(snapshots, k=10)
+            u = build(p_new).solve(basis=Vt.T)                         # 10 unknowns, full field back
+
+        Unlike every other way of solving here, this returns an **approximation**, so the relative residual
+        of the FULL system at the lifted solution is measured (one matvec) and a basis that does not span
+        the solution fails loud rather than returning a plausible wrong field — the measured value stays on
+        ``fem.basis_residual``, and ``fem.BASIS_RESIDUAL_LIMIT`` relaxes the bar for deliberately coarse
+        work. ``U`` must be orthonormal. It composes with ``linear=``/``precond=`` (which see the reduced
+        operator) and is differentiable in the basis itself under ``jax.grad`` — the learned-subspace path.
+        Steady and **first-order transient** (linear and nonlinear); a transient block is reduced once at
+        solve time and the marcher steps in the reduced space, returning the trajectory at full width —
+        certified there by the projection error of the initial state rather than a residual. Refused,
+        each with its own reason: second-order-in-time, complex, and periodic-tied problems. A reduced NONLINEAR solve returns a deferred trace node, as a periodic one does. Nonlinear
+        reduction is a memory win, not a speed one: the full-order residual is still evaluated per Newton
+        step (no hyper-reduction).
+
+        ``shard=`` controls multi-device execution of the default steady-linear solve. The default
+        (``None``) is **automatic**: the operator's nonzero axis is partitioned across every visible
+        device and one ``all-reduce`` combines the partial scatter-adds. That is a placement decision,
+        not a different algorithm — the answer moves only by reduction order (~1e-14) — and it is on by
+        default because the alternative on a multi-device box is idle silicon. On a single-device host
+        it resolves to the untouched single-device path. ``shard=False`` (or ``1``) opts out,
+        ``shard=N`` pins a device count, and a device list pins exactly; over-requesting fails loud.
+        What shards: the steady-linear solve (default or a Krylov slot with Jacobi or no preconditioner), a
+        linear transient march, and a NONLINEAR solve or march -- which has no operator to partition, so
+        its cells are split instead (one all-reduce per residual or ``J.v``). Sparse-direct branches
+        (periodic, 1-D, fused-complex, ``lu``) cannot; ``adapt=``, moving geometry and a deferred node
+        evaluated by ``crux`` are not wired. ``docs/fem/inverse.md`` has the full table.
+
+        ``profile=True`` runs the (eager, non-parametric) solve inside a JAX Perfetto trace, prints the DOF
+        count + wall time, and writes the trace to ``./jno_traces`` — like ``jno.core.solve(profile=True)``.
+        Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
+        work to time.
+
+        A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
+        (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
+        ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
+        accepted.
+
+        Args:
+            solve_fn: your own solver, the total override (see above); ``None`` uses the defaults.
+            adapt: ``jno.solve.remesh(...)`` (h-adaptivity) or ``jno.solve.relocate(...)`` (r-adaptivity).
+            checkpoint: ``jno.solve.checkpoint(path, every=...)`` writes a transient or load-path march to
+                disk as it runs and resumes from it, e.g. ``fem.solve(checkpoint=jno.solve.checkpoint("runs/heat",
+                every=200))``.
+            contact: ``jno.solve.contact()`` re-runs the contact pairing (``u.gap`` / ``u.slide``) from the
+                deformed configuration until it settles; required when a gap lists several candidate surfaces.
+            continuation: ``jno.solve.continuation(k=values)`` marches a parameter through ``values``, each
+                solve warm-started from the last (``"all"`` as first argument returns the whole family).
+            x0: warm start for the iterative solve.
+            nonlinear: the linearisation driver slot (``jno.solve.newton()``, ...).
+            linear: the inner linear solver slot (``jno.solve.gmres()``, ``jno.solve.lu()``, ...).
+            precond: the preconditioner slot (``jno.precond.jacobi()``, ``jno.precond.amg()``, ...).
+            time: the time scheme of a transient problem (``jno.solve.theta(0.5)``, ``bdf2``, ...,
+                optionally ``.adaptive()``).
+            tau: the load-step schedule of a ``domain(tau=...)`` march: ``jno.solve.adaptive(limit=...)``,
+                ``jno.solve.arclength(...)``, or a recorded ``fem.tau_schedule`` to replay.
+            basis: an orthonormal ``(n_dofs, k)`` Galerkin basis (see above).
+            shard: multi-device execution (see above).
+            profile: run inside a JAX trace and report the time (see above).
             **kwargs: values of the form's ``jno.np.parameter`` nodes by name (``fem.solve(k=2.0)``), which
                 make a parametric form concrete for this solve.
 
@@ -3474,7 +3562,16 @@ class FEM:
         # (nonlinear and transient both bypass `_compose_slots`), so logging inside them left two of
         # the three modes silent about which solver actually ran.
         from .utils.logger import get_logger
+        from .utils.solver.solver_api import at_solve_spec
 
+        if linear is None and all(
+            a_ is None
+            for a_ in (solve_fn, adapt, checkpoint, contact, continuation, x0, nonlinear, precond, time, tau, basis, shard)
+        ):
+            linear = _default_direct(self)
+        if linear is None and precond is None and solve_fn is None:
+            linear = _default_saddle_step_solve(self)
+        linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 
         # Structural singularity is checked at BUILD and reported HERE. A form whose terms cover only
@@ -3524,6 +3621,7 @@ class FEM:
                         time=time,
                         tau=tau,
                         shard=shard,
+                        span=span,
                         **kwargs,
                     )
             finally:
@@ -3778,6 +3876,7 @@ class FEM:
         tau=None,
         shard=None,
         continuation=None,
+        span=None,
         **kwargs,
     ):
         """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
@@ -3853,8 +3952,22 @@ class FEM:
             _values = {k: kwargs.pop(k) for k in list(kwargs) if k in _param_names}
             if _values:
                 kwargs["values"] = _values
+        if (
+            self._mode == "transient"
+            and solve_fn is None
+            and linear is None
+            and precond is None
+            and getattr(self.domain, "_fem_prefer_direct", False)
+        ):
+            # The C0/C1 vertex families (Hermite/Argyris/Morley, the 1-D beam) march on a sparse-direct step,
+            # as their steady solve does: the Krylov default returned NaN on a u_tt beam, and its noise pins
+            # an adaptive controller at its smallest step (see `compose_transient_step_solvers`).
+            from . import solve as _solve_ns
+
+            linear = _solve_ns.lu()
         has_slots = (
             (x0 is not None)
+            or (span is not None)
             or (nonlinear is not None)
             or (linear is not None)
             or (precond is not None)
@@ -4063,6 +4176,7 @@ class FEM:
                 time=time,
                 shard=shard,
                 kwargs=kwargs,
+                span=span,
             )
             from_slots = True
         else:
@@ -4115,15 +4229,20 @@ class FEM:
                 "not march one: the march is triggered by step history (`.i(k)` in the terms) together "
                 "with a `domain(tau=(start, end, n))` grid. Add both, or drop tau=."
             )
-        if from_slots and getattr(precond, "complex_native", False) and self._complex_legs is not None:
-            # A complex-native preconditioner (AMS) solves the sparse COMPLEX operator ``A_r + i·A_i``
-            # directly, never the real-equivalent block — so it wants the Re/Im legs the fusion retained,
-            # not the fused 2n system. Real-equivalent preconditioners (form/jacobi/…) stay on the block.
+        _cn_linear = bool((getattr(linear, "traits", None) or {}).get("complex_native"))
+        if from_slots and (getattr(precond, "complex_native", False) or _cn_linear) and self._complex_legs is not None:
+            # A complex-native preconditioner (AMS), or a direct backend that factors complex matrices
+            # (MKL PARDISO), solves the sparse COMPLEX operator ``A_r + i·A_i`` directly, never the
+            # real-equivalent block — so it wants the Re/Im legs the fusion retained, not the fused 2n
+            # system. The direct case halves the factor memory, and the periodic reduction and the host
+            # copies run on n-sized legs instead of a 2n block with four times the entries. Real-equivalent
+            # preconditioners (form/jacobi/…) stay on the block.
             if kwargs.get("values"):
                 raise NotImplementedError(
-                    "fem.solve(precond=<complex-native>, <parameter>=...): the complex-native solve works on the "
-                    "assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
-                    "Use a real-equivalent preconditioner, or build the form with the value fixed."
+                    "fem.solve(<complex-native linear or precond>, <parameter>=...): the complex-native solve works "
+                    "on the assembled Re/Im legs, which carry no runtime parameter, so the values would be dropped. "
+                    "Use a real-equivalent solver (e.g. jno.solve.lu(backend='host')), or build the form with the "
+                    "value fixed."
                 )
             return _solve_complex_block(self._complex_legs, periodic=self._periodic, complex_solve=solve_fn)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -4517,7 +4636,7 @@ class FEM:
         except Exception:  # noqa: BLE001 -- a form the check cannot read is solved as a general one
             return False
 
-    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs):
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, time=None, shard=None, kwargs, span=None):
         """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
         from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
 
@@ -4530,6 +4649,8 @@ class FEM:
             raise ValueError(
                 f"fem.solve(time=...) picks a time-integration scheme, but this problem is {self._mode}, not transient."
             )
+        if span is not None and self._mode != "transient":
+            raise ValueError(f"fem.solve(span=...) marches a window of a transient problem; this one is {self._mode}.")
         if time is not None and getattr(time, "limit", None) is not None:
             # Checked here rather than in the scheme, because not every transient route reaches a
             # scheme's own `integrate` — and applying the wrong step-size criterion silently would be a
@@ -4545,12 +4666,12 @@ class FEM:
             # slot/precond see the step operator (M + theta dt A) -- materialized ONCE before the
             # scan when the operator is time-independent -- and the nonlinear slot drives each
             # implicit step. The bring-your-own (block, args, save_ts) contract is unchanged.
-            if x0 is not None:
-                raise ValueError(
-                    "fem.solve: x0= on a transient problem -- the initial state comes from the initial "
-                    "conditions, and each step already warm-starts from the previous state."
-                )
-            from .utils.solver.backend_blocks import _default_transient_integrate
+            from .utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate, window_block
+
+            if x0 is not None or span is not None:  # march a window from a given state (checked here, once)
+                _window_grid = _block_time_grid(window_block(self._op, span, x0, who="fem.solve"))
+                if kwargs.get("save_ts") is None:
+                    kwargs = {**kwargs, "save_ts": _window_grid}
             from .utils.solver.solver_api import (
                 _refresh_cadence,
                 _uncached,
@@ -4576,7 +4697,14 @@ class FEM:
                 else compose_transient_step_solvers(nonlinear, linear, precond, self, self._op, time)
             )
 
+            # A scheme's structural refusals read concrete values; inside `jno.core` the march is traced and
+            # they would skip, so the scheme gets to run them once here, on the built operator.
+            _preflight = getattr(time, "preflight", None)
+            if _preflight is not None:
+                _preflight(self._op)
+
             def _stepper(block, args, save_ts):
+                block = window_block(block, span, x0, who="fem.solve")  # the block itself without x0= / span=
                 if time is not None:  # jno.solve.theta(...) / jno.solve.exponential(...)
                     return time.integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
                 if _cadence is not None and not isinstance(save_ts, jax.core.Tracer):
@@ -4688,6 +4816,7 @@ class FEM:
         X0=None,
         contour=None,
         log=False,
+        deflate=None,
     ):
         """Generalized eigenproblem ``K x = λ M x`` on this fem: ``K`` is this **source-less** fem's
         operator (its stiffness bilinear form) and ``M`` is the ``mass`` bilinear form assembled on the
@@ -4717,6 +4846,12 @@ class FEM:
         structure: one ``eigs`` per k-point) makes the pencil complex; the modes come back complex on the
         ``n``-space, and a complex ``X0`` warm-starts the next k-point.
 
+        ``deflate=`` (with ``precond=``) leaves a known subspace out: formulas in the domain's coordinates, an
+        ``(n, m)`` array on the full DOF space, or a callable -- the space values :func:`jno.precond.coarse`
+        takes. A free structure's rigid-body modes, ``deflate=[(1, 0), (0, 1), (-y, x)]``, then skip its zero
+        eigenvalues and the solve returns the first ``k`` elastic modes::
+
+            lam, X = K.eigs(mass=[rho * ui @ vi], k=6, precond=jno.precond.amg(), deflate=[(1, 0), (0, 1), (-y, x)])
         ``log=True`` prints each iteration of LOBPCG (``precond=``) or of the shift-invert iteration (``sigma=``)
         while it runs (``log=N``: every N-th and the last); the dense reduction and ARPACK have no loop to report.
         """
@@ -4763,6 +4898,7 @@ class FEM:
                     ("sigma", sigma),
                     ("precond", precond),
                     ("X0", X0),
+                    ("deflate", deflate),
                 )
                 if val is not None
             ]
@@ -4816,13 +4952,32 @@ class FEM:
             _W = jnp.asarray(X0)
             _W = _W[:, None] if _W.ndim == 1 else _W
             X0 = jax.vmap(restrict, in_axes=1, out_axes=1)(_W)
+        if deflate is not None:
+            if _cn is not None:
+                raise NotImplementedError(
+                    "fem.eigs(deflate=...) on a complex (or Bloch-tied) pencil is not supported: the space would have "
+                    "to be lifted into the real-equivalent block. Drop deflate=."
+                )
+            from .utils.solver.deflation import resolve_space
+
+            deflate = jnp.asarray(resolve_space(deflate, self, n_full, A=K, who="fem.eigs(deflate=...)"))
+            if restrict is not None:
+                deflate = jax.vmap(restrict, in_axes=1, out_axes=1)(deflate)
         # the real-equivalent block doubles every complex mode, so ask for 2k and thin afterwards
         _k_solve = 2 * k if _cn is not None else k
         _finish = (
             (lambda lam, X: _thin_real_equivalent_pairs(lam, X, _cn)) if _cn is not None else (lambda lam, X: (lam, X))
         )
         solver = _solve.eigs(
-            k=_k_solve, which=which, sigma=sigma, linear=linear, precond=precond, tol=tol, maxiter=maxiter, X0=X0
+            k=_k_solve,
+            which=which,
+            sigma=sigma,
+            linear=linear,
+            precond=precond,
+            tol=tol,
+            maxiter=maxiter,
+            X0=X0,
+            deflate=deflate,
         )
         if restrict is None:
             return _finish(*solver(K, M))
@@ -5213,6 +5368,7 @@ class FEM:
         from .trace import FunctionCall
         from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
+        expr = _lower_unknowns(expr)  # a `domain.unknown()` field is the trial here, not a coefficient
         bare = getattr(expr, "expr", expr)
         op = getattr(self, "operator", None)
         declared = dict(getattr(op, "runtime_parameter_exprs", None) or {})
@@ -6096,7 +6252,7 @@ def _face_nodes(
                     _c = np.asarray(cells)
                     _m = np.asarray(_cell_region_mask(domain, owner)).reshape(-1)
                     if _m.shape[0] == _c.shape[0]:
-                        own = np.unique(_c[_m > 0])
+                        own = unique_values(_c[_m > 0])
                 if own is None and owner in ti:  # no assembly cells here: the partition is all there is
                     own = np.asarray(ti[owner], dtype=int).reshape(-1)
                 if own is not None:
@@ -6173,7 +6329,7 @@ def _build_periodic_reduction(
     except Exception:  # noqa: BLE001 - a domain with no volume block (1-D flat-chain route)
         _ct = None
     bfacets = _boundary_facets(points, cells, dim, ele_order, _ct) if cells is not None else None
-    bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
+    bnodes = unique_values(bfacets) if bfacets is not None and bfacets.size else None
 
     pairs = [(main, secondary) for (main, secondary, *_ignore) in ties]
     # Bloch phase per pair (``e^{i k·L}``); 1.0 = plain periodic (the ties may be 4-tuples pre-Bloch).
@@ -6209,7 +6365,7 @@ def _build_periodic_reduction(
                     # ...and the face's node set gains the higher-order nodes those facets carry, which
                     # is what the mortar integrates over. `union1d` so this can only ADD: at order 1 a
                     # facet IS its vertices, so the set is unchanged and P1 ties do not move.
-                    faces[tag] = np.union1d(np.asarray(faces.get(tag, np.empty(0, int))), np.unique(facets[tag]))
+                    faces[tag] = np.union1d(np.asarray(faces.get(tag, np.empty(0, int))), unique_values(facets[tag]))
     else:  # native 1D / no assembly cells -> flat-chain fallback
         facets = {
             t: ff
@@ -6259,14 +6415,7 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": red["is_bloch"],
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6321,14 +6470,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return {
-        "blocks": blocks,
-        "off_full": off_full,
-        "off_red": off_red,
-        "n_full": off_full[-1],
-        "n_red": off_red[-1],
-        "is_bloch": is_bloch,
-    }
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6395,7 +6537,7 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _hanging_constraints(domain: Any, points: Any, cells: Any, order: int) -> dict:
@@ -6459,7 +6601,7 @@ def _build_hanging_reduction_multifield(domain: Any, hang: dict, cells: Any, cel
         )
         off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
         off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, region: str) -> Dict[int, np.ndarray]:
@@ -6496,7 +6638,7 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     facets = _boundary_facets(points, cells, dim, int(order))
     if facets is None or facets.size == 0:
         return {}
-    bnodes = np.unique(facets)
+    bnodes = unique_values(facets)
     sel = _face_nodes(domain, points, bnodes, region)
     if sel is None or len(sel) == 0:
         return {}
@@ -6579,13 +6721,21 @@ def _region_node_normals(domain: Any, points: Any, cells: Any, order: int, regio
     return out
 
 
-def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int) -> dict:
+def _build_slip_reduction(
+    domain: Any, slip_bcs: List[Any], fem_obj: Any, cells: Any, ele_order: int, prescribed: Any = None, tv_dofs: Any = None
+) -> dict:
     """Exact elimination of the slip conditions ``n·u = 0`` -> a prolongation in the periodic format.
 
     Each condition removes one velocity component per constrained node (partial-pivoted, see
     :func:`~jno.utils.solver.fem_utils.build_slip_prolongation`); every other field passes through as an
     identity block. Reusing the periodic reduction's dict shape means the reduce / solve / prolong /
     restrict path needs no new branch — ``fem.solve`` sees a reduced system exactly as it does for a tie.
+
+    ``prescribed`` (``(dof, value)`` pairs, coupled numbering) and ``tv_dofs`` (time-varying prescribed
+    DOFs) are the essential conditions of the same form. A prescribed component is never eliminated, and a
+    condition that only restates prescribed values is dropped (see ``build_slip_prolongation``): where a slip
+    wall meets a face that already fixes the normal component, eliminating it would leave that boundary
+    condition no row to be imposed into.
     """
     from jax.experimental import sparse as jsparse
 
@@ -6662,10 +6812,19 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         nodes = sorted(merged)
         node_dofs = np.asarray([[n * vec_i + c for c in range(vec_i)] for n in nodes], dtype=np.int64)
         coeff_blocks = [np.stack(merged[n], axis=0) for n in nodes]
-        pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks)
+        lo, hi = (int(offsets[i]), int(offsets[i + 1])) if offsets.size > 1 else (0, n_i)
+        fixed_i = {int(d) - lo: _concrete_value(g) for d, g in (prescribed or ()) if lo <= int(d) < hi}
+        fixed_i.update({int(d) - lo: None for d in (tv_dofs or ()) if lo <= int(d) < hi})
+        pro = build_slip_prolongation(n_i, node_dofs, coeff_blocks, prescribed=fixed_i)
         from .utils.solver import slip_runtime as _srt
 
         if _srt.runtime_info(domain, pts_i, np.asarray(pts_i)[nodes]):
+            if pro["dropped"]:
+                raise NotImplementedError(
+                    "jno.fem: a slip surface that moves with runtime coordinates meets a face whose essential "
+                    "condition already fixes the normal component; the runtime prolongation tracks every "
+                    "slip condition and cannot drop the redundant ones."
+                )
             # The slip surface moves with runtime coordinates: keep P's STRUCTURE, rebuild its values per
             # solve (see `slip_runtime`). The plan's P at the build coordinates must equal the reference.
             if runtime is not None:
@@ -6694,7 +6853,12 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
 
         get_logger().info(
             f"jno.fem: slip `n·u = 0` on {'+'.join(by_field[i])} -> {len(nodes)} node(s), "
-            f"{n_i - int(pro['n_red'])} DOF(s) eliminated exactly."
+            f"{n_i - int(pro['n_red'])} DOF(s) eliminated exactly"
+            + (
+                f"; {len(pro['dropped'])} condition(s) already held by prescribed values, not eliminated."
+                if pro["dropped"]
+                else "."
+            )
         )
         blocks.append({"P": pro["P"], "kept": pro["kept_nodes"], "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
@@ -6733,6 +6897,21 @@ def _build_slip_reduction(domain: Any, slip_bcs: List[Any], fem_obj: Any, cells:
         "coupling": "slip",
         **({"slip_runtime": runtime} if runtime is not None else {}),
     }
+
+
+def _multifield_reduction(blocks, off_full, off_red, **extra) -> dict:
+    """The multi-field periodic reduction dict, with its block-diagonal ``P`` built HERE, while the block
+    prolongations are concrete. ``reduce_matrix_periodic`` runs inside the traced Newton body; without the
+    cached ``P_blockdiag`` a non-selection block (an N1E tie, a Bloch phase) cannot be rebuilt there, and
+    ``PᵀJP`` silently falls onto the dense ``n x n`` path -- the slip builder has cached it for that reason."""
+    from .utils.solver.fem_utils import _blockdiag_bcoo
+
+    out = {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    Pg = _blockdiag_bcoo([b["P"] for b in blocks], off_full, off_red) if len(blocks) > 1 else None
+    if Pg is not None:
+        out["P_blockdiag"] = Pg
+    out.update(extra)
+    return out
 
 
 def _build_periodic_reduction_multifield(
@@ -6789,7 +6968,7 @@ def _build_periodic_reduction_multifield(
             )
             off_full.append(off_full[-1] + int(red_i["P"].shape[0]))
             off_red.append(off_red[-1] + int(red_i["P"].shape[1]))
-        return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+        return _multifield_reduction(blocks, off_full, off_red)
 
     # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
     blocks, off_full, off_red = [], [0], [0]
@@ -6812,7 +6991,7 @@ def _build_periodic_reduction_multifield(
         blocks.append({"P": P_i, "kept": kept_i, "vec": v_i, "is_selection": sel_i})
         off_full.append(off_full[-1] + int(P_i.shape[0]))
         off_red.append(off_red[-1] + int(P_i.shape[1]))
-    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+    return _multifield_reduction(blocks, off_full, off_red)
 
 
 def _complex_recombine(n: int):
@@ -6906,6 +7085,14 @@ def _fuse_complex_steady(fem_obj: "FEM") -> "FEM":
     else:
         fem_obj._periodic_2n = _duplicate_periodic(per)
     return fem_obj
+
+
+def _concrete_value(g: Any) -> Any:
+    """A prescribed value as a Python number, or ``None`` when it is not concrete (traced / array-valued)."""
+    try:
+        return complex(np.asarray(g).reshape(()))
+    except Exception:  # noqa: BLE001 - traced or not a scalar: nothing to compare eagerly
+        return None
 
 
 def _prescribed_dofs(domain: Any) -> Tuple[list, list]:
@@ -7617,7 +7804,7 @@ def _check_movable_bc_nodes(domain: Any, dirichlet_raw: Any, boundary_terms: Any
     facets = np.sort(np.stack([cells[:, list(c)] for c in combos], axis=1), axis=-1)
     facets = facets.reshape(-1, len(combos[0]))
     _uniq, _cnt = np.unique(facets, axis=0, return_counts=True)
-    bnodes = np.unique(_uniq[_cnt == 1])
+    bnodes = unique_values(_uniq[_cnt == 1])
     if bnodes.size == 0:
         return
     coords = pts[bnodes]
@@ -7682,7 +7869,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     _op_d = getattr(fem_obj._op, "dirichlet_dofs", None)
     if _op_d is not None:
         _d.extend(int(i) for i in np.asarray(_op_d).reshape(-1))
-    d_dofs = jnp.asarray(np.unique(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
+    d_dofs = jnp.asarray(unique_values(np.asarray(_d, dtype=np.int64)), dtype=jnp.int32) if _d else None
 
     # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
     # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
@@ -7964,6 +8151,9 @@ def fem(
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
     prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
+    from ._strong_form import _refuse_inside
+
+    _refuse_inside(constraints if isinstance(constraints, (list, tuple)) else [constraints], "jno.fem")
     _fn._CHUNK_CONSUMED[0] = False
     _fn._QUAD_EXPLICIT[0] = quad_degree is not None
     _fn._QUAD_REPORTED.clear()
@@ -8155,6 +8345,8 @@ def _fem_impl(
         spec = _periodic_tie_spec(c, domain)
         (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
     constraints = core_constraints
+    # a face operator (`jno.np.sqrtm(L)`) reads the Bloch phase of the ties across its face
+    domain._faceop_ties = list(periodic_ties)
     # Ties of a field to a constant unknown (`u(region) - U`) reduce the system by a prolongation like a
     # periodic tie; a constant's own essential value (`U - g`) is a one-DOF Dirichlet row. Both are peeled
     # off before classification -- neither names a region the classifier could read.
@@ -8291,11 +8483,13 @@ def _fem_impl(
         for c in _net_trial_only:
             support, _rg = _region_and_support(c, domain)
             _comp, _val, _vnode = _dirichlet_spec(_bare(c))
-            if support not in ("boundary", "initial") or not _is_bare_neural_value_node(_vnode):
+            if support == "initial":
+                continue  # any expression: the initial state is re-formed from the runtime args (`state0_fn`)
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
                 raise NotImplementedError(
                     "jno.fem: a network in an essential (trial-only) constraint must be a *bare* net(x) value "
-                    "on a boundary region (a Dirichlet profile) or the 'initial' region (an initial "
-                    "condition) — a compound expression (e.g. 1 + net(x)) is not supported."
+                    "on a boundary region (a Dirichlet profile), or any expression in an initial condition "
+                    "on the 'initial' region — a compound Dirichlet value (e.g. 1 + net(x)) is not supported."
                 )
         if _net_trial_only:
             if _trial_spaces(constraints) - _NATIVE_SPACES:
@@ -8365,6 +8559,9 @@ def _fem_impl(
         fem_obj._term_residual_factory = getattr(domain, "_fem_native_term_residual", None)
         fem_obj._has_facet_tables = bool(getattr(domain, "_fem_native_has_facet_tables", False))
         fem_obj._term_functional_factory = getattr(domain, "_fem_native_term_functional", None)
+        fem_obj._element_triplets_factory = getattr(domain, "_fem_native_element_triplets", None)
+        fem_obj._step_triplets_factory = getattr(domain, "_fem_native_step_triplets", None)
+        fem_obj._structure_factory = getattr(domain, "_fem_native_structure", None)
         fem_obj._block_value_shapes = list(getattr(domain, "_fem_native_field_shapes", None) or ())
         fem_obj._block_vecs = list(getattr(domain, "_fem_native_field_vecs", None) or ())
         fem_obj._block_constant = list(getattr(domain, "_fem_native_field_constant", None) or ())
@@ -8477,6 +8674,8 @@ def _fem_impl(
                     fem_obj,
                     getattr(domain, "_fem_native_assembly_cells", None),
                     int(getattr(domain, "_fem_native_assembly_order", 1)),
+                    prescribed=_dpairs_c,
+                    tv_dofs=_tvdofs_c,
                 )
             periodic = _build_constant_tie_reduction(
                 fem_obj, const_ties, [d for d, _g in _dpairs_c] + _tvdofs_c, slip=_slip_c
@@ -8517,7 +8716,9 @@ def _fem_impl(
         if slip_bcs:
             # Exact slip elimination. Built in the periodic dict shape so the whole reduce / solve /
             # prolong / restrict path below is reused with no new branch.
-            periodic = _build_slip_reduction(domain, slip_bcs, fem_obj, cells, ele_order)
+            periodic = _build_slip_reduction(
+                domain, slip_bcs, fem_obj, cells, ele_order, prescribed=_dpairs, tv_dofs=_tvdofs
+            )
         elif _nonnodal_topo is not None and _nonnodal_topo.get("family") in ("N1E", "N2E", "RT"):
             # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
             periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
@@ -8609,6 +8810,7 @@ def _fem_impl(
         the values they were assembled with.
         """
         out = _finalize_core(fem_obj)
+        _refuse_frozen_ic_trainables(out, ic_residuals)
         if _mean_gauge_fields:
             out._mean_gauges = _build_mean_gauge_ops(out, _mean_gauge_fields)
         # Structural, so it is known here for every mode -- and being known at BUILD time is what
@@ -8703,7 +8905,9 @@ def _fem_impl(
             classification.append("initial")
         elif has_test:
             _retag_coords_for_quadrature(c, support, region)
-            bare = _bare(c)
+            bare = _clean_weak_summands(_bare(c), support)
+            if bare is None:  # the whole term is a structural zero (`0 * v`): nothing to assemble
+                continue
             if support == "volume":
                 if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
@@ -8917,8 +9121,9 @@ def _fem_impl(
     # `u.across(main)` (a two-face boundary coupling) is assembled by the non-nodal path's general
     # boundary-integrand machinery, which also carries Lagrange fields -- so a Lagrange-only form that
     # reads it (a 2-D A_z eddy problem with a thin-conductor two-port) is routed there too.
+    # A face operator `jno.np.sqrtm(L)(trace)` (`faceop_*`, a dense block over one face) is assembled there too.
     _reads_across = any(
-        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("across_")
+        isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith(("across_", "faceop_"))
         for c in constraints
         for n in _walk(_bare(c))
     )
@@ -9131,8 +9336,19 @@ def _fem_impl(
         # `_fuse_complex_steady` build the real 2n block — which also carries the parametric legs, so a
         # 1D complex *inverse* rides the same path.
         _cx_bd = any(_bares_have_complex_coeff(exprs) for exprs in boundary_terms.values())
+        from .utils.solver.fem_1d import complex_dirichlet_regions
+
+        if not (_bares_have_complex_coeff(volume_terms) or _cx_bd) and (
+            _cx_real := complex_dirichlet_regions(domain, dirichlet_values)
+        ):
+            # A complex essential value on a REAL 1-D form reached `float(g)` in the Dirichlet assembly and
+            # failed with a bare TypeError; 2-D/3-D refuse it by name, so does 1-D now.
+            raise NotImplementedError(
+                f"jno.fem: a COMPLEX essential value on region(s) {sorted(set(_cx_real))} of a real 1D form is "
+                "not supported -- the Dirichlet rows hold real values. Use a real essential value and carry the "
+                "complex part in the operator or the source (a `1j` there makes the form complex)."
+            )
         if _bares_have_complex_coeff(volume_terms) or _cx_bd:
-            from .utils.solver.fem_1d import complex_dirichlet_regions
             from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_1d
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_1d
 
@@ -10057,6 +10273,132 @@ def _ic_component(bare: Any) -> Any:
     return None if trial_side is None else _component_index_of(trial_side)
 
 
+def _weak_summands(node: Any, sign: float = 1.0) -> List[Tuple[float, Any]]:
+    """``[(sign, summand)]`` of a term's top-level ``+``/``-`` tree. Products are NOT distributed."""
+    from .trace import BinaryOp
+
+    op = getattr(node, "op", None)
+    if isinstance(node, BinaryOp) and op in ("+", "-"):
+        return _weak_summands(node.left, sign) + _weak_summands(node.right, sign if op == "+" else -sign)
+    return [(sign, node)]
+
+
+def _clean_weak_summands(bare: Any, support: str = "volume") -> Any:
+    """A weak term with its structural-zero summands dropped, refusing a summand that has no test function.
+
+    Every additive piece of a weak form pairs with a test function. A piece without one has no equation to
+    go into, and the assemblers met it four different ways: 1-D integrated it into a SILENTLY wrong answer
+    (``2 + u' v'`` moved the solution by 0.48), a 1-D transient and the 2-D transient failed with an
+    unrelated TypeError, the non-nodal path refused even the harmless ``0`` that builtin ``sum()`` seeds,
+    and only the native steady path said what was wrong. Decided here, once, for every assembler: a
+    concrete real literal zero (``_is_structural_zero``) is dropped; anything else without a test is refused.
+    Returns ``None`` when every summand is a structural zero."""
+    from .trace import BinaryOp, Literal
+    from .utils.solver.fem_utils import _is_structural_zero
+
+    parts = _weak_summands(bare)
+    # A zero that marks the form stays. A complex zero (`0j * u * v`) marks it complex: dropping it would
+    # assemble the real problem, with a complex essential value then cast to float. A zero reading step
+    # history (`0 * s.i(-1) * v`) marks a load-path march: dropping it would turn the march into one solve.
+    from .trace import HistoryRef
+
+    def _marks_the_form(t):
+        return any(_node_has_complex_literal(n) or isinstance(n, HistoryRef) for n in _walk(t))
+
+    kept = [(sg, t) for sg, t in parts if not (_is_structural_zero(t) and not _marks_the_form(t))]
+    for _sg, t in kept:
+        if not _contains(t, TestFunction):
+            raise ValueError(
+                f"jno.fem: a {support} weak-form summand carries no test field, so it belongs to no "
+                f"equation -- {t!r}. Every additive piece of a weak form pairs with a test function: a "
+                "source term is `- f * v`, not `- f`."
+            )
+    if len(kept) == len(parts):
+        return bare
+    if not kept:
+        return None
+    out = None
+    for sg, t in kept:
+        if out is None:
+            out = t if sg > 0 else BinaryOp("*", Literal(-1.0), t)
+        else:
+            out = BinaryOp("+" if sg > 0 else "-", out, t)
+    return out
+
+
+def _initialized_parameter_values(node: Any) -> dict:
+    """``{name: value}`` for every parameter in ``node`` whose ``.initialize(...)`` has not been applied yet.
+
+    The initializer is LAZY -- the training loop applies it when it sets the models up -- so a value read at
+    build time is still the zeros the parameter is born with. An initial state baked at build (a nodal data
+    field handed in as ``u(initial) - g``) then started the march from 0, with nothing to flag it."""
+    from .geometry.parametric import initial_value
+
+    out = {}
+    for nd in _walk(node):
+        m = getattr(nd, "model", None)
+        if type(nd).__name__ != "ModelCall" or not getattr(m, "_is_parameter", False):
+            continue
+        name = getattr(m, "_parameter_name", None)
+        val = initial_value(nd)
+        if (
+            val is None
+            and getattr(m, "_weight_tree", None) is not None
+            and not hasattr(m._weight_tree, "__fspath__")
+            and not isinstance(m._weight_tree, str)
+        ):
+            val = jnp.asarray(m._weight_tree)
+        if name is not None and val is not None:
+            out[name] = jnp.reshape(jnp.asarray(val), jnp.shape(m.module.value))
+    return out
+
+
+def _ic_trainable_names(ic_residuals: List[Any]) -> List[str]:
+    """Names of the trainable parameters and networks an initial condition's value reads.
+
+    An optimizer-less nodal DATA field (a known initial state handed in as a field) is not a trainable."""
+    from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs, _collect_runtime_parameter_exprs
+
+    names: List[str] = []
+    for ic in ic_residuals:
+        trial_side = _ic_trial_side(ic)
+        if trial_side is None:
+            continue
+        value = ic.right if trial_side is ic.left else ic.left
+        for pn, pd in _collect_runtime_parameter_exprs(value, {}).items():
+            pm = getattr(pd, "model", None)
+            if (
+                getattr(pm, "_opt_fn", None) is None
+                and np.asarray(getattr(getattr(pm, "module", None), "value", 0.0)).size > 1
+            ):
+                continue
+            names.append(pn)
+        names.extend(_collect_neural_coefficient_exprs(_bare(value)))
+    return names
+
+
+def _refuse_frozen_ic_trainables(fem_obj: Any, ic_residuals: List[Any]) -> None:
+    """A trainable in an initial condition that the built operator does not take as a runtime argument
+    would be read once, at its stored value: a silently frozen trainable (and one ``jno.core`` never sees).
+    The paths that re-form the initial state from the runtime arguments publish its name; refuse the rest."""
+    if not ic_residuals:
+        return
+    names = _ic_trainable_names(ic_residuals)
+    if not names:
+        return
+    taken = set(getattr(getattr(fem_obj, "_op", None), "runtime_parameter_exprs", None) or {})
+    missing = sorted(set(names) - taken)
+    if missing:
+        raise NotImplementedError(
+            f"jno.fem: the initial condition reads the trainable(s) {missing}, but this form's assembly path "
+            "fixes the initial state at build time, so they would never train. A trainable initial condition "
+            "is wired on a first-order-in-time (u_t) transient on 2-D/3-D Lagrange fields, single or coupled. "
+            "Not on: 1-D line domains, the non-nodal families (Hermite, Argyris, Morley, Nedelec, RT), "
+            "second-order-in-time (u_tt) forms, complex transients. There, put the trainable in a source "
+            "term or a Dirichlet value, or give the initial condition as a fixed value."
+        )
+
+
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
@@ -10073,17 +10415,17 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
         value_node = bare.right if trial_side is bare.left else bare.left
     if value_node is None:
         return jnp.zeros((n,))
-    from .utils.solver.parametric_helpers import _is_neural_coefficient
-
-    if _is_neural_coefficient(_bare(value_node)):
-        # A net-valued IC threads its weights only on the real, first-order-in-time transient path
-        # (``state0_fn`` re-forms the initial state from ``args``). This routine bakes the IC at assembly
-        # (complex-transient / second-order-in-time), so the weights would silently NOT train — reject it.
+    _trainables = _ic_trainable_names([bare])
+    if _trainables:
+        # A trainable IC (a network, or a ``jno.np.parameter`` anywhere in the value) threads only where the
+        # initial state is re-formed from the runtime args (``state0_fn``). This routine bakes the IC at
+        # assembly (1-D, complex-transient, second-order-in-time), so it would silently NOT train -- reject it.
         raise NotImplementedError(
-            "jno.fem: a net-valued initial condition u(initial) - net(x) is wired on a real, "
-            "first-order-in-time transient form (its weights thread the initial state); this path "
-            "(complex-transient or second-order-in-time) bakes the IC at assembly and cannot thread the "
-            "weights. Use a real first-order transient form, or a constant/field initial condition here."
+            f"jno.fem: the initial condition reads the trainable(s) {sorted(_trainables)}, and this form's "
+            "path (a 1-D line, a complex transient or a second-order-in-time u_tt form) fixes the initial state "
+            "at build time, so they would never train. A trainable initial condition is wired on a real "
+            "first-order (u_t) transient on 2-D/3-D Lagrange fields. Here, put the trainable in a source term "
+            "or a Dirichlet value, or give the initial condition as a fixed value."
         )
     comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
     n_nodes = int(jnp.asarray(pts).shape[0])
@@ -10095,7 +10437,14 @@ def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -
     from .utils.solver.time_route import _infer_time_window
 
     # an initial condition sits at the start time: a value written with the time variable reads it there
-    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts), t=_infer_time_window(domain)[0])).reshape(-1)
+    vals = jnp.asarray(
+        _eval_value_node_at(
+            value_node,
+            jnp.asarray(pts),
+            params=_initialized_parameter_values(value_node) or None,
+            t=_infer_time_window(domain)[0],
+        )
+    ).reshape(-1)
     if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
         per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
         return jnp.zeros((n,)).at[comp::vec].set(per)
@@ -10585,7 +10934,8 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
     * ``'mass'``      -> ``M = integral phi_i phi_j``              (``k^T M k = integral k^2``)
 
     Assembled natively: the bilinear form is retagged to the quadrature pool and run through
-    ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes.
+    ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes, sparse (held
+    dense it was n x n on the device, 73 MB at 3 k nodes and 80 GB at 100 k).
     """
     from .utils.solver.fem_native import assemble_fem_native
 
@@ -10603,12 +10953,11 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
     _retag_coords_for_quadrature(bare, "volume", "volume")
     qd = int(getattr(domain, "_fem_quad_degree", 0) or 2)
     op, _mode, _offs = assemble_fem_native(domain, [bare], {}, [], [], vec=1, quad_degree=qd)
-    A = op[0]
-    return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+    return op[0]
 
 
-def _assemble_h1_stiffness(domain: Any):  # back-compat alias
-    return _assemble_fe_gram(domain, "stiffness")
+def _assemble_h1_stiffness(domain: Any):  # back-compat alias: dense, for a small mesh and a test
+    return _assemble_fe_gram(domain, "stiffness").todense()
 
 
 def _fe_element_gradient_data(domain: Any):

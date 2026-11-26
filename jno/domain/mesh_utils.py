@@ -51,6 +51,8 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.spatial import KDTree
 
+from ..utils.sets import unique_values
+
 
 class MeshConnectivity(dict):
     """The mesh-connectivity mapping, with entries that may be computed on **first read**.
@@ -590,7 +592,7 @@ class MeshUtils:
         else:
             raise ValueError("Unsupported mesh type.")
 
-        boundary_indices = np.unique(boundary_elements)
+        boundary_indices = unique_values(boundary_elements)
         return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
 
     @staticmethod
@@ -630,7 +632,7 @@ class MeshUtils:
             # ``e.ravel()`` interleaves per edge -- (e0a, e0b, e1a, e1b, ...) -- so the weights must
             # ``repeat`` (each edge's normal twice, adjacent), not ``tile``.
             acc[:, c] = np.bincount(e.ravel(), weights=np.repeat(n[:, c], 2), minlength=len(pts))
-        idx = np.unique(e)
+        idx = unique_values(e)
         out = acc[idx]
         return out / (np.linalg.norm(out, axis=1, keepdims=True) + 1e-20), idx
 
@@ -760,7 +762,7 @@ class MeshUtils:
         flat, contrib = faces.ravel(), np.repeat(n, faces.shape[1], axis=0)
         vnorm = np.stack([np.bincount(flat, weights=contrib[:, c], minlength=len(pts)) for c in range(3)], axis=1)
 
-        boundary_indices = np.unique(faces.ravel())
+        boundary_indices = unique_values(faces.ravel())
         out = vnorm[boundary_indices]
         lens = np.linalg.norm(out, axis=1, keepdims=True)
 

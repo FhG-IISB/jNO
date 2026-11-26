@@ -574,7 +574,7 @@ as `fem.solve(time=…)`, the *same* slot object — to change it:
 
 ```python
 traj = jno.fdm([...]).solve(time=jno.solve.theta(0.5))   # Crank–Nicolson (2nd-order in time)
-traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # step-doubling adaptive step size
+traj = jno.fdm([...]).solve(time=jno.solve.adaptive())   # adaptive step size (step doubling on backward Euler)
 ```
 
 `save_ts=` picks the times the march returns, as in `fem.solve(save_ts=…)`. The step Δt stays the one
@@ -610,8 +610,8 @@ sol = jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
 ```
 
 [`jno.precond.schwarz()`](solvers.md#overlapping-schwarz-jnoprecondschwarz) needs METIS
-(`pip install "jax-numerical-operators[fdm]"`). Its rigid-body coarse space (`nullspace="rigid"`) reads
-FDM's layout, one DOF block per component.
+(`pip install "jax-numerical-operators[fdm]"`). A coarse space written as formulas
+(`schwarz(coarse=[(1, 0), (0, 1), (-y, x)])`) is placed by FDM's layout, one DOF block per component.
 
 Setting either assembles the strong-form operator as a sparse matrix once: one JVP per colour of the
 stencil pattern, checked against the matrix-free action before use. What happens next depends on the

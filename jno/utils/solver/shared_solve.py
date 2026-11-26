@@ -56,8 +56,11 @@ def _group_of(node):
     if key is None:
         return None
     spec = getattr(node, "_linear_spec", None)
-    spec_key = None if spec is None else (getattr(spec, "name", None), getattr(spec, "key", None) or id(spec))
-    return (key, spec_key), fem
+    if spec is None:
+        return (key, None), fem
+    settings = getattr(spec, "settings", None)  # two `lu()` asked for alike are one solver, whichever object
+    same = getattr(spec, "key", None) or (tuple(sorted(settings.items())) if settings else id(spec))
+    return (key, (getattr(spec, "name", None), same)), fem
 
 
 def solve_shared(evaluator, node, ctx, memo) -> bool:

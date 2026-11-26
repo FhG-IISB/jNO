@@ -261,7 +261,7 @@ def _driven_maxwell(mesh_size, k0, volume_loss=0.0):
     vol = inner(cu, cv) - k0**2 * inner(ui, vi)
     if volume_loss:
         vol = vol + 1j * volume_loss * inner(ui, vi)
-    return jno.fem([vol, 1j * k0 * inner(tu, tv), 2j * k0 * inner(g, tv)])
+    return jno.fem([vol, 1j * k0 * inner(tu, tv), -2j * k0 * inner(jno.np.cross(g, nb), tv)])
 
 
 @pytest.mark.parametrize("k0", [1.0, 3.0])

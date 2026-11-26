@@ -165,8 +165,44 @@ u.reshape(d.grid["shape"])                                    # nodes are C-orde
 consistent with the `nx`/`ny`/`nz` of every other grid in jNO. A 128×128 *pixel* grid for a
 foundation model is therefore `.structured(n=127)`. Omit `n` to derive it from the shape's `size=`.
 
-A plan that cannot be a lattice — a CSG cut, a disk, a graded `size=` callable, `.curved()` — is
-**refused by name** rather than quietly meshed with gmsh, since the caller who then reads `d.grid` or
+#### Several boxes: a rectilinear lattice
+
+A plan built only from axis-aligned rects/boxes — named regions joined with `+`, and `|`, `-`, `&` —
+is meshed as a **rectilinear** lattice: every face of every box is a grid plane, and the slab between
+two neighbouring planes is split evenly at the finest `size=` of the regions it crosses. Interfaces are
+therefore exact, every cell is a voxel (or its six Kuhn tets), and opposite faces match node for node,
+so a periodic edge-element (N1E) tie keeps the lattice instead of re-meshing it with gmsh.
+
+```python
+d = (
+    shape.box(0.3, 0.3, 0, 0.5, 0.5, 0.06).name("hole").attach(eps=1.0).size(0.1)
+  + shape.box(0, 0, 0, 0.8, 0.8, 0.06).name("film").attach(eps=eps_cr).size(0.03)
+  + shape.box(0, 0, -0.3, 0.8, 0.8, 0).name("quartz").attach(eps=2.4)
+  + shape.box(0, 0, 0.06, 0.8, 0.8, 0.4).name("air").attach(eps=1.0)
+).sized(0.2).structured().domain()
+```
+
+By default every slab is uniform, so the spacing **jumps** at the plane between two slabs (0.03 in the
+film, 0.2 straight below it). `.structured(grading=r)` blends it instead: away from every finer slab
+the cells grow by at most about `r` per cell until they reach their own slab's size — the spacing is
+`min_j(h_j + (r − 1)·dist(x, slab j))`, the geometric growth the gmsh path builds into its size bands
+(about 1.1 there). The box faces stay grid planes.
+
+```python
+d = plan.structured(grading=1.3).domain()   # 0.03 in the film, growing by 1.3x per cell to 0.2
+```
+
+A slab runs through the whole domain along the other axes, so a size is felt along every slab its
+region crosses: here the film's 0.03 sets the x and y spacing everywhere, while z stays at 0.2 in the
+quartz and air. A thin layer whose thickness is below its `size=` gets one cell through it (the planes
+resolve the thickness), so give a thin layer the size you want *in its plane*. Cells outside the plan
+(an L-shaped union) are dropped. Regions, attachments, the outer face names (by outward direction) and
+the interface tags `"a|b"` come as on the gmsh path; `n=` cell counts are refused (they cannot say
+which slab gets how many cells), and so is `regions(conforming=False)`. The spacing is not uniform, so
+`d.grid` is `None` and `jno.fdm` assembles on the mesh.
+
+A plan that cannot be a lattice — a disk or other non-box primitive, a rotation, a graded `size=`
+callable, `.curved()` — is **refused by name** rather than quietly meshed with gmsh, since the caller who then reads `d.grid` or
 expects hexes would otherwise fail somewhere else. The named faces (`left`/`right`/`bottom`/`top`,
 plus `front`/`back` in 3-D), `boundary`, `interior`, and any `.name()`/`.attach()` region come with
 the lattice as usual.

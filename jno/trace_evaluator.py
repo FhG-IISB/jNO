@@ -34,9 +34,11 @@ from .trace import (
     ModelWeights,
     NetworkGradient,
     Noise,
+    Norm,
     OperationCall,
     OperationDef,
     Placeholder,
+    RegionMask,
     StateField,
     TemporalDerivative,
     TensorTag,
@@ -46,6 +48,7 @@ from .trace import (
     TunableModuleCall,
     Variable,
     collect_tags,
+    region_mask_key,
 )
 
 
@@ -104,6 +107,7 @@ from .integration_operators import IntegrationOperators
 from .utils import get_logger
 from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
 from .utils.schemes import resolve_scheme, scheme_family
+from .utils.sets import unique_values
 
 
 def _uniform_grid_spec(domain, n_values: int):
@@ -719,6 +723,7 @@ class TraceEvaluator:
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
         (Integral, "_eval_integral"),
+        (Norm, "_eval_norm"),
         (IntegralTime, "_eval_integral_time"),
         (TemporalDerivative, "_eval_temporal_derivative"),
         (OperationDef, "_eval_operation_def"),
@@ -728,7 +733,20 @@ class TraceEvaluator:
         (GroupedAssembly, "_eval_grouped_assembly"),
         (NetworkGradient, "_eval_network_gradient"),
         (Noise, "_eval_noise"),
+        (RegionMask, "_eval_region_mask"),
     ]
+
+    def _eval_region_mask(self, expr, ctx):
+        """A region indicator read at points: its 0/1 membership must be in the context (a sampler that
+        knows the points puts it there, e.g. RCWA's permittivity grid). ``jno.fem`` resolves it per cell
+        in its own kernels and never comes here."""
+        key = region_mask_key(expr.region)
+        if key in ctx.context:
+            return ctx.context[key]
+        raise ValueError(
+            f"RegionMask({expr.region!r}) is a per-cell region indicator: evaluating it at points needs the "
+            f"points' membership in the context under {key!r} (jno.utils.solver.fem_utils.region_membership_at)."
+        )
 
     def _dispatch(self, expr, ctx):
         """Look up handler in the dispatch table and call it -- once per node, context and trace.
@@ -2860,6 +2878,181 @@ class TraceEvaluator:
 
                 return jax.vmap(hess_single)(points)
 
+    def _first_domain_variable(self, target, ctx):
+        """The first spatial Variable in ``target`` that belongs to a domain (a normal's ``n_`` tag only
+        when nothing else is there), or ``None``: what an integral or a norm reduces over."""
+        first_spatial_var = None
+
+        def _find_spatial(node):
+            nonlocal first_spatial_var
+            if first_spatial_var is not None:
+                return
+            if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+                bound = ctx.var_bindings.get(id(node), node)
+                b_tag = getattr(bound, "tag", "")
+                if getattr(bound, "_domain", None) is not None and not b_tag.startswith("n_"):
+                    first_spatial_var = bound
+                    return
+            for attr in ("target", "left", "right"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder):
+                    _find_spatial(child)
+            for attr in ("args", "variables"):
+                for child in getattr(node, attr, []):
+                    if isinstance(child, Placeholder):
+                        _find_spatial(child)
+
+        _find_spatial(target)
+
+        if first_spatial_var is None:
+            # Fall back: accept normal vars too (e.g. nx.integrate())
+            def _find_any_spatial(node):
+                nonlocal first_spatial_var
+                if first_spatial_var is not None:
+                    return
+                if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+                    bound = ctx.var_bindings.get(id(node), node)
+                    if getattr(bound, "_domain", None) is not None:
+                        first_spatial_var = bound
+                        return
+                for attr in ("target", "left", "right"):
+                    child = getattr(node, attr, None)
+                    if isinstance(child, Placeholder):
+                        _find_any_spatial(child)
+                for attr in ("args", "variables"):
+                    for child in getattr(node, attr, []):
+                        if isinstance(child, Placeholder):
+                            _find_any_spatial(child)
+
+            _find_any_spatial(target)
+
+        return first_spatial_var
+
+    def _eval_norm(self, expr, ctx):
+        """A function-space norm (:class:`~jno.trace.Norm`): ``l2`` on the evaluated points; the others on
+        all nodes of the field's region, with the backend picked from the domain (``jno.residual_norms``)."""
+        from .residual_norms import pointwise_sq, sobolev_operator
+
+        kind, finish = expr.kind, (lambda v: v) if expr.squared else jnp.sqrt
+        if kind == "l2":
+            vals = self._dispatch(expr.target, ctx)
+            expr.backend = "points"
+            return finish(jnp.squeeze(jnp.mean(jnp.square(vals))))  # exactly the mse when squared
+
+        var = self._first_domain_variable(expr.target, ctx)
+        if var is None:
+            raise ValueError(
+                f"norm({expr.space!r}): no spatial Variable with a domain in the expression, so there is no region "
+                "to take the norm over."
+            )
+        raw_tag = var.tag
+        tag = raw_tag[2:] if raw_tag.startswith("n_") else raw_tag
+        domain = var._domain
+        mesh_free = domain.__dict__.get("_mesh") is None and domain.__dict__.get("_lazy_plan") is not None
+        if expr.method == "points" or (mesh_free and expr.method is None):
+            return self._eval_norm_point_cloud(expr, ctx, domain, tag, finish)
+        with jax.ensure_compile_time_eval():  # method="mesh" on a mesh-free shape builds it here, outside the trace
+            mc = domain.mesh_connectivity
+        if mc is None:
+            return self._eval_norm_point_cloud(expr, ctx, domain, tag, finish)
+
+        cached = self._get_integral_cache(domain, tag, mc, "nodal")
+        region_pts = jnp.array(cached["region_pts"])
+        new_ctx_dict = dict(ctx.context)
+        new_ctx_dict[tag] = region_pts
+        if raw_tag != tag:
+            new_ctx_dict[raw_tag] = new_ctx_dict.get(raw_tag, region_pts)
+        if cached["is_boundary"] and cached["normals"] is not None:
+            new_ctx_dict[f"n_{tag}"] = jnp.array(cached["normals"])
+        new_ctx = self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+        vals = self._dispatch(expr.target, new_ctx)
+        n_pts = region_pts.shape[0]
+        if vals.shape[0] != n_pts:
+            raise ValueError(
+                f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {n_pts} nodes of '{tag}'. The "
+                "compiler hands a norm one batch sample and one time level at a time, so this layout is unexpected "
+                "(a jNO bug); please report it with the expression."
+            )
+        sq = pointwise_sq(vals)
+        weights = jnp.array(cached["weights"])
+
+        if kind in ("L2", "L1", "Linf"):
+            expr.backend = "region"
+            if kind == "L2":
+                return finish(jnp.sum(weights * sq))
+            norm = jnp.sum(weights * jnp.sqrt(sq)) if kind == "L1" else jnp.sqrt(jnp.max(sq))
+            return norm**2 if expr.squared else norm
+
+        if cached["is_boundary"]:
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the boundary tag '{tag}' is not supported (an H^s norm on the boundary, "
+                "e.g. H^-1/2, is not implemented). Use 'L2', 'L1' or 'Linf' there."
+            )
+        if n_pts != int(np.asarray(mc["points"]).shape[0]):
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the sub-region '{tag}' is not supported yet: the Sobolev backends need the "
+                "whole volume mesh. Take the norm over the full interior."
+            )
+        backend = expr.method or ("grid" if mc.get("grid") is not None else "mesh")
+        if backend == "grid" and mc.get("grid") is None:
+            raise ValueError(f"norm({expr.space!r}, method='grid'): region '{tag}' is not a structured lattice.")
+        op = sobolev_operator(domain, tag, mc, backend, expr.s, expr.bc, expr.scale, expr.solver, expr.precond)
+        expr.backend = op.name
+        return finish(op(vals))
+
+    def _eval_norm_point_cloud(self, expr, ctx, domain, tag, finish):
+        """A norm on a point cloud -- a shape domain without a mesh (its points sampled from the geometry), or
+        points with no geometry at all: the point rule with weight ``|Omega| / N`` (``L2``, ``L1``), the
+        maximum (``Linf``) and the Green's kernel (``H-1``), on the points being evaluated."""
+        from .residual_norms import point_cloud_volume, point_kernel_norm_sq, pointwise_sq, shape_volume
+
+        raw = jnp.asarray(ctx.context[tag])
+        if int(np.prod(raw.shape[:-2])) != 1:
+            raise ValueError(
+                f"norm({expr.space!r}) on '{tag}': its points come as {tuple(raw.shape)}. The compiler hands a norm "
+                "one batch sample and one time level at a time, so this layout is unexpected (a jNO bug); please "
+                "report it with the expression."
+            )
+        flat = raw.reshape(raw.shape[-2], raw.shape[-1])  # (N, D): the layout the derivative nodes expect
+        new_ctx = self._EvalCtx({**ctx.context, tag: flat}, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+        vals = self._dispatch(expr.target, new_ctx)
+        while vals.ndim > 2 and vals.shape[0] == 1:
+            vals = vals[0]
+        expr.backend = "points"
+        if expr.kind == "Linf":
+            norm = jnp.sqrt(jnp.max(pointwise_sq(vals)))
+            return norm**2 if expr.squared else norm
+        if expr.kind == "H" and expr.s != -1.0:
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the point cloud '{tag}' is not available: without a mesh only 'l2', "
+                "'L2', 'L1', 'Linf' and 'H-1' (Green's kernel) work. Give the shape a mesh size "
+                "(jno.shape.rect(..., size=h)) or use a lattice (.structured(n=...))."
+            )
+        dim = int(domain.dimension)
+        pts = flat[:, :dim]
+        if vals.shape[0] != pts.shape[0]:
+            raise ValueError(
+                f"norm({expr.space!r}): the field has shape {tuple(vals.shape)} on the {pts.shape[0]} points of "
+                f"'{tag}', an unexpected layout (a jNO bug); please report it with the expression."
+            )
+        kind_name = getattr(domain, "_geometry_tags", {}).get(tag)
+        if kind_name is not None and (kind_name[0] == "boundary" or kind_name[1] is not None):
+            raise NotImplementedError(
+                f"norm({expr.space!r}) on the sampled boundary tag '{tag}' of a mesh-free domain is not supported "
+                "(it needs the boundary's measure). Use 'Linf', or give the shape a mesh size."
+            )
+        if domain.__dict__.get("_lazy_plan") is not None:
+            volume = shape_volume(domain)
+        else:
+            host = np.asarray(domain.context[tag])
+            volume = point_cloud_volume(domain, tag, host.reshape(-1, host.shape[-1])[:, :dim])
+        if expr.kind == "L2":
+            return finish(volume * jnp.mean(pointwise_sq(vals)))
+        if expr.kind == "L1":
+            norm = volume * jnp.mean(jnp.sqrt(pointwise_sq(vals)))
+            return norm**2 if expr.squared else norm
+        return finish(point_kernel_norm_sq(pts, vals, expr.scale, volume))
+
     def _eval_integral(self, expr: "Integral", ctx):
         """Evaluate a mesh-based integral reduction.
 
@@ -2882,50 +3075,7 @@ class TraceEvaluator:
             return self._eval_integral_vectorized(expr, ctx)
 
         # ── Scalar path ────────────────────────────────────────────────────────
-        first_spatial_var = None
-
-        def _find_spatial(node):
-            nonlocal first_spatial_var
-            if first_spatial_var is not None:
-                return
-            if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
-                bound = ctx.var_bindings.get(id(node), node)
-                b_tag = getattr(bound, "tag", "")
-                if getattr(bound, "_domain", None) is not None and not b_tag.startswith("n_"):
-                    first_spatial_var = bound
-                    return
-            for attr in ("target", "left", "right"):
-                child = getattr(node, attr, None)
-                if isinstance(child, Placeholder):
-                    _find_spatial(child)
-            for attr in ("args", "variables"):
-                for child in getattr(node, attr, []):
-                    if isinstance(child, Placeholder):
-                        _find_spatial(child)
-
-        _find_spatial(expr.target)
-
-        if first_spatial_var is None:
-            # Fall back: accept normal vars too (e.g. nx.integrate())
-            def _find_any_spatial(node):
-                nonlocal first_spatial_var
-                if first_spatial_var is not None:
-                    return
-                if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
-                    bound = ctx.var_bindings.get(id(node), node)
-                    if getattr(bound, "_domain", None) is not None:
-                        first_spatial_var = bound
-                        return
-                for attr in ("target", "left", "right"):
-                    child = getattr(node, attr, None)
-                    if isinstance(child, Placeholder):
-                        _find_any_spatial(child)
-                for attr in ("args", "variables"):
-                    for child in getattr(node, attr, []):
-                        if isinstance(child, Placeholder):
-                            _find_any_spatial(child)
-
-            _find_any_spatial(expr.target)
+        first_spatial_var = self._first_domain_variable(expr.target, ctx)
 
         if first_spatial_var is None:
             raise ValueError(
@@ -3151,7 +3301,7 @@ class TraceEvaluator:
                     np.add.at(vols, tris[:, 0], share)
                     np.add.at(vols, tris[:, 1], share)
                     np.add.at(vols, tris[:, 2], share)
-                    reg_indices = np.unique(tris.flatten()).astype(int)
+                    reg_indices = unique_values(tris.flatten()).astype(int)
                     region_pts_np = points_arr[reg_indices]
                     weights_np = vols[reg_indices]
                 else:

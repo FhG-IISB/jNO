@@ -99,6 +99,7 @@ Maturity is stated per capability; each link goes to the page that documents it.
 |------------|----------|-------|
 | Forward PINNs (residual minimisation) | [stable](tutorials/01-basics/laplace-1d.md) | Hard or soft BC enforcement |
 | Variational PINNs (weak-form losses) | [stable](tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md) | Network trial functions against the FEM weak form |
+| Residual norms (`r.norm("H-1")`, L2, H^s losses) | [beta](tutorials/08-fem-and-varpinns/h-minus-1-residual-loss.md) | Grid (any s) or P1 mesh (s = ±1) backend, picked from the domain |
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](tutorials/11-operator-learning/index.md) | PDE-residual or data-driven |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](adaptive/resampling.md) | |
 | Stochastic PDEs & noise nodes (gaussian / uniform / laplace) | [stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
@@ -136,14 +137,14 @@ for full definitions:
 
 ## Tutorials
 
-47 tutorial pages: 45 worked examples and two overviews. Start with the PINN group if you are new to
+48 tutorial pages: 46 worked examples and two overviews. Start with the PINN group if you are new to
 jNO; jump straight to FEM or FDM if you arrived for the solvers.
 
 | Group | Count | Covers |
 |-------|-------|--------|
 | [PINN](tutorials/01-basics/laplace-1d.md) | 8 | Laplace 1-D, variable-coefficient Poisson, Allen–Cahn, viscous Burgers, inverse parameter, Fredholm integral equation, gradient conflict, Fokker–Planck |
 | [Operator learning](tutorials/11-operator-learning/index.md) | 3 | Overview, DeepONet on a parametric Poisson, FNO2D supervised |
-| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 28 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
+| [FEM](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | 29 | Poisson, VPINN, Deep Ritz, Helmholtz + PML, elasticity, coarse spaces for Schwarz, Navier–Stokes (2-D and 3-D, stabilised, high Re, vortex shedding), droplets, LES subgrid models, laser melt pool, tied two-mesh coating, Rayleigh–Bénard, phase-field fracture, wave & elastodynamics, full-waveform inversion, inverse diffusivity field, adaptive refinement, topology optimisation, 2-D Maxwell |
 | [FDM](tutorials/09-fdm/poisson-2d-fdm.md) | 4 | Poisson, heat, mixed BC, inverse source |
 | [Bayesian](tutorials/10-bayesian-pinns/index.md) | 2 | Overview and an inverse coefficient with uncertainty |
 | [RCWA](tutorials/12-rcwa/binary-grating-orders.md) | 1 | Binary-grating diffraction orders |

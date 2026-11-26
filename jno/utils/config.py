@@ -296,6 +296,28 @@ def enable_compile_cache(directory: str | None = None) -> str:
     return path
 
 
+def hoist_constants_after_import() -> None:
+    """``JAX_USE_SIMPLIFIED_JAXPR_CONSTANTS=1`` for a process that imported JAX before jNO, as most scripts do.
+
+    JAX reads that setting at three points, and two of them are in its import (which types may be literals, and the
+    default of ``LoweringParameters``), so ``jax.config.update`` alone leaves a half-switched state. Private, like the
+    rest of jNO's use of ``jax._src``; the pin on JAX in ``pyproject.toml`` is what keeps it valid."""
+    import dataclasses
+
+    import jax
+    from jax._src import core
+    from jax._src.array import ArrayImpl
+    from jax._src.interpreters import mlir
+
+    jax.config.update("jax_use_simplified_jaxpr_constants", True)
+    core.literalable_types.add(ArrayImpl)
+    params = mlir.LoweringParameters
+    with_defaults = [f.name for f in dataclasses.fields(params) if f.init and f.default is not dataclasses.MISSING]
+    defaults = list(params.__init__.__defaults__)
+    defaults[with_defaults.index("hoist_constants_as_args")] = True
+    params.__init__.__defaults__ = tuple(defaults)
+
+
 def disable_compile_cache() -> None:
     """Turn the persistent compilation cache back off (it is on by default) — the programmatic twin
     of ``JNO_COMPILE_CACHE=0`` / ``[jno] compile_cache = false``."""

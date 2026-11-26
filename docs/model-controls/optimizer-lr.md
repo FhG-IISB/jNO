@@ -47,10 +47,71 @@ k.optimizer(optax.chain(                                 # compose with optax di
 
 | Optimizer | What it is | Reference |
 |---|---|---|
-| `engd()` | Energy Natural Gradient Descent — preconditions with the inverse energy Gram matrix G⁻¹; auto-detects `gram_terms`; compatible with `line_search=True` | Müller & Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent*, ICML 2023, arXiv:2302.13163 |
-| `ssbroyden()` / `ssbfgs()` | Self-Scaled Broyden / BFGS quasi-Newton with a zoom line search — strong on smooth PINN / inverse losses | Urbán, Stefanou & Pons, *Unveiling the optimization process of PINNs*, J. Comput. Phys. **523** (2025) 113656 |
+| `engd()` | Energy Natural Gradient Descent — preconditions with the inverse energy Gram matrix G⁻¹; auto-detects `gram_terms`; compatible with `line_search=True`; `momentum=` / `damping=` give SPRING (Gauss-Newton with momentum, Levenberg-Marquardt damping) | Müller & Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent*, ICML 2023, arXiv:2302.13163; SPRING: Goldshlager, Abrahamsen & Lin 2024, arXiv:2401.10190 |
+| `ssbroyden()` / `ssbfgs()` | Self-Scaled Broyden / BFGS quasi-Newton with a zoom line search — strong on smooth PINN / inverse losses. The default stores a dense `P × P` matrix (a few thousand parameters at most); `pairs=m` keeps the metric on `m` directions in `m·P` numbers for larger networks (see below) | Urbán, Stefanou & Pons, *Unveiling the optimization process of PINNs*, J. Comput. Phys. **523** (2025) 113656 |
 | `soap()` / `scale_by_soap()` | SOAP — Shampoo with Adam in the preconditioner's eigenbasis | Vyas et al., *SOAP: Improving and Stabilizing Shampoo using Adam* (2024), arXiv:2409.11321 |
+| `lm()` | Levenberg-Marquardt on the PINN residuals; the damping adapts to the gain ratio and rejected steps are retried within the epoch, so the loss never rises; dense (smaller of `P x P`, `m x m`) | Levenberg (1944); Marquardt (1963); Madsen, Nielsen & Tingleff, *Methods for Non-Linear Least Squares Problems* (2004), Sec. 3.2 |
+| `dngd()` | Dual Natural Gradient Descent — the Gauss-Newton step solved over the `m` residual rows, with geodesic acceleration; `solver="nystrom_pcg"` is matrix-free | Jnini & Vella, *Dual Natural Gradient Descent for Scalable Training of PINNs* (2025), arXiv:2505.21404 |
+| `nystrom_ngd()` | Matrix-free natural gradient: Nyström-preconditioned CG on `JᵀJ + μI`, adaptive sketch rank, Armijo steps | Bioli, Marcati & Sangalli, *Accelerating Natural Gradient Descent for PINNs with Randomized Numerical Linear Algebra*, CMAME (2026), doi:10.1016/j.cma.2026.119456 |
+| `dsgnar()` | Doubly-sketched Gauss-Newton; the step length comes from probing for a target gain ratio. **Not yet validated** at the published scale (see its docstring) | Webb, Jerad & Cartis, *An Optimisation Framework for the Well-Conditioned Training of PINNs* (2026), arXiv:2607.02194 |
+| `nncg()` | NysNewton-CG — damped Newton by Nyström-preconditioned CG on Hessian-vector products, Armijo steps; a fine-tuning stage after Adam / L-BFGS | Rathore, Lei, Frangella, Lu & Udell, *Challenges in Training PINNs: A Loss Landscape Perspective*, ICML 2024, arXiv:2402.01868 |
+| `score()` | SCORE — self-scaled Broyden with a decrement-based step `1/(1+λ)` and a secant pair shifted by the decrement | Si, An, Ma & Yan, *From Non-Convex Self-Concordant Regularization to Scalable Quasi-Newton Training of PINNs* (2026), arXiv:2608.04206 |
+| `ss_esoap()` / `scale_by_ss_esoap()` | SS-ESOAP — SOAP with a secant-energy step scale, eigenbasis refreshes when the factors drift, and a downscaled variance state | Wang, Toftrup, Loeschcke, Wang & Anandkumar, *SS-ESOAP: Self-Scaled Adaptive Preconditioning for Physics-Informed Learning* (2026), arXiv:2608.29448 |
 | `md()` / `md_decouple()` | Magnitude–Direction Decoupling — a **generic wrapper** that factorizes each weight matrix `W = diag(γ_row) Ŵ diag(γ_col)` into a fixed-norm direction `Ŵ` + learnable per-row/column gains, stepping any optax base optimizer on the direction; removes weight decay / warmup and transfers the LR across width | Hägele, Hernández-Cano, Kosson & Jaggi, *Improving Neural Network Training by Decoupling the Magnitude and Direction of Weight Vectors* (2026), arXiv:2606.25971, Algorithm 2 |
+
+### Gauss-Newton optimizers for PINNs (`engd`, `lm`, `dngd`, `nystrom_ngd`, `dsgnar`)
+
+These are **sentinels**, not optax transforms: their step needs the per-point residual of every loss
+term, which an optax `update()` never sees. `jno.core.solve()` builds one `(residual.grad(net), 1.0)`
+pair per loss term involving the model (or uses `gram_terms=`), runs the step in a callback and
+applies it through `optax.sgd(1.0)`. Every one minimises `½‖r̂‖²` with `r̂_k = √(w_k/N_k) r_k`, the
+weighted sum of the `.mse` terms, needs float64 for its last digits and `inner_steps=1`.
+
+```python
+jax.config.update("jax_enable_x64", True)
+net.optimizer(jno.optimizers.lm())          # P up to ~10^4: dense Levenberg-Marquardt
+net.optimizer(jno.optimizers.dngd())        # more parameters than residual rows: m x m solve
+net.optimizer(jno.optimizers.nystrom_ngd()) # large networks: matrix-free
+jno.core([pde.mse, bc.mse]).solve(500)
+```
+
+Which to pick: `engd` / `lm` when the parameter count is in the thousands; `dngd` when the network
+has more parameters than residual rows (dense up to `m` of a few thousand, `solver="nystrom_pcg"`
+beyond); `nystrom_ngd` when neither `J` nor a Gram matrix fits in memory. On the two-dimensional
+Poisson problem of the test suite (1020 residual rows) `lm`, `dngd`, `nystrom_ngd` and `engd` reach
+rel-L2 below `1e-3` in 200 steps; the optax transforms `nncg`, `score` and `ss_esoap` need the loss
+only (`nncg` and `score` read it through `value_fn`, which `jno.core` passes).
+
+### Self-scaled Broyden on larger networks (`pairs=`)
+
+`ssbroyden()` and `ssbfgs()` store a dense `P × P` matrix: 11 MB for 1 185 parameters, 315 GB for a
+4 × 256 network (198 401 parameters). `pairs=m` keeps the same metric on at most `m` directions, in
+`m·P` numbers (160 MB for that network at `m = 100`), and never forms the matrix. The layout, an
+orthonormal basis with a small matrix on it and a multiple of the identity on the rest, is the
+limited-memory reduced-Hessian method of Gill & Leonard (SIAM J. Optim. 14, 2003), here with the
+self-scaled update:
+
+```python
+net.optimizer(jno.optimizers.ssbroyden(pairs=100))
+```
+
+Until `m` directions are in use the steps are those of the dense solver (a secant pair adds one
+direction, at most two). Then the quarter of the directions of lowest curvature is dropped. A step
+that raises the loss by more than 10 % is rejected and the metric restarted, which costs one more
+loss evaluation per step. More memory gives a lower error; with only about 30 directions it is
+close to L-BFGS.
+
+Measured relative L2 error (float64, one seed, an uncontrolled workstation GPU; 2026-11-21):
+
+| Network, budget | Problem | `ssbroyden()` | `pairs=300` | `pairs=100` | `pairs=30` | `optax.lbfgs` (memory 100) |
+|---|---|---|---|---|---|---|
+| 2 × 32, 3000 steps | Poisson 2D | 9.1e-8 | 5.5e-7 | 1.2e-6 | 3.2e-4 | 1.3e-3 |
+| 2 × 32, 3000 steps | Helmholtz 2D | 2.6e-5 | 4.4e-5 | 5.5e-4 | 3.3e-2 | 6.2e-3 |
+| 4 × 256, 120 s | Poisson 2D | does not fit | 2.0e-6 | 3.0e-6 | – | 2.0e-4 |
+| 4 × 256, 120 s | Helmholtz 2D | does not fit | 3.2e-2 | 3.9e-2 | – | 6.4e-3 |
+
+On the large Helmholtz problem L-BFGS was ahead after 120 s: both reach the same loss per step in
+that early phase, and an L-BFGS step took 39 ms against 98 ms.
 
 ### Magnitude–Direction Decoupling (`md`)
 
@@ -74,7 +135,7 @@ base optimizer. `gain_axis` selects the gains: `("row", "col")` (default), `("ro
 **Not yet implemented (v1):** `gain_axis="scalar"` (single tied scalar gain, Algorithm 1); conv / >2-D
 kernels (they pass through undecoupled); embedding / LM-head per-row unit-norm; the Muon RMS-matching
 update-scale factor; gain maps other than softplus; line-search base optimizers
-(`ssbroyden`/`ssbfgs`); and driving η_W from the model's `.scale()` schedule.
+(`ssbroyden`/`ssbfgs`/`nncg`/`score`); and driving η_W from the model's `.scale()` schedule.
 
 **Add your own:** drop an optax-compatible `GradientTransformation` into a new module under
 `jno/optimizers/` and re-export it from `jno/optimizers/__init__.py` — it then works everywhere an

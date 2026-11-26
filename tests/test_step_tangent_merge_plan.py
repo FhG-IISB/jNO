@@ -73,9 +73,9 @@ def test_the_step_tangent_reaches_the_csr_conversion_already_sorted(monkeypatch)
     seen = []
     orig = mf.csr_parts
 
-    def spy(A):
+    def spy(A, **kw):
         seen.append((int(A.nse), bool(getattr(A, "indices_sorted", False))))
-        return orig(A)
+        return orig(A, **kw)
 
     monkeypatch.setattr(mf, "csr_parts", spy)
     monkeypatch.setattr(mf, "_FORMAT", "csr")

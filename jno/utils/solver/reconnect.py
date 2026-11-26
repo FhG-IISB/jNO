@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..sets import unique_values
+
 
 def _circumradius_2d(P: np.ndarray) -> np.ndarray:
     """Circumradius of each triangle ``P[k] = (3, 2)``: ``abc / (4 area)``."""
@@ -213,4 +215,4 @@ def n_components(n_points: int, cells: np.ndarray) -> int:
     used = np.zeros(n_points, dtype=bool)
     used[c.reshape(-1)] = True
     _k, lab = connected_components(A, directed=False)
-    return int(np.unique(lab[used]).size)
+    return int(unique_values(lab[used]).size)

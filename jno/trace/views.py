@@ -183,6 +183,40 @@ def _directional(view, components, scheme):
     return out
 
 
+def _bindings_on_two_meshes(cv, other_cv) -> bool:
+    """Do two coordinate bindings name Variables of two different domains (an interface condition between
+    problems on their own meshes)?"""
+    doms = {id(getattr(v, "_domain", None)) for v in cv.values()}
+    other = {id(getattr(v, "_domain", None)) for v in other_cv.values()}
+    return None not in {getattr(v, "_domain", None) for v in list(cv.values()) + list(other_cv.values())} and not (
+        doms & other
+    )
+
+
+def _coord_sets_of(*operands) -> tuple:
+    """Every distinct coordinate binding among ``operands``, kept whole.
+
+    ``_coord_vars`` is one merged binding, so an expression that combines two bindings -- the two sides of a
+    periodic tie, or an interface condition between problems on two meshes, ``Tg - Ts`` -- keeps at most one
+    (or a tie stamp). The full list survives here for a reader that needs each side's region, such as a
+    partitioned coupling that hands each problem its own part."""
+    out = []
+    flat = []
+    for o in operands:  # `jnn.stack([a, b])` hands its operands over as one list
+        flat.extend(o if isinstance(o, (list, tuple)) else [o])
+    for o in flat:
+        if o is None:
+            continue
+        sets = getattr(o, "_coord_sets", None)
+        if sets is None:
+            cv = getattr(o, "_coord_vars", None)
+            sets = (dict(cv),) if cv else ()
+        for cv in sets:
+            if not any(len(cv) == len(c) and all(c.get(k) is v for k, v in cv.items()) for c in out):
+                out.append(cv)
+    return tuple(out)
+
+
 def _tag_of_coord_vars(cv) -> Optional[str]:
     """The single region tag shared by a bound view's coordinate Variables, or ``None``."""
     tags = {getattr(v, "tag", None) for v in (cv or {}).values()}
@@ -362,6 +396,20 @@ class ScalarView(_DelegatesToPlaceholder):
     def expr(self) -> Placeholder:
         """The underlying Placeholder — pass this to ``jno.np`` functions."""
         return self._expr
+
+    # Comparisons give a boolean node for `jnn.where`, as the Placeholder's do (Python looks operator methods up on
+    # the class, so `__getattr__` never forwarded them and `p >= p0` on a view raised a TypeError).
+    def __gt__(self, other):
+        return self._expr > getattr(other, "_expr", other)
+
+    def __lt__(self, other):
+        return self._expr < getattr(other, "_expr", other)
+
+    def __ge__(self, other):
+        return self._expr >= getattr(other, "_expr", other)
+
+    def __le__(self, other):
+        return self._expr <= getattr(other, "_expr", other)
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -1014,8 +1062,22 @@ class VectorView(_DelegatesToPlaceholder):
         raise ValueError("curl requires 2 or 3 spatial variables")
 
     # -- reductions / pairwise --
-    def norm(self) -> "ScalarView":
-        """L2 norm ``sqrt(∑ u_i²)`` → ScalarView."""
+    def norm(self, space: "str | None" = None, **opts):
+        """Euclidean norm ``sqrt(∑ u_i²)`` per point → ScalarView; with a ``space``, the function-space norm of
+        the field, a scalar built on that pointwise norm: ``(∫ |u|² dx)^(1/2)`` for ``"L2"``, the sum of the
+        components' squared norms for a Sobolev space such as ``"H-1"``.
+
+        Args:
+            space: ``None`` for the pointwise norm, or a space name (``"l2"``, ``"L2"``, ``"L1"``, ``"Linf"``,
+                ``"H1"``, ``"H-1"``, ``"H^s"``).
+            **opts: the options of the function-space norm, as for a scalar field: ``bc``, ``scale``,
+                ``method``, ``solver``, ``precond``.
+
+        Returns:
+            ScalarView: the norm per point, or a scalar ``Norm`` node.
+        """
+        if space is not None:
+            return Placeholder.norm(self._expr, space, **opts)
         return ScalarView(FunctionCall(lambda x: jnp.linalg.norm(x, axis=-1), [self._expr], "norm", True))
 
     def dot(self, other) -> "ScalarView":
@@ -2111,16 +2173,34 @@ class MatrixView(_DelegatesToPlaceholder):
         """Eigenvalues via ``jnp.linalg.eigh`` (symmetric input, ascending) → VectorView."""
         return VectorView(FunctionCall(lambda x: jnp.linalg.eigh(x)[0], [self._expr], "eigvals"))
 
-    def norm(self, ord: str = "fro") -> "ScalarView":
-        """Matrix norm (Frobenius by default) → ScalarView.
+    def norm(self, space: "str | None" = None, *, ord="fro", **opts):
+        """Matrix norm per point (Frobenius by default) → ScalarView; with a ``space``, the function-space norm
+        of the field (a scalar), see :meth:`jno.trace.Placeholder.norm`.
 
         Args:
-            ord: the norm, as for ``jnp.linalg.norm`` over the last two axes: ``"fro"`` (default),
-                ``"nuc"``, ``1``, ``2``, ``-1``, ``-2``, ``inf`` or ``-inf``.
+            space: ``None`` for the pointwise norm, or a space name (``"L2"``, ``"H-1"``, ...). The legacy
+                positional ``ord`` (``M.norm("nuc")``, ``M.norm(2)``) is still read as ``ord``.
+            ord: the pointwise norm, as for ``jnp.linalg.norm`` over the last two axes: ``"fro"`` (default),
+                ``"nuc"``, ``1``, ``2``, ``-1``, ``-2``, ``inf`` or ``-inf``. With a Sobolev ``space`` only
+                ``"fro"`` (a Hilbert norm) is allowed.
+            **opts: the options of :meth:`jno.trace.Placeholder.norm` (``bc``, ``scale``, ``method``, ``solver``).
 
         Returns:
-            ScalarView: the norm per point.
+            ScalarView: the norm per point, or a scalar ``Norm`` node.
         """
+        if space is not None and (space in ("fro", "nuc") or not isinstance(space, str)):
+            space, ord = None, space  # legacy positional ord
+        if space is not None:
+            if ord == "fro":
+                return Placeholder.norm(self._expr, space, **opts)
+            from ..residual_norms import parse_space
+
+            if parse_space(space)[0] == "H":
+                raise ValueError(
+                    f"MatrixView.norm({space!r}, ord={ord!r}): a Sobolev norm needs the Frobenius (Hilbert) "
+                    "pointwise norm. Use ord='fro', or an L2/L1/Linf space."
+                )
+            return Placeholder.norm(self.norm(ord=ord)._expr, space, **opts)
         return ScalarView(
             FunctionCall(
                 lambda x, _o=ord: jnp.linalg.norm(x, ord=_o, axis=(-2, -1)),
@@ -2902,6 +2982,16 @@ class FieldViewWithPartials(ScalarView):
         if spatial_coords:
             self._validate_field_coords(np)
 
+    @property
+    def inside(self) -> "FieldViewWithPartials":
+        """At a boundary face of a ``jno.fvm`` problem: this field read in the cell next to the face, where the view
+        itself is the face's value. ``ub - G(ub.inside)`` gives the face its outer state from the inside one (an
+        open outflow, an outlet at a back pressure, an inflow from a plenum, a valve closing into a wall)."""
+        from . import InsideValue
+
+        cv = object.__getattribute__(self, "_coord_vars")
+        return _with_scheme(type(self)(InsideValue(self._expr), dict(cv)), getattr(self, "_bind_scheme", None))
+
     def _validate_field_coords(self, np_mod) -> None:
         import warnings
 
@@ -2973,7 +3063,10 @@ class FieldViewWithPartials(ScalarView):
         tie_tags = extra = None
         if other_cv:
             conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
-            if conflict and _is_periodic_tie_combination(
+            if conflict and _bindings_on_two_meshes(cv, other_cv):
+                pass  # an interface condition between problems on two meshes: each side keeps its own binding
+                # (`_coord_sets`); nothing can differentiate across the two, so there is nothing ambiguous
+            elif conflict and _is_periodic_tie_combination(
                 object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
             ):
                 # jno.fdm periodic tie `u(A) - u(B)`: the BinaryOp discards the per-side views, so stash
@@ -3008,6 +3101,7 @@ class FieldViewWithPartials(ScalarView):
         new = FieldViewWithPartials.__new__(FieldViewWithPartials)
         ScalarView.__init__(new, new_expr)
         object.__setattr__(new, "_coord_vars", cv)
+        object.__setattr__(new, "_coord_sets", _coord_sets_of(self, other))
         object.__setattr__(new, "_spatial_coords", sc)
         _with_scheme(new, getattr(self, "_bind_scheme", None))  # `.bind(..., scheme=...)` survives arithmetic
         if tie_tags is not None:
@@ -3239,7 +3333,9 @@ def _make_named_with_partials_cls(view_cls):
             tie_tags = extra = None
             if other_cv:
                 conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
-                if conflict and _is_periodic_tie_combination(
+                if conflict and _bindings_on_two_meshes(cv, other_cv):
+                    pass  # see FieldViewWithPartials._rewrap: each mesh keeps its own binding (`_coord_sets`)
+                elif conflict and _is_periodic_tie_combination(
                     object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
                 ):
                     # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the
@@ -3267,6 +3363,7 @@ def _make_named_with_partials_cls(view_cls):
                 # the stamp, because the outer op discards the tie's own view.
                 tie_tags = getattr(self, "_periodic_tie", None) or getattr(other, "_periodic_tie", None)
             res = _with_scheme(type(self)(new_expr, cv), getattr(self, "_bind_scheme", None))
+            object.__setattr__(res, "_coord_sets", _coord_sets_of(self, other))
             if tie_tags is not None:
                 object.__setattr__(res, "_periodic_tie", tie_tags)
             extra = extra or getattr(self, "_tie_extra", None) or getattr(other, "_tie_extra", None)
@@ -3306,8 +3403,23 @@ def _make_named_with_partials_cls(view_cls):
                         continue
                     result = result.d(var, scheme=scheme)
                     i += 1
+                if all(getattr(cv[name], "axis", None) == "temporal" for name in seq):
+                    # A time derivative lives where the field is bound, so it keeps the binding (as the scalar
+                    # field view's does): unbound, a vector equation `q.bind(...).t + ...` said nowhere where it
+                    # holds, and an algebraic row beside it read as a pin. A spatial partial stays the plain view.
+                    return _with_scheme(type(self)(result, cv), getattr(self, "_bind_scheme", None))
                 return type(self)._base_view(result)
             return getattr(object.__getattribute__(self, "_expr"), key)
+
+        @property
+        def inside(self):
+            """At a boundary face of a ``jno.fvm`` problem: this field read in the cell next to the face, where the view
+            itself is the face's value. ``qb - G(qb.inside)`` gives the face its outer state from the inside one (an
+            open outflow, an outlet at a back pressure, an inflow from a plenum, a valve closing into a wall)."""
+            from . import InsideValue
+
+            cv = object.__getattribute__(self, "_coord_vars")
+            return _with_scheme(type(self)(InsideValue(self._expr), cv), getattr(self, "_bind_scheme", None))
 
         # No no-args ``grad()`` / ``laplacian()`` convenience methods —
         # tutorials write the explicit form ``u.xx + u.yy`` etc., which reads

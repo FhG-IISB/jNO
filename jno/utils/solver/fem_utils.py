@@ -728,6 +728,53 @@ def _collect_tag_mask_names(node, out=None):
     return out
 
 
+def region_membership_at(domain, region, X):
+    """``(n,)`` bool: which of the points ``X`` (``(n, dim)``) lie in the named region, or ``None`` when the
+    region is a mesh-file volume region (known per CELL only, no point membership).
+
+    The geometric sources of a region, in the order :func:`_cell_region_mask` resolves them: a geometry
+    part (``domain._source_regions``), a ``domain.tag`` predicate, a ``shape.regions`` sub-region (analytic
+    CSG membership minus every higher-priority region). Used at cell centroids by the FEM assembly and at
+    arbitrary sample points by RCWA's permittivity grid -- one rule, so the two cannot disagree."""
+    X = np.asarray(X)
+    dim = int(domain.dimension)
+    src = getattr(domain, "_source_regions", {}) or {}
+    preds = getattr(domain, "_tag_predicates", {}) or {}
+    shape_regions = getattr(domain, "_shape_regions", {}) or {}
+    if region in src:
+        from shapely import contains_xy
+
+        return np.asarray(contains_xy(src[region], X[:, 0], X[:, 1]), dtype=bool)
+    elif region in preds:
+        return np.asarray(preds[region](*[X[:, i] for i in range(dim)]), dtype=bool)
+    elif region in shape_regions:
+        # A shape.regions sub-region: analytic CSG membership of the point (2-D and 3-D),
+        # MINUS every higher-priority region, because shape.regions lets regions overlap and resolves
+        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
+        # the mesh itself is labelled (`emit._to_meshio`).
+        #
+        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
+        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
+        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
+        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
+        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
+        # a 37% leak that pulled the whole crystal region 780 K cold.
+        names = list(shape_regions)
+        m = np.asarray(shape_regions[region].contains(X), dtype=bool)
+        for earlier in names[: names.index(region)]:
+            try:
+                m &= ~np.asarray(shape_regions[earlier].contains(X), dtype=bool)
+            except NotImplementedError as exc:
+                raise NotImplementedError(
+                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
+                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
+                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
+                    f"shape."
+                ) from exc
+        return m
+    return None
+
+
 def _cell_region_mask(domain, region):
     """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
 
@@ -751,79 +798,48 @@ def _cell_region_mask(domain, region):
 
         cells = np.asarray(mesh.cells_dict[mesh_cell_type(domain, dim)])
     centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
-    src = getattr(domain, "_source_regions", {}) or {}
-    preds = getattr(domain, "_tag_predicates", {}) or {}
-    shape_regions = getattr(domain, "_shape_regions", {}) or {}
-    if region in src:
-        from shapely import contains_xy
+    m = region_membership_at(domain, region, centroids)
+    if m is not None:
+        return np.asarray(m, dtype=bool).astype(np.float64)
+    # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
+    # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
+    #
+    # Unlike the geometric sources (`region_membership_at`) this is exact membership, not centroid membership: the mesh
+    # already records which cell belongs to which material, so there is nothing to classify.
+    # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
+    # quadrature points for another disagrees on cells straddling a material boundary.
+    from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
 
-        m = np.asarray(contains_xy(src[region], centroids[:, 0], centroids[:, 1]))
-    elif region in preds:
-        m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
-    elif region in shape_regions:
-        # A shape.regions sub-region: analytic CSG membership of the cell centroid (2-D and 3-D),
-        # MINUS every higher-priority region, because shape.regions lets regions overlap and resolves
-        # them by declaration order -- a cell belongs to the FIRST region containing it, which is how
-        # the mesh itself is labelled (`emit._to_meshio`).
-        #
-        # Without the subtraction these masks are not a partition, and `domain.by_region` (a sum of
-        # RegionMask * value) silently double counts. The failure is quiet and physical rather than an
-        # error: an enclosing background region -- e.g. a bounding rect declared last to pick up the
-        # leftover void -- contains EVERY cell, so its coefficient is added to every other region's.
-        # Measured on the furnace: the graphite-felt insulation ran at k = 0.5 + 0.186 instead of 0.5,
-        # a 37% leak that pulled the whole crystal region 780 K cold.
-        names = list(shape_regions)
-        m = np.asarray(shape_regions[region].contains(centroids), dtype=bool)
-        for earlier in names[: names.index(region)]:
-            try:
-                m &= ~np.asarray(shape_regions[earlier].contains(centroids), dtype=bool)
-            except NotImplementedError as exc:
-                raise NotImplementedError(
-                    f"jno.fem per-region integration: region {region!r} is declared after {earlier!r}, "
-                    f"so resolving it needs to exclude {earlier!r}'s cells -- but {earlier!r} has no "
-                    f"closed-form point membership. Declare it first, or give it a CSG-representable "
-                    f"shape."
-                ) from exc
-    else:
-        # A NAMED VOLUME REGION OF THE MESH FILE (a gmsh physical volume). Resolved last, so a
-        # same-named `domain.tag` predicate keeps winning and nothing that worked before changes.
-        #
-        # Unlike every branch above this is exact membership, not centroid membership: the mesh
-        # already records which cell belongs to which material, so there is nothing to classify.
-        # That is the point -- a coordinate predicate evaluated at centroids for one purpose and at
-        # quadrature points for another disagrees on cells straddling a material boundary.
-        from ...domain.mesh_utils import mesh_cell_region_membership, p1_cells_dict, volume_cell_type
-
-        membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
-        if region not in membership:
+    membership = mesh_cell_region_membership(getattr(domain, "mesh", None), dim)
+    if region not in membership:
+        raise ValueError(
+            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+            f"domain.tag(name, predicate), a shape.regions() sub-region, or a geometry part, "
+            f"or name a volume region of the mesh file. Mesh volume regions here: "
+            f"{sorted(membership)}."
+        )
+    m = membership[region]
+    if a_cells is not None:
+        # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
+        # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
+        # in a different order, and the coefficient would then be permuted per cell rather than
+        # wrong in a way anything notices. Compare the connectivity itself.
+        _want = volume_cell_type(domain.mesh, dim)
+        _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
+        if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
             raise ValueError(
-                f"jno.fem per-region integration: unknown region {region!r}. Define it with "
-                f"domain.tag(name, predicate), a shape.regions() sub-region, or a geometry part, "
-                f"or name a volume region of the mesh file. Mesh volume regions here: "
-                f"{sorted(membership)}."
+                f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
+                f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
+                f"domain mesh it was read from "
+                f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
+                "mesh change so the two agree."
             )
-        m = membership[region]
-        if a_cells is not None:
-            # The membership indexes the DOMAIN mesh; the mask must describe the cell order the
-            # kernel vmaps over. Equal length is not enough -- a rebuild can produce the same count
-            # in a different order, and the coefficient would then be permuted per cell rather than
-            # wrong in a way anything notices. Compare the connectivity itself.
-            _want = volume_cell_type(domain.mesh, dim)
-            _dom_cells = np.asarray(p1_cells_dict(domain.mesh)[_want]) if _want else None
-            if _dom_cells is None or not np.array_equal(np.asarray(a_cells), _dom_cells):
-                raise ValueError(
-                    f"jno.fem per-region integration: region {region!r} comes from the mesh file's "
-                    f"cell sets, but the assembly mesh ({len(np.asarray(a_cells))} cells) is not the "
-                    f"domain mesh it was read from "
-                    f"({0 if _dom_cells is None else len(_dom_cells)} cells). Re-assemble after the "
-                    "mesh change so the two agree."
-                )
-        if not m.any():
-            raise ValueError(
-                f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
-                "mesh, so its coefficient would contribute a silent zero. Check the region name "
-                "against domain.avaiable_mesh_tags."
-            )
+    if not m.any():
+        raise ValueError(
+            f"jno.fem per-region integration: the mesh region {region!r} owns NO cell on this "
+            "mesh, so its coefficient would contribute a silent zero. Check the region name "
+            "against domain.avaiable_mesh_tags."
+        )
     return np.asarray(m, dtype=bool).astype(np.float64)
 
 
@@ -2588,40 +2604,65 @@ def _promote_to_degree(points, cells_p1, ref_pts, cell_type=None, *, entity_keys
     # caller -- which knows whether the domain carries a non-conforming interface -- must say which.
     _wtol = 1e-9
     _wround = 1e-6
+    nv = points.shape[0]
+    if entity_keys:
+        # One key per reference point: the sorted global vertex ids of its entity, the weights in that same order. A
+        # reference point's non-zero weights are the same in every cell, so this is one sort per reference point.
+        nzs = [np.flatnonzero(np.abs(weights[d]) > _wtol) for d in range(ndof)]
+        m = max((nz.size for nz in nzs), default=0)
+        keys = np.full((ncell, ndof, 2 * m), -1, dtype=np.int64)
+        for d, nz in enumerate(nzs):
+            vids = cells_p1[:, nz].astype(np.int64)
+            order = np.argsort(vids, axis=1, kind="stable")
+            keys[:, d, : nz.size] = np.take_along_axis(vids, order, axis=1)
+            keys[:, d, m : m + nz.size] = np.round(weights[d][nz][order] / _wround).astype(np.int64)
+        seed = np.full((nv, 2 * m), -1, dtype=np.int64)
+        seed[:, 0] = np.arange(nv)
+        seed[:, m] = int(round(1.0 / _wround))
+    else:
+        keys = np.round(phys / tol).astype(np.int64)
+        seed = np.round(points / tol).astype(np.int64)
+    # The vertices come first, so they keep ids 0..nv-1; a key several of them share (the two faces of a tied interface)
+    # names the last of them. Every other key is a new node, numbered in order of first appearance, cell by cell.
+    group, first = _row_groups(np.concatenate([seed, keys.reshape(-1, keys.shape[-1])]))
+    gid = np.empty(first.size, dtype=np.int64)
+    gid[group[:nv]] = np.arange(nv)  # in order: the last vertex of a group stays
+    new = np.flatnonzero(first >= nv)
+    new = new[np.argsort(first[new], kind="stable")]
+    gid[new] = nv + np.arange(new.size)
+    cells_k = gid[group[nv:]].reshape(ncell, ndof)
+    new_pts = phys.reshape(-1, phys.shape[-1])[first[new] - nv]
+    return np.concatenate([points, new_pts]), cells_k
 
-    def _coord_key(c, d):
-        return tuple(np.round(np.asarray(phys[c, d]) / tol).astype(np.int64))
 
-    def _entity_key(c, d):
-        w = weights[d]
-        nz = np.flatnonzero(np.abs(w) > _wtol)
-        vids = np.asarray(cells_p1[c])[nz]
-        order = np.argsort(vids, kind="stable")
-        return (tuple(int(v) for v in vids[order]), tuple(np.round(w[nz][order] / _wround).astype(np.int64)))
+_ROW_HASH_MULTIPLIER = np.uint64(0x100000001B3)
+_ROW_HASH_SHIFT = np.uint64(29)
 
-    _key = _entity_key if entity_keys else _coord_key
-    ent_to_gid: dict = {}
-    out_pts: List[Any] = []
-    for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
-        _seed = (
-            ((vid,), (int(round(1.0 / _wround)),))
-            if entity_keys
-            else tuple(np.round(np.asarray(points[vid]) / tol).astype(np.int64))
-        )
-        ent_to_gid[_seed] = vid
-        out_pts.append(points[vid])
-    cells_k = np.zeros((ncell, ndof), dtype=np.int64)
-    nid = points.shape[0]
-    for c in range(ncell):
-        for d in range(ndof):
-            k = _key(c, d)
-            gid = ent_to_gid.get(k)
-            if gid is None:
-                gid, ent_to_gid[k] = nid, nid
-                out_pts.append(phys[c, d])
-                nid += 1
-            cells_k[c, d] = gid
-    return np.asarray(out_pts), cells_k
+
+def _row_groups(rows):
+    """``(group, first)``: each row's group of equal rows, and each group's first row.
+
+    By a 64-bit hash of the rows, sorted, with neighbours compared in full; a hash collision (none measured on meshes)
+    falls back to sorting the columns themselves. A Python dict over tuples took 25 of the 36 s of a 950 k-dof P2 build."""
+    n = rows.shape[0]
+    if n == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty
+    h = np.full(n, 0xCBF29CE484222325, dtype=np.uint64)
+    for j in range(rows.shape[1]):
+        h = (h ^ rows[:, j].astype(np.uint64)) * _ROW_HASH_MULTIPLIER
+        h ^= h >> _ROW_HASH_SHIFT
+    order = np.argsort(h)
+    r, hs = rows[order], h[order]
+    same_row = np.all(r[1:] == r[:-1], axis=1)
+    if np.any((hs[1:] == hs[:-1]) & ~same_row):
+        order = np.lexsort(rows.T[::-1])
+        r = rows[order]
+        same_row = np.all(r[1:] == r[:-1], axis=1)
+    starts = np.flatnonzero(np.concatenate([[True], ~same_row]))
+    group = np.empty(n, dtype=np.int64)
+    group[order] = np.cumsum(np.concatenate([[True], ~same_row])) - 1
+    return group, np.minimum.reduceat(order, starts)
 
 
 def _zero_mass_dirichlet_rows(M, bc):
@@ -3015,7 +3056,7 @@ def _covers_local_3d(s_facets: np.ndarray, m_facets: np.ndarray, pts3: np.ndarra
     mf = np.asarray(m_facets, dtype=int)
     if sf.size == 0 or mf.size == 0:
         return False
-    q = P[np.unique(sf[:, :3])]
+    q = P[unique_values(sf[:, :3])]
     ids, w, _g0, _a = project_points(q, mf, P, np.tile(np.eye(1, P.shape[1], 0), (len(q), 1)))
     proj = np.einsum("qk,qkd->qd", w, P[ids])
     # Judge each vertex against the facet it actually landed on, not against the median facet of the
@@ -3043,7 +3084,7 @@ def _main_covers_secondary_3d(s_facets: np.ndarray, m_facets: np.ndarray, loc: n
     m = np.asarray(m_facets, int)[:, :3]
     if s.size == 0 or m.size == 0:
         return False
-    pts = np.asarray(loc, dtype=float)[np.unique(s)]
+    pts = np.asarray(loc, dtype=float)[unique_values(s)]
     best = np.full(len(pts), -np.inf)
     for f in range(m.shape[0]):
         v = np.asarray(loc, dtype=float)[m[f]]
@@ -3076,7 +3117,7 @@ def _facet_rim_nodes(facets: np.ndarray, *, edges: bool) -> np.ndarray:
     tri = f[:, :3]
     e = np.sort(np.stack([tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=1).reshape(-1, 2), axis=1)
     uniq, counts = np.unique(e, axis=0, return_counts=True)
-    return np.unique(uniq[counts == 1]).astype(np.int64) if uniq.size else np.empty(0, dtype=np.int64)
+    return unique_values(uniq[counts == 1]).astype(np.int64) if uniq.size else np.empty(0, dtype=np.int64)
 
 
 def _rim_redistribution(facets: np.ndarray, s_at: Dict[int, int], n_s: int, *, edges: bool, rim_nodes: Any = None):
@@ -3194,7 +3235,7 @@ def _mortar_rows_3d(
     ks, km = int(s_facets.shape[1]), int(m_facets.shape[1])
     xy = np.asarray(loc, dtype=float)
 
-    s_nodes, m_nodes = np.unique(s_facets), np.unique(m_facets)
+    s_nodes, m_nodes = unique_values(s_facets), unique_values(m_facets)
     s_at = {int(v): i for i, v in enumerate(s_nodes)}
     m_at = {int(v): i for i, v in enumerate(m_nodes)}
     diag = np.zeros(len(s_nodes))
@@ -3351,8 +3392,8 @@ def _mortar_rows_2d(
     sa, sb = t[s_facets[:, 0]], t[s_facets[:, 1]]
     ma, mb = t[m_facets[:, 0]], t[m_facets[:, 1]]
 
-    s_nodes = np.unique(s_facets)
-    m_nodes = np.unique(m_facets)
+    s_nodes = unique_values(s_facets)
+    m_nodes = unique_values(m_facets)
     s_at = {int(n): i for i, n in enumerate(s_nodes)}
     m_at = {int(n): i for i, n in enumerate(m_nodes)}
     diag = np.zeros(len(s_nodes))
@@ -4248,7 +4289,7 @@ def prolongation_from_ties(
     }
 
 
-def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-12) -> Dict[str, object]:
+def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-12, prescribed=None) -> Dict[str, object]:
     """Master–slave prolongation ``P`` for homogeneous linear constraints ``C·u_node = 0`` at nodes.
 
     One row of ``C`` per condition; the canonical case is a slip / no-penetration wall, where the row
@@ -4273,9 +4314,18 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
     ``prolong_periodic`` / ``restrict_state_periodic``), at **DOF level** (``vec = 1``, ``kept_nodes``
     holding retained DOF ids), so the whole reduce/solve/prolong path is reused unchanged.
 
+    ``prescribed`` maps DOF ids that an essential condition already fixes to their value (``None`` when it
+    is not a concrete number, e.g. time-varying). Such a DOF is never chosen as a pivot: it keeps its own
+    row, so the Dirichlet value can still be imposed into it after the reduction, and it enters the
+    eliminated components' rows like any other retained DOF -- exact for any value. A condition that
+    involves ONLY prescribed components (a slip wall meeting a face that already fixes the normal
+    component, e.g. ``n = e_y`` where ``u_y = 0``) has nothing left to eliminate; it is dropped when the
+    prescribed values satisfy it, and raises when they contradict it or cannot be checked.
+
     Scope: homogeneous conditions only (``C·u = 0``). A non-homogeneous ``C·u = g`` needs an affine
     offset ``u = P ũ + u_0``, which this prolongation cannot carry — the caller must reject it.
     """
+    prescribed = {} if prescribed is None else {int(k): v for k, v in dict(prescribed).items()}
     node_dofs = np.asarray(node_dofs, dtype=np.int64)
     if node_dofs.ndim != 2:
         raise ValueError(f"build_slip_prolongation: node_dofs must be (K, d); got {node_dofs.shape}.")
@@ -4305,6 +4355,7 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
     data: List[float] = []
     eliminated: List[int] = []
     per_node: List[Tuple[np.ndarray, np.ndarray]] = []  # (pivot local ids, reduced coefficient block)
+    dropped: List[Tuple[int, np.ndarray]] = []  # (node index, condition row) satisfied by prescribed values
 
     for a in range(K):
         C = blocks_in[a].copy()  # (m, d)
@@ -4327,24 +4378,49 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
         R = C.copy()
         pivots: List[int] = []
         free = list(range(d))
+        fixed = {j for j in range(d) if int(node_dofs[a, j]) in prescribed}
+        live: List[int] = []  # rows that eliminate a component; a dropped row eliminates none
         for i in range(m):
-            cand = [(abs(R[i, j]), j) for j in free]
-            mag, j = max(cand)
-            if mag <= 1e-8:
+            mag_any = max(abs(R[i, j]) for j in free)
+            if mag_any <= 1e-8:
                 raise ValueError(
                     f"build_slip_prolongation: the conditions at the node with DOFs {node_dofs[a].tolist()} "
-                    f"are numerically parallel (pivot {mag:.3e} after eliminating {pivots}). Two slip "
+                    f"are numerically parallel (pivot {mag_any:.3e} after eliminating {pivots}). Two slip "
                     "surfaces meeting at a near-tangent angle cannot both be imposed exactly; tag the "
                     "shared edge into one region, or impose one of them weakly."
                 )
+            cand = [(abs(R[i, j]), j) for j in free if j not in fixed]
+            mag, j = max(cand) if cand else (0.0, -1)
+            if mag <= 1e-8:
+                # Only prescribed components are left in this condition: it is a statement about values
+                # already fixed, so it constrains nothing new -- provided those values satisfy it.
+                vals = [prescribed[int(node_dofs[a, k])] for k in free if abs(R[i, k]) > 1e-8]
+                if any(v is None for v in vals):
+                    raise ValueError(
+                        f"build_slip_prolongation: the slip condition at the node with DOFs "
+                        f"{node_dofs[a].tolist()} involves only components an essential condition prescribes, "
+                        "with a value that is not a concrete number, so it cannot be checked against them. "
+                        "Prescribe that component as a constant, or keep the slip region off this face."
+                    )
+                res = sum(R[i, k] * complex(prescribed[int(node_dofs[a, k])]).real for k in free if abs(R[i, k]) > 1e-8)
+                ref = max([1.0] + [abs(complex(v)) for v in vals])
+                if abs(res) > 1e-10 * ref:
+                    raise ValueError(
+                        f"build_slip_prolongation: the slip condition at the node with DOFs "
+                        f"{node_dofs[a].tolist()} contradicts the values an essential condition prescribes "
+                        f"there (n·u = {res:.3e} != 0 from the prescribed components alone)."
+                    )
+                dropped.append((a, R[i].copy()))
+                continue
             pivots.append(j)
             free.remove(j)
+            live.append(i)
             R[i] = R[i] / R[i, j]
             for i2 in range(m):
                 if i2 != i:
                     R[i2] = R[i2] - R[i2, j] * R[i]
         # After full reduction: u_pivot[i] = -sum_j R[i, j] * u_free[j]
-        per_node.append((np.array(pivots, dtype=np.int64), R))
+        per_node.append((np.array(pivots, dtype=np.int64), R[live]))
         eliminated.extend(int(node_dofs[a, j]) for j in pivots)
 
     if len(set(eliminated)) != len(eliminated):
@@ -4398,6 +4474,8 @@ def build_slip_prolongation(n_full: int, node_dofs, coeffs, *, tol: float = 1e-1
         "is_selection": False,  # an eliminated row is a weighted combination, never a plain selection
         "is_bloch": False,
         "coupling": "slip",
+        # conditions dropped because the prescribed values alone satisfy them: (node index, row)
+        "dropped": dropped,
     }
 
 
@@ -4655,6 +4733,16 @@ def normalize_chunk(chunk):
 # already well above it, so the floor stops mattering exactly where it would have been wrong.
 _CHUNK_MEMORY_FRACTION = 0.0015
 _CHUNK_MIN_CELLS = 8192  # saturation floor; see above -- not derivable, so kept low on purpose
+# The floor counts cells, and it was measured on small blocks: a P2 vector cell holds 30 x 30 x 30 entries against P1's
+# 4 x 4 x 4, so 8192 of them overran the memory cap 50x. Assembly of 33 k cells of 3-D P2 elasticity, cells/chunk:
+#
+#   cells/chunk    16384    8192    4096    2048    1024     512     256
+#   XLA peak MiB    1498    1323     920     744     596     538     526
+#   assembly ms      176     174     173     174     212     216     217
+#
+# and P2 and P1 Laplacians are at their optimum at 8192 whatever is above. So the floor also bounds a chunk's bytes, here
+# at the knee: where a chunk stops being free. Above this one a cell is so large that a few already fill the device.
+_CHUNK_FLOOR_BYTES = 400 << 20
 _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
 
 
@@ -4704,7 +4792,7 @@ def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
         return None if n_items <= setting else _balanced_chunk(n_items, int(setting))
     per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
     chunk = max(1, chunk_budget_bytes() // per)
-    chunk = max(chunk, _CHUNK_MIN_CELLS)  # never starve the device to honour the byte cap
+    chunk = max(chunk, min(_CHUNK_MIN_CELLS, _CHUNK_FLOOR_BYTES // per))  # never starve the device to honour the byte cap
     if n_items <= chunk:
         return None  # one chunk anyway -- skip the scan overhead entirely
     return _balanced_chunk(n_items, chunk)
@@ -4762,6 +4850,8 @@ _ELEM_MAP_STATS: Dict[str, Any] = {"id_hits": 0, "content_hits": 0, "misses": 0,
 _LIFT_MIN_BYTES = 1 << 16
 #: ``JNO_ELEM_MAP_LIFT=0`` restores the baked path everywhere (A/B measurement).
 import os as _os
+
+from ..sets import unique_values
 
 _LIFT_ENABLED = _os.environ.get("JNO_ELEM_MAP_LIFT", "1") != "0"
 #: Compiled lifted programs, keyed by the lifted CONTENT key (big arrays by aval, the rest by value).
@@ -5930,15 +6020,15 @@ def compress_plan_blocks(blocks):
     pending, n_pending = [], 0
     for b in blocks:
         for k in _block_keys(b, stride, _PLAN_BATCH):
-            u = np.unique(k)
+            u = unique_values(k)
             pending.append(u)
             n_pending += u.shape[0]
             # merge when the pending uniques outgrow what is merged: amortised O(nse log nse), bounded memory
             if n_pending > max(_PLAN_BATCH, uniq.shape[0]):
-                uniq = np.unique(np.concatenate([uniq, *pending]))
+                uniq = unique_values(np.concatenate([uniq, *pending]))
                 pending, n_pending = [], 0
     if pending:
-        uniq = np.unique(np.concatenate([uniq, *pending]))
+        uniq = unique_values(np.concatenate([uniq, *pending]))
     del pending
     inv32 = np.empty(total, np.int32)
     off = 0
@@ -6315,7 +6405,10 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
     transverse position; the tie weight is the Bloch phase times an orientation **sign** (+1 if the two
     edges point the same way along their lo→hi canonical direction, −1 if opposed — the tangential moment
     flips with the edge orientation). Corner edges shared by two periodic faces are tied twice; the chain is
-    resolved to a single retained main DOF. Returns a legacy single-field prolongation dict."""
+    resolved to a single retained main DOF. Returns a legacy single-field prolongation dict whose ``P`` is
+    a sparse signed selection (BCOO, one entry per row)."""
+    from scipy.spatial import cKDTree
+
     mid = np.asarray(edge_midpoints, dtype=np.float64)
     dirs = np.asarray(edge_dirs, dtype=np.float64)
     if phases is None:
@@ -6334,10 +6427,9 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
         mm, sm = mid[me], mid[se]
         axis = int(np.argmax(np.abs(mm.mean(axis=0) - sm.mean(axis=0))))  # periodic axis = largest mean gap
         tr = [d for d in range(mid.shape[1]) if d != axis]
-        mt, st = mm[:, tr], sm[:, tr]
-        d2 = np.sum((st[:, None, :] - mt[None, :, :]) ** 2, axis=-1)
-        nn = np.argmin(d2, axis=1)
-        dist = np.sqrt(d2[np.arange(len(se)), nn])
+        # nearest main edge per secondary edge in the transverse plane: a KD-tree, O(n log n) (a dense
+        # secondary x main distance matrix is O(n_face^2) memory)
+        dist, nn = cKDTree(mm[:, tr]).query(sm[:, tr])
         for k, s in enumerate(se):
             if dist[k] > tol:
                 raise ValueError(
@@ -6349,22 +6441,30 @@ def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, p
             s2m[int(s)], weight[int(s)] = m, sign * complex(ph)
 
     secondarys = set(s2m)
-    kept = np.array([e for e in range(n_edges) if e not in secondarys], dtype=int)
+    is_sec = np.zeros(n_edges, dtype=bool)
+    is_sec[list(secondarys)] = True
+    kept = np.flatnonzero(~is_sec)
     col = {int(e): j for j, e in enumerate(kept)}
-    P = np.zeros((n_edges, len(kept)), dtype=(np.complex128 if is_bloch else np.float64))
-    for j, e in enumerate(kept):
-        P[e, j] = 1.0
+    # ONE entry per row -- the kept identity, or the chained weight to the kept main -- so P is a sparse
+    # signed selection: the reductions remap A's triplets in O(nnz) with the weight on each (and its
+    # conjugate on the left for P^H A P). A dense P made every reduced operator dense.
+    main = np.empty(n_edges, dtype=np.int64)
+    w_all = np.ones(n_edges, dtype=np.complex128)
+    main[kept] = np.arange(len(kept))
     for s in secondarys:  # resolve a possibly-chained tie (corner edge tied via two faces) to a kept main
         m, w = s2m[s], weight[s]
         while m in s2m:
             w *= weight[m]
             m = s2m[m]
-        P[s, col[m]] = w if is_bloch else w.real  # non-Bloch weight is a real ±1 sign
+        main[s], w_all[s] = col[m], w
+    rows = np.arange(n_edges, dtype=np.int64)
+    data = w_all if is_bloch else w_all.real  # non-Bloch weight is a real ±1 sign
+    P = jsparse.BCOO((jnp.asarray(data), jnp.asarray(np.stack([rows, main], axis=1))), shape=(n_edges, len(kept)))
     return {
-        "P": jnp.asarray(P),
+        "P": P,
         "kept_nodes": kept,
         "vec": 1,
-        "is_selection": False,  # ±1 signs (and complex phases) → not a pure 0/1 selection
+        "is_selection": True,  # one entry per row; the ±1 sign / Bloch phase rides in the remap weight
         "is_bloch": is_bloch,
         "n_full": int(n_edges),
         "n_red": int(len(kept)),

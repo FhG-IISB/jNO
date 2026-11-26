@@ -118,6 +118,13 @@ The classical supports are just *which* of a node's two dofs are pinned:
 The slope condition rides the same `u.dn` essential-rotation channel the 2-D C¹ plate families use,
 so a beam and a plate are clamped by the same notation.
 
+**In time.** A transient beam is written the same way, with `u_t` (beam heat flow, `ui.t * vi + EI lap·lap`)
+or `u_tt` (vibration). The initial state is the L² projection of the initial value onto the (value, slope)
+pairs, so the slopes come from it too, and each step takes the sparse-direct solve, as the 2-D C¹ families
+do. Measured, simply supported, `u0 = sin(πx)`, `h = 0.05`: `u_t + w'''' = 0` with `bdf()` at `rtol = 1e-6` is
+2.9e-6 off `exp(-π⁴t)·sin(πx)`; `u_tt + w'''' = 0` on the default undamped march (θ = ½, 200 steps) is 3.3e-6
+off `cos(π²t)·sin(πx)`. `bdf()` and `sdirk()` refuse a `u_tt` beam, which they would damp.
+
 !!! measured "Nodally exact for a uniform load"
     To machine precision: a cantilever gives `qL⁴/8` at the tip and `qL³/6` for the tip slope;
     simply supported gives `5qL⁴/384` at mid-span; clamped-clamped `qL⁴/384`.

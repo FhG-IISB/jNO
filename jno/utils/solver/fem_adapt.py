@@ -36,6 +36,7 @@ from typing import Any
 import numpy as np
 
 from ...trace import Constraint
+from ..sets import unique_values
 
 
 def _boundary_edges_from_triangles(tris: np.ndarray) -> np.ndarray:
@@ -2250,7 +2251,7 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     size = h0.copy()
     marked_cells = np.asarray(marked_cells, dtype=np.int64)
     if marked_cells.size:
-        marked_vertices = np.unique(tris[marked_cells].reshape(-1))
+        marked_vertices = unique_values(tris[marked_cells].reshape(-1))
         size[marked_vertices] = h0[marked_vertices] / float(refine_factor)
     return size
 
@@ -2811,7 +2812,7 @@ def harmonic_extension(
     if prescribed is None:
         bfacets = _boundary_edges_from_triangles(cells) if dim == 2 else _boundary_faces_from_tets(cells)
         is_b = np.zeros(n, dtype=bool)
-        is_b[np.unique(bfacets.reshape(-1))] = True
+        is_b[unique_values(bfacets.reshape(-1))] = True
     else:
         is_b = np.asarray(prescribed, dtype=bool).reshape(-1)
         if is_b.shape != (n,):
@@ -6529,7 +6530,7 @@ def run_mesh_motion(
     # simplex as the pointwise route did. Boundary-ness is connectivity, so it is hoisted.
     _bfac = _mesh_boundary_facets(d)[1]
     _on_bnd = np.zeros(n_verts, dtype=bool)
-    _on_bnd[np.unique(np.asarray(_bfac).reshape(-1))] = True
+    _on_bnd[unique_values(np.asarray(_bfac).reshape(-1))] = True
     interior_cell_j = jnp.asarray(~_on_bnd[shared_cells].any(axis=1))
     # ALE: a weak form that reads `coord.d(t)` states the transport relative to the moving mesh itself
     # (`u_t + (c - w).grad u`), so the nodal values RIDE with their vertices -- transferring them as well

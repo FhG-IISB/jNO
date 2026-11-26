@@ -195,11 +195,14 @@ problem repeats**.
     There is deliberately no `auto`: which wins depends on hardware jNO cannot inspect. Install both
     with `pip install jax-numerical-operators[fem]`.
 
+!!! note "Which backend `lu()` means"
+    With no `backend=`, `jno.solve.lu()` is `"cudss"` on a GPU where cuDSS is installed and float64 is on, and `"device"` everywhere else. So is a parametric form solved with no `linear=` at all. cuSolver's `spsolve` is a QR, and against cuDSS it loses by more with every size: one parametric solve on an RTX 3070 took 280 ms against 11 ms at 7.6 k P2 dofs, 2.4 s against 36 ms at 13 k P1 elasticity dofs, and over 240 s against 0.13 s at 49 k P2 dofs. The answers and every derivative mode agree to round-off (`tests/test_default_direct_solve.py`). The solve's log line names the backend that ran; `backend="device"` asks for cuSolver by name.
+
 ??? measured "`backend="host"` — SuperLU on the host"
     factors on the HOST (SuperLU) and drives it from the device; same answer and same gradients (wrapped in `custom_linear_solve`, transpose via SuperLU `trans="T"`). Measured **faster** where cuSolver also works — Stokes 21,839 DOFs 0.27 s vs 1.67 s, H(curl) 17,072 complex DOFs 13.3 s vs 36.4 s — and it runs meshes cuSolver rejects (Stokes 26,908, H(curl) 26,154, both of which fail on GPU). Affordable because a direct solve factorises **once**: the operator crosses PCIe once, not per iteration. Read the win as *cuSolver's sparse LU is weak*, not *GPUs lose* — see the row below
 
 ??? measured "`backend="cudss"` — NVIDIA cuDSS"
-    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's block Krylov sweep needs), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead
+    NVIDIA cuDSS — the **fastest** direct backend wherever it runs, because it separates the symbolic *plan* from the numeric *factorization* and jNO caches on the **sparsity**, so the plan survives a change of values. Against `backend="host"` on an RTX 3070 (fp64 at 1/64 rate — the *unfavourable* card): Stokes saddle factorization **3.4 ms vs 79.9 ms**, lap3d 50³ **576 ms vs 64,856 ms**, and **64.7× per Newton step** at n=64,000. Also factors the Stokes saddle cuSolver calls *singular*, with smaller residuals. Needs the optional stack (`nvmath-python`, `cudss`, `cupy`); raises a clear `ImportError` otherwise. Fill-in still governs 3-D (69×→218× nnz growth at lap3d 20³–40³), so it moves the ceiling and makes **device memory** the binding constraint — it is not a substitute for a preconditioner  Two things happen automatically: a **block right-hand side** `(n, k)` is solved in one call (measured **2.7× at k=4 to 5.4× at k=16** over the same factorization solved column by column — this is what the shift-invert eigensolver's block Krylov sweep needs), and an exactly symmetric operator is factored as **LDLᵀ instead of general LU** (1.41× faster, **1.38× less peak device memory** on lap3d 40³). Symmetry is tested to within a few ulps rather than bitwise — an assembled FEM tangent for a symmetric form is symmetric only up to *assembly round-off* (a vector element block contracts components in a different order for `(a,i),(b,j)` than for `(b,j),(a,i)`, measured **0.25 ulps**), so a bitwise rule sent every vector and coupled problem down the general-LU branch. Within the gate the two triangles are **averaged**, a correction bounded by the asymmetry it removes and therefore no larger than the round-off already in the matrix; outside it nothing is touched. The margin is not a knife-edge: the weakest *genuine* asymmetry that can be constructed — an advection coefficient of 1e-12, meaningless beside the Laplacian — is already **191 ulps**. Measured end-to-end on a 3-D vector tangent, general → symmetric is **1.07–1.13×** at 3.4k–11.8k DOFs (growing with size) and **1.10–1.62×** on lap3d 20³–50³. The rest of the rule stands: symmetry is still tested and SPD is never inferred — a matrix symmetric only to ~1e-15 would otherwise be silently factored as `(A+Aᵀ)/2`, and a wrong SPD guess returns NaN. A **replaced pivot** is first given iterative refinement against the true matrix (Wilkinson 1963 — the remedy cuDSS's own docs prescribe), so a zero-pivot-but-nonsingular operator or a marginally conditioned saddle is *solved* (refined to ~1e-10 per solve, one SpMV per step) rather than refused; a genuinely singular operator — one whose refinement residual will not contract — still **raises**: cuDSS signals it through neither an exception nor a NaN, returning a finite plausible vector instead A factor call with the values the slot's factors already came from runs no factorisation (one compare on the device): a constant operator solved at every step of a march, or a frozen auxiliary solve inside an optimisation step, is factored once.
 
 ??? measured "`backend="pardiso"` — Intel MKL PARDISO"
     Intel MKL PARDISO, multithreaded CPU. **The fastest factorization of the four**, and like cuDSS it splits symbolic analysis from numeric factorization, so a Newton step reuses the analysis. On lap3d 50³ (n=125,000) against single-threaded SuperLU's 65,212 ms: factorization **298 ms**, Newton re-factorization **296 ms — 220×**, where cuDSS reaches 115×. Its adjoint is cheaper too — `Aᵀx = b` comes from the *same* factorization rather than a second one. An exactly symmetric operator uses LDLᵀ (1.9× on lap3d 50³, 13× on a saddle), which needs the upper triangle with an **explicit diagonal** — without that a saddle's constraint rows come back empty and PARDISO rejects the matrix. Like cuDSS it returns finite garbage on a singular operator, so jNO checks the perturbed-pivot count and **raises**. `pip install jax-numerical-operators[pardiso]`, x86-64
@@ -275,11 +278,13 @@ changes the converged solution, only the speed, so specs need no gradient path.
 | `jno.precond.saddle(mass_weight=…, laplace_weight=…)` | the standard saddle recipe as **one call** | Stokes / Biot — the common case |
 | `jno.precond.lsc()` / `saddle(schur="lsc")` | least-squares commutator — the **convection-aware** Schur factor | Navier–Stokes, where the pressure-mass recipe degrades with Re |
 | `jno.precond.fsai(power=…)` | factored sparse approximate inverse `M⁻¹ = GᵀG` — two sparse products, no triangular solves | **SPD only** — the rung between `jacobi` and multigrid, when the factor is reused ([below](#fsai-jnoprecondfsai)) |
-| `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `nullspace="rigid"` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
-| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace="rigid"` for elasticity; needs the optional `pyamg` |
+| `jno.precond.schwarz(parts=…)` | algebraic overlapping Schwarz (domain decomposition), two-level | SPD elliptic systems split across **several devices**; elasticity with `coarse=[(1, 0), (0, 1), (-y, x)]` ([below](#overlapping-schwarz-jnoprecondschwarz)) |
+| `jno.precond.amg(cycles=…, nullspace=…)` | hybrid algebraic multigrid — host setup (`pyamg`), device apply | large SPD systems; `nullspace=` the rigid-body modes for elasticity (a [space](#coarse-spaces-and-deflation-jnoprecondcoarse)); needs the optional `pyamg` |
 | `jno.precond.jaxamg(symmetric=…)` | GPU AMG via NVIDIA AmgX — setup and apply both on device | large systems on a GPU; needs the optional stack |
 | `reuse=` (on every spec) | keep an expensive setup across solves: `True` once, `k` every k-th solve | Newton loops, transients and optimisation loops, where the operator barely changes between solves |
 | `M1 + M2` / `M1 @ M2` | **arithmetic on specs** — applied in parallel and summed, or in sequence right-to-left | writing your own Schur approximation instead of asking for one |
+| `M1 >> M2` | **multiplicative**: `M1`, then `M2` on the residual it left | a coarse space with a smoother — deflation, two-level methods ([below](#coarse-spaces-and-deflation-jnoprecondcoarse)) |
+| `jno.precond.coarse(space, parts=…)` | the correction `Z (ZᵀAZ)⁻¹ Zᵀ` on a subspace `Z` you write down | a few slow modes another preconditioner cannot reach: stiff inclusions, rigid-body modes, constants per subdomain |
 
 Every one of them is passed the same way — `fem.solve(precond=…)`, alongside whichever `linear=`
 solver it is accelerating. Nothing else about the problem changes:
@@ -297,7 +302,8 @@ fem.solve(linear=jno.solve.fgmres(tol=1e-10),
           precond=jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=30)))
 
 # reuse an expensive setup across solves: build once, pass the SAME spec every time
-M = jno.precond.amg(nullspace="rigid", reuse=True)   # rigid-body modes for a displacement field
+rigid = [(1, 0), (0, 1), (-y, x)]                    # rigid-body modes of a 2-D displacement field
+M = jno.precond.amg(nullspace=rigid, reuse=True)
 fem.solve(linear=jno.solve.cg(tol=1e-10), precond=M)
 
 # three more with the same shape, each needing something the others do not:
@@ -334,8 +340,8 @@ reduced field by field. The block preconditioners split *that* operator: the sli
 reduced with the same field's `P`. So `block_diag`, `triangular`, `saddle` (mass, Cahouet–Chabard,
 `lsc`), `pcd` and `jno.solve.staggered` are written exactly as on the untied problem. The preconditioners
 that build a pattern once (`fsai`, `schwarz`) build it from the reduced operator, and
-`schwarz(nullspace="rigid")` builds its rigid-body modes on the full mesh and restricts them to the kept
-DOFs (a translation along a periodic direction restricts exactly). One case is refused
+a coarse space written as formulas (`schwarz(coarse=...)`, `coarse(...)`, `amg(nullspace=...)`) is evaluated
+on the full mesh and restricted to the kept DOFs (a translation along a periodic direction restricts exactly). One case is refused
 by name: a complex form solved as its fused real-equivalent `[Re; Im]` block. There a field is not one
 contiguous slice, so use a complex-native composition (a child such as `ams()`) or a whole-system
 preconditioner.
@@ -731,6 +737,141 @@ sparsity pattern poisons the factor with NaN rather than applying a stale one.
     **reused**: a constant-operator march, `reuse=True` across solves, several right-hand sides.
     `power=2` grows the setup steeply (7.1 s on the P2 case, for 32 iterations) — start with `power=1`.
 
+### Coarse spaces and deflation — `jno.precond.coarse()`
+
+A preconditioner like Jacobi or a Schwarz smoother acts locally, so the few modes that vary slowly across
+the whole problem are the ones it leaves: one per stiff inclusion in a high-contrast material, the
+rigid-body motions of an elastic body, the constant on each subdomain. A **coarse space** `Z` names them,
+and `coarse(Z)` is the operator `Q r = Z (ZᵀAZ)⁻¹ Zᵀ r` that solves the problem exactly on `span Z`.
+
+The space is a **value**, written once and evaluated on whatever problem the solve runs on:
+
+| `space` | what it is |
+|---|---|
+| `[1]`, `[1, x, y]` | formulas in the domain's coordinates, one per column (`x, y` from `d.variable(...)`) |
+| `[(1, 0), (0, 1), (-y, x)]` | a tuple per vector field: here the 2-D rigid-body modes |
+| `{p: [1]}` | on a problem with several fields, the field it lives on (zeros elsewhere) |
+| an `(n, k)` array | vectors on the system being solved (the reduced one, if a tie reduces it) |
+| a sparse `(n, k)` matrix | `scipy.sparse` or a JAX `BCOO`: vectors that live on parts of the domain (GenEO's per-subdomain eigenvectors), stored by their nonzeros. Columns with the same nonzero rows form a group; groups may overlap |
+| `ctx -> (n, k)` | computed once, when the solve sets up (`ctx.fem`, `ctx.n`, `ctx.A`) |
+| `jno.space.eigvecs(k)` | the `k` lowest eigenvectors of the operator, by LOBPCG at setup -- the classical deflation space, worth it when the operator is reused |
+| `jno.space.geneo(tau=0.2)` | GenEO: per Schwarz subdomain, the eigenvectors of a local generalized eigenproblem below `tau`, from the subdomain's own cells (needs `parts=schwarz(coarse=False)`) |
+
+`parts=` splits every vector over subdomains: a whole number (METIS parts), a list of region names, or a
+`schwarz(coarse=False)` spec, whose subdomains it then shares. `coarse` combines with another
+preconditioner `M` through the spec algebra (Tang, Nabben, Vuik & Erlangga, *J. Sci. Comput.* 39, 2009):
+
+| written | name | symmetric | Krylov method |
+|---|---|---|---|
+| `Q >> M >> Q` | BNN | yes | `cg` |
+| `Q + M` | additive coarse | yes | `cg` |
+| `M >> Q` | A-DEF2 (deflation) | no | `gmres` / `fgmres` |
+| `Q >> M` | A-DEF1 | no | `gmres` / `fgmres` |
+
+A non-symmetric combination under `cg` runs flexible CG, which handles a slight asymmetry but not
+A-DEF's: on a high-contrast problem `amg() >> Q` took 364 flexible-CG iterations, 138 with `fgmres`, and
+BNN took 150 under plain `cg`.
+
+```python
+R = jno.shape.rect
+d = (
+    R(0.20, 0.20, 0.30, 0.30).name("inc1").attach(k=1e6)
+  + R(0.60, 0.50, 0.70, 0.60).name("inc2").attach(k=1e6)
+  + R(0.40, 0.75, 0.50, 0.85).name("inc3").attach(k=1e6)
+  + R(0.00, 0.00, 1.00, 1.00).name("matrix").attach(k=1.0)
+).sized(0.02).domain()
+...
+Q = jno.precond.coarse([1], parts=["inc1", "inc2", "inc3"])     # one vector per inclusion
+fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.jacobi() >> Q)
+```
+
+With Jacobi alone the CG iterations follow the contrast (226 at 1e2, 382 at 1e6); with one vector per
+inclusion they barely move (160, 192). Smoothed-aggregation AMG already resolves these modes on this
+problem, so there deflation adds nothing; the coarse space pays where the preconditioner is local.
+
+For elasticity the coarse space is the rigid-body modes, on the Schwarz subdomains:
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse([(1, 0), (0, 1), (-y, x)], parts=S)
+fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+Rigid-body modes stop the growth with the number of subdomains, but a stiffness jump that cuts through
+the subdomains still costs: a subdomain holding a stiff and a soft layer has more nearly free motions than
+the three rigid ones. **GenEO** (Spillane, Dolean, Hauret, Nataf, Pechstein & Scheichl, *Numer. Math.* 126,
+2014) finds them. For each overlapping subdomain it solves `A_i^N v = λ D_i A_ii D_i v`, where `A_i^N` is the
+operator assembled over the subdomain's own cells (natural conditions where it is cut) and `D_i` the
+partition of unity, and keeps the eigenvectors with `λ < tau` as coarse vectors:
+
+```python
+S = jno.precond.schwarz(parts=64, coarse=False)
+Q = jno.precond.coarse(jno.space.geneo(), parts=S)       # or jno.precond.schwarz(parts=64, coarse=jno.space.geneo())
+fem.solve(linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+On a layered block with stiffness contrast 10⁴ it takes 26, 38 and 40 CG iterations at 4, 16 and 64
+subdomains, about the same as the homogeneous block (23, 39, 36), where the rigid modes take 73, 136 and 110.
+The local eigenproblems are dense and batched over the subdomains on the device. It needs a real, symmetric
+positive definite problem on native FEM of any element (a Morley plate with rigidity contrast 10⁴ goes from 238
+iterations at one level to 37 over 64 subdomains), or else a symmetric diagonally dominant operator (FDM
+diffusion, say), whose edges stand in for the cells and which measures the same on a layered problem. On a
+system reduced by periodic ties, slip or hanging nodes each cell's matrix is carried over as `Pᵀ K_e P`, and on
+a march the cells combine as the step operator does (`M + θΔt A`; a mass that changes, or a Bloch phase, raises).
+A short step needs less of it: on layered diffusion at contrast 10⁴ it keeps 54 vectors at a long step, where it
+halves the iterations, 5 at `Δt = 10⁻³`, where the local solves are already enough, and none at `Δt = 10⁻⁷`.
+
+In 3-D the iterations hold too, with a larger space. On a layered P1 block at contrast 10⁴, from 7,344 to 42,192
+unknowns and 16 to 128 subdomains, it takes 43 to 51 iterations where the rigid modes take 101 to 158, keeping up
+to 16 % of the unknowns as coarse vectors. It matters less as subdomains shrink below the layers: at 512 subdomains
+on 42,192 unknowns the rigid modes take 57. The eigenproblems are dense, so they run in chunks that fit the device;
+when the coarse matrix is what runs out of memory, cap it with `nev=` (`nev=24` at 256 subdomains: 66 iterations).
+
+By default the space is computed once, when the solve sets up; `ZᵀAZ` and the local solves still follow the
+operator. When the stiffness pattern itself moves -- a damage band opening, a design changing, a material
+yielding -- give the spec that holds it `reuse=k`:
+
+```python
+Q = jno.precond.coarse(jno.space.geneo(), parts=S, reuse=1)   # or jno.precond.schwarz(coarse=jno.space.geneo(), reuse=1)
+fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.cg(), precond=Q >> S >> Q)
+```
+
+`reuse=1` recomputes the space at every solve and, inside `jno.solve.newton()`,
+`jno.solve.staggered(direct=True)` or a nonlinear march's Newton steps, at every linearization, from the tangent and the iterate it was
+assembled at (a staggered block step leaves the other fields out). `reuse=k` recomputes it every k-th
+solve; inside one compiled loop, which cannot count solves, it raises. Such a space has a fixed number of
+columns per subdomain -- `nev`, by default twice what the setup's operator needs -- and masks the ones above
+`tau`, so only its values change and the recompute runs inside the compiled loop; a subdomain that uses all
+its columns is logged. It pays only when a piece of the body comes loose. On a plate pulled by a load with a free top
+and a prescribed damage band across it (stiffness 10⁻⁶ in the band), the intact plate's space took 54 iterations
+where the recomputed one took 40 (64 subdomains; 68 with rigid modes). On the phase-field notched plate, held by
+displacements at both ends, the space of the first step lost nothing: 1375 iterations over the 44 block solves of
+the load path against 1374 recomputed, and 4444 at one level. Recomputing is one batch of local eigenproblems per
+linearization, so measure before paying for it.
+
+!!! warning "A kernel is not a slow mode"
+    A vector the operator maps to zero (the constant of a pure-Neumann problem) makes `ZᵀAZ` singular, and
+    `coarse` refuses it: that problem is singular, and the fix is a gauge term in the problem (pin a value,
+    a mean-value constraint), not a preconditioner. A vector that vanishes (a part made only of eliminated
+    Dirichlet rows) is dropped and logged.
+
+The space, the partition and the entry tables are set up once on the host; `ZᵀAZ` and its inverse follow
+the operator's values on every solve, inside a compiled solve, a Newton loop or a march. The tables are
+built on every entry the problem's assembly emits, so a spec set up on one operator also serves another of
+the same problem whose coefficients do not cancel where the first one's did (a uniform design, then a
+graded one). A global space
+(`parts=None`) needs only products with the operator, so it also works matrix-free; a partitioned one needs
+the assembled matrix. Formulas need nodal Lagrange fields (a Hermite, Morley, Argyris or edge-element field
+raises: give an array). The coarse matrix `ZᵀAZ` has one row per kept direction (at most `parts × k`). Up to
+1,000 directions it is dense and factored by a symmetric eigendecomposition when it is Hermitian, an SVD
+otherwise (GenEO's: a Cholesky on its kept directions). Above that, a real symmetric one split over several parts is stored by its nonzero blocks (parts
+that meet through the operator) and factored by a sparse block Cholesky over the parts' graph, in a
+nested-dissection order, each separator eliminated as one dense supernode. There a direction `ZᵀAZ` does not see raises even when it only repeats other parts'
+vectors, which the dense path would drop.
+
+Tutorial: [Coarse spaces for Schwarz (layered elasticity)](tutorials/08-fem-and-varpinns/coarse-spaces-layered-elasticity.md)
+-- rigid-body modes against one-level Schwarz over 4 to 64 subdomains, the gap a stiffness jump leaves, and GenEO.
+
 ### Overlapping Schwarz — `jno.precond.schwarz()`
 
 Domain decomposition as a **preconditioner**, built from the assembled operator alone: no mesh, no
@@ -746,17 +887,18 @@ physics, so any FEM or FDM system qualifies. (This is not the multi-method coupl
    inverses. The results are added back, summing where subdomains overlap.
 4. **Coarse correction** (`coarse=True`, the default). One small global problem with a few unknowns per
    subdomain carries information across the whole domain in one step. Without it, the iteration count
-   grows with the number of parts; with it, it stays flat.
+   grows with the number of parts; with it, it stays flat. It is a [coarse space](#coarse-spaces-and-deflation-jnoprecondcoarse)
+   on the subdomains, applied as `Q >> S >> Q`: one constant per part by default, or any space you write.
 
 ```python
 fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz())
-fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(nullspace="rigid"))  # elasticity
+fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(coarse=[(1, 0), (0, 1), (-y, x)]))  # elasticity
 fem.solve(linear=jno.solve.cg(tol=1e-8), precond=jno.precond.schwarz(), shard=4)          # 4 devices
 ```
 
 On `jno.fdm` it composes the same way, on the operator FDM assembles for the slots
 ([FDM solver slots](fdm.md#solver-slots-linear-and-precond)), including inside a `jno.core` training step
-and for vector unknowns with `nullspace="rigid"`:
+and for vector unknowns with a rigid-body coarse space:
 
 ```python
 jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
@@ -766,16 +908,20 @@ jno.fdm([...]).solve(linear=jno.solve.cg(), precond=jno.precond.schwarz())
 |---|---|
 | `parts` | number of subdomains; default ~256 unknowns each, rounded up to a multiple of the device count |
 | `overlap` | layers of neighbours each subdomain grows by |
-| `coarse` | two-level (default) or one-level |
+| `coarse` | `True` one constant per subdomain (Nicolaides 1987, the default); `False` one level; or a [space](#coarse-spaces-and-deflation-jnoprecondcoarse) split over the subdomains -- formulas such as the rigid-body modes `[(1, 0), (0, 1), (-y, x)]`, which elasticity needs, an `(n, k)` array, or a callable |
 | `restricted` | RAS (Cai & Sarkis 1999): usually fewer iterations but **non-symmetric** — `cg` then runs flexible CG |
-| `nullspace` | what the coarse space carries per subdomain: `None` one constant (Nicolaides 1987); `"rigid"` the rigid-body modes of a displacement field (translations + rotations), which elasticity needs; or an explicit `(n, k)` array |
 | `float32` | [single-precision application](#single-precision-inside-a-double-solve-float32true) |
+
+!!! note "On the CPU, set `OMP_NUM_THREADS=1` for this setup"
+    In jNO's pixi environment the batched factorizations of a Schwarz or GenEO setup run far slower on the CPU with
+    OpenBLAS's default threads. The cause and the cost of the setting are in
+    [Troubleshooting](troubleshooting.md#schwarz-or-geneo-setup-is-very-slow-on-the-cpu).
 
 !!! measured "CG to 1e-8, two-level, RTX 3070 — iterations at 64 / 256 parts"
     | Problem | Iterations | Solve |
     |---|---|---|
     | 2-D Poisson, 11.8k | 50 / 43 | 32 / 24 ms |
-    | 2-D cantilever, `nullspace="rigid"` | 57 / 41 | 44 / 55 ms |
+    | 2-D cantilever, rigid-body coarse space | 57 / 41 | 44 / 55 ms |
     | 3-D Poisson, 18.9k | 37 / 34 | 130 / 63 ms |
 
     On the cantilever the coarse space decides the scaling: at 16 / 64 / 256 parts, one constant per part
@@ -848,7 +994,8 @@ two routes to the same root, a convergence study — ask Newton for it:
 `fem.solve(nonlinear=jno.solve.newton(rtol=1e-12, atol=1e-12))`.
 
 ```python
-fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace="rigid", reuse=True))  # forcing included
+rigid = [(1, 0), (0, 1), (-y, x)]
+fem.solve(linear=jno.solve.cg(), precond=jno.precond.amg(nullspace=rigid, reuse=True))  # forcing included
 ```
 
 ### Picard / lagged coefficients — `jno.lag`
@@ -1466,9 +1613,10 @@ the tangent within a step but not across steps (the reverse pass would store one
 | `jno.solve.theta(1.0)` | 1 | L-stable | the default — robust, damps everything |
 | `jno.solve.theta(0.5)` | 2 | A-stable only | smooth problems; **rings** on stiff modes |
 | `jno.solve.bdf2()` | 2 | **L-stable** | stiff / saddle-point systems — flow's workhorse |
+| `jno.solve.bdf(order=None\|1..5)` | 1–5, chosen per step | L-stable to 2, A(α) above | stiff transients on error-controlled steps: one implicit solve per step |
 | `jno.solve.sdirk(order=2\|3)` | 2 or 3 | **L-stable**, stiffly accurate | higher order where BDF2 is not enough; state-dependent mass allowed |
 | `jno.solve.rosenbrock("ros34pw2"\|"ros2")` | 3 or 2 | **L-stable** | nonlinear blocks **without Newton**: one linear solve per stage |
-| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks |
+| `jno.solve.exponential()` | exact in time | unconditional | linear, autonomous blocks (`mass="consistent"` for the system the other schemes solve) |
 | `…​.adaptive(rtol=…)` | wraps a one-step scheme | — | multi-rate transients |
 
 `bdf2` exists because `theta` cannot be second order *and* L-stable at once. Crank–Nicolson's
@@ -1489,12 +1637,54 @@ A state-dependent mass `c(u)·u_t` is marched in BDF2's non-conservative form
 it is not the conservative form an enthalpy mass `H(u)_t` would want. It composes with periodic ties
 (the march carries the reduced state; the mass action is reduced like the residual). Refused loudly
 rather than mis-integrated: a second-order-in-time (`u_tt`) block (assembled at θ=½ *so that* it is not
-damped), and `.adaptive()` (step doubling sizes a one-step method).
+damped). `bdf2().adaptive(rtol=…)` is the variable-step march of `bdf(order=2)`, below.
+
+### Variable-step, variable-order BDF — `bdf()`
+
+`jno.solve.bdf()` is the stiff integrator of MATLAB's `ode15s` and SUNDIALS CVODE: backward differentiation
+formulas of order 1 to 5 on error-controlled steps, the order chosen per step for the largest step
+(Shampine & Reichelt, SIAM J. Sci. Comput. 18, 1997). Each step is ONE implicit solve, and the error
+estimate comes from the predictor, so no stage or step is taken twice. The coefficients are those of the
+actual, unequal past steps (variable-coefficient BDF), and the default `ndf=True` adds the
+Klopfenstein–Shampine correction, which keeps the stability and shrinks the error constant.
+
+```python
+sol = fem.solve(time=jno.solve.bdf())                                  # orders 1-5, rtol 1e-4
+sol = fem.solve(time=jno.solve.bdf().adaptive(rtol=1e-6, atol=1e-9))
+sol = fem.solve(time=jno.solve.bdf(order=2).adaptive(rtol=1e-5))       # order held at 2
+```
+
+The step is a backward-Euler step from a shifted state, so it carries what that step carries: Newton on a
+nonlinear block, the solver slots, Dirichlet and algebraic rows, a state-dependent mass (non-conservative
+form), complex and periodic fields, and reverse-mode gradients at the realized step schedule. Measured on a
+two-mode heat problem: the error at all save times follows `rtol` (1e-4 → 2e-4, 1e-6 → 5e-6), and at
+`rtol = 1e-6` the variable-order march needs about a quarter of the attempts of order 2 held.
+**Scope:** orders 3–5 are A(α)-stable only (α = 86°, 73°, 51°), so a lightly damped oscillation loses accuracy
+there; use `sdirk`, `theta(0.5)` or `bdf(order=2)` for it. A `u_tt` block is refused. Every attempt is kept
+for the gradient, so memory grows with `max_steps`.
 
 Every scheme needs each transient term **linear in `u_t`** — `c(u)·u_t`, or `u_t` inside a contraction such
 as `τ (u·∇v)·u_t` (the time derivative inside a residual-based stabilisation). A term quadratic in `u_t`, or
 `u_t` inside a nonlinear function, is refused: it used to be marched with `(u − u_prev)²/Δt` where `/Δt²`
 belonged. The `u_t⊗u_t` piece of a residual-based VMS Reynolds stress is such a term — drop that piece.
+
+### The exponential scheme on every element
+
+`exponential(mass="consistent")` integrates the same semidiscrete system as every other scheme, exactly in
+time: on each element family's heat-type test problem (Lagrange P1–P3, Q1/Q2, tets, hexes, lines, vector,
+coupled, Hermite, cover, Morley, N1E in 2-D and 3-D) it lands within 1e-8 to 1e-10 of a tight adaptive SDIRK3,
+and within 7e-4 on Argyris, whose mass is too ill-conditioned for its CG mass solve. The default `mass="lumped"`
+replaces `M` by its row sums: a different spatial discretisation (4e-2 off the consistent one on P1 triangles,
+8e-2 on Q1 hexes), refused where the row sums are not positive (a P2 vertex, a Hermite slope, an edge DOF).
+`symmetric=True` (Lanczos) is refused on an operator that is not symmetric on its free DOFs, such as a one-way
+coupling between fields; pass `symmetric=False`. Algebraic rows other than walls (a pressure, an RT flux) are
+refused as before.
+
+A trainable coefficient, network or initial condition is fine as long as the operator does not read time
+(a time-dependent source is): `exponential()` then takes the operator at the runtime values and is reverse-mode
+differentiable on both mass treatments, matching finite differences to 1e-9. An operator that reads time is
+refused. The refusals above run once when `fem.solve(time=jno.solve.exponential(...))` is called, on the
+operator at the stored values, so they also hold inside `jno.core`, where the march itself is traced.
 
 ### Higher order — `sdirk` and `rosenbrock`
 
@@ -1522,6 +1712,15 @@ sol = fem.solve(time=jno.solve.rosenbrock().adaptive(rtol=1e-4))
 ```
 
 Both expose a stepper, so `.adaptive()` works, and both refuse second-order-in-time (`u_tt`) blocks.
+SDIRK and ROS34PW2 carry an embedded lower-order solution built from the same stages (order 2 for SDIRK3
+and ROS34PW2, order 1 for SDIRK2), so the controller gets its error estimate without extra solves; every
+other base is sized by step doubling (one step against two half-steps). A step over the tolerance is
+rejected and retried smaller; the step sizes are treated as constants in the gradient. The error norm
+leaves out index-2 rows (zero mass and a zero diagonal, the incompressibility row of a saddle problem),
+whose error converges an order lower: counted, they drove SDIRK3 on unsteady Stokes to the step floor.
+Dirichlet rows and pressure pins stay in. On the 2-D heat
+test of `tests/test_fem_adaptive_timestep.py` at `rtol=1e-5`, the embedded pair needed about 40% fewer
+base steps than step doubling for an error no larger.
 On a nonlinear heat problem, ROS34PW2 reached a given accuracy in the least wall time of the schemes
 compared (θ, BDF2, SDIRK, ROS2). Time-to-accuracy depends on the problem, so compare on yours.
 
@@ -1531,6 +1730,13 @@ formed **once** and the preconditioner materialized **once before the time loop*
 each implicit step of a nonlinear block. Second-order-in-time (`u_tt`) flows through the same augmented
 block. Each step warm-starts from the previous state; the first state is the initial condition
 (`u.initialize(u0)` or `u(initial) - u0`).
+
+With no `linear=`/`precond=`, a linear block's step is solved by Jacobi-BiCGStab with a GMRES rescue, except
+on a **saddle**: a row with zero mass and a zero diagonal (the incompressibility row of unsteady Stokes)
+gets `jno.solve.lu()` instead. Jacobi has nothing to scale on those rows and the Schur complement shrinks
+with `dt`; measured on unsteady Stokes (P2/P1), the Krylov step was right at `dt = 1e-3` and NaN at
+`dt = 1e-4`. A Krylov step that does not converge raises at the end of the solve, naming the step solve,
+instead of returning a NaN trajectory.
 
 !!! measured "A constant step operator factorizes once, not once per step"
     The step matrix is

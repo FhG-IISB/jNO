@@ -221,10 +221,19 @@ def constrain_operator(A, devices):
     nnz = int(A.data.shape[0])
     m = (nnz // nd) * nd
     spec = NamedSharding(mesh, P(SHARD_AXIS))
+    indices = A.indices
+    if isinstance(indices, jax.core.Tracer):
+        head, tail = indices[:m], indices[m:]
+    else:
+        # A concrete pattern with traced values reaches the program as an argument, in the placement it has: read
+        # through a constraint from a whole copy, XLA gathers it onto every device. So it is placed partitioned here.
+        with jax.ensure_compile_time_eval():
+            head = jax.device_put(indices[:m], spec)
+            tail = jax.device_put(indices[m:], NamedSharding(mesh, P()))
     data = with_sharding_constraint(A.data[:m], spec)
-    rows = with_sharding_constraint(A.indices[:m, 0], spec)
-    cols = with_sharding_constraint(A.indices[:m, 1], spec)
-    t_data, t_rows, t_cols = A.data[m:], A.indices[m:, 0], A.indices[m:, 1]
+    rows = with_sharding_constraint(head[:, 0], spec)
+    cols = with_sharding_constraint(head[:, 1], spec)
+    t_data, t_rows, t_cols = A.data[m:], tail[:, 0], tail[:, 1]
 
     def matvec(v):
         out = jax.ops.segment_sum(data * v[cols], rows, num_segments=n)

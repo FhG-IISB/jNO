@@ -11,7 +11,14 @@ Two treatments:
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+
+
+def _safe_norm(sq):
+    """``sqrt(max(sq, 0))`` whose derivative is 0, not ``inf * 0 = NaN``, where ``sq`` is 0."""
+    pos = sq > 0.0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, sq, 1.0)), 0.0)
 
 
 def _dense(M):
@@ -40,19 +47,31 @@ def m_inner_funm(L_mv, m_inner, e0, v, fun, order):
     The three-term recurrence ``β_{j+1} q_{j+1} = L q_j − α_j q_j − β_j q_{j-1}`` uses the M-inner-product
     throughout (``α_j = ⟨q_j, L q_j⟩_M``), giving a symmetric tridiagonal ``T``; then
     ``f(L) v = ‖v‖_M · Q f(T) e_1``. ``order`` is the Krylov size."""
-    beta0 = jnp.sqrt(jnp.maximum(m_inner(v, v), 0.0))
+    beta0 = _safe_norm(m_inner(v, v))
     q = jnp.where(beta0 > 1e-300, v / jnp.where(beta0 > 1e-300, beta0, 1.0), e0)
     Q, alphas, betas = [q], [], []
     q_prev, beta = jnp.zeros_like(q), jnp.zeros((), q.dtype)
+    # BREAKDOWN: once the Krylov space is invariant (it always is after as many steps as free unknowns, and
+    # a symmetric mesh can get there sooner) the next beta is round-off. Dividing by it builds a garbage
+    # vector, and keeping it repeats an eigenvalue of T, where the derivative of `eigh` divides by the gap:
+    # the gradient came back NaN (measured: lumped `jno.solve.exponential` with a trainable coefficient).
+    # From breakdown on, a step contributes a zero vector, a zero coupling and a diagonal entry above the
+    # spectrum, distinct per step: a decoupled block that leaves f(T) e1 unchanged and every eigenvalue simple.
+    done = jnp.zeros((), bool)
+    scale = jnp.zeros((), q.dtype)
     for _j in range(order):  # unrolled (order small) so full reorthogonalization is straightforward
         w = L_mv(q)
         alpha = m_inner(q, w)
         w = w - alpha * q - beta * q_prev
         for qk in Q:  # FULL M-reorthogonalization — without it ghost eigenvalues corrupt the gradient
             w = w - m_inner(qk, w) * qk
-        beta_next = jnp.sqrt(jnp.maximum(m_inner(w, w), 0.0))
+        beta_next = _safe_norm(m_inner(w, w))
+        scale = jnp.maximum(scale, jax.lax.stop_gradient(jnp.abs(alpha) + beta + beta_next))
+        alpha = jnp.where(done, jax.lax.stop_gradient(scale) * (2.0 + _j), alpha)
+        done = done | (beta_next <= 1e-10 * scale)
+        beta_next = jnp.where(done, 0.0, beta_next)
         q_prev, beta = q, beta_next
-        q = jnp.where(beta_next > 1e-300, w / jnp.where(beta_next > 1e-300, beta_next, 1.0), q)
+        q = jnp.where(done, 0.0, w / jnp.where(done, 1.0, beta_next))
         alphas.append(alpha)
         betas.append(beta_next)
         Q.append(q)

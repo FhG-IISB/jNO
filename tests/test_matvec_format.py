@@ -243,3 +243,82 @@ def test_a_real_csr_operator_applies_to_a_complex_vector(cols):
     v = v[:, 0] if cols == 1 else v
     mv = mf.csr_matvec(mf.csr_parts(Ab), A.shape)
     np.testing.assert_allclose(np.asarray(mv(jnp.asarray(v))), A.toarray() @ v, rtol=1e-12, atol=1e-12)
+
+
+def _padded(A, extra=3):
+    """``A`` with out-of-bound entries added at the end, as ``sum_duplicates(nse=...)`` leaves them"""
+    import jax.experimental.sparse as jsp
+
+    n, m = A.shape
+    pad = jnp.full((extra, 2), jnp.asarray([n, m], A.indices.dtype))
+    return jsp.BCOO(
+        (jnp.concatenate([A.data, jnp.full(extra, 123.0, A.data.dtype)]), jnp.concatenate([A.indices, pad])),
+        shape=A.shape,
+        indices_sorted=True,
+        unique_indices=True,
+    )
+
+
+def _small_operator():
+    import jax.experimental.sparse as jsp
+
+    rng = np.random.default_rng(3)
+    dense = rng.normal(size=(40, 30)) * (rng.uniform(size=(40, 30)) < 0.3)
+    return jsp.BCOO.fromdense(jnp.asarray(dense)), jnp.asarray(dense)
+
+
+def test_padding_is_told_apart_on_the_device():
+    A, _dense = _small_operator()
+    assert mf.has_padding(A) is False
+    assert mf.has_padding(_padded(A)) is True
+
+
+def test_the_csr_of_an_operator_shares_its_values():
+    """no second copy of the values on the device, and the product is the dense matrix's"""
+    A, dense = _small_operator()
+    parts = mf.csr_parts(A, padded=False)
+    assert parts[0] is A.data
+    v = jnp.asarray(np.random.default_rng(4).normal(size=A.shape[1]))
+    np.testing.assert_allclose(np.asarray(mf.csr_matvec(parts, A.shape)(v)), np.asarray(dense @ v), rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("padded", [False, True])
+def test_a_traced_operator_told_its_padding_gives_the_dense_product(padded, transpose):
+    """told there is none, nothing is masked; a padded operator goes through the mask and its entries count for nothing"""
+    A, dense = _small_operator()
+    B = _padded(A) if padded else A
+    n = A.shape[0] if transpose else A.shape[1]
+    v = jnp.asarray(np.random.default_rng(5).normal(size=n))
+    want = dense.T @ v if transpose else dense @ v
+    got = jax.jit(lambda M, w: mf.csr_matvec(mf.csr_parts(M, padded=padded), M.shape, transpose)(w))(B, v)
+    np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-12, atol=1e-12)
+
+
+def test_a_large_operator_is_not_measured(monkeypatch):
+    """timing two formats costs 40 bytes an entry on the device: past 5% of the pool it goes to CSR with no timing"""
+    A, _dense = _small_operator()
+    monkeypatch.setattr(mf, "_FORMAT", "auto")
+    monkeypatch.setattr(mf, "_DECISIONS", {})
+    monkeypatch.setattr(mf, "_time_products", lambda *a: pytest.fail("timed a large operator"))
+    monkeypatch.setattr(mf, "_device_limit", lambda: int(A.nse) * 40 * 10)
+    assert mf.choose(A) == "csr"
+    monkeypatch.setattr(mf, "_device_limit", lambda: None)
+    assert not mf._measuring_costs_too_much(A)
+
+
+def test_numpy_indices_with_traced_values_trace():
+    """the direct Newton's tangent: indices as NumPy arrays, values traced, inside a compiled loop; rows unsorted"""
+    _A, dense = _small_operator()
+    dense = np.asarray(dense)
+    rows, cols = np.nonzero(dense)
+    p = np.random.default_rng(6).permutation(rows.size)
+    idx, vals = np.stack([rows, cols], 1)[p], dense[rows, cols][p]
+    # through the pytree (as a solver's tangent arrives), which keeps NumPy leaves; the constructor would convert them
+    treedef = jax.tree_util.tree_structure(jsp.BCOO((jnp.asarray(vals), jnp.asarray(idx)), shape=dense.shape))
+    make = lambda v: jax.tree_util.tree_unflatten(treedef, [v, idx])  # noqa: E731
+    assert isinstance(make(jnp.asarray(vals)).indices, np.ndarray)
+    w = jnp.asarray(np.random.default_rng(7).normal(size=dense.shape[1]))
+    mv = lambda v, w_: mf.csr_matvec(mf.csr_parts(make(v)), dense.shape)(w_)  # noqa: E731
+    got = jax.jit(mv)(jnp.asarray(vals), w)
+    np.testing.assert_allclose(np.asarray(got), dense @ np.asarray(w), rtol=1e-12, atol=1e-12)
