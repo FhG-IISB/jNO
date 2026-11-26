@@ -18,8 +18,12 @@ function, is scattered to the face's two nodes. The term becomes
 an internal ``Coupling`` with its support declared, so Newton's tangent carries the whole term exactly (dense on the
 radiating nodes), including dG/dT and d eps/dT.
 
+A runtime scalar ``jno.np.parameter`` may appear in the term or in ``eps`` (``.attach(eps=0.8 * s)``, or inside a law
+of T): the coupling declares it, so ``fem.solve(s=value)`` solves at that value without recompiling, and the radiosity
+reads the same scaled emissivity as the term's prefactor.
+
 Scope: 2-D and axisymmetric meshes (the enclosure's own scope); the term must use the field and the test function
-unbound (``T``, ``v``), not their coordinate-bound views, and no derivatives.
+unbound (``T``, ``v``), not their coordinate-bound views, and no derivatives; no network or frozen parameter.
 """
 
 from __future__ import annotations
@@ -127,11 +131,21 @@ def _face_eval(e, env):
             )
         return env["fields"][key]
     from ..trace import ModelCall
+    from ..utils.solver.parametric_helpers import _is_frozen_parameter, _is_runtime_scalar_parameter, _parameter_name
 
+    if isinstance(e, ModelCall) and _is_runtime_scalar_parameter(e) and not _is_frozen_parameter(e):
+        value = jnp.asarray(env["params"][_parameter_name(e)])  # the solve's value, one per parameter
+        if value.size != 1:
+            raise NotImplementedError(
+                f"d.irradiation: the parameter {_parameter_name(e)!r} has {value.size} values; a radiation term reads "
+                "scalar parameters only (one number per solve), not a field or a vector."
+            )
+        return value.reshape(())
     if isinstance(e, ModelCall):
         raise NotImplementedError(
-            "d.irradiation: a trainable parameter or network (jno.np.parameter, jno.nn) cannot be in a radiation term "
-            "yet; it is evaluated on the radiating faces, outside the weak-form trace. Use a number or a law of T."
+            "d.irradiation: a frozen parameter or a network (jno.nn) cannot be in a radiation term yet; it is evaluated "
+            "on the radiating faces, outside the weak-form trace. Use a number, a law of T or a runtime "
+            "jno.np.parameter (solved at a value with fem.solve(name=value))."
         )
     raise NotImplementedError(
         f"d.irradiation: {type(e).__name__} cannot be evaluated on a radiating face (no derivatives, networks or "
@@ -214,15 +228,21 @@ def _lower(term, nodes):
     cuts = np.cumsum([0, *[p.size for p in rad.parts]])
     n_nodes = int(pts.shape[0])
 
-    def eps_faces(t):
-        env = {"fields": {key: t}, "coords": mids, "tags": tags, "G": None, "test": 1.0}
+    # Runtime parameters (jno.np.parameter, solved at a value) anywhere in the term or the emissivity: the coupling
+    # declares them, and jno.fem hands their values to the residual and the tangent as a {name: value} dict.
+    from ..utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    params = _collect_runtime_parameter_exprs(eps_expr, _collect_runtime_parameter_exprs(term))
+
+    def eps_faces(t, args=None):
+        env = {"fields": {key: t}, "coords": mids, "tags": tags, "G": None, "test": 1.0, "params": args or {}}
         return jnp.broadcast_to(jnp.asarray(_face_eval(eps_expr, env), dtype=t.dtype), t.shape)
 
-    def faces_of(u):
+    def faces_of(u, args=None):
         """Per-face field t (mean of the two nodes), emissivity e and irradiation G, from the nodal vector."""
         u = jnp.asarray(u).reshape(-1)[:n_nodes]
         t = 0.5 * (u[a] + u[b])
-        e = eps_faces(t)
+        e = eps_faces(t, args)
         G = jnp.concatenate(
             [
                 radiosity_irradiation(part.view_factor, e[lo:hi], t[lo:hi])
@@ -231,23 +251,26 @@ def _lower(term, nodes):
         )
         return t, e, G
 
-    def at_gauss(t, G, test=1.0):
+    def at_gauss(t, G, test=1.0, args=None):
         """The face environment at the 2m Gauss points: coordinates there, everything else per face, twice."""
         two = lambda x: jnp.concatenate([x, x]) if hasattr(x, "shape") and jnp.ndim(x) > 0 else x  # noqa: E731
-        return {"fields": {key: two(t)}, "coords": gauss, "tags": np.concatenate([tags, tags]), "G": two(G), "test": test}
+        return {
+            "fields": {key: two(t)}, "coords": gauss, "tags": np.concatenate([tags, tags]), "G": two(G), "test": test,
+            "params": args or {},
+        }  # fmt: skip
 
     m = len(elements)
 
-    def contributions(t, G):
+    def contributions(t, G, args=None):
         """The term's integral against each face's two hat functions, ``(ca, cb)`` of shape (m,): pointwise in the
         face (a function of that face's t and G only)."""
-        c = jnp.broadcast_to(jnp.asarray(_face_eval(term, at_gauss(t, G)), dtype=jnp.float64), (2 * m,))
+        c = jnp.broadcast_to(jnp.asarray(_face_eval(term, at_gauss(t, G, args=args)), dtype=jnp.float64), (2 * m,))
         w = c * 0.5 * jnp.concatenate([length, length])  # Gauss weight 1/2 per point, times the face length
         return (w * phi_a).reshape(2, m).sum(0), (w * (1.0 - phi_a)).reshape(2, m).sum(0)
 
-    def residual(u):
-        t, _, G = faces_of(u)
-        ca, cb = contributions(t, G)
+    def residual(u, args=None):
+        t, _, G = faces_of(u, args)
+        ca, cb = contributions(t, G, args)
         return jnp.zeros(jnp.asarray(u).reshape(-1).shape[0], dtype=ca.dtype).at[a].add(ca).at[b].add(cb)
 
     # The exact tangent on the radiating nodes, without differentiating through the radiosity solve (k JVPs of
@@ -258,12 +281,13 @@ def _lower(term, nodes):
     k = int(S.size)
     la, lb = np.searchsorted(S, elements[:, 0]), np.searchsorted(S, elements[:, 1])
 
-    def tangent_block(u):
-        t, e, G = faces_of(u)
+    def tangent_block(u, args=None):
+        t, e, G = faces_of(u, args)
         ones, zeros = jnp.ones_like(t), jnp.zeros_like(t)
-        (ca, cb), (ca_t, cb_t) = jax.jvp(contributions, (t, G), (ones, zeros))
-        _, (ca_G, cb_G) = jax.jvp(contributions, (t, G), (zeros, ones))
-        de = jax.jvp(eps_faces, (t,), (ones,))[1]
+        at = lambda t, G: contributions(t, G, args)  # noqa: E731
+        (ca, cb), (ca_t, cb_t) = jax.jvp(at, (t, G), (ones, zeros))
+        _, (ca_G, cb_G) = jax.jvp(at, (t, G), (zeros, ones))
+        de = jax.jvp(lambda t: eps_faces(t, args), (t,), (ones,))[1]
         h = de * STEFAN_BOLTZMANN * t**4 + 4.0 * e * STEFAN_BOLTZMANN * t**3 - de * G
         B = jnp.zeros((k, k), dtype=ca.dtype)
         B = B.at[la, la].add(0.5 * ca_t).at[la, lb].add(0.5 * ca_t).at[lb, la].add(0.5 * cb_t).at[lb, lb].add(0.5 * cb_t)
@@ -277,15 +301,16 @@ def _lower(term, nodes):
         return B
 
     # the term must be linear in the test function: with v = 0 it has to vanish
-    t0, _, G0 = faces_of(jnp.full(n_nodes, 1000.0))
-    if float(jnp.max(jnp.abs(jnp.asarray(_face_eval(term, at_gauss(t0, G0, test=0.0)))))) > 0.0:
+    ones_args = {name: jnp.ones(()) for name in params}  # any value: linearity in v does not depend on it
+    t0, _, G0 = faces_of(jnp.full(n_nodes, 1000.0), ones_args)
+    if float(jnp.max(jnp.abs(jnp.asarray(_face_eval(term, at_gauss(t0, G0, test=0.0, args=ones_args)))))) > 0.0:
         raise ValueError(
             "d.irradiation: the radiation term must be linear in the test function (... * v * dS); "
             "with v = 0 it does not vanish."
         )
 
     names = "; ".join(",".join(medium) for medium in rad.media)
-    c = Coupling(residual, name=f"radiation[{names}]", field_key=key)
+    c = Coupling(residual, name=f"radiation[{names}]", field_key=key, params=list(params.values()))
     c._support = S
     c._tangent_block = tangent_block
     return c

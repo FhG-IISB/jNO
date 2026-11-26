@@ -7498,14 +7498,30 @@ def _coupling_support(couplings, slices):
     return np.unique(np.concatenate(parts)) if parts else None
 
 
+def _analytic_blocks(couplings, slices, pick=lambda args: args):
+    """``[(lo, hi, dofs, block_fn)]`` for :func:`_with_coupling_block` when EVERY coupling states its own tangent
+    block (``_tangent_block`` and ``_support``), else None (the block then comes from JVPs). ``block_fn(u_slice,
+    args)`` calls the coupling's block, with its runtime parameters ``pick(args)`` (the ``{name: value}`` dict) when
+    it declared ``params``."""
+    out = []
+    for c, (lo, hi) in zip(couplings, slices):
+        fn = getattr(c, "_tangent_block", None)
+        if fn is None or getattr(c, "_support", None) is None:
+            return None
+        call = (lambda us, args, f=fn: f(us, pick(args) or {})) if c.params else (lambda us, args, f=fn: f(us))
+        out.append((lo, hi, np.asarray(c._support), call))
+    return out
+
+
 def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, log, analytic=None, pinned=None):
     """``J(u, args) = J_local(u, args) + B(u, args)``: the assembled local tangent plus the couplings' Jacobian
     as a dense ``k x k`` block on their declared ``support`` (k DOFs), in ONE BCOO.
 
     ``B`` comes from forward-mode AD of the coupling residual restricted to the support: k JVPs per call,
     exact, and differentiable like everything else. When every coupling supplies its own tangent block
-    (``analytic``: ``[(lo, hi, dofs, block_fn)]``, the block on its ``dofs`` of the field slice ``[lo:hi]``, as
-    ``Coupling._tangent_block`` gives it -- the radiation term does), those are summed instead: no JVPs, and
+    (``analytic``: ``[(lo, hi, dofs, block_fn)]``, ``block_fn(u[lo:hi], args)`` the block on its ``dofs`` of the
+    field slice ``[lo:hi]``, as ``Coupling._tangent_block`` gives it -- the radiation term does; see
+    :func:`_analytic_blocks`), those are summed instead: no JVPs, and
     the rows in ``pinned`` are zeroed as the residual's are. It is exact only because the support is: every coupling
     reads and writes nothing outside it (``enclosure.load`` declares the nodes its gathers read and its
     scatter writes). Entries that coincide with the local tangent's are summed by the solvers
@@ -7535,7 +7551,7 @@ def _with_coupling_block(local_jacobian, coupling_residual, support, n, names, l
         if blocks:
             B = jnp.zeros((k, k), dtype=u.dtype)
             for lo, hi, pos, block_fn in blocks:
-                B = B.at[pos[:, None], pos[None, :]].add(block_fn(u[lo:hi]))
+                B = B.at[pos[:, None], pos[None, :]].add(block_fn(u[lo:hi], args))
             if pinned is not None:
                 B = jnp.where(jnp.isin(S_j, pinned)[:, None], 0.0, B)
         else:
@@ -7736,18 +7752,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 if support is None:
                     block.jacobian = None
                 else:
-                    _an = [
-                        (lo, hi, np.asarray(c._support), c._tangent_block)
-                        for c, (lo, hi) in zip(couplings, slices)
-                        if getattr(c, "_tangent_block", None) is not None and not c.params
-                    ]
+                    _an = _analytic_blocks(couplings, slices, lambda ta: ta[1])  # the step's args are (t, args)
                     from .utils.logger import get_logger
 
                     _jw = _with_coupling_block(
                         lambda u, ta, _j=_jloc: _j(u, ta[0], ta[1]),
                         lambda u, ta: coupling_residual(u, ta[1]),
                         support, n, [c.name for c in couplings], get_logger(),
-                        _an if len(_an) == len(couplings) else None, d_dofs,
+                        _an, d_dofs,
                     )  # fmt: skip
 
                     def _t_jacobian(u, t, args=None, _jw=_jw):
@@ -7782,13 +7794,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     support = _coupling_support(couplings, slices)
     _names = [c.name for c in couplings]
     # every coupling that can state its own tangent block does (no JVPs); one that cannot sends all to autodiff
-    _analytic = [
-        (lo, hi, np.asarray(c._support), c._tangent_block)
-        for c, (lo, hi) in zip(couplings, slices)
-        if getattr(c, "_tangent_block", None) is not None and getattr(c, "_support", None) is not None and not c.params
-    ]
-    if len(_analytic) != len(couplings):
-        _analytic = None
+    _analytic = _analytic_blocks(couplings, slices)
     from .utils.logger import get_logger
 
     _log = get_logger()

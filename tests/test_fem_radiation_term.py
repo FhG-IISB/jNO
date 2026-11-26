@@ -87,6 +87,41 @@ def test_conduction_and_radiation_across_the_gap_match_the_series_solution():
     assert sol.max() == pytest.approx(T1 + q * R1**2 / (4 * k), rel=1e-3)  # the core's parabola on top
 
 
+def test_a_runtime_parameter_in_the_emissivity_is_solved_at_its_value():
+    """The core's emissivity is 0.6 s with s = jno.np.parameter: one jno.fem, solved at s = 1 and s = 0.5, gives the
+    series solution of the gap above with eps1 = 0.6 and 0.3. The radiosity reads the scaled emissivity (not only the
+    term's prefactor), and Newton's analytic tangent carries the parameter."""
+    from scipy.optimize import brentq
+
+    eps2, k, k_gas, q = 0.8, 20.0, 0.05, 5e5
+    s = jno.np.parameter((1,), name="s")
+    d = _cylinders(0.6 * s, eps2, h=0.02)
+    d.attach("core", q=q)
+    T, v = d.fem_symbols(names=("T", "v"))
+    x, y, _ = d.variable("interior", split=True)
+    Ti, vi = T.bind(x=x, y=y), v.bind(x=x, y=y)
+    outer = d.variable("boundary", split=True)[:2]
+    T.initialize(800.0)
+    fem = jno.fem(
+        [
+            d.k * (Ti.d(x) * vi.d(x) + Ti.d(y) * vi.d(y)) - d.q * vi,
+            d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v,
+            T(*outer) - 300.0,
+        ]
+    )
+    pts = np.asarray(d.mesh.points)
+    rho = np.hypot(pts[:, 0], pts[:, 1])
+    P = q * np.pi * R1**2
+    T2 = 300.0 + P * np.log(R3 / R2) / (2 * np.pi * k)
+    for sv in (1.0, 0.5):
+        sol = np.asarray(fem.solve(s=sv, nonlinear=jno.solve.newton(direct=True, atol=1e-8, rtol=0.0, max_steps=60)))
+        eps1 = 0.6 * sv
+        rad = lambda T1, e1=eps1: 2 * np.pi * R1 * SIGMA * (T1**4 - T2**4) / (1 / e1 + (R1 / R2) * (1 / eps2 - 1))  # noqa: E731
+        T1 = brentq(lambda T1: rad(T1) + 2 * np.pi * k_gas * (T1 - T2) / np.log(R2 / R1) - P, T2, 5000.0)
+        assert sol[np.isclose(rho, R1, atol=1e-9)].mean() == pytest.approx(T1, rel=1e-3)
+        assert sol[np.isclose(rho, R2, atol=1e-9)].mean() == pytest.approx(T2, rel=1e-3)
+
+
 def test_axisymmetric_term_reproduces_two_concentric_spheres():
     """The same geometry read as a meridian half-plane: two concentric spheres, Q = 4 pi r1^2 sigma (T1^4 - T2^4)
     / (1/eps1 + (r1/r2)^2 (1/eps2 - 1)). Axisymmetry comes from the domain, the ring measure from dS = 2 pi r."""
@@ -122,9 +157,9 @@ def test_guards():
         lower_radiation_terms([d.eps(T) * (SIGMA * Ti**4 - d.irradiation(T)) * v])
     with pytest.raises(ValueError, match="exactly one test function"):
         lower_radiation_terms([d.eps(T) * (SIGMA * T**4 - d.irradiation(T))])
-    e = jno.np.parameter((1,), name="e")
-    with pytest.raises(NotImplementedError, match="trainable parameter"):
-        jno.fem([e * (SIGMA * T**4 - d.irradiation(T)) * v])
+    net = jno.np.parameter((1,), name="e").freeze()
+    with pytest.raises(NotImplementedError, match="frozen parameter or a network"):
+        lower_radiation_terms([net * (SIGMA * T**4 - d.irradiation(T)) * v])
     with pytest.raises(ValueError, match="linear in the test function"):
         lower_radiation_terms([d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v + 1.0 + 0.0 * v])
     disk = jno.shape.disk
@@ -182,4 +217,30 @@ def test_the_analytic_tangent_equals_forward_mode_autodiff():
     ref = jax.jacfwd(lambda us: c.residual_fn(u.at[S].set(us))[S])(u[S])
     np.testing.assert_allclose(
         np.asarray(c._tangent_block(u)), np.asarray(ref), rtol=1e-8, atol=1e-8 * float(jnp.abs(ref).max())
+    )
+
+
+def test_parameters_in_the_term_and_the_emissivity():
+    """Runtime parameters anywhere in the term: in an emissivity law (a) and as a factor of the term (b). The
+    coupling declares both; its residual is the parameter-free one at the same numbers, and its analytic tangent
+    equals forward-mode autodiff."""
+    a, b = jno.np.parameter((1,), name="a"), jno.np.parameter((1,), name="b")
+    d = _cylinders(h=0.08)
+    d.attach("core", eps=lambda T: a * (0.3 + 2e-4 * T))
+    T, v = d.fem_symbols(names=("T", "v"))
+    c = lower_radiation_terms([b * d.eps(T) * (SIGMA * T**4 - d.irradiation(T)) * v])[0]
+    from jno.utils.solver.parametric_helpers import _parameter_name
+
+    assert sorted(_parameter_name(p) for p in c.params) == ["a", "b"]
+    _, _, u = _lowered()
+    args = {"a": jnp.asarray([0.7]), "b": jnp.asarray([1.3])}
+    d0 = _cylinders(h=0.08)
+    d0.attach("core", eps=lambda T: 0.7 * (0.3 + 2e-4 * T))
+    T0, v0 = d0.fem_symbols(names=("T", "v"))
+    c0 = lower_radiation_terms([1.3 * d0.eps(T0) * (SIGMA * T0**4 - d0.irradiation(T0)) * v0])[0]
+    np.testing.assert_allclose(np.asarray(c.residual_fn(u, args)), np.asarray(c0.residual_fn(u)), rtol=1e-12, atol=1e-9)
+    S = jnp.asarray(c._support)
+    ref = jax.jacfwd(lambda us: c.residual_fn(u.at[S].set(us), args)[S])(u[S])
+    np.testing.assert_allclose(
+        np.asarray(c._tangent_block(u, args)), np.asarray(ref), rtol=1e-8, atol=1e-8 * float(jnp.abs(ref).max())
     )
