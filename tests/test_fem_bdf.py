@@ -318,3 +318,22 @@ def test_reverse_mode_memory_does_not_grow_with_the_step_budget():
 
     small, big = temp_bytes(250), temp_bytes(4000)
     assert big < 8 * small, f"temp {small} -> {big} bytes for a 16x budget"  # was 16x (10.7 MB -> 171 MB) before
+
+
+def test_bdf_traces_the_step_solve_once_not_once_per_order():
+    """The order switch sits around the cheap formula weights and error estimates, not around the step: the block's
+    step (a Krylov solve, its adjoint, the residual gate) is traced once, so bdf compiles about like an sdirk march
+    instead of five times the program (a switch over the whole step traced it once per order)."""
+    from jno.utils.solver.backend_blocks import _default_step_solve
+
+    traced = []
+
+    def counting(matvec, rhs, x0, diag_fn):
+        traced.append(1)
+        return _default_step_solve(matvec, rhs, x0, diag_fn())
+
+    fem = _form(6)
+    jno.solve.bdf().adaptive(rtol=1e-5, atol=1e-8, max_steps=40).integrate(
+        fem.operator, {}, SAVE[-1:], linear_solve=counting, nonlinear_solve=None
+    )
+    assert len(traced) == 1, f"the step was traced {len(traced)} times"
