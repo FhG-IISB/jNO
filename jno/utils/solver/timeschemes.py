@@ -1247,7 +1247,7 @@ def bdf_march(
     from .backend_blocks import _step_solve_tolerance
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
-    with _step_solve_tolerance(rtol):
+    with _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt):
         (t_end, *_), (ts, us) = _budgeted_scan(
             body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[2][0])
         )
@@ -1434,7 +1434,7 @@ def adaptive_march(
     from .backend_blocks import _step_solve_tolerance
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
-    with _step_solve_tolerance(rtol):
+    with _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt):
         (t_end, *_), (ts, us) = _budgeted_scan(
             body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[1])
         )
