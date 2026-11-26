@@ -3318,7 +3318,9 @@ class FEM:
         from .utils import beacon
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
+        from .utils.solver.placement import require_host_backend
 
+        require_host_backend("jno.fem(...).solve()")
         # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
         log = kwargs.pop("log", False)
         _t0 = _time.perf_counter()
@@ -8181,7 +8183,9 @@ def _host_assembly_scope():
         return contextlib.nullcontext()  # the caller expressed a preference; it wins
     if jax.default_backend() == "cpu":
         return contextlib.nullcontext()  # nothing to move away from
-    hosts = jax.devices("cpu")
+    from .utils.solver.placement import _host_devices
+
+    hosts = _host_devices()  # empty under JAX_PLATFORMS=cuda: assemble on the device then
     return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
 
 

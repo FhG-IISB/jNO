@@ -239,11 +239,12 @@ def _optimizer_states_match(a, b) -> bool:
 def _cpu_device():
     """Return a CPU JAX device.
 
-    Raises RuntimeError if no CPU backend is available — jNO requires
-    JAX_PLATFORMS=cuda,cpu (or cpu) so that pure_callback and host-side
-    data staging always have a CPU device.
+    Raises RuntimeError if no CPU backend is available (``JAX_PLATFORMS=cuda`` alone): host-side data staging
+    needs a CPU device, so the message names ``JAX_PLATFORMS=cuda,cpu``.
     """
-    cpu_devs = jax.devices("cpu")
+    from .utils.solver.placement import _host_devices
+
+    cpu_devs = _host_devices()
     if not cpu_devs:
         raise RuntimeError(
             "No CPU JAX device found. Set JAX_PLATFORMS=cuda,cpu (or cpu) "
