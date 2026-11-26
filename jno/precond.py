@@ -1096,6 +1096,42 @@ def gmg(
     return _precision(_GMG(n_pre, n_post, omega, min_size), float32)
 
 
+def _complex_block_csr(csr):
+    """``M = Mr + i Mi`` (scipy CSR, ``n x n``) of the real-equivalent block ``[[Mr, -Mi], [Mi, Mr]]`` (``2n x 2n``),
+    or ``None`` when ``csr`` does not have that structure (odd size, or the diagonal / off-diagonal blocks differ)."""
+    import numpy as np
+
+    N = int(csr.shape[0])
+    if N % 2 or csr.shape[1] != N:
+        return None
+    n = N // 2
+    csr = csr.tocsr()
+    a11, a12, a21, a22 = csr[:n, :n], csr[:n, n:], csr[n:, :n], csr[n:, n:]
+    scale = float(np.abs(csr.data).max()) if csr.nnz else 1.0
+    tol = 1e-12 * max(scale, 1e-300)
+    for gap in (a11 - a22, a12 + a21):
+        if gap.nnz and float(np.abs(gap.data).max()) > tol:
+            return None
+    return (a11 + 1j * a21).tocsr()
+
+
+def _complex_operator_of_block(op, who):
+    """The complex ``n x n`` operator of a form assembled as its real-equivalent ``2n`` block."""
+    import jax.experimental.sparse as jsp
+
+    from .utils.solver.amg import _to_scipy_csr
+    from .utils.solver.solver_api import LinearOperator
+
+    M = _complex_block_csr(_to_scipy_csr(op.bcoo)) if getattr(op, "bcoo", None) is not None else None
+    if M is None:
+        raise ValueError(
+            f"{who}: the assembled complex form is not a real-equivalent block [[Re, -Im], [Im, Re]], so its "
+            "complex operator cannot be read from it. A complex-native solve needs the form on the same "
+            "unknowns as the system (complex terms on one field space)."
+        )
+    return LinearOperator(jsp.BCOO.from_scipy_sparse(M.tocoo()))
+
+
 class _Form(_Spec):
     """Spec assembling an auxiliary weak form as the preconditioner operator; see :func:`form`."""
 
@@ -1108,15 +1144,28 @@ class _Form(_Spec):
         self.inner = inner_solver
         self.quad_degree = quad_degree
         self._op = None  # assembled once (static terms); rebuilt per refresh (callable terms)
+        self._op_cplx = False  # the assembled form is complex: ``_op`` is its real-equivalent 2n block
+        self._op_n = None  # the same form as the complex n x n operator, built on demand (complex-native solve)
+
+    @property
+    def complex_native(self):
+        """Follows the inner spec: a form whose inner is complex-native (AMS) makes the solve complex-native, so
+        the form is handed to it as the complex ``n x n`` operator ``A_r + i A_i`` rather than the fused real
+        ``2n`` block. Every other inner works on the real-equivalent block, as before."""
+        return isinstance(self.inner, _Spec) and bool(getattr(self.inner, "complex_native", False))
+
+    def _assemble(self, fem):
+        from .utils.solver.solver_api import PrecondContext as _Ctx
+
+        self._op, self._op_cplx = _Ctx(None, fem)._assemble_form(self.terms, self.quad_degree)
+        self._op_n = None
 
     def prepare(self, fem):
         """Eager one-time assembly (called at compose time, OUTSIDE any trace — assembling a
         fresh ``jno.fem`` inside the Newton/Picard ``while_loop`` entangles with loop tracers).
         The callable variant skips this: it has no terms until a concrete iterate arrives."""
         if self._op is None and self._terms_fn is None:
-            from .utils.solver.solver_api import PrecondContext as _Ctx
-
-            self._op = _Ctx(None, fem).assemble(self.terms, quad_degree=self.quad_degree)
+            self._assemble(fem)
 
     def refresh_from(self, sol, fem):
         """Re-assemble the auxiliary operator from the CONCRETE outer iterate ``sol``.
@@ -1134,10 +1183,8 @@ class _Form(_Spec):
             return
         import numpy as _np
 
-        from .utils.solver.solver_api import PrecondContext as _Ctx
-
         self.terms = list(self._terms_fn(_np.asarray(sol).reshape(-1)))
-        self._op = _Ctx(None, fem).assemble(self.terms, quad_degree=self.quad_degree)
+        self._assemble(fem)
 
     def materialize(self, ctx: PrecondContext):
         if self._op is None and self._terms_fn is not None:
@@ -1149,13 +1196,21 @@ class _Form(_Spec):
                 "Run the solve eagerly, or use a static form([...]) with a frozen coefficient."
             )
         if self._op is None:  # cached on the FULL space (no operator attached), like `prepare` does
-            self._op = PrecondContext(None, ctx.fem).assemble(self.terms, quad_degree=self.quad_degree)
+            self._assemble(ctx.fem)
         # The form is assembled (and cached) on the full finite-element space. On a system reduced by a
         # periodic tie / slip elimination / hanging nodes the operator it preconditions is `P^T A P` --
         # inside a block composition, one field's `P_i^T A_ii P_i` -- so reduce the form with that same P.
         # Without this a pressure-mass Schur block was sized for the full pressure space while the Krylov
         # vector it was applied to carried only the reduced one.
-        op = ctx._to_space(self._op, what="the jno.precond.form auxiliary operator")
+        full = self._op
+        if self._op_cplx and ctx._is_complex():
+            # The solve is complex-native (``ctx.A`` is the complex n x n operator), so the form is too: its
+            # complex operator, reduced with P^H on a tied system -- never the 2n block, which no n-sized
+            # vector fits (an inner AMS read that as a "mixed" system).
+            if self._op_n is None:
+                self._op_n = _complex_operator_of_block(self._op, "jno.precond.form")
+            full = self._op_n
+        op = ctx._to_space(full, what="the jno.precond.form auxiliary operator")
         if self.inner is False:
             # APPLY, don't invert: `M v = A v`. This is the middle factor of a product like PCD,
             # where `F_p` is applied between two inverses. It is a preconditioner FACTOR, not a
@@ -2634,6 +2689,16 @@ def _fem_concrete_operator(fem):
     return _leg(op[0]) if hasattr(op[0], "evaluate") else op[0]  # (A, b) or (FemLinearSystem, …)
 
 
+def _ams_real_equivalent_error(n, n_edges, who):
+    """AMS was handed a ``2 x`` edge-count operator: the real-equivalent block of a complex system, not a mixed one."""
+    return (
+        f"{who}: this operator is {n} x {n}, exactly twice the {n_edges} DOFs of the edge (H(curl)) space, so it is "
+        "the real-equivalent block [[Re, -Im], [Im, Re]] of a complex system, not a mixed one. AMS works on the "
+        "complex n x n operator: use it directly (precond=jno.precond.ams()), or as the inner of a complex "
+        "form(...), which then runs the solve complex-native. It cannot sit inside real_equivalent(...)."
+    )
+
+
 def _hermitian(M):
     """``Mᴴ`` of a BCOO (``Mᵀ`` when real): the restriction onto the auxiliary space of a tie-reduced system."""
     T = M.T
@@ -2737,6 +2802,8 @@ class _AMS(_Spec):
         n_edges = self._G.shape[0]
         if int(ctx.A.shape[0]) != n_edges:
             if field is None:
+                if int(ctx.A.shape[0]) == 2 * n_edges:
+                    raise ValueError(_ams_real_equivalent_error(int(ctx.A.shape[0]), n_edges, "jno.precond.ams().build"))
                 raise ValueError(
                     f"jno.precond.ams().build: this operator is {int(ctx.A.shape[0])} x "
                     f"{int(ctx.A.shape[0])} but the edge (H(curl)) space has {n_edges} DOFs, so it is a "
@@ -2791,6 +2858,8 @@ class _AMS(_Spec):
         # signature (n,k=89920),(k=103385,m)`, leaving the caller to work out that 103385 - 89920 is the
         # Lagrange block and that AMS was never told which block is its own.
         _ne = int(self._G.shape[0])
+        if int(ctx.A.shape[0]) == 2 * _ne:
+            raise ValueError(_ams_real_equivalent_error(int(ctx.A.shape[0]), _ne, "jno.precond.ams"))
         if int(ctx.A.shape[0]) != _ne:
             raise ValueError(
                 f"jno.precond.ams: this operator is {int(ctx.A.shape[0])} x {int(ctx.A.shape[0])} but "
