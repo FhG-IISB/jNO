@@ -5027,6 +5027,36 @@ def assemble_fem_native(
                     f"tag({region!r}, region={_owner!r}) selected no nodes: the predicate and the body "
                     "do not overlap. Check the predicate reaches that body's surface."
                 )
+        # A `domain.tag` POINT SET (not a body's faces, not an interface) is resolved by its predicate. On the
+        # boundary that predicate is read among the boundary nodes only (a thick band around a cylinder pins the
+        # cylinder, not the fluid around it): deliberate, so a pin never reaches interior nodes of a tag that also
+        # touches the boundary -- but then it must not do so silently.
+        _pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
+        if (
+            _pred is not None
+            and region != "boundary"
+            and _owner is None
+            and region not in (getattr(domain, "_interior_face_tags", ()) or ())
+        ):
+            _sel = np.flatnonzero(np.asarray(_pred(*(pts_all[:, i] for i in range(dim))), dtype=bool).reshape(-1))
+            if bnodes.size == 0:
+                # an interior pin: no boundary node matched, so the predicate over ALL nodes is the set (the
+                # fallback below intersects it with the boundary and would pin nothing at all)
+                if _sel.size == 0:
+                    raise ValueError(
+                        f"jno.fem: the Dirichlet pin on tag {region!r} selects no node of the mesh: its predicate "
+                        "holds at none of the mesh nodes. Widen the predicate or refine the mesh."
+                    )
+                return [int(n) for n in _sel]
+            _free = np.setdiff1d(_sel, np.asarray(bnodes, dtype=np.int64))
+            _warned = domain.__dict__.setdefault("_tag_interior_pin_warned", set())
+            if _free.size and region not in _warned:
+                _warned.add(region)
+                domain.log.warning(
+                    f"jno.fem: a Dirichlet pin on tag {region!r} constrains its {len(bnodes)} boundary node(s) only; "
+                    f"its predicate also holds at {_free.size} interior node(s), which stay free. To pin interior "
+                    "nodes give them a tag of their own that touches no boundary node (e.g. an interior patch)."
+                )
         if bnodes.size == 0:  # interior pin (no boundary facet matched) -> predicate over all nodes
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]
