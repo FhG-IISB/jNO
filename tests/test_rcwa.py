@@ -767,6 +767,30 @@ def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
 
 
 @needs_fmmax
+@pytest.mark.parametrize("readout", ["field", "field3d"])
+def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
+    """#313: with a period of exactly two wavelengths in air, the (+-2,0) and (0,+-2) orders have kz = 0 in the
+    air layer. T and R stay finite, but the interior amplitudes (and so the field in every layer above that
+    one) were NaN with nothing to signal it. It must raise and name the order; a period off the resonance
+    gives a finite field."""
+    from jno.rcwa import Rcwa
+
+    g = np.ones((16, 16))
+    g[4:12, 4:12] = 3.0
+
+    def solve(period):
+        stack = [(0.5, 2.13), (0.36, g), (0.5, 1.0)]
+        return Rcwa(stack, period=(period, period), orders=25, wavelength=WL, assume_periodic=True).solve()
+
+    # Where the solve's own T/R guard already trips (the efficiencies come out NaN on some backends, here a
+    # GPU), the same grazing message is raised one step earlier: either way it is loud, never a NaN field.
+    with pytest.raises(jno.RcwaError, match="grazing"):
+        getattr(solve(2.0), readout)(nx=16, density=20.0)
+    out = getattr(solve(2.1), readout)(nx=16, density=20.0)
+    assert np.isfinite(np.asarray(out[0])).all()
+
+
+@needs_fmmax
 def test_field3d_is_differentiable_in_the_design():
     """field3d returns a JAX |E|^2: jax.grad of the absorbed power in a patterned lossy layer w.r.t. the
     layer's loss matches a central finite difference."""

@@ -289,6 +289,27 @@ class _Sol:
         exy, eyy = out0("y")  # input y-pol -> output (E_x, E_y)
         return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
+    def _nonfinite_field_message(self):
+        """Why the interior amplitudes are NaN/inf: name the order(s) whose z-wavevector vanishes in a layer
+        (a grazing order, kz = 0, makes the interior propagation 1/kz blow up while T and R stay finite)."""
+        bc = np.asarray(self._ex.basis_coefficients)
+        grazing = []
+        for i, layer in enumerate(self._layers):
+            ev = np.abs(np.asarray(layer.eigenvalues))  # per order and polarization: ~ |kz|
+            near = np.where(ev < 1e-4 * max(float(ev.max()), 1e-300))[0]
+            grazing += [(i, tuple(int(c) for c in bc[j % self._nt])) for j in near]
+        what = (
+            "; ".join(f"order {o} in layer {i}" for i, o in dict.fromkeys(grazing))
+            if grazing
+            else "no single grazing order was identified"
+        )
+        return (
+            "the interior field is non-finite (NaN/inf) although T and R are finite: an order sits at grazing "
+            f"incidence (kz = 0), the Rayleigh/Wood condition ({what}; period={self._period}, wl={self._wl}). "
+            "Shift the wavelength, the incidence angle or the period slightly (e.g. a period of 2.1 instead of "
+            "2.0 wavelengths), or lower orders= so the truncation drops that order."
+        )
+
     def _field_volume(self, nx=80, density=40.0):
         """``(|E|², x, y, z)`` on the full 3-D reconstruction grid — the shared core of :meth:`field`
         and :meth:`field3d`. ``|E|²`` has shape ``(nx, ny, nz)``; the coordinate arrays come straight
@@ -299,6 +320,9 @@ class _Sol:
         znum = [max(4, int(round(float(t) * density))) for t in self._thick]
         smi = fm.stack_s_matrices_interior(self._layers, self._thick)
         amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
+        leaves = jax.tree_util.tree_leaves(amps)  # an fmmax result is a pytree; a trace steps aside, as the T/R guard
+        if all(_concrete(a) for a in leaves) and not all(np.all(np.isfinite(np.asarray(a))) for a in leaves):
+            raise RcwaError(self._nonfinite_field_message())
         efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
         # JAX all the way: |E|^2 stays differentiable in the design (permittivity grids), so it can feed a
         # coupled objective (absorbed power -> heat). NumPy callers (plotting) accept the JAX array as is.
