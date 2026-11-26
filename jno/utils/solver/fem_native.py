@@ -2105,20 +2105,20 @@ def assemble_fem_native(
     # fields are richer than P1: the coefficient then resolves more coarsely than the fields it
     # multiplies, which is a modelling fact the caller should know rather than discover from a result.
     # The canonical case is a P1 design field against a P2 velocity in topology optimisation.
-    if _field_param_names and len(fields) > 1:
-        from .parametric_helpers import _contains_fem_field_parameter
-
+    # Only the nodal (P1) ones: a per-cell (P0) parameter is not resolved on the vertex mesh at all.
+    _nodal_param_names = _field_param_names - _cell_field_names
+    if _nodal_param_names and len(fields) > 1:
         _pf_idxs: set = set()
         for bare in volume_terms:
             for sign, sub in _split_additive_terms(domain, bare):
                 coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
-                if _contains_fem_field_parameter(coeff):
+                if _nodal_param_names & set(_collect_runtime_parameter_exprs(coeff, {})):
                     tfi = _test_field_index(coeff, field_index)
                     if tfi is not None:
                         _pf_idxs.add(int(tfi))
         _higher = sorted({int(fields[i]["order"]) for i in _pf_idxs} - {1})
         if _higher:
-            _names = ", ".join(repr(n) for n in sorted(_field_param_names))
+            _names = ", ".join(repr(n) for n in sorted(_nodal_param_names))
             warnings.warn(
                 f"jno.fem: the field parameter(s) {_names} carry P1 (mesh-vertex) values and interpolate "
                 f"on the P1 basis, but they appear in terms tested by order-{_higher} field(s). The "
