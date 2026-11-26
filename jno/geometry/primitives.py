@@ -94,6 +94,8 @@ class Rect:
         Returns:
             str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
         """
+        if not (self.x0 - tol < x < self.x1 + tol and self.y0 - tol < y < self.y1 + tol):
+            return None  # on a face's plane but outside the face
         if abs(x - self.x0) < tol:
             return "left"
         if abs(x - self.x1) < tol:
@@ -283,6 +285,10 @@ class Box:
         Returns:
             str | None: the sub-boundary name (e.g. ``"left"``, ``"top"``, ``"arc"``), or ``None``.
         """
+        if not (
+            self.x0 - tol < x < self.x1 + tol and self.y0 - tol < y < self.y1 + tol and self.z0 - tol < z < self.z1 + tol
+        ):
+            return None  # on a face's plane but outside the face
         if abs(x - self.x0) < tol:
             return "left"
         if abs(x - self.x1) < tol:

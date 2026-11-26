@@ -489,3 +489,33 @@ def test_a_regions_group_meshes_with_its_members_cell():
 def test_the_cell_choice_still_reaches_the_mesh_through_a_chain():
     """End to end, since the field being carried is only worth anything if the mesher sees it."""
     assert "triangle" not in _cells(shape.rect(0, 0, 1, 1, size=0.4).quad().attach(k=1.0).name("a"))
+
+
+def _extent(d, tag):
+    pts = np.asarray(d._mesh_pool[tag])[:, :3]
+    return pts.min(0), pts.max(0)
+
+
+def test_named_box_faces_of_a_cut_tag_the_outer_faces_only():
+    """`(box - box).name(...) + box(...)`: the walls of the cut-out hole were tagged left/right/front/back and its
+    floor `bottom` as well, so a condition on `left` or `bottom` also pinned the inside of the hole. The cut's
+    own faces keep no box-face name (they stay in `boundary`; select them with `where=`)."""
+    box = shape.box
+    cell = (box(0, 0, 0, 2, 1, 1) - box(0.5, 0.25, 0.25, 1.5, 0.75, 1.0)).name("cell")
+
+    d = (cell + box(2, 0, 0, 3, 1, 1).name("b")).sized(0.4).domain()
+    lo, hi = _extent(d, "left")
+    assert hi[0] < 1e-9 and lo[0] > -1e-9  # the plane x = 0 only
+    lo, hi = _extent(d, "right")
+    assert lo[0] > 3.0 - 1e-9  # x = 3 only, not the hole wall at x = 1.5
+    for name, axis, value in (("front", 1, 0.0), ("back", 1, 1.0), ("bottom", 2, 0.0), ("top", 2, 1.0)):
+        lo, hi = _extent(d, name)
+        assert abs(lo[axis] - value) < 1e-9 and abs(hi[axis] - value) < 1e-9, (name, lo, hi)
+
+
+def test_a_cut_keeps_the_names_of_its_cutter_that_do_not_clash():
+    """A drilled cylinder keeps its wall name `side` (only a box-face name of the cutter is ambiguous)."""
+    import jno
+
+    d = jno.domain(shape.box(0, 0, 0, 4, 4, 1) - shape.cylinder(2, 2, -1, 0, 0, 3, 0.5))
+    assert "side" in d.avaiable_mesh_tags
