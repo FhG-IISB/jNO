@@ -1982,6 +1982,21 @@ def test_a_tag_matching_no_boundary_node_stays_interior():
     assert "middle" not in d._boundary_regions
 
 
+def test_a_pin_on_a_tag_reaching_interior_nodes_is_refused_on_the_1d_assembler():
+    """A pin on a point-set tag reaches every node its predicate selects on the native Lagrange assembler; the 1D
+    assembler pins endpoints only, so a tag that also holds at interior nodes is refused by name rather than pinned
+    at its endpoint alone."""
+    d = _line(0.1)
+    d.tag("left_part", lambda x: x < 0.3)  # the left end and the interior nodes up to 0.3
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xp = d.variable("left_part", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match=r"1D.*left_part.*off the boundary"):
+        jno.fem([ui.x * vi.x, u(xp) - 0.0, u(xr) - 1.0])
+
+
 def _allen_cahn(eps=0.15, T=2.0, nstep=24, mesh_size=0.02, wide=0.30):
     """Transient Allen-Cahn, u_t = eps^2 u_xx + u - u^3, from a deliberately over-wide interface.
 

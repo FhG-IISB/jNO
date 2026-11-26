@@ -2526,13 +2526,11 @@ class domain(MeshIOMixin):
             callable | None: Function returning whether a point belongs to the tagged region, or ``None`` if
                 the tag is unknown.
         """
-        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary.
-        # the assembler applies a location-fn to EVERY node, so a bare predicate selecting a thick region
-        # would also pin interior dofs (a thick boundary predicate pinned the interior velocity and
-        # silently zeroed the interior pressure rows). Intersecting with the full-boundary region
-        # keeps Dirichlet boundary-restricted, while the exact predicate misses no boundary node
-        # (per-facet proximity alone can miss nodes on a curved boundary). NB: such a predicate is
-        # evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic, not bare numpy).
+        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary, for a
+        # location function (a surface term, sampling). A Dirichlet pin on the tag is not resolved here: the
+        # native assembler reaches EVERY node the predicate selects, interior ones too (`_boundary_node_ids`).
+        # NB: such a predicate is evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic,
+        # not bare numpy).
         where = getattr(self, "_tag_predicates", {}).get(tag, None)
         if where is not None:
             dim = self.dimension
@@ -2711,10 +2709,10 @@ class domain(MeshIOMixin):
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
         sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
-        to mesh nodes/facets, and a ``jno.fem`` boundary condition bound to ``name`` is applied on
-        exactly the boundary facets where ``where`` holds (FEM location-functions are evaluated only
-        against the boundary, so a bare predicate selects the right subset -- there is no
-        interior/boundary flag). Untagged boundary stays natural (do-nothing), which is how you get a
+        to mesh nodes/facets, and a surface term bound to ``name`` integrates over exactly the
+        boundary facets where ``where`` holds, and a Dirichlet pin ``u(name) - g`` fixes EVERY mesh node where
+        ``where`` holds -- boundary and interior alike, so a boundary-only pin is written with a predicate that
+        holds on the boundary only (a thin shell, not a thick band). Untagged boundary stays natural (do-nothing), which is how you get a
         natural outflow on a complex geometry.
 
         Only the **spatial** coordinates are passed to ``where`` (never time): a region is the same

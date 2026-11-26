@@ -3632,7 +3632,7 @@ def _lagrange_dirichlet_pins(
     u_i = 0``, correct only for real ``g``), and a value/vertex-count mismatch.
     """
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     pins = []
     for fk, region, _comp, _value, value_node in dirichlet_raw:
@@ -3649,6 +3649,7 @@ def _lagrange_dirichlet_pins(
         if dofmaps is not None and fidx in dofmaps:  # P_k, k >= 2: every DOF on the region, by interpolation
             pins.extend(_general_trace_pins(dofmaps[fidx], "value", region, value_node, domain, pts_np, cells, offs[fidx]))
             continue
+        _refuse_pin_off_the_boundary(domain, region, "non-nodal Lagrange")
         vs = np.asarray(_region_node_ids(domain, region), dtype=np.int64)
         if vs.size == 0:
             raise ValueError(
@@ -3703,13 +3704,14 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     ``g`` is the Dirichlet value node, evaluated at the vertex coordinate. (A clamped BC -- additionally
     pinning the gradient DOFs to ``∇g`` -- is a follow-on; needed for optimal rates and the C¹ elements.)"""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     pins = []
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Hermite":
             continue
+        _refuse_pin_off_the_boundary(domain, region, "Hermite")
         for v in _region_node_ids(domain, region):
             v = int(v)
             g = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[v][None, :]))).reshape(-1)
@@ -3730,7 +3732,7 @@ def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, o
     derivative along the assembler's globally-oriented normal ``R90·(P[hi]-P[lo])``, so ``h`` (given as the
     *outward* normal derivative) is multiplied by the per-edge sign relating the two."""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     def _val(value_node, xy):
         return float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(xy)[None, :])).reshape(()))
@@ -3752,6 +3754,7 @@ def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, o
         if fidx is None or spaces[fidx] != "Morley":
             continue
         base = offs[fidx]
+        _refuse_pin_off_the_boundary(domain, region, "Morley")
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
         if kind == "value":
             for v in region_nodes:  # deflection: value DOF at each boundary vertex
@@ -3787,7 +3790,7 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     loudly**. Pins are dict-unioned per edge, so a corner is consistently pinned by both incident edges. (For
     Morley — no Hessian DOFs, edge-normal DOF is ``∂ₙ`` — the same two BCs work on *any* orientation.)"""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     def _derivs(value_node, xy):
         def gfun(p):
@@ -3814,6 +3817,7 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
             continue
         base = offs[fidx]
         edge_base = base + 6 * n_verts
+        _refuse_pin_off_the_boundary(domain, region, "Argyris")
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
         for eid in boundary_edges:
             va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi)
@@ -3873,7 +3877,7 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
     (an interior edge can join two boundary vertices through the volume). Homogeneous PEC, lowest order;
     every other case (nonzero ``u×n = g``, degree k, N2E, RT) goes through :func:`_general_trace_pins`."""
     from ..._fem import _constant_of
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
     from .fem_facets import build_facet_connectivity
 
     cells = np.asarray(domain.mesh.cells_dict["tetra"])
@@ -3891,6 +3895,7 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
                 "jno.fem (non-nodal, 3D): only the homogeneous PEC tangential BC `n×E = 0` is wired; a "
                 "prescribed nonzero tangential trace is a follow-on."
             )
+        _refuse_pin_off_the_boundary(domain, region, "N1E")
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for f in range(fc.n_bfaces):
             fn = [int(x) for x in fc.face_nodes[f]]
@@ -3916,6 +3921,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     evaluating anything. Facet criterion: boundary facets whose vertices all lie in the region (for a
     value BC on a region with no boundary facet, every facet, plus whole cells, of the region)."""
     from ..._fem import _constant_of, _eval_value_node_at
+    from .fem_1d import _refuse_pin_off_the_boundary
     from .fem_dofmap import (
         entity_dofs_of_tasks,
         facet_outward_normals,
@@ -3924,6 +3930,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
         region_trace_entities,
     )
 
+    _refuse_pin_off_the_boundary(domain, region, "non-nodal")
     mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): essential region {region!r} has no location function.")
@@ -4055,7 +4062,7 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
     if dim == 3:  # 3-D N1E tangential (PEC) — facet-based boundary edges, not the 2-D single-use rule
         return out + _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _line_quadrature, _region_node_ids
+    from .fem_1d import _line_quadrature, _refuse_pin_off_the_boundary, _region_node_ids
 
     cell_edges = np.asarray(top.cell_edges)
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
@@ -4076,6 +4083,7 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
                 "jno.fem (non-nodal): an essential edge-trace BC is supported on RT (u·n) and N1E (u×n) only."
             )
         is_n1e = spaces[fidx] == "N1E"
+        _refuse_pin_off_the_boundary(domain, region, "N1E/RT")
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for eid in boundary:
             va, vb = (int(x) for x in top.edge_vertices[eid])

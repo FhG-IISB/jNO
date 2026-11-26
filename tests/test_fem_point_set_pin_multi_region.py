@@ -85,19 +85,62 @@ def test_a_point_set_pin_wholly_inside_the_domain_fixes_its_nodes():
     np.testing.assert_allclose(sol, np.linalg.solve(A, rhs), rtol=1e-5, atol=1e-6)  # the iterative solve, to its tolerance
 
 
-def test_a_pin_on_a_tag_that_reaches_the_boundary_pins_its_boundary_part_and_says_so(capfd):
-    """A tag that also touches the boundary keeps the deliberate reading of a boundary pin (a thick band around a
-    cylinder pins the cylinder, not the fluid around it). Its interior nodes stay free, which used to go unsaid:
-    one warning now names the tag and the counts."""
+def test_a_pin_on_a_tag_that_reaches_the_boundary_and_the_interior_pins_both():
+    """A pin reaches EVERY node its tag's predicate selects, boundary and interior alike (it used to pin the boundary
+    part only and leave the interior part free). Oracle: every selected node equals the value and the rest equals the same problem with those rows replaced by
+    identity rows by hand."""
 
     def pred(x, y):
         return np.abs(x - 0.5) < 0.12  # a band across the square, top to bottom
 
-    d, terms, band, interior = _band_problem(pred, boundary_value=0.0)
-    fem = jno.fem(list(terms))
-    out, err = capfd.readouterr()
-    n_free = int((band & interior).sum())
-    assert n_free > 0 and f"{n_free} interior node(s)" in out + err and "'band'" in out + err
+    d, terms, band, interior = _band_problem(pred)
+    assert (band & interior).any() and (band & ~interior).any()
+    sol = np.asarray(jno.fem(list(terms)).solve()).reshape(-1)
+    np.testing.assert_allclose(sol[band], 2.0, atol=1e-10)
+
+    A, rhs = jno.fem(list(terms[:2])).operator  # the boundary pin only
+    A, rhs = np.array(A.todense()), np.array(rhs).reshape(-1)
+    for i in np.flatnonzero(band):
+        A[i, :] = 0.0
+        A[i, i] = 1.0
+        rhs[i] = 2.0
+    np.testing.assert_allclose(sol, np.linalg.solve(A, rhs), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_a_surface_predicate_pins_boundary_nodes_only(order):
+    """The boundary-only spelling: a predicate that holds on the boundary alone (a thin shell around the edge) pins
+    the boundary nodes and no interior node, at P1 and P2 (edge midpoints included)."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    d.tag("rim", lambda x, y: (np.abs(x - 0.5) > 0.5 - 1e-9) | (np.abs(y - 0.5) > 0.5 - 1e-9))
+    x, y, _ = d.variable("interior", split=True)
+    k = d.variable("rim", split=True)
+    u, v = d.fem_symbols(order=order)
+    a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(k[0], k[1]) - 2.0])
     sol = np.asarray(fem.solve()).reshape(-1)
-    np.testing.assert_allclose(sol[band & ~interior], 2.0, atol=1e-10)  # the boundary part is pinned
-    assert (np.abs(sol[band & interior] - 2.0) > 1e-3).all()  # the interior part is not
+    pts = np.asarray(fem.field_points[0])
+    edge = (np.abs(pts[:, 0] - 0.5) > 0.5 - 1e-9) | (np.abs(pts[:, 1] - 0.5) > 0.5 - 1e-9)
+    np.testing.assert_allclose(sol[edge], 2.0, atol=1e-10)
+    assert (np.abs(sol[~edge] - 2.0) > 1e-3).all()
+
+
+def test_a_vector_pin_on_a_tag_reaching_the_interior_pins_every_component_of_every_selected_node():
+    """The same reach for a vector P2 field: both components of every selected node (boundary, interior, edge
+    midpoints) take the value; the other nodes stay free."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+    d.tag("band", lambda x, y: np.abs(x - 0.5) < 0.2)
+    x, y, _ = d.variable("interior", split=True)
+    k = d.variable("band", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), order=2)
+    a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem(
+        [a.x[0] * t.x[0] + a.y[0] * t.y[0] + a.x[1] * t.x[1] + a.y[1] * t.y[1] - 1.0 * t[0], u(k[0], k[1]) - (2.0, -1.0)]
+    )
+    sol = np.asarray(fem.solve()).reshape(-1, 2)
+    pts = np.asarray(fem.field_points[0])
+    band = np.abs(pts[:, 0] - 0.5) < 0.2
+    assert (band & (pts[:, 1] > 1e-9) & (pts[:, 1] < 1 - 1e-9)).any(), "the band must reach interior nodes"
+    np.testing.assert_allclose(sol[band, 0], 2.0, atol=1e-10)
+    np.testing.assert_allclose(sol[band, 1], -1.0, atol=1e-10)
+    assert (np.abs(sol[~band, 0] - 2.0) > 1e-3).all()

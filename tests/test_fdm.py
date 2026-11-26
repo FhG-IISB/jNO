@@ -49,6 +49,22 @@ def _poisson_homogeneous(mesh_size):
     return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
 
 
+def test_a_pin_on_a_tag_reaching_interior_nodes_is_refused_by_the_fd_solver():
+    """A pin on a point-set tag reaches every node its predicate selects on the native Lagrange assembler; the FD
+    solver pins registered boundary nodes only, so a tag that also holds at interior nodes is refused by name."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    d.tag("band", lambda x, y: x < 0.3)  # the left edge and the interior nodes up to 0.3
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("band", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    prob = jno.fdm([-ui.laplacian(x, y, scheme=_COT) - 1.0 * jnn.sin(x), u(xb, yb) - 0.0])
+    with pytest.raises(NotImplementedError, match=r"finite-difference.*band.*off the boundary"):
+        prob.solve()
+
+
 def test_poisson_homogeneous_dirichlet():
     assert _poisson_homogeneous(0.06) < 1e-2
 

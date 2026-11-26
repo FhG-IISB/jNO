@@ -27,6 +27,7 @@ path is unaffected.
 | Temporal order inside a group | a group nested in a product CHAIN (`rho * c(T) * (T_t + u.grad T) * phi`) or handed to an OPERATOR (`inner(u_t + K*u, v)`) stays atomic, and its spatial part is stripped into the mass matrix | raises |
 | A march that never solves | an ABSOLUTE `atol` above the form's own residual scale passes Newton's first test at the incoming iterate, so every step returns its input | raises (the residual is bit-identical before and after) |
 | `d.tag(name, pred)` over a geometry face | the predicate filters point sampling only; facets still map through the geometry, so naming a DIFFERENT face splits the region | warns |
+| `u(tag) - g` on a `d.tag(name, pred)` point set | pins every node the predicate selects, interior ones too (a thick band pins the band); write a boundary-only predicate for a boundary pin. 1-D, non-nodal and finite-difference fields pin boundary nodes only and refuse a tag that reaches interior nodes |
 | Second order in time | nodal Lagrange only, 1-D/2-D/3-D, scalar or vector; the **temporal** side must stay linear | raises |
 | Reduced-order `basis=` | steady + first-order transient only | raises |
 | Runtime Dirichlet parameters | steady linear, steady nonlinear, linear transient; on a coupled (multi-field) form only on a first-order transient, not steady or on the τ load path (the parameter's nodes and the constrained field's do not share a numbering) | raises |
