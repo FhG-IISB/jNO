@@ -40,6 +40,25 @@ def _cfl_substeps(dt, limit):
         return jnp.maximum(1, jnp.ceil(dt / limit - 1e-12)).astype(jnp.int32)
 
 
+def _flux_run(step, flux, dt, s0, t0):
+    """``run(u, t_start, sub) -> (u, acc)`` of a flux-accumulating ``step`` (see ``stepper(flux=)``): ``sub`` substeps
+    of ``dt``, the scheme's quadrature of ``flux`` summed over them, from a zero of the flux's shape."""
+    shape = jax.eval_shape(flux, s0, t0)
+    zero = jnp.zeros(shape.shape, shape.dtype)
+
+    def run(u, t_start, sub):
+        h = dt / sub
+
+        def body(i, carry):
+            w, acc = carry
+            w, part = step(w, t_start + i * h, h)
+            return w, acc + part
+
+        return jax.lax.fori_loop(0, sub, body, (u, zero))
+
+    return run
+
+
 class _TimeScheme:
     """Base for the ``fem.solve(time=…)`` schemes.
 
@@ -1832,7 +1851,10 @@ class _ERKScheme(_TimeScheme):
 
         return jax.lax.fori_loop(0, 8, body, U)
 
-    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None, flux=None):
+        """``step(u, t, dt) -> u_next``: one explicit step. With ``flux=f`` (``f(U, t)`` an array: the interface
+        flux of a stage state, say) the step returns ``(u_next, acc)`` with ``acc = dt sum_i b_i f(U_i, t_i)``,
+        the scheme's own quadrature of ``f`` over the step: what the step took out of the interface."""
         mass, residual = _block_mass_and_residual(block, args)
         A, b, c = self.A, self.b, self.c
         n = int(jnp.asarray(block.state0).size)
@@ -1849,7 +1871,7 @@ class _ERKScheme(_TimeScheme):
             return -_apply_mass_inverse(mass(t), structure, algebraic, residual(U, t))
 
         def step_fn(u, t, dt, guess=None):
-            ks = []
+            ks, acc = [], None
             for i in range(b.size):
                 U = u
                 for j in range(i):
@@ -1858,11 +1880,15 @@ class _ERKScheme(_TimeScheme):
                 if has_alg:
                     U = self._project(residual, U, t + c[i] * dt, algebraic)
                 ks.append(rate(U, t + c[i] * dt))
+                if flux is not None and b[i] != 0:
+                    part = (dt * b[i]) * flux(U, t + c[i] * dt)
+                    acc = part if acc is None else acc + part
             out = u
             for i in range(b.size):
                 if b[i] != 0:
                     out = out + (dt * b[i]) * ks[i]
-            return self._project(residual, out, t + dt, algebraic) if has_alg else out
+            out = self._project(residual, out, t + dt, algebraic) if has_alg else out
+            return out if flux is None else (out, acc)
 
         return step_fn
 
@@ -1885,30 +1911,42 @@ class _ERKScheme(_TimeScheme):
         )
         # The compiled pieces are kept on the block, keyed by the tableau, so a repeated solve of a problem that
         # keeps its block (jno.fvm does) neither traces nor compiles again; a traced march is built afresh.
-        cache = {} if traced else block.__dict__.setdefault("_erk_compiled", {})
+        # a flux functional in the block's metadata (a coupling's interface flux): the march also returns the
+        # scheme's own quadrature of it over the window, ``(states, acc)``; its closure holds the window's data, so
+        # nothing compiled for it is kept on the block
+        flux = (block.metadata or {}).get("flux_functional")
+        cache = {} if traced or flux is not None else block.__dict__.setdefault("_erk_compiled", {})
         # keyed on everything a compiled piece bakes in: the tableau, the step and the number of steps (the grid
         # itself is an argument), so the windows of a coupled march (`window_block`) share them
         ident = (self.name, self.A.tobytes(), self.b.tobytes(), self.c.tobytes(), int(grid.shape[0]), dt)
         step = cache.get(("step", ident))
         if step is None:
-            step = cache[("step", ident)] = self.stepper(block, args)
+            step = cache[("step", ident)] = self.stepper(block, args, flux=flux)
 
-        def run(u, t_start, sub):
-            h = dt / sub
-            return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+        if flux is None:
+
+            def run(u, t_start, sub):
+                h = dt / sub
+                return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+
+        else:
+            run = _flux_run(step, flux, dt, s0, grid[0])
 
         if self.cfl is not None and not traced:
             # Evaluated eagerly: the substeps of every interval come from the CFL limit of the state at its start,
             # so a wave that speeds up during the march is followed.
-            states, u = [s0], s0
+            states, u, acc = [s0], s0, 0.0
             for k in range(1, grid.shape[0]):
                 sub = max(1, int(np.ceil(dt / float(cfl_dt(u, self.cfl)) - 1e-12)))
                 if ("run", ident, sub) not in cache:
                     cache[("run", ident, sub)] = jax.jit(partial(run, sub=sub))
                 u = cache[("run", ident, sub)](u, grid[k - 1])
+                if flux is not None:
+                    u, part = u
+                    acc = acc + part
                 states.append(u)
-            traj = jnp.stack(states)
-            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+            traj = _resample_trajectory(jnp.stack(states), grid, save_ts, s0.dtype, self._order)
+            return traj if flux is None else (traj, acc)
         # Traced (a gradient through the march, a coupling's window): one number of substeps, from the initial
         # state -- a traced count when that state is traced too
         sub = 1 if self.cfl is None else _cfl_substeps(dt, cfl_dt(jax.lax.stop_gradient(s0), self.cfl))
@@ -1917,16 +1955,20 @@ class _ERKScheme(_TimeScheme):
 
             def advance(u, t_next):
                 u = run(u, t_next - dt, sub)
-                return u, u
+                return (u, u) if flux is None else (u[0], u)
 
             def march(s0, grid):
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
-                return jnp.concatenate([s0[None, :], ys], axis=0)
+                if flux is None:
+                    return jnp.concatenate([s0[None, :], ys], axis=0)
+                return jnp.concatenate([s0[None, :], ys[0]], axis=0), ys[1].sum(axis=0)
 
             if not traced and isinstance(sub, int):
                 march = cache[("march", ident, sub)] = jax.jit(march)
         traj = march(s0, grid)
-        return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        if flux is None:
+            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        return _resample_trajectory(traj[0], grid, save_ts, s0.dtype, self._order), traj[1]
 
     def __repr__(self):
         cfl = "" if self.cfl is None else f", cfl={self.cfl}"

@@ -186,13 +186,11 @@ def _contact_heat_drift(n_b):
 
 def test_a_substepping_sender_passes_its_window_mean_flux_and_heat_is_conserved():
     # The flux the fem bar takes over a window must be what the fvm bar gave out: its mean over the window, not
-    # its end value. After the contact jump the flux falls fast within a window; the end value lost 24 % of the
-    # heat moved. The mean, by the trapezoid rule over the sender's steps, is off only on the first step after
-    # the jump, where the flux is singular, and shrinks with that step.
+    # its end value (24 % of the heat moved lost). The sender hands over the mean its scheme integrated over its own
+    # stages, so the heat is conserved to the iteration's tolerance, at any step; the trapezoid rule over its steps
+    # was off by 2.4 % and 0.8 % (ten and twenty sender steps per window), from the first step after the jump.
     coarse, fine = _contact_heat_drift(101), _contact_heat_drift(201)
-    # measured 2.4 % and 0.8 % (ten and twenty sender steps per window; the end value: 24 %): the first-step
-    # error falls faster than the step
-    assert coarse < 0.03 and fine < 0.5 * coarse, (coarse, fine)
+    assert coarse < 1e-7 and fine < 1e-7, (coarse, fine)
 
 
 def _two_fem_bars(h=0.03, time=None):

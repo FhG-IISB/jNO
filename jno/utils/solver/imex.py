@@ -93,9 +93,12 @@ class IMEXScheme:
 
         return local, explicit, mass_diag, nf, n
 
-    def stepper(self, block, args):
+    def stepper(self, block, args, flux=None):
         """``step(u, t, dt) -> u_next``: one IMEX step of ``block`` with its runtime arguments ``args``. The fluxes
-        are taken explicitly, the cell-local terms implicitly, by a Newton on each cell's ``nf x nf`` block."""
+        are taken explicitly, the cell-local terms implicitly, by a Newton on each cell's ``nf x nf`` block.
+        With ``flux=f`` (``f(U, t)`` an array, a transport flux through an interface) the step returns
+        ``(u_next, acc)`` with ``acc = h sum_j b_j f(U_j, t_j)``, ``b`` the explicit weights of the last stage (the
+        scheme is stiffly accurate): what the step's explicit transport took through the interface."""
         local, explicit, mass_diag, nf, n = self._parts(block, args)
         A_ex, A_im, c = self.A_ex, self.A_im, self.c
         s = A_ex.shape[0]
@@ -154,7 +157,10 @@ class IMEXScheme:
                 Es.append(explicit(U, ti))
                 Ls.append(local(U, ti))
                 Ms.append(m)
-            return Us[-1]  # stiffly accurate: the last stage is the step
+            if flux is None:
+                return Us[-1]  # stiffly accurate: the last stage is the step
+            acc = sum((h * A_ex[-1, j]) * flux(Us[j], t + c[j] * h) for j in range(s) if A_ex[-1, j] != 0.0)
+            return Us[-1], acc
 
         return step
 
@@ -166,7 +172,7 @@ class IMEXScheme:
         from functools import partial
 
         from .backend_blocks import _block_time_grid, _resample_trajectory
-        from .timeschemes import _cfl_substeps
+        from .timeschemes import _cfl_substeps, _flux_run
 
         s0 = jnp.asarray(block.state0).reshape(-1)
         grid = jnp.asarray(_block_time_grid(block), s0.dtype)
@@ -177,25 +183,36 @@ class IMEXScheme:
         traced = isinstance(s0, jax.core.Tracer) or any(
             isinstance(a, jax.core.Tracer) for a in jax.tree_util.tree_leaves(args)
         )
-        cache = {} if traced else block.__dict__.setdefault("_imex_compiled", {})
+        # a flux functional in the block's metadata (see ERK's integrate): the march also returns its quadrature
+        flux = (block.metadata or {}).get("flux_functional")
+        cache = {} if traced or flux is not None else block.__dict__.setdefault("_imex_compiled", {})
         ident = (self.method, self.newton_tol, self.newton_steps, int(grid.shape[0]), dt)
         step = cache.get(("step", ident))
         if step is None:
-            step = cache[("step", ident)] = self.stepper(block, args)
+            step = cache[("step", ident)] = self.stepper(block, args, flux=flux)
 
-        def run(u, t_start, sub):
-            h = dt / sub
-            return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+        if flux is None:
+
+            def run(u, t_start, sub):
+                h = dt / sub
+                return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+
+        else:
+            run = _flux_run(step, flux, dt, s0, grid[0])
 
         if self.cfl is not None and not traced:
-            states, u = [s0], s0
+            states, u, acc = [s0], s0, 0.0
             for k in range(1, grid.shape[0]):
                 sub = max(1, int(np.ceil(dt / float(cfl_dt(u, self.cfl)) - 1e-12)))
                 if ("run", ident, sub) not in cache:
                     cache[("run", ident, sub)] = jax.jit(partial(run, sub=sub))
                 u = cache[("run", ident, sub)](u, grid[k - 1])
+                if flux is not None:
+                    u, part = u
+                    acc = acc + part
                 states.append(u)
-            return _resample_trajectory(jnp.stack(states), grid, save_ts, s0.dtype, self._order)
+            traj = _resample_trajectory(jnp.stack(states), grid, save_ts, s0.dtype, self._order)
+            return traj if flux is None else (traj, acc)
         # traced (a coupling's window, a gradient): one number of substeps from the initial state, itself traced
         # when that state is
         sub = 1 if self.cfl is None else _cfl_substeps(dt, cfl_dt(jax.lax.stop_gradient(s0), self.cfl))
@@ -204,12 +221,17 @@ class IMEXScheme:
 
             def advance(u, t_next):
                 u = run(u, t_next - dt, sub)
-                return u, u
+                return (u, u) if flux is None else (u[0], u)
 
             def march(s0, grid):
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
-                return jnp.concatenate([s0[None, :], ys], axis=0)
+                if flux is None:
+                    return jnp.concatenate([s0[None, :], ys], axis=0)
+                return jnp.concatenate([s0[None, :], ys[0]], axis=0), ys[1].sum(axis=0)
 
             if not traced and isinstance(sub, int):
                 march = cache[("march", ident, sub)] = jax.jit(march)
-        return _resample_trajectory(march(s0, grid), grid, save_ts, s0.dtype, self._order)
+        traj = march(s0, grid)
+        if flux is None:
+            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        return _resample_trajectory(traj[0], grid, save_ts, s0.dtype, self._order), traj[1]

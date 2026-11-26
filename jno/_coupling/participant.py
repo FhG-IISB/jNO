@@ -189,17 +189,22 @@ class Participant:
 
         return not any(walk(c) for c in self.constraints())
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
-        """``(end, frames)``: the state after the window ``[t0, t0 + window]`` from ``state``, the data held over it,
-        and the states at the problem's own steps from the window's start, ``(n_steps + 1, n)`` (a flux it sends is
-        their mean over the window), or ``None`` when it sends its end state's flux. ``params``
-        (``{layer_id: value}``) gives trainable parameters their (possibly traced) values, as in :meth:`solve`."""
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
+        """``(end, frames)``, or ``(end, frames, means)`` when ``flux`` is given and taken: the state after the window ``[t0, t0 + window]`` from ``state``, the data held
+        over it, the states at the problem's own steps from the window's start, ``(n_steps + 1, n)`` (a flux it
+        sends is, failing ``means``, their mean over the window), or ``None`` when it sends its end state's flux.
+        ``flux`` (a list of ``(expr, tag, interface)``) asks an explicit or IMEX march for the window mean of each
+        flux as its own scheme integrates it, over its stages; ``means`` is the list of them (nodal values like
+        :meth:`sample`'s). ``params`` (``{layer_id: value}``) gives
+        trainable parameters their (possibly traced) values, as in :meth:`solve`."""
         raise NotImplementedError
 
+    stage_flux = False  # does march(flux=) return the stage quadrature of the flux?
+
     @staticmethod
-    def _frames(traj):
-        """``(end, frames)`` of a window's trajectory ``(n_steps + 1, n)``."""
-        return traj[-1].reshape(-1), traj
+    def _frames(traj, means=None):
+        """``(end, frames)`` of a window's trajectory ``(n_steps + 1, n)``, and ``means`` when given."""
+        return (traj[-1].reshape(-1), traj) if means is None else (traj[-1].reshape(-1), traj, means)
 
     def initial(self, problem):
         """The state its initial condition gives."""
@@ -312,7 +317,7 @@ class FDMParticipant(_StrongForm):
 
     kind = "fdm"
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window, with the data held over it (read through ``_override``, as jno.fvm's march reads them). Its
         steps are direct solves, as :meth:`solve` is: exact to round-off, so the coupling and its gradient are not
         limited by a Krylov tolerance."""
@@ -386,53 +391,81 @@ class FVMParticipant(_StrongForm):
 
         return jno.fvm(self.constraints() + list(extra), centering=self.problem.graph.centering)
 
-    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
-        """Evaluated on the tag's boundary faces with the problem's own boundary rule (face values and normal
-        derivatives as its fluxes see them), then lumped to the nodes: ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with
-        ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly. Compiled once per expression."""
+    def _flux_rows(self, problem, expr, tag, iface):
+        """``rows(state, data, params)``: ``expr`` on the tag's boundary faces with the problem's own boundary rule
+        (face values and normal derivatives as its fluxes see them), then lumped to the nodes:
+        ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly."""
         import jax.numpy as jnp
 
-        data, params = data or {}, params or {}
-        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         faces = np.asarray(problem._region_faces(tag))
         A = jnp.asarray(self._attachment(problem, faces, iface))
         # how its boundary rule treats each condition is decided on concrete values, once; a problem sampled
         # before it was ever solved (a coupling's probe reads its initial state) has not decided it yet
         problem._decide_condition_affinity(problem._concrete_scope())
+
+        def rows(state, data, params):
+            return (A @ self._face_values(problem, state, expr, faces, data, params)) / A.sum(axis=1)
+
+        return rows
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        """:meth:`_flux_rows` at ``state``, compiled once per expression."""
+        import jax.numpy as jnp
+
+        data, params = data or {}, params or {}
+        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
+        rows = self._flux_rows(problem, expr, tag, iface)
         cache = problem.__dict__.setdefault("_cpl_sample", {})
 
         def run(state, values, pvalues):
-            F = self._face_values(problem, state, expr, faces, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
-            return (A @ F) / A.sum(axis=1)
+            return rows(state, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
 
         args = (jnp.asarray(state), [data[k] for k in keys], [params[k] for k in pkeys])
         return _compiled(cache, (id(expr), tag, keys, pkeys), run, *args)
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    stage_flux = True
+
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window, compiled once per window length for an autonomous problem: the data are traced inputs
         (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
-        substeps inside the program, from the state at the window's start, so every window runs the same one."""
+        substeps inside the program, from the state at the window's start, so every window runs the same one.
+        ``flux`` (a list of ``(expr, tag, interface)``): the march also takes the window mean of each flux as its
+        scheme integrates it over its stages (see :meth:`Participant.march`)."""
         import jax.numpy as jnp
 
         params = params or {}
         keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         span = self._span(t0, window)
         state = jnp.asarray(state).reshape(-1)
+        flux = list(flux or [])
+        rows = [self._flux_rows(problem, e, tag, iface) for e, tag, iface in flux]
+        sizes = [int(iface.weights.size) for _, _, iface in flux]
 
         def run(values, pvalues, x0):
-            problem._override = self._scope(problem, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
+            d, p = dict(zip(keys, values)), dict(zip(pkeys, pvalues))
+            problem._override = self._scope(problem, d, p)
             try:
-                traj = problem._march(time=time, x0=x0, span=span)
+                if not rows:
+                    traj = jnp.asarray(problem._march(time=time, x0=x0, span=span))
+                    return traj.reshape(traj.shape[0], -1)
+                f = lambda U, t: jnp.concatenate([r(U, d, p) for r in rows])  # noqa: E731
+                traj, acc = problem._march(time=time, x0=x0, span=span, flux=f)
             finally:
                 problem._override = None
             traj = jnp.asarray(traj)
-            return traj.reshape(traj.shape[0], -1)
+            return traj.reshape(traj.shape[0], -1), acc / float(window)
 
         args = ([data[k] for k in keys], [params[k] for k in pkeys], state)
+        fkey = tuple((id(e), tag) for e, tag, _ in flux)
         if not self.autonomous():  # its own times: compiled per window
-            return self._frames(_compiled({}, None, run, *args))
-        cache = problem.__dict__.setdefault("_cpl_march", {})
-        return self._frames(_compiled(cache, (keys, pkeys, span, repr(time)), run, *args))
+            out = _compiled({}, None, run, *args)
+        else:
+            cache = problem.__dict__.setdefault("_cpl_march", {})
+            out = _compiled(cache, (keys, pkeys, span, repr(time), fkey), run, *args)
+        if not rows:
+            return self._frames(out)
+        traj, mean = out
+        return self._frames(traj, list(jnp.split(mean, np.cumsum(sizes)[:-1])))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -588,7 +621,7 @@ class FEMParticipant(Participant):
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window of the FEM's own time block: its step solvers (a direct step, composed once per scheme), a
         window copy of the block from ``state``, and the data as the runtime arguments. Going through
         ``fem.solve`` composed new step solvers on every call, a new compiled-march key each time (0.5 s a window,
