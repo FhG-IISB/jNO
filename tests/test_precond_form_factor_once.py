@@ -116,3 +116,33 @@ def test_default_form_keeps_a_real_form_real():
     assert out.dtype == np.float64
     np.testing.assert_allclose(M @ out, r, atol=1e-9)
     assert isinstance(spec._op.bcoo, jsparse.BCOO)
+
+
+def test_factor_once_refuses_a_singular_matrix_pardiso_only_perturbed():
+    """PARDISO perturbs a pivot of a singular matrix and returns a finite vector with nothing said; a
+    preconditioner built on it would apply that silently. FactorOnce checks its factorization once, on the
+    first solve, with the same test lu(backend="pardiso") uses."""
+    if not linear._pardiso_available():
+        pytest.skip("pypardiso is not installed")
+    f = linear.FactorOnce(sp.csr_matrix(np.array([[1.0, 1.0], [1.0, 1.0 + 1e-14]])))
+    with pytest.raises(RuntimeError, match=r"SINGULAR.*perturbed 1 pivot"):
+        f.solve(np.array([1.0, 2.0]))
+
+
+def test_factor_once_refines_against_a_perturbed_nonsingular_factor():
+    """A perturbed pivot on a NONSINGULAR matrix: the raw PARDISO answer has a residual of 8e-8 and no digits
+    (cond 1e13). FactorOnce reports it once and refines every solve against the true matrix, as
+    lu(backend="pardiso") does, so a preconditioner built on it applies the inverse it claims to."""
+    if not linear._pardiso_available():
+        pytest.skip("pypardiso is not installed")
+    A = np.array([[1.0, 1.0], [1.5, 1.5 + 9e-14]])
+    b = np.array([1.0, 1.5 + 1e7 * 9e-14])
+    linear._warned_pardiso_perturbed = False
+    f = linear.FactorOnce(sp.csr_matrix(A))
+    with pytest.warns(RuntimeWarning, match=r"perturbed 1 pivot\(s\)"):
+        x = f.solve(b)
+    assert f._entry["perturbed"] == 1
+    assert np.linalg.norm(A @ x - b) / np.linalg.norm(b) < 1e-9
+    bt = np.array([1.0, 1.0 + 1e7 * 9e-14])  # the same large solution entry for A^T x = b
+    xt = f.solve_t(bt)  # the transposed direction from the same factorization, refined too
+    assert np.linalg.norm(A.T @ xt - bt) / np.linalg.norm(bt) < 1e-9

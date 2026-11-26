@@ -1141,10 +1141,15 @@ class FactorOnce:
             solver = e["solver"]
             rhs = np.asfortranarray(b.reshape(b.shape[0], -1).astype(self.dtype, copy=False))
             with _pardiso_thread_count(solver, e["threads"]):
+                if e.get("perturbed") is None:  # once per factorization, as lu(backend="pardiso"): a singular
+                    # operator raises, a perturbed pivot on a nonsingular one is reported and every solve refined
+                    e["perturbed"] = _pardiso_check_factorization(solver, e["A"], rhs, np, self.shape, transpose)
                 solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
                 solver.set_phase(33)
                 try:
                     x = solver._call_pardiso(e["A"], rhs)
+                    if e["perturbed"]:  # the factors are of a perturbed matrix: refine against the true one
+                        x = _pardiso_refine(solver, e["A"], rhs, x, np, transpose)[0]
                 finally:
                     solver.set_iparm(12, 0)
             return np.asarray(np.asarray(x).reshape(b.shape), dtype=out_dtype)
