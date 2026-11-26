@@ -4556,11 +4556,21 @@ class FEM:
         if per is None:
             res_at = lambda uu: op.residual(uu, vals)  # noqa: E731
         else:
-            from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
+            from .utils.solver.fem_utils import (
+                prolong_periodic,
+                reduce_vector_periodic,
+                restrict_state_periodic,
+                wrap_reduced_dirichlet,
+            )
 
-            def res_at(ur, _p=per, _o=op, _v=vals):
+            def _free(ur, _p=per, _o=op, _v=vals):
                 full = _o.residual(prolong_periodic(_p, ur), _v)
                 return reduce_vector_periodic(_p, jnp.asarray(full).reshape(-1))
+
+            # The residual the solve worked on, so with the prescribed rows `Pᵀ` polluted re-imposed (a
+            # prescribed DOF that is a tie target): the bare `Pᵀ r(P u)` keeps the eliminated DOFs'
+            # reaction in those rows, which no iterate removes, and a converged Newton was refused.
+            res_at = wrap_reduced_dirichlet(per, _free)[0]
 
             u = restrict_state_periodic(per, u)
             if u0.shape[0] != u.shape[0]:

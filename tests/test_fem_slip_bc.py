@@ -432,3 +432,40 @@ def test_slip_wall_meeting_a_clamped_face_keeps_both_conditions():
     assert np.abs(sol[top, 1]).max() < 1e-12, "slip wall violated"
     assert np.abs(sol[left]).max() < 1e-12, "clamp lost at the corner the slip wall shares"
     assert np.abs(sol[top & ~left, 0]).max() > 1e-3, "the wall should slide, not be clamped"
+
+
+def test_a_parametric_nonlinear_solve_on_a_slip_wall_tied_to_a_prescribed_dof_is_judged_converged():
+    """A tilted slip wall meets a face that prescribes one component, so the prescribed DOF becomes a tie
+    TARGET: `Pᵀ` sums the eliminated component's equation into its reduced row, and the solve re-imposes the
+    value there. The verdict on `fem.solve(param=value)` must judge that same re-imposed residual. It
+    judged the bare `Pᵀ r(P u)` instead, whose polluted rows keep a reaction no iterate can remove, so a
+    converged Newton -- cold or warm-started -- was refused as "did not converge"."""
+    d = jno.shape.polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 0.7), (0.0, 1.0)], size=0.2).domain()
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    ct = d.variable("e2", normals=True, split=True)  # the tilted top: n has both components
+    cl = d.variable("e3", split=True)  # the left side, where only u_y is prescribed
+    c = jno.np.parameter((1,), name="c")
+    grad, inner = jno.np.grad, jno.np.inner
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    k = 1.0 + c * (ui[0] * ui[0] + ui[1] * ui[1])
+    weak = k * inner(grad(u, [xi, yi]), grad(phi, [xi, yi]), n_contract=2) - (1.0 * vi.component(0) + 0.5 * vi.component(1))
+    ut = u(ct[0], ct[1])
+    fem = jno.fem([weak, ct[-2] * ut[0] + ct[-1] * ut[1] - 0.0, u(cl[0], cl[1])[1] - 0.0])
+    assert fem._periodic.get("dirichlet_reduced"), "the corner must make the prescribed u_y a tie target"
+
+    newton = jno.solve.newton(direct=True, rtol=1e-10, atol=1e-10)
+    cold = np.asarray(fem.solve(nonlinear=newton, c=1.0)).reshape(-1)
+    assert fem.stats["nonlinear"]["converged"]
+    warm = np.asarray(fem.solve(nonlinear=newton, x0=cold, c=2.0)).reshape(-1)
+    assert fem.stats["nonlinear"]["converged"]
+    assert fem.stats["nonlinear"]["residual"] <= 1e-10
+
+    # the answer is a root of the system with both conditions in force, read off the nodal values
+    pts, U = np.asarray(fem.field_points[0]), warm.reshape(-1, 2)
+    left = np.abs(pts[:, 0]) < 1e-9
+    top = np.abs(pts[:, 1] - (1.0 - 0.3 * pts[:, 0])) < 1e-9
+    n = np.array([0.3, 1.0]) / np.hypot(0.3, 1.0)
+    assert np.abs(U[left, 1]).max() < 1e-12, "the prescribed u_y is lost at the corner"
+    assert np.abs(U[top] @ n).max() < 1e-12, "the slip wall is violated"
+    assert np.abs(warm - cold).max() > 1e-4, "c must change the answer, or the warm start proves nothing"
