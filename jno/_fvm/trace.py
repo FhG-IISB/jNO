@@ -1186,6 +1186,17 @@ class _TraceFVM(StrongFormProblem):
             spatial = self._residual_fn(extra_params=getattr(self, "_override", None))
             spatial_first = self._residual_fn(extra_params=getattr(self, "_override", None), first_order=True)
         c_of, m_of = self._time_coefficients(scope)
+        # A window of a coupling marches [0, window] on a clock shifted by the window's start (`_time_shift`, a traced
+        # argument of the compiled window), so one program serves every window of a problem that reads time.
+        shift = getattr(self, "_time_shift", None)
+
+        def at(f):
+            return f if shift is None else (lambda y, t, *rest: f(y, t + shift, *rest))
+
+        def at_coef(f):
+            return f if shift is None else (lambda t=None: f(None if t is None else t + shift))
+
+        spatial, spatial_first, c_of, m_of = at(spatial), at(spatial_first), at_coef(c_of), at_coef(m_of)
         V = jnp.tile(self.ops.volume, self._nf)
         pinned = np.zeros(self._Ntot, dtype=bool)
         for k, cells, _ in self._pins:
@@ -1247,8 +1258,8 @@ class _TraceFVM(StrongFormProblem):
                     "jno.solve.imex: a vertex-centred problem's pinned rows, or a u.tt problem, are not split yet."
                 )
             override = getattr(self, "_override", None)
-            local_fn = self._residual_fn(part="local", extra_params=override)
-            flux_first = self._residual_fn(part="flux", first_order=True, extra_params=override)
+            local_fn = at(self._residual_fn(part="local", extra_params=override))
+            flux_first = at(self._residual_fn(part="flux", first_order=True, extra_params=override))
             common["metadata"]["local_residual"] = local_fn
             common["metadata"]["local_layout"] = (self._nf, self._N)
             common["metadata"]["mass_diag"] = mass_diag
