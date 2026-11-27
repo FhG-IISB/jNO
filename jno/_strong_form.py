@@ -15,6 +15,17 @@ import jax.numpy as jnp
 import numpy as np
 
 
+def _decided(decide):
+    """``decide()``, or ``None`` when it needs a concrete value that is traced (``float``/``bool`` of a tracer):
+    a structural probe of a residual that closes over a coefficient ``jax.grad`` is differentiating by."""
+    import jax
+
+    try:
+        return decide()
+    except (jax.errors.ConcretizationTypeError, jax.errors.TracerBoolConversionError):
+        return None
+
+
 def _rtol(dtype=None) -> float:
     """The relative tolerance to which two floating-point results that should be equal are compared (an
     affine probe, a symmetry probe, a node on a lattice): ``√ε`` of ``dtype`` (the default float if ``None``),
@@ -547,7 +558,9 @@ class StrongFormProblem:
             a, b = self._symmetry_probe(make_K())
             return abs(a - b) <= _rtol() * max(abs(a), abs(b), np.finfo(float).tiny)
 
-        out = all(self._for_every_parameter(symmetric))
+        out = _decided(lambda: all(self._for_every_parameter(symmetric)))
+        if out is None:  # a traced coefficient (jax.grad of the solve): not decidable here, so not symmetric
+            return False
         if key is not None:
             cache[key] = out
         return out
@@ -569,7 +582,13 @@ class StrongFormProblem:
                 j1 = jax.jvp(fun, (w,), (v,))[1]
                 return bool(jnp.linalg.norm(j1 - j0) <= _rtol(j0.dtype) * (float(jnp.linalg.norm(j0)) or 1.0))
 
-            cache[key] = all(self._for_every_parameter(affine))
+            out = _decided(lambda: all(self._for_every_parameter(affine)))
+            if out is None:
+                # The residual closes over a traced value (a coefficient differentiated by jax.grad), so its JVPs
+                # are traced and cannot be compared here. Not affine, then: Newton solves an affine residual in
+                # one step, so the answer is the same, and nothing is cached for a later concrete call.
+                return False
+            cache[key] = out
         return cache[key]
 
     @staticmethod
