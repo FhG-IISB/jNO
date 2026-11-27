@@ -356,6 +356,43 @@ def uniform_kz(
     return jnp.where(jnp.imag(kz) < 0, -kz, kz)
 
 
+def uniform_blocks(
+    omega,
+    transverse_wavevectors: jnp.ndarray,
+    eps,
+    thickness,
+    dtype: jnp.dtype = jnp.complex64,
+):
+    """Per-order ``(n, 2, 2)`` blocks ``(A, B~, C~, D)`` of ``expm(i M_L d)`` for a uniform isotropic layer.
+
+    Each order is exactly ``A = D = cos(q d) I`` and ``B~ = i sin(q d)/q B_o``, ``C~ = i sin(q d)/q C_o``, with the
+    order's ``2 x 2`` blocks ``B_o``, ``C_o`` of ``M_L``: O(n), no matrix function at all.
+    """
+    omega = jnp.asarray(omega, dtype=dtype)
+    eps = jnp.asarray(eps, dtype=dtype)
+    kx = transverse_wavevectors[:, 0]
+    ky = transverse_wavevectors[:, 1]
+    q = uniform_kz(transverse_wavevectors, eps, omega, dtype=dtype)
+    qd = q * thickness
+    cos_qd = jnp.cos(qd)
+    sin_q = jnp.where(q == 0, thickness, jnp.sin(qd) / jnp.where(q == 0, 1.0, q))
+
+    def mat2(a, b_, c_, d):
+        return jnp.stack([jnp.stack([a, b_], -1), jnp.stack([c_, d], -1)], -2)
+
+    b12 = kx * ky / (eps * omega)
+    b = mat2(omega - ky**2 / (eps * omega), b12, b12, omega - kx**2 / (eps * omega))
+    c12 = -kx * ky / omega
+    c = mat2(omega * eps - kx**2 / omega, c12, c12, omega * eps - ky**2 / omega)
+    a = mat2(cos_qd, jnp.zeros_like(cos_qd), jnp.zeros_like(cos_qd), cos_qd)
+    return a, 1j * sin_q[:, None, None] * b, 1j * sin_q[:, None, None] * c, a
+
+
+def per_order_dense(t: jnp.ndarray) -> jnp.ndarray:
+    """The ``2n x 2n`` component-major matrix of per-order ``(n, 2, 2)`` blocks."""
+    return block2x2(jnp.diag(t[:, 0, 0]), jnp.diag(t[:, 0, 1]), jnp.diag(t[:, 1, 0]), jnp.diag(t[:, 1, 1]))
+
+
 def uniform_layer_transfer(
     omega,
     transverse_wavevectors: jnp.ndarray,
@@ -383,44 +420,8 @@ def uniform_layer_transfer(
     Returns:
         The ``4n x 4n`` transfer matrix.
     """
-    omega = jnp.asarray(omega, dtype=dtype)
-    eps = jnp.asarray(eps, dtype=dtype)
-    n = transverse_wavevectors.shape[0]
-    kx = transverse_wavevectors[:, 0]
-    ky = transverse_wavevectors[:, 1]
-    q = uniform_kz(transverse_wavevectors, eps, omega, dtype=dtype)
-
-    # Per-order 2x2 blocks of B (u coupling) and C (v coupling).
-    b11 = omega - ky**2 / (eps * omega)
-    b12 = kx * ky / (eps * omega)
-    b22 = omega - kx**2 / (eps * omega)
-    c11 = omega * eps - kx**2 / omega
-    c12 = -kx * ky / omega
-    c22 = omega * eps - ky**2 / omega
-
-    qd = q * thickness
-    cos_qd = jnp.cos(qd)
-    sin_qd = jnp.where(q == 0, thickness, jnp.sin(qd) / q)
-
-    def diag(x):
-        return jnp.diag(x)
-
-    a11 = diag(cos_qd)
-    a22 = diag(cos_qd)
-    btilde_11 = 1j * diag(sin_qd * b11)
-    btilde_12 = 1j * diag(sin_qd * b12)
-    btilde_22 = 1j * diag(sin_qd * b22)
-    ctilde_11 = 1j * diag(sin_qd * c11)
-    ctilde_12 = 1j * diag(sin_qd * c12)
-    ctilde_22 = 1j * diag(sin_qd * c22)
-
-    zero = jnp.zeros((n, n), dtype=dtype)
-    return block2x2(
-        block2x2(a11, zero, zero, a22),
-        block2x2(btilde_11, btilde_12, btilde_12, btilde_22),
-        block2x2(ctilde_11, ctilde_12, ctilde_12, ctilde_22),
-        block2x2(a11, zero, zero, a22),
-    )
+    a, b, c, d = uniform_blocks(omega, transverse_wavevectors, eps, thickness, dtype=dtype)
+    return block2x2(per_order_dense(a), per_order_dense(b), per_order_dense(c), per_order_dense(d))
 
 
 # -----------------------------------------------------------------------------
@@ -456,14 +457,18 @@ def uniform_anisotropic_layer_transfer(
     Returns:
         The ``4n x 4n`` transfer matrix.
     """
-    b, c = uniform_aniso_bc(omega, transverse_wavevectors, eps_comps, mu_comps, dtype=dtype)
-    ta, tb, tc, td = slice_transfer(b, c, b @ c, thickness, doublings, series_degree(dtype))  # (n, 2, 2) each
-
-    def diag_block(t):
-        return block2x2(jnp.diag(t[:, 0, 0]), jnp.diag(t[:, 0, 1]), jnp.diag(t[:, 1, 0]), jnp.diag(t[:, 1, 1]))
-
+    ta, tb, tc, td = uniform_aniso_blocks(omega, transverse_wavevectors, eps_comps, mu_comps, thickness, doublings, dtype)
     # (u1 over orders | u2 over orders | v1 | v2), matching the isotropic uniform transfer's block layout.
-    return block2x2(diag_block(ta), diag_block(tb), diag_block(tc), diag_block(td))
+    return block2x2(per_order_dense(ta), per_order_dense(tb), per_order_dense(tc), per_order_dense(td))
+
+
+def uniform_aniso_blocks(
+    omega, transverse_wavevectors, eps_comps, mu_comps, thickness, doublings: int, dtype=jnp.complex64
+):
+    """Per-order ``(n, 2, 2)`` blocks ``(A, B~, C~, D)`` of a uniform anisotropic layer's transfer: the thin-slice
+    series on each order's ``2 x 2`` blocks, O(n)."""
+    b, c = uniform_aniso_bc(omega, transverse_wavevectors, eps_comps, mu_comps, dtype=dtype)
+    return slice_transfer(b, c, b @ c, thickness, doublings, series_degree(dtype))
 
 
 # -----------------------------------------------------------------------------

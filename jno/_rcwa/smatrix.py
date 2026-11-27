@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import jax
 import jax.numpy as jnp
 
 from . import layer
@@ -80,21 +81,28 @@ def chunk_smatrix(blocks, y_r, z_r) -> Tuple[jnp.ndarray, jnp.ndarray]:
     products (O(n^2)). A chunk's growth is bounded at build (``|q| d_c <= 1``), so ``T'22`` is well conditioned.
     """
     a, b, c, d = blocks
+    if a.ndim == 3:  # per-order (n, 2, 2) blocks of a uniform layer: the same algebra, O(n)
+        by, dy = b @ y_r, d @ y_r
+        t21 = 0.5 * (a + by - z_r @ (c + dy))
+        t22 = 0.5 * (a - by - z_r @ (c - dy))
+        t = inverse_2x2(t22)
+        return -t @ t21, t
     by, dy = right(b, y_r), right(d, y_r)
     t21 = 0.5 * (a + by - left(z_r, c + dy))
     t22 = 0.5 * (a - by - left(z_r, c - dy))
     two_n = a.shape[-1]
     sol = jnp.linalg.solve(t22, jnp.concatenate([t21, jnp.eye(two_n, dtype=a.dtype)], axis=-1))
-    return -sol[:, :two_n], sol[:, two_n:]
+    return -sol[..., :two_n], sol[..., two_n:]
 
 
 def double(r: jnp.ndarray, t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """``S * S`` for a symmetric ``S = (r, t)``: ``t' = t (I - r^2)^-1 t``, ``r' = r + t r (I - r^2)^-1 t``.
 
-    (``r`` commutes with ``(I - r^2)^-1``.) Four matmuls and one solve with ``2n`` right-hand sides.
+    (``r`` commutes with ``(I - r^2)^-1``.) Four matmuls and one solve with ``2n`` right-hand sides; on
+    per-order ``(n, 2, 2)`` blocks the same in O(n).
     """
     eye = jnp.eye(r.shape[-1], dtype=r.dtype)
-    x = jnp.linalg.solve(eye - r @ r, t)
+    x = jnp.linalg.solve(eye - r @ r, t) if r.ndim == 2 else inverse_2x2(eye - r @ r) @ t
     return r + (t @ r) @ x, t @ x
 
 
@@ -125,10 +133,10 @@ def star(sa, sb):
     lhs2 = jnp.linalg.solve(eye - a22 @ b11, jnp.concatenate([a21, a22 @ b12], axis=-1))
     two_n = a11.shape[-1]
     return (
-        a11 + a12 @ lhs1[:, :two_n],
-        a12 @ lhs1[:, two_n:],
-        b21 @ lhs2[:, :two_n],
-        b22 + b21 @ lhs2[:, two_n:],
+        a11 + a12 @ lhs1[..., :two_n],
+        a12 @ lhs1[..., two_n:],
+        b21 @ lhs2[..., :two_n],
+        b22 + b21 @ lhs2[..., two_n:],
     )
 
 
@@ -169,6 +177,24 @@ def sweep(slabs, rho: jnp.ndarray):
         rs.append(big_r)
         xs.append(x)
     return rs[::-1], xs[::-1]
+
+
+def sweep_scan(r_all: jnp.ndarray, t_all: jnp.ndarray, rho: jnp.ndarray):
+    """:func:`sweep` over slabs stacked as ``(L, 2n, 2n)`` arrays, as one ``lax.scan`` (compiled once, however many
+    slabs). Returns the reflection in front of the first slab and the stacked ``X``."""
+    eye = jnp.eye(rho.shape[-1], dtype=rho.dtype)
+
+    def step(big_r, rt):
+        r, t = rt
+        x = jnp.linalg.solve(eye - r @ big_r, t)
+        return r + t @ (big_r @ x), x
+
+    return jax.lax.scan(step, rho, (r_all, t_all), reverse=True)
+
+
+def carry_scan(xs: jnp.ndarray, a0: jnp.ndarray) -> jnp.ndarray:
+    """The amplitude behind the last of the stacked slabs (``xs`` from :func:`sweep_scan`), as one ``lax.scan``."""
+    return jax.lax.scan(lambda a, x: (x @ a, None), a0, xs)[0]
 
 
 def carry(xs, a0: jnp.ndarray):

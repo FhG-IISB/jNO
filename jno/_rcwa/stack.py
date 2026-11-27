@@ -39,6 +39,7 @@ from typing import Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from . import basis as basis_mod
 from . import layer, matrices, smatrix
@@ -318,6 +319,10 @@ class StateStack:
         # One entry per layer POSITION (0 for a non-aniso layer): the traced consumer at
         # `_layer_material` indexes by the ABSOLUTE layer index (iss_mwurllzvaj6pf4).
         self._uniform_doublings = [0] * nl
+        # The build norms ||P||_inf behind those counts (patterned path, per-order uniform path), kept so that a
+        # group of films solved together can size one shared count for its own chunk thickness.
+        self._p_norm = [0.0] * nl
+        self._p_norm_uniform = [0.0] * nl
         if chunk_override is not None and len(chunk_override) < nl:
             raise ValueError(f"`chunk_override` must have one entry per layer ({nl}), got {len(chunk_override)}.")
 
@@ -379,13 +384,15 @@ class StateStack:
                 # A build-time static bound from the prototype; the traced core rebuilds B and C from the
                 # solve grids and reports in `load` how close they come to it.
                 b_mat, c_mat, _, _ = self._patterned_bc(comps, self._omega, self._twv)
-                k_patterned = layer.series_doublings(layer.matrix_inf_norm(b_mat @ c_mat), d_c)
+                self._p_norm[li] = layer.matrix_inf_norm(b_mat @ c_mat)
+                k_patterned = layer.series_doublings(self._p_norm[li], d_c)
             if ncomp > 1:
                 # A tensor layer whose solve grids collapse to constants takes the per-order uniform path,
                 # which needs its own static count (sized on the prototype's largest component values).
                 eps5, mu5 = _largest_components(comps, is_mu)
                 b_u, c_u = layer.uniform_aniso_bc(self._omega, self._twv, eps5, mu5, dtype=self._cdt)
-                self._uniform_doublings[li] = layer.series_doublings(layer.matrix_inf_norm(b_u @ c_u), d_c)
+                self._p_norm_uniform[li] = layer.matrix_inf_norm(b_u @ c_u)
+                self._uniform_doublings[li] = layer.series_doublings(self._p_norm_uniform[li], d_c)
             if doublings_override is not None:
                 k_patterned = int(doublings_override)
             self._doublings.append(k_patterned)
@@ -485,12 +492,12 @@ class StateStack:
             _load_guard(res)
         return res
 
-    def _layer_material(self, li, layer_grid, omega, twv, count: bool, d_c=None):
+    def _layer_material(self, li, layer_grid, omega, twv, count: bool, d_c=None, static=None):
         """The traced material record of layer `li` for the per-solve grids.
 
         Returns a :class:`_LayerRecord` whose ``transfer(d)`` gives the four
-        ``2n x 2n`` blocks of the transfer over any depth ``d`` (the chunk,
-        or a sub-chunk depth for an interior plane), whose ``blocks`` are
+        blocks of the transfer over any depth ``d`` (``2n x 2n``, or per order
+        ``(n, 2, 2)`` for a uniform layer), whose ``blocks`` are
         those at the chunk thickness ``d_c`` (the chunk S-matrix; ``None``
         when ``d_c`` is not given), whose ``load`` is the layer's share of the
         solve's build-budget diagnostic at ``d_c``, and which carries
@@ -502,13 +509,20 @@ class StateStack:
         ``uniform_now`` is a per-solve SHAPE decision (static under trace);
         the uniform shortcut is a property of the per-solve permittivity,
         never a structure decision.
+
+        ``static`` overrides the film's own static counts with a group's,
+        ``(doublings, uniform_doublings, d_c_build)`` (``d_c_build`` may then be
+        traced: it is the build thickness over the group's chunk count).
         """
         entry = layer_grid if isinstance(layer_grid, tuple) else (layer_grid,)
         comps = [jnp.asarray(c).astype(self._cdt) for c in entry]
         shapes = tuple(tuple(jnp.shape(c)) for c in comps)
         uniform_now = shapes == ((1, 1),) or all(s == (1, 1) for s in shapes)
         degree = layer.series_degree(self._cdt)
-        d_c_build = self._thick[li] / self._chunks[li]
+        if static is None:
+            k_pat, k_uni, d_c_build = self._doublings[li], self._uniform_doublings[li], self._thick[li] / self._chunks[li]
+        else:
+            k_pat, k_uni, d_c_build = static
 
         def thickness_load(d):
             return (jnp.abs(jnp.real(d)) / (layer.THICKNESS_MARGIN * d_c_build)) ** 2
@@ -517,14 +531,12 @@ class StateStack:
             mu_comps = comps[5:] if len(comps) == 10 else None
             eps_scalars = tuple(jnp.reshape(c, ()) for c in comps[:5])
             mu_scalars = tuple(jnp.reshape(c, ()) for c in mu_comps) if mu_comps is not None else None
-            k = self._uniform_doublings[li]
+            k = k_uni
             b_u, c_u = layer.uniform_aniso_bc(omega, twv, eps_scalars, mu_scalars, dtype=self._cdt)
             p_u = b_u @ c_u
 
             def transfer(d, omega=omega, twv=twv, eps=eps_scalars, mu=mu_scalars, k=k):
-                return chunk_blocks(
-                    layer.uniform_anisotropic_layer_transfer(omega, twv, eps, mu, d, doublings=k, dtype=self._cdt)
-                )
+                return layer.uniform_aniso_blocks(omega, twv, eps, mu, d, k, dtype=self._cdt)  # per order
 
             def load(d, p_u=p_u, k=k):
                 return jnp.maximum(layer.series_load(p_u, d, k), thickness_load(d))
@@ -540,7 +552,7 @@ class StateStack:
             eps = jnp.reshape(comps[0], ())
 
             def transfer(d, omega=omega, twv=twv, eps=eps):
-                return chunk_blocks(layer.uniform_layer_transfer(omega, twv, eps, d, dtype=self._cdt))
+                return layer.uniform_blocks(omega, twv, eps, d, dtype=self._cdt)  # per order
 
             load = thickness_load
             rec = dict(mode="uniform", eps_zz=eps, mu_zz=jnp.asarray(1.0, dtype=self._cdt), z_eps=None, z_mu=None)
@@ -549,7 +561,7 @@ class StateStack:
                 _PATTERNED_SOLVES[0] += 1  # counting oracle (traces only)
             b, c, z_eps, z_mu = self._patterned_bc(comps, omega, twv)
             p = b @ c
-            k = self._doublings[li]
+            k = k_pat
 
             def transfer(d, b=b, c=c, p=p, k=k):
                 return layer.slice_transfer(b, c, p, d, k, degree)
@@ -567,9 +579,13 @@ class StateStack:
 
     def _slab(self, rec, li, thickness, chunks: int, y_r, z_r):
         """The symmetric S-matrix ``(r, t)`` of film ``li`` over ``thickness`` (may be traced): the transfer over
-        ``thickness / chunks`` turned into a chunk S-matrix, then doubled up (``chunks`` static)."""
+        ``thickness / chunks`` turned into a chunk S-matrix, then doubled up (``chunks`` static). A uniform film
+        does all of it per order on ``(n, 2, 2)`` blocks, O(n), and expands to ``2n x 2n`` only at the end."""
         blocks = rec.blocks if thickness is None else rec.transfer(thickness / chunks)
-        return smatrix.layer_smatrix(*smatrix.chunk_smatrix(blocks, y_r, z_r), chunks)
+        r, t = smatrix.layer_smatrix(*smatrix.chunk_smatrix(blocks, y_r, z_r), chunks)
+        if r.ndim == 3:  # a uniform film's per-order S-matrix, O(n) until here
+            r, t = smatrix.dense(r), smatrix.dense(t)
+        return r, t
 
     def _gap_chunks(self, li, gap: float) -> int:
         """Static chunk count for a sub-thickness ``gap`` of film ``li``: no chunk thicker than the film's own
@@ -615,15 +631,18 @@ class StateStack:
         n = self._n
         fr = self._frame(wl, kin, amb_sup, amb_sub)
         y_r, z_r, y_sup, y_sub = fr["y_r"], fr["z_r"], fr["y_sup"], fr["y_sub"]
-        records = self._records(grids, fr["omega"], fr["twv"], thick, count=True)
-        load = jnp.max(jnp.stack([jnp.real(r.load) for r in records])) if records else jnp.asarray(0.0)
-
-        slabs = [self._slab(rec, li, None, self._chunks[li], y_r, z_r) for li, rec in enumerate(records)]
-        rho_sub = smatrix.ambient_reflection(y_r, y_sub)
-        rs, xs = smatrix.sweep(slabs, smatrix.dense(rho_sub))
+        rho_sub = smatrix.dense(smatrix.ambient_reflection(y_r, y_sub))
         u_inc = self._incident(pol)
-        u_ref, a_top = smatrix.reflect_plane_wave(rs[0], y_sup, z_r, u_inc)
-        a_bot = smatrix.carry(xs, a_top)[-1]
+        if grids:
+            r_all, t_all, loads = self._film_smatrices(grids, thick, fr, count=True)
+            load = jnp.max(loads)
+            big_r, xs = smatrix.sweep_scan(r_all, t_all, rho_sub)
+            u_ref, a_top = smatrix.reflect_plane_wave(big_r, y_sup, z_r, u_inc)
+            a_bot = smatrix.carry_scan(xs, a_top)
+        else:  # no finite films: the ambients meet directly
+            load = jnp.asarray(0.0)
+            u_ref, a_bot = smatrix.reflect_plane_wave(rho_sub, y_sup, z_r, u_inc)
+        rho_sub = smatrix.per_order(rho_sub, n)
         u_sub = a_bot + smatrix.apply(rho_sub, a_bot)
         v_ref = -smatrix.apply(y_sup, u_ref)
         v_sub = smatrix.apply(y_sub, u_sub)
@@ -646,6 +665,48 @@ class StateStack:
             v_ref,
             load,
         )
+
+    def _film_smatrices(self, grids, thick, fr, count):
+        """Every film's S-matrix stacked as ``(L, 2n, 2n)`` arrays, and its load ``(L,)``.
+
+        Films with the same per-solve structure (uniform or patterned, component count, grid shapes) and the same
+        chunk count are built by one ``lax.map`` (a loop compiled once), with the group's largest doubling count
+        (never less accurate than a film's own). The compiled program grows with the number of such groups, not
+        of films; chunk counts are powers of two, so films of different thickness fall into few groups. (A
+        ``vmap`` of the group compiled as fast but ran 1.1-1.6x slower on the CPU.)
+        """
+        thick = self._thick if thick is None else thick
+        omega, twv, y_r, z_r = fr["omega"], fr["twv"], fr["y_r"], fr["z_r"]
+        groups, entries = {}, []
+        for li, g in enumerate(grids):
+            comps = tuple(jnp.asarray(c).astype(self._cdt) for c in (g if isinstance(g, tuple) else (g,)))
+            shapes = tuple(tuple(jnp.shape(c)) for c in comps)
+            groups.setdefault((all(sh == (1, 1) for sh in shapes), shapes, self._chunks[li]), []).append(li)
+            entries.append(comps)
+        rs, ts, loads, order = [], [], [], []
+        for (uniform_now, shapes, c), members in groups.items():
+            static = (max(self._doublings[li] for li in members), max(self._uniform_doublings[li] for li in members))
+            if count and not uniform_now:
+                _PATTERNED_SOLVES[0] += len(members)  # counting oracle (traces only)
+            rep = members[0]
+            ncomp = len(shapes)
+            stacked = tuple(jnp.stack([entries[li][j] for li in members]) for j in range(ncomp))
+            d_vec = jnp.stack([jnp.real(jnp.asarray(thick[li])) for li in members])
+            d_build = jnp.asarray([self._thick[li] for li in members], dtype=d_vec.dtype)
+
+            def one(comps, d, d_b, rep=rep, c=c, static=static, ncomp=ncomp):
+                entry = comps if ncomp > 1 else comps[0]
+                rec = self._layer_material(rep, entry, omega, twv, count=False, d_c=d / c, static=(*static, d_b / c))
+                r, t = self._slab(rec, rep, None, c, y_r, z_r)
+                return r, t, jnp.real(rec.load)
+
+            r, t, ld = jax.lax.map(lambda args, one=one: one(*args), (stacked, d_vec, d_build))
+            rs.append(r)
+            ts.append(t)
+            loads.append(ld)
+            order.extend(members)
+        perm = np.argsort(np.asarray(order))
+        return tuple(jnp.concatenate(x)[perm] for x in (rs, ts, loads))
 
     def _records(self, grids, omega, twv, thick, count):
         """Per-layer material records at the per-solve chunk thickness ``thick[li] / chunks[li]``."""
