@@ -76,24 +76,80 @@ def test_the_bound_is_at_least_a_four_field_block_sweep():
     )
 
 
-def test_a_round_robin_over_n_blocks_reuses_every_factorization():
-    """Sweep distinct operators the way `triangular` does, twice. On the second pass every operator
-    must already be cached -- that is the whole point, and it is what fails at a bound below N."""
+def _count_factorizations(monkeypatch):
+    """Count the SuperLU factorizations ``host_lu_solve`` performs."""
+    import scipy.sparse.linalg as spla
+
+    calls = [0]
+    real = spla.splu
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(spla, "splu", counted)
+    return calls
+
+
+def test_a_round_robin_over_n_blocks_reuses_every_factorization(monkeypatch):
+    """Sweep distinct operators the way `triangular` does. A factorization is kept once its operator RECURS, so
+    the first sweep keeps none, the second factors each block once more and keeps it, and every later sweep is
+    all hits -- which is what fails at a bound below N."""
     n_blocks, n = 4, 24
     ops = [_operator(n, 10 * k) for k in range(n_blocks)]
     b = jnp.asarray(np.ones(n))
+    calls = _count_factorizations(monkeypatch)
 
-    for op in ops:  # first sweep: populate
+    for op in ops:  # first sweep: nothing recurs yet
+        _linear.host_lu_solve(op, b)
+    assert len(_linear._FACTOR_CACHE) == 0
+    for op in ops:  # second sweep: each block is met again and kept
         _linear.host_lu_solve(op, b)
     assert len(_linear._FACTOR_CACHE) == n_blocks, (
         f"{len(_linear._FACTOR_CACHE)} entries held for {n_blocks} distinct blocks -- "
         "an entry was evicted before it could be reused"
     )
+    assert calls[0] == 2 * n_blocks, f"{calls[0]} factorizations over two sweeps: more than one extra per block"
 
-    keys_after_first = set(_linear._FACTOR_CACHE)
-    for op in ops:  # second sweep: must be all hits
+    keys_after_second = set(_linear._FACTOR_CACHE)
+    for op in ops:  # third sweep: must be all hits
         _linear.host_lu_solve(op, b)
-    assert set(_linear._FACTOR_CACHE) == keys_after_first, "the second sweep re-factorised instead of hitting the cache"
+    assert set(_linear._FACTOR_CACHE) == keys_after_second
+    assert calls[0] == 2 * n_blocks, "the third sweep re-factorised instead of hitting the cache"
+
+
+def test_a_resolve_loop_over_changing_operators_keeps_no_factorization(monkeypatch):
+    """A coefficient rescaled on every call meets each operator in one solve and its adjoint, never again. The
+    adjoint shares the forward's factorization, and nothing is kept in the cache (it used to hold eight dead
+    ones: 886 -> 2441 MB over 13 calls of a 13k-unknown 3-D problem)."""
+    import jax
+
+    n = 24
+    base = _operator(n, 5)
+    b = jnp.asarray(np.ones(n))
+    calls = _count_factorizations(monkeypatch)
+
+    def loss(s):
+        A = jsp.BCOO((base.data * s, base.indices), shape=base.shape)
+        return jnp.sum(_linear.host_lu_solve(A, b) ** 2)
+
+    g = jax.jit(jax.grad(loss))
+    scales = [1.0 + 0.1 * i for i in range(_linear._FACTOR_CACHE_MAX + 3)]
+    for s in scales:
+        g(s).block_until_ready()
+    assert len(_linear._FACTOR_CACHE) == 0, f"{len(_linear._FACTOR_CACHE)} factorizations kept by a loop that never repeats"
+    assert calls[0] == len(scales), f"{calls[0]} factorizations for {len(scales)} operators (forward and adjoint share one)"
+
+
+def test_a_constant_operator_march_factors_once_and_then_keeps_it(monkeypatch):
+    """The constant-operator case the cache exists for: one factorization serves every step, and it is kept."""
+    n = 30
+    op, b = _operator(n, 1.0), jnp.ones(n)
+    calls = _count_factorizations(monkeypatch)
+    for _ in range(6):
+        _linear.host_lu_solve(op, b)
+    assert calls[0] == 1, f"{calls[0]} factorizations over 6 solves of one operator"
+    assert len(_linear._FACTOR_CACHE) == 1
 
 
 def test_the_cached_solve_is_the_same_answer_as_an_uncached_one():
@@ -148,18 +204,21 @@ def test_a_newton_solve_keeps_none_of_its_step_factorizations():
     assert len(_linear._FACTOR_CACHE) == 0, f"{len(_linear._FACTOR_CACHE)} Newton-step factorizations kept"
     _linear._FACTOR_CACHE.clear()
     kept = _two_root_newton(jno.solve.lu(backend="host", reuse=True))
-    assert len(_linear._FACTOR_CACHE) >= 2  # one per step: the explicit choice wins
+    assert len(_linear._FACTOR_CACHE) == 0  # no tangent repeats, so none recurs either way
     np.testing.assert_allclose(plain, 1.0, atol=1e-10)
     np.testing.assert_allclose(plain, kept, rtol=0, atol=1e-13)
 
 
 def test_outside_a_newton_solve_the_default_still_keeps():
-    """The constant-operator case the cache exists for: the default (reuse=None) keeps, and a repeat hits."""
+    """The constant-operator case the cache exists for: the default (reuse=None) keeps once the operator has
+    been asked for three times, and a repeat hits."""
     n = 30
     op, b = _operator(n, 1.0), jnp.ones(n)
-    _linear.host_lu_solve(op, b)
+    for _ in range(3):
+        _linear.host_lu_solve(op, b)
     assert len(_linear._FACTOR_CACHE) == 1
     with _linear.factorizations_not_kept():
         _linear.host_lu_solve(_operator(n, 2.0), b)
-        _linear.host_lu_solve(_operator(n, 3.0), b, reuse=True)  # an explicit choice wins inside too
+        for _ in range(3):  # an explicit choice wins inside too
+            _linear.host_lu_solve(_operator(n, 3.0), b, reuse=True)
     assert len(_linear._FACTOR_CACHE) == 2

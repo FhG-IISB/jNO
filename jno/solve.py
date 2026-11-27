@@ -202,6 +202,13 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool | No
             there; keeping the factorizations held up to 8 of them (measured: 38.9 GB at 44,313 DOFs, against
             a flat 3.0 GB uncached at 28,675). The factorization at the converged root is kept, so the
             gradient's transpose solve reuses it. ``True`` / ``False`` force the choice everywhere.
+            A factorization enters the cache only once its operator recurs (a second sighting after another
+            operator was factored, or a third consecutive solve), so a re-solve loop that rescales a
+            coefficient on every call keeps one factorization in memory, not eight: a block sweep over
+            several operators pays one extra factorization per operator the first time round. In such a loop
+            ``reuse=False`` is the leanest choice (nothing outlives its solve) and costs the adjoint a second
+            factorization; measured on 13,116 unknowns, 3-D elasticity: RSS 997 MB with ``False``, 1079 MB
+            by default, 2441 MB before the change.
     """
     if host is not None:
         if backend is not None:
