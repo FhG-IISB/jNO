@@ -6109,6 +6109,19 @@ def _ref_interior_facet_dofs(
     # triangle (3 edges) or -- on a hexahedron -- a QUADRILATERAL (4). `fv` arrives in perimeter
     # order, so the cycle is simply consecutive pairs.
     nfv = len(fv)
+    if dim == 3 and nfv == 4:
+        # A quadrilateral facet's vertices arrive in the cell's own vertex order, and basix numbers a
+        # quadrilateral (0,0), (1,0), (0,1), (1,1): consecutive pairs then include both DIAGONALS and miss two
+        # edges, and the two "edges from a" below span a sheared square. Face and edge nodes were dropped
+        # that way (54 of 386 boundary nodes at Q4, some already at Q2), and a Dirichlet condition left them
+        # free. Walk the perimeter instead: by angle about the centroid, in the facet's plane.
+        fv = np.asarray(fv, dtype=float)
+        c = fv.mean(axis=0)
+        e1 = fv[0] - c
+        nrm = np.cross(fv[1] - fv[0], fv[2] - fv[0])
+        e2 = np.cross(nrm, e1)
+        ang = np.arctan2((fv - c) @ e2 / np.linalg.norm(e2), (fv - c) @ e1 / np.linalg.norm(e1))
+        fv = fv[np.argsort(ang, kind="stable")]
     edges = [(fv[0], fv[1])] if dim == 2 else [(fv[i], fv[(i + 1) % nfv]) for i in range(nfv)]
     ordered: List[int] = []
     used: set = set()
