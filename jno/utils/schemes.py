@@ -27,6 +27,7 @@ SCHEME_FAMILIES: dict[str, str] = {
     "automatic_differentiation": "exact derivatives of the traced function (jacfwd / jacrev)",
     "finite_difference": "stencils over the mesh or structured grid",
     "spectral": "FFT on a uniform grid; ':cosine' mirrors instead of assuming periodicity",
+    "spectral_basis": "the basis of a spectral unknown (domain.unknown(space='spectral')); options via jno.sp(...)",
 }
 
 

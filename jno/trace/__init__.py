@@ -3941,6 +3941,19 @@ class ModelCall(Placeholder):
             )
         return sym
 
+    @property
+    def basis(self):
+        """The spectral space of a spectral unknown (``domain.unknown(space="spectral", order=...)``): its
+        ``nodes``, ``coeffs(values)`` / ``values(coeffs)``, interpolation ``basis(values, x, y)``,
+        ``refine(values, order)``, ``integrate`` and ``wavenumbers``. See :mod:`jno._spectral.space`."""
+        sp = getattr(self.model, "__dict__", {}).get("_spectral_space")
+        if sp is None:
+            raise AttributeError(
+                "`.basis` belongs to a spectral unknown (domain.unknown(space='spectral', order=...)); this is a "
+                f"{type(self.model).__name__} output."
+            )
+        return sp
+
     def test(self) -> "TestFunction":
         """The FEM **test function** of this unknown (``domain.unknown()``): ``v = u.test()``. In ``jno.fem``
         the unknown is the trial function and ``v`` its test function -- same space, shape and order."""

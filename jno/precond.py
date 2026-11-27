@@ -63,6 +63,7 @@ __all__ = [
     "fsai",
     "schwarz",
     "coarse",
+    "spectral",
 ]
 
 
@@ -4156,3 +4157,14 @@ def chebyshev(
     double -- see :func:`_materialize_in_float32`.
     """
     return _precision(_Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters), float32)
+
+
+def spectral(*, max_block: int = 4096, rcond: float = 1e-12):
+    """The **Fourier-mode block** preconditioner of a ``jno.spectral`` problem: the operator's dense block per Fourier
+    mode (over the polynomial nodes of every unknown), read by probing and inverted mode by mode. Exact for an
+    operator whose coefficients do not vary along the Fourier axes (walls included), so GMRES takes one or two
+    iterations; the default of a large spectral solve. ``max_block`` bounds the block size (an all-Chebyshev
+    problem is one block: a dense LU). See :mod:`jno._spectral.precond`."""
+    from ._spectral.precond import SpectralPrecond
+
+    return SpectralPrecond(max_block=max_block, rcond=rcond)

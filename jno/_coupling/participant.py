@@ -695,12 +695,119 @@ class FEMParticipant(Participant):
         return found[0]
 
 
+class SpectralParticipant(_StrongForm):
+    """A ``jno.spectral`` problem. Its interface is the face nodes of its unknown's grid; what it sends is read from
+    its own basis (a flux is the spectral normal derivative), and to another spectral side its data cross by
+    spectral interpolation along the face (:meth:`spectral_interp`), so two spectral sides keep spectral accuracy
+    whatever their node counts. Data to or from a mesh side cross by the usual maps over its face nodes."""
+
+    kind = "spectral"
+
+    def __init__(self, problem):
+        self.problem = problem
+        self.domain = problem.domain
+        grids = {problem._grid_of(u) for u in problem.unknowns}
+        if len(grids) != 1:
+            raise NotImplementedError("coupling: a jno.spectral problem with unknowns on several grids is not coupled yet.")
+        self.grid = grids.pop()
+        self.points = np.asarray(self.grid.points, dtype=float)
+        self.dim = self.grid.ndim
+        self._interfaces = {}
+        self._faces = {}
+
+    def _face(self, tag):
+        from .._spectral.domain import FACE_NAMES, region_points
+
+        hit = self._faces.get(tag)
+        if hit is None:
+            region = self.problem._region_of(tag)
+            names = FACE_NAMES.get(self.dim, ())
+            axis = next((i for i, pair in enumerate(names) if region in pair), None)
+            if axis is None:
+                raise ValueError(f"coupling: a spectral interface is a face of the box (left, right, ...); got {region!r}.")
+            pts, idx, _ = region_points(self.grid, region)
+            hit = self._faces[tag] = (axis, np.asarray(idx), np.asarray(pts))
+        return hit
+
+    def interface(self, tag, measure=None):
+        key = (tag, measure if isinstance(measure, (str, type(None))) else id(measure))
+        if key not in self._interfaces:
+            axis, idx, pts = self._face(tag)
+            others = [i for i in range(self.dim) if i != axis]
+            shape = tuple(self.grid.shape[i] for i in others)
+            local = np.arange(idx.size).reshape(shape)
+            if len(others) == 1:
+                facets = np.stack([local[:-1], local[1:]], axis=1)
+            else:
+                a, b = local[:-1, :-1].ravel(), local[1:, :-1].ravel()
+                c, d = local[1:, 1:].ravel(), local[:-1, 1:].ravel()
+                facets = np.stack([a, b, c, d], axis=1)
+            self._interfaces[key] = Interface.from_facets(idx, pts, facets, measure)
+        return self._interfaces[key]
+
+    def spectral_interp(self, tag, points):
+        """``(m, n_face)``: the face values' spectral interpolant at ``points`` (the other side's interface nodes)."""
+        axis, idx, _ = self._face(tag)
+        others = [i for i in range(self.dim) if i != axis]
+        pts = np.asarray(points, dtype=float)
+        H = None
+        for i in others:
+            L = self.grid.axes[i].interp_matrix(pts[:, i])
+            H = L if H is None else np.einsum("mi,mj->mij", H, L).reshape(pts.shape[0], -1)
+        return H
+
+    def march(self, problem, state, t0, window, data, time=None, params=None):
+        import jax.numpy as jnp
+
+        span = self._span(t0, window)
+        problem._override = self._scope(problem, data, params)
+        try:
+            traj = problem._march(time=time, x0=jnp.asarray(state).reshape(-1), span=span)
+        finally:
+            problem._override = None
+        traj = jnp.asarray(traj)
+        return self._frames(traj.reshape(traj.shape[0], -1))
+
+    def initial(self, problem):
+        import jax.numpy as jnp
+
+        return jnp.asarray(problem._initial_state()).reshape(-1)
+
+    def rebuild(self, extra):
+        import jno
+
+        return jno.spectral(self.constraints() + list(extra))
+
+    def solve(self, problem, data, x0=None, params=None):
+        import jax.numpy as jnp
+
+        from .. import solve as _solve
+
+        scope = self._scope(problem, data, params)
+        x0 = None if x0 is None else jnp.asarray(x0).reshape(-1)
+        linear = _solve.dense() if problem._Ntot <= 4096 else None
+        return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=linear)).reshape(-1)
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        import jax.numpy as jnp
+
+        scope = {
+            **problem._params_scope(self._scope(problem, data or {}, params)),
+            **problem._inject(jnp.asarray(state).reshape(-1)),
+        }
+        vals = problem._evaluate_on(expr, self.grid, scope, None, {})
+        return jnp.asarray(vals)[np.asarray(iface.nodes), 0]
+
+
 def participant(problem) -> Participant:
-    """The adapter for a ``jno.fem``, ``jno.fdm`` or ``jno.fvm`` problem."""
+    """The adapter for a ``jno.fem``, ``jno.fdm``, ``jno.fvm`` or ``jno.spectral`` problem."""
     from .._fem import FEM
     from .._fvm.trace import _TraceFVM
+    from .._spectral.trace import _TraceSpectral
     from ..fdm import _TraceFDM
 
+    if isinstance(problem, _TraceSpectral):
+        return SpectralParticipant(problem)
     if isinstance(problem, FEM):
         return FEMParticipant(problem)
     if isinstance(problem, _TraceFVM):

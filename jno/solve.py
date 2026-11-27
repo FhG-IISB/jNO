@@ -73,6 +73,7 @@ __all__ = [
     "sdirk",
     "rosenbrock",
     "theta",
+    "etdrk4",
     "coupling",
     "erk",
     "imex",
@@ -2150,6 +2151,18 @@ def enrich(
         eps=eps,
         metric_field=metric_field,
     )
+
+
+def etdrk4(*, contour: int = 32):
+    """Fourth-order **exponential time differencing** (Cox & Matthews 2002, contour φ-functions of Kassam &
+    Trefethen 2005) for a spectral problem on a periodic box: ``jno.spectral([...]).solve(time=jno.solve.etdrk4())``.
+    The constant-coefficient linear terms of each equation (``nu*(w.xx + w.yy)``, ``u.xxxx``) are integrated
+    exactly from their Fourier symbol, so the step is set by the nonlinear terms alone; algebraic unknowns
+    (a streamfunction, ``psi.xx + psi.yy + w``) are solved mode by mode at every stage. ``contour`` is the number
+    of points of the φ-function contour."""
+    from ._spectral.etd import ETDRK4Scheme
+
+    return ETDRK4Scheme(contour=contour)
 
 
 def theta(theta: float = 1.0):

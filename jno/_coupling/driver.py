@@ -757,7 +757,7 @@ class Coupled:
         from ..utils.solver.timeschemes import _ERKScheme
 
         w = np.full(m + 1, 1.0 / m)
-        if isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)):
+        if isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)) or getattr(self._time_of(i), "continuous_flux", False):
             w[0] = w[-1] = 0.5 / m
         else:
             w[0] = 0.0
@@ -767,7 +767,16 @@ class Coupled:
         cache = self.__dict__.setdefault("_maps", {})
         key = (d.receiver, d.receiver_tag, d.sender, d.sender_tag, d.flux)
         if key not in cache:
-            cache[key] = (conservative if d.flux else consistent)(dst, src)
+            send, recv = self.parts[d.sender], self.parts[d.receiver]
+            interp = getattr(send, "spectral_interp", None)
+            if interp is not None and (not d.flux or getattr(recv, "kind", None) == "spectral"):
+                # a spectral sender's interpolant read at the receiver's nodes: spectrally accurate (a flux too, when
+                # the receiver is spectral: both sides hold it pointwise)
+                import scipy.sparse as _sp
+
+                cache[key] = _sp.csr_matrix(interp(d.sender_tag, dst.points))
+            else:
+                cache[key] = (conservative if d.flux else consistent)(dst, src)
         return cache[key]
 
     def _map_jnp(self, d, dst, src):
@@ -1297,9 +1306,10 @@ def detect(constraints):
     shared-mesh region; those are ``jno.dd``'s) and, besides them, only conditions; else ``None``."""
     from .._fem import FEM
     from .._fvm.trace import _TraceFVM
+    from .._spectral.trace import _TraceSpectral
     from ..fdm import _TraceFDM
 
-    kinds = (FEM, _TraceFVM, _TraceFDM)
+    kinds = (FEM, _TraceFVM, _TraceFDM, _TraceSpectral)
     problems = [c for c in constraints if isinstance(c, kinds)]
     if len(problems) < 2 or any(getattr(p, "region_geometry", None) is not None for p in problems):
         return None

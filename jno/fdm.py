@@ -3032,6 +3032,15 @@ def fdm(constraints):
             "jno.fdm(domain, residual=..., dirichlet=...) has been removed — write the residual and the "
             "boundary condition as terms instead."
         )
+    from ._spectral.trace import _is_spectral_model, spectral
+    from ._strong_form import _find_unknowns
+
+    try:
+        has_spectral = any(_is_spectral_model(m) for m in _find_unknowns(list(constraints)))
+    except (ValueError, NotImplementedError, TypeError):
+        has_spectral = False  # _TraceFDM reports what is wrong with the list in its own words
+    if has_spectral:
+        return spectral(list(constraints))  # a spectral unknown is solved by its own basis: jno.spectral
     return _TraceFDM(list(constraints))
 
 
