@@ -12,9 +12,11 @@ the permittivity grid) or with a vector formulation, where the Toeplitz rule is
 corrected by a term involving the tangent vector field of the interfaces
 (Liu eqs. 48--51). The default formulation is ``JONES_DIRECT_FOURIER`` (the
 ``jno.rcwa`` default): the tangent field is found in the Fourier domain by one
-fixed-coefficient Newton step of an alignment loss (``vector.py`` conventions,
-grad-decoupled via ``stop_gradient`` so design gradients flow only through the
-permittivity itself). All eight fmmax vector schemes are implemented (``POL``,
+fixed-coefficient Newton step of an alignment loss (``vector.py`` conventions).
+The field is differentiated through: it follows the interfaces, so a design that
+moves an edge moves the field, and dropping that term (as a ``stop_gradient``
+did here before) made every vector formulation's design gradient wrong (37 %
+for the default). All eight fmmax vector schemes are implemented (``POL``,
 ``NORMAL``, ``JONES``, ``JONES_DIRECT`` and their ``_FOURIER`` variants), plus
 the callable tangent-field hook.
 
@@ -73,6 +75,14 @@ _FOURIER_LOSS_WEIGHT = 0.2
 
 #: Absolute tolerance below which the tangent field counts as 1-D.
 _ATOL_1D_FIELD_ANGLE = 1e-2
+
+
+def _abs2(x: jnp.ndarray) -> jnp.ndarray:
+    """``|x|**2`` as ``re**2 + im**2``: the same value as ``jnp.abs(x) ** 2``, but a polynomial, so every
+    derivative exists at ``x = 0``. The tangent-field Newton step differentiates its loss twice, and the
+    design gradient once more; through ``abs`` that third derivative is 0 * inf = NaN wherever the field
+    meets its target exactly (a 1-D grating)."""
+    return jnp.real(x) ** 2 + jnp.imag(x) ** 2
 
 
 # -----------------------------------------------------------------------------
@@ -184,12 +194,12 @@ def _tangent_terms(tx: jnp.ndarray, ty: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.n
     for ``tx = 0`` (1-D grating periodic in x) the tangent field has a y
     component only, and eq. 43 is recovered exactly only with the swapped order.
     """
-    denom = jnp.abs(tx) ** 2 + jnp.abs(ty) ** 2
+    denom = _abs2(tx) + _abs2(ty)
     denom_safe = jnp.where(jnp.isclose(denom, 0), 1.0, denom)
-    pyy = jnp.abs(tx) ** 2 / denom_safe
+    pyy = _abs2(tx) / denom_safe
     pyx = jnp.conj(tx) * ty / denom_safe
     pxy = tx * jnp.conj(ty) / denom_safe
-    pxx = jnp.abs(ty) ** 2 / denom_safe
+    pxx = _abs2(ty) / denom_safe
     return pxx, pxy, pyx, pyy
 
 
@@ -695,10 +705,13 @@ def compute_tangent_field(
     Port of ``fmmax.vector.compute_tangent_field`` restricted to a single
     real-space array: the Fourier coefficients of the tangent field are found by
     ``steps`` (static) Newton iterations of a quadratic alignment loss, then
-    transformed back to real space. The density is grad-decoupled
-    (``stop_gradient``), matching fmmax: design gradients flow through the
-    permittivity itself, not through the interface geometry, so the field is a
-    constant of the density for differentiation purposes.
+    transformed back to real space. The loss is quadratic in the Fourier
+    coefficients, so the Newton step is one linear solve and the field is a
+    smooth function of the density away from the degenerate inputs: it is
+    differentiated through (fmmax stops the gradient here, which drops the
+    term of a moving interface; see ``tests/test_rcwa_gradients.py``). A grid
+    without any edge and a 1-D grating take the safe branches below, whose
+    derivatives are finite.
 
     Args:
         permittivity: Real-space density ``(nx, ny)``.
@@ -717,7 +730,7 @@ def compute_tangent_field(
     """
     if permittivity.ndim != 2:
         raise ValueError(f"`permittivity` must be a 2-D real-space grid, got shape {permittivity.shape}.")
-    arr = jax.lax.stop_gradient(permittivity)
+    arr = permittivity
     grid_shape: Tuple[int, int] = arr.shape[-2:]
 
     # Rescale the weights so a supercell with proportionally more terms gives
@@ -827,7 +840,7 @@ def _normalize(field: jnp.ndarray) -> jnp.ndarray:
 
 
 def _field_magnitude(field: jnp.ndarray) -> jnp.ndarray:
-    magnitude_squared = jnp.sum(jnp.abs(field) ** 2, axis=-1, keepdims=True)
+    magnitude_squared = jnp.sum(_abs2(field), axis=-1, keepdims=True)
     is_zero = magnitude_squared == 0
     magnitude_squared_safe = jnp.where(is_zero, 1.0, magnitude_squared)
     return jnp.where(is_zero, 0.0, jnp.sqrt(magnitude_squared_safe))
@@ -952,7 +965,7 @@ def _alignment_loss(
     elementwise_alignment_loss_weight: jnp.ndarray,
 ) -> jnp.ndarray:
     assert elementwise_alignment_loss_weight.ndim == field.ndim
-    elementwise_loss = jnp.sum(jnp.abs(field - target_field) ** 2, axis=-1, keepdims=True)
+    elementwise_loss = jnp.sum(_abs2(field - target_field), axis=-1, keepdims=True)
     return jnp.mean(elementwise_alignment_loss_weight * elementwise_loss)
 
 
@@ -970,7 +983,7 @@ def _fourier_loss(
     basis_vectors = jnp.stack([primitive_lattice_vectors.u, primitive_lattice_vectors.v], axis=-1)
     area = jnp.abs(jnp.linalg.det(basis_vectors))
     kt = jnp.linalg.norm(transverse_wavevectors, axis=-1) * jnp.sqrt(area)
-    return jnp.sum(jnp.abs(fourier_field) ** 2 * kt[..., jnp.newaxis] ** 2)
+    return jnp.sum(_abs2(fourier_field) * kt[..., jnp.newaxis] ** 2)
 
 
 def _smoothness_loss(field: jnp.ndarray, primitive_lattice_vectors: basis_mod.LatticeVectors) -> jnp.ndarray:
@@ -984,7 +997,7 @@ def _smoothness_loss(field: jnp.ndarray, primitive_lattice_vectors: basis_mod.La
     area = jnp.abs(jnp.linalg.det(basis_vectors))
     normalized_basis = basis_vectors / jnp.sqrt(area)
     grads = _field_forward_difference_gradient(field, normalized_basis)
-    return jnp.mean(jnp.abs(jnp.asarray(grads)) ** 2)
+    return jnp.mean(_abs2(jnp.asarray(grads)))
 
 
 def _field_forward_difference_gradient(field: jnp.ndarray, basis_vectors: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:

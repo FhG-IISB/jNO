@@ -138,12 +138,36 @@ def test_formulation_dispatch_and_hook(disk_grid, expansion, lattice):
         assert e_vec.shape == e_fft.shape
 
 
-def test_tangent_field_is_grad_decoupled(disk_grid, expansion, lattice):
-    """The tangent field is a stop-gradient constant of the density."""
-    g = jnp.asarray(disk_grid, jnp.float32)
+def test_tangent_field_follows_the_design(disk_grid, expansion, lattice):
+    """The tangent field is differentiated through, not stopped: it follows the interfaces, so a change of the
+    grid that moves an edge changes the field. Its directional derivative is finite, nonzero, and equals a
+    central difference. (A stop-gradient here dropped the moving-interface term and made every vector
+    formulation's design gradient wrong; ``tests/test_rcwa_gradients.py`` checks the end-to-end gradients.)"""
+    prev = jax.config.jax_enable_x64  # float64 for this check: a float32 central difference is too noisy
+    jax.config.update("jax_enable_x64", True)
+    try:
+        _check_tangent_field_derivative(disk_grid, expansion, lattice)
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _check_tangent_field_derivative(disk_grid, expansion, lattice):
+    rng = np.random.default_rng(1)
+    k = np.fft.fftfreq(disk_grid.shape[0]) * disk_grid.shape[0]
+    bump = np.real(
+        np.fft.ifft2(np.fft.fft2(rng.standard_normal(disk_grid.shape)) * np.exp(-(k[:, None] ** 2 + k[None, :] ** 2) / 8.0))
+    )
+    # Break the disk's symmetry: on a symmetric grid several pixels tie for the maximum gradient magnitude that
+    # scales the field, and the field has a kink there (autodiff and a central difference then differ).
+    g = jnp.asarray(disk_grid + 2.0 * bump / np.abs(bump).max(), jnp.float64)
+    weight = jnp.asarray(rng.standard_normal(g.shape), jnp.float64)
+    direction = np.real(
+        np.fft.ifft2(np.fft.fft2(rng.standard_normal(g.shape)) * np.exp(-(k[:, None] ** 2 + k[None, :] ** 2) / 8.0))
+    )
+    direction = jnp.asarray(direction / np.abs(direction).max(), jnp.float64)
 
     def tangent_of_grid(g):
-        tx, _ = matrices.compute_tangent_field(
+        tx, ty = matrices.compute_tangent_field(
             g,
             expansion,
             lattice,
@@ -151,10 +175,15 @@ def test_tangent_field_is_grad_decoupled(disk_grid, expansion, lattice):
             fourier_loss_weight=0.05,
             smoothness_loss_weight=0.0,
         )
-        return jnp.sum(jnp.abs(tx))
+        return jnp.sum(weight * (jnp.real(tx) + 0.5 * jnp.imag(ty)))
 
-    grad = jax.grad(tangent_of_grid)(g)
-    np.testing.assert_allclose(grad, 0.0, atol=1e-12)
+    grad = np.asarray(jax.grad(tangent_of_grid)(g))
+    assert np.all(np.isfinite(grad))
+    directional = float(np.sum(grad * np.asarray(direction)))
+    h = 1e-5
+    fd = (float(tangent_of_grid(g + h * direction)) - float(tangent_of_grid(g - h * direction))) / (2 * h)
+    assert abs(fd) > 1e-2, "the field must move with the design"
+    assert directional == pytest.approx(fd, rel=1e-5)
 
 
 def test_transverse_matrices_jit_clean(disk_grid, expansion, lattice):
