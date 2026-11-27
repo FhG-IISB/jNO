@@ -64,6 +64,8 @@ References:
  * The fmmax test-only oracle (the reference for the committed golden parity): https://github.com/facebookresearch/fmmax
 """
 
+import functools
+import warnings
 from dataclasses import dataclass, field
 
 import jax
@@ -94,6 +96,46 @@ _UNIFORM_RTOL = 1e-12
 
 class RcwaError(ValueError):
     """Raised for any ill-posed RCWA problem — always loud, never a silent wrong answer."""
+
+
+class RcwaWarning(UserWarning):
+    """Issued from inside ``jax.jit``/``grad``/``vmap`` where :class:`RcwaError` would be raised eagerly.
+
+    A compiled program cannot raise a Python exception on a computed value, and a design loop should see the
+    problem rather than die in an opaque runtime error; the eager path still raises."""
+
+
+#: Largest accepted T + R - 1 (the house energy guard).
+_ENERGY_TOL = 5e-3
+
+
+def _efficiency_problem(T, R, orders, period, wl):
+    """Host-side check of plane-wave efficiencies: the message for a non-finite or energy-violating result,
+    or ``None``. ``T``/``R`` may be batched (a vmapped solve): one bad member is enough."""
+    t, r = np.asarray(T, float), np.asarray(R, float)
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(r))):
+        return (
+            "non-finite efficiency (NaN/inf): likely a Rayleigh/Wood anomaly where a diffraction "
+            "order is exactly grazing (the wavelength coincides with a period resonance, e.g. "
+            f"wavelength == period). Nudge the wavelength or period. (period={period}, wl={wl})"
+        )
+    total = float(np.max(t + r))
+    if total > 1.0 + _ENERGY_TOL:
+        return (
+            f"energy not conserved: T+R={total:.4f} > 1 at orders={orders}. "
+            "The state-space solve is not converged: raise orders= for more Fourier orders, or "
+            "-- for a thick high-contrast layer -- thin the sub-slab chunking (the T+R>1 cliff "
+            "is the un-chunked impedance recursion; auto chunking is fixed at build, so rebuild "
+            "the Rcwa if chunking is the culprit), or the structure is unphysical."
+        )
+    return None
+
+
+def _warn_on_efficiency_problem(T, R, *, orders, period, wl):
+    """The traced counterpart of the eager guard: a host callback that warns (see :class:`RcwaWarning`)."""
+    msg = _efficiency_problem(T, R, orders, period, wl)
+    if msg is not None:
+        warnings.warn(msg, RcwaWarning, stacklevel=2)
 
 
 # =====================================================================================
@@ -1261,21 +1303,17 @@ class Rcwa:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
         sol = _Sol(self, res, self._ex, nt, res.pin, wl, thick=thick, period=self.period, pol=pol)
         T, R = sol.efficiency("T"), sol.efficiency("R")
-        if _concrete(T):  # never-silent runtime guards run on the eager forward pass; they step aside under trace
-            if not (np.isfinite(float(T)) and np.isfinite(float(R))):
-                raise RcwaError(
-                    "non-finite efficiency (NaN/inf): likely a Rayleigh/Wood anomaly where a diffraction "
-                    "order is exactly grazing (the wavelength coincides with a period resonance, e.g. "
-                    f"wavelength == period). Nudge the wavelength or period. (period={self.period}, wl={wl})"
-                )
-            if float(T) + float(R) > 1.0 + 5e-3:
-                raise RcwaError(
-                    f"energy not conserved: T+R={float(T) + float(R):.4f} > 1 at orders={self.orders}. "
-                    "The state-space solve is not converged: raise orders= for more Fourier orders, or "
-                    "-- for a thick high-contrast layer -- thin the sub-slab chunking (the T+R>1 cliff "
-                    "is the un-chunked impedance recursion; auto chunking is fixed at build, so rebuild "
-                    "the Rcwa if chunking is the culprit), or the structure is unphysical."
-                )
+        if _concrete(T) and _concrete(R):  # eager: never-silent, raise
+            msg = _efficiency_problem(T, R, self.orders, self.period, wl)
+            if msg is not None:
+                raise RcwaError(msg)
+        else:  # under jit/grad/vmap: the same check on the host, as a warning
+            wl_shown = float(wl) if _concrete(wl) else "traced"
+            jax.debug.callback(
+                functools.partial(_warn_on_efficiency_problem, orders=self.orders, period=self.period, wl=wl_shown),
+                jnp.real(T),
+                jnp.real(R),
+            )
         return sol
 
     def _solve_source(self, source, layers_spec, wl, kin):

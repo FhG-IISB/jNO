@@ -369,7 +369,7 @@ concrete fix:
 | `eps` varies continuously in z | raises unless `slices=N` |
 | no source / forcing in the problem | raises — nothing to illuminate with |
 | forcing spread over a z-range, not one face | raises — put the incident wave on one ambient |
-| energy `T + R > 1` after a solve | raises — raise `orders` |
+| energy `T + R > 1`, or a non-finite efficiency, after a solve | raises — raise `orders`; inside `jax.jit` / `grad` / `vmap` the same check runs on the host and issues an `RcwaWarning` (a compiled program cannot raise) |
 
 Two field conventions are baked in so callers never rediscover them: the Poynting flux is summed
 *with sign* (an `abs()` sum over-counts and can report `T+R>1`), and the `JONES_DIRECT_FOURIER`
