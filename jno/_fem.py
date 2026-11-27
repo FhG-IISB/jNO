@@ -10764,8 +10764,18 @@ def _assemble_second_order_time(
     # placeholders (parameters at 0 / stored weights) used for the ``.M``/``.A`` accessors and sizing.
     _vec_asm = 1 if multifield else vec  # coupled fields carry their own per-field vec
 
+    from .utils.solver.fem_utils import _MATRIX_FREE
+
+    # `jno.fem(matrix_free=True)` covers the linear, parameter-free u_tt form: the M2 / C / K groups come back as
+    # unstored operators and the augmented block below is applied, never stored. A nonlinear or parametric form
+    # assembles as before (``jno.fem`` restores the flag when it returns).
+    _mf = bool(_MATRIX_FREE[0]) and not is_nonlinear and not has_param
+    _MATRIX_FREE[0] = _mf
+
     def _native_group(terms, bterms):
         op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=_vec_asm, quad_degree=quad_degree)
+        if isinstance(op, tuple) and getattr(op[0], "matrix_free", False):  # an unstored operator
+            return {"A0": op[0], "b0": jnp.asarray(op[1]).reshape(-1), "rpe": {}, "is_param": False, "offs": list(_offs)}
         if isinstance(op, tuple):  # static (A, b): a parameter-free group
             A0, b0 = _to_bcoo(op[0]), jnp.asarray(op[1]).reshape(-1)  # BCOO — the 2N block is composed sparsely
             return {
@@ -10810,7 +10820,7 @@ def _assemble_second_order_time(
     gm = _native_group(mass2_raw, {})  # u_tt -> M2 (mass; block-diagonal + couplings for multifield)
     n = int(gm["A0"].shape[0])
     dtype = gm["A0"].dtype
-    Z = _bcoo_empty(n, n, dtype)  # the zero block / zero damping — sparse, so the 2N block never densifies
+    Z = None if _mf else _bcoo_empty(n, n, dtype)  # the zero block / zero damping — sparse, so the 2N block never densifies
     gc = _native_group(damp_raw, {}) if damp_raw else None  # u_t -> C (damping)
     # A nonlinear spatial operator is assembled as a residual/jacobian below, not a linear K matrix.
     gk = None if is_nonlinear else _native_group(stiff_raw, boundary_terms)  # spatial operator K + load F
@@ -10837,12 +10847,18 @@ def _assemble_second_order_time(
         # step, just below) -- without the flag the assembler's fail-loud fallthrough guard fires on
         # this legitimate consumer.
         tv_dirichlet_external=True,
+        dirichlet_pairs_only=_mf,  # matrix-free: only the conditions are wanted from this pass, not an operator
     )
     pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
     rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
     g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
     tv = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])  # driven boundaries g(x,t)
     has_tv = bool(tv)
+    if _mf and has_tv:
+        raise NotImplementedError(
+            "jno.fem(matrix_free=True): a driven boundary g(x, t) on a second-order-in-time (u.tt) form is not "
+            "supported yet. Hold the boundary value constant, or leave matrix_free out (the form is then assembled)."
+        )
     rows_tv = jnp.concatenate([jnp.asarray(e[0], dtype=int) for e in tv]) if tv else jnp.zeros((0,), dtype=int)
     rows_all = jnp.concatenate([rows, rows_tv])  # every Dirichlet displacement DOF (constant + driven)
     nrows = int(rows_all.shape[0])
@@ -10983,6 +10999,8 @@ def _assemble_second_order_time(
             metadata=meta,
             **common,
         )
+    elif _mf:
+        block = _matrix_free_second_order_block(gm["A0"], gc["A0"] if gc else None, gk["A0"], gk["b0"], rows, g, common)
     elif not has_param and not has_tv:
         # parameter-free, constant Dirichlet: assemble the augmented block once (the fast, common path)
         M2, C, K, F = gm["A0"], (gc["A0"] if gc else Z), gk["A0"], gk["b0"]
@@ -11035,6 +11053,76 @@ def _assemble_second_order_time(
     # offs = [0, n] gives the familiar [0, n, 2n]; a coupled system gets [u1..uF, v1..vF].
     aug_offsets = list(gm["offs"][:-1]) + [n + o for o in gm["offs"]]
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=aug_offsets)
+
+
+def _matrix_free_second_order_block(M2, C, K, F, rows, g, common):
+    r"""The augmented block of :func:`_assemble_second_order_time` with nothing stored but coefficients
+    (``jno.fem(matrix_free=True)``): the same ``M_aug ẏ + A_aug y = c_aug`` in ``y = [u; v]``,
+
+        A_aug y = [-M2 v;  K u + C v],   M_aug = diag(M2, M2),
+
+    every Dirichlet row (``rows`` in the displacement block and in the velocity block) replaced by an identity row
+    holding ``u = g``, ``v = 0``. ``M2``, ``C``, ``K`` are unstored operators (``C`` may be ``None``). ``M_aug`` is
+    stored as its diagonal when ``M2`` is diagonal (the GLL rule at a Q_k field's own nodes), so an explicit scheme
+    (``jno.solve.erk``) divides by it and a step costs one stiffness apply per stage: the spectral-element wave
+    march. Otherwise it is applied like the rest. ``K``'s diagonal is never needed (it sits off the block
+    diagonal), so it is never computed."""
+    from .utils.solver.backend_blocks import SemidiscreteTimeBlock
+    from .utils.solver.fem_native import diagonal_bcoo, diagonal_entries
+    from .utils.solver.solver_api import LinearOperator
+
+    n = int(K.shape[0])
+    dtype = K.dtype
+    keep_u = jnp.ones((n,), dtype)
+    if int(rows.shape[0]):
+        keep_u = keep_u.at[rows].set(0.0)
+    keep = jnp.concatenate([keep_u, keep_u])  # 0 on every Dirichlet row of both blocks
+
+    # A diagonal M2 (GLL) is applied as a product, not a pass over the cells, and its unstored operator is let go
+    # (nothing below holds it), so its kept coefficients are freed.
+    d2 = diagonal_entries(M2.mv, n, dtype)
+    if d2 is not None:
+        M2 = None
+
+    def raw(y):
+        u, v = y[:n], y[n:]
+        bottom = K @ u if C is None else K @ u + C @ v
+        return jnp.concatenate([-(d2 * v) if M2 is None else -(M2 @ v), bottom])
+
+    def mv(y):
+        y = jnp.asarray(y)
+        return keep * raw(y) + (1.0 - keep) * y
+
+    def diag_A():
+        dC = jnp.zeros((n,), dtype) if C is None else jnp.asarray(C.diag()).reshape(-1)
+        return keep * jnp.concatenate([jnp.zeros((n,), dtype), dC]) + (1.0 - keep)
+
+    A_aug = LinearOperator.from_matvec(mv, diag_fn=diag_A, shape=(2 * n, 2 * n))
+    A_aug.matrix_free, A_aug.dtype = True, dtype
+    A_aug.coefficient_bytes = sum(int(getattr(op, "coefficient_bytes", 0)) for op in (M2, C, K) if op is not None)
+
+    if d2 is not None:
+        M_aug = diagonal_bcoo(keep * jnp.concatenate([d2, d2]))
+    else:
+
+        def mv_M(y):
+            y = keep * jnp.asarray(y)
+            return keep * jnp.concatenate([M2 @ y[:n], M2 @ y[n:]])
+
+        def diag_M():
+            dm = jnp.asarray(M2.diag()).reshape(-1)
+            return keep * jnp.concatenate([dm, dm])
+
+        M_aug = LinearOperator.from_matvec(mv_M, diag_fn=diag_M, shape=(2 * n, 2 * n))
+        M_aug.matrix_free, M_aug.dtype = True, dtype
+
+    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), jnp.asarray(F, dtype).reshape(-1)])
+    meta = {"theta": 0.5, "second_order": True}
+    if int(rows.shape[0]):
+        c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
+        # u = g, v = 0 on those rows: held, not solved, by an explicit scheme (see `_ERKScheme.stepper`)
+        meta["held_rows"] = (jnp.concatenate([rows, rows + n]), jnp.concatenate([g, jnp.zeros_like(g)]))
+    return SemidiscreteTimeBlock(M=M_aug, A=A_aug, affine_bias=c_aug, metadata=meta, **common)
 
 
 # ---------------------------------------------------------------------------

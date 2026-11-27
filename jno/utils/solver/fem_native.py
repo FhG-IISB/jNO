@@ -1269,46 +1269,16 @@ def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
     return merged, interior
 
 
-def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
-    """``(A, b)`` of a steady linear form whose operator is applied, never stored (``jno.fem(matrix_free=True)``).
+def _unstored_operator(lin, mask, pin, diag_fn, n):
+    """``v -> mask * lin(mask * v) + pin * v`` as a :class:`LinearOperator` that stores no matrix.
 
-    The residual is linearised ONCE (``jax.linearize``): its pass over the cells is partially evaluated, so the
-    geometry, the quadrature weights and the coefficients are computed here and kept, and ``A v`` is what is
-    left -- gather, the gradient contractions (sum-factorised on a Q_k quadrilateral / hexahedron), a scaling
-    per quadrature point, the transposed contractions, scatter-add. Differentiating at every apply instead
-    (``jax.jvp``) recomputes the whole primal pass beside the tangent: measured 6x the apply on Q5 hexahedra.
-    The memory is the kept coefficients, tens of numbers per quadrature point, where the assembled operator
-    holds ``O(k^d)`` entries per DOF (measured, Q5 hexahedra: 322).
-
-    Essential conditions are eliminated as :func:`fem_1d._apply_dirichlet_symmetric` does on a stored matrix:
-    known columns moved to the load, constrained rows and columns zeroed, the pinned row kept at the local
-    diagonal scale. The diagonal (for Jacobi) comes from the assembler's own matrix-free ``diag=True`` pass.
+    ``lin`` is a linearised residual (a ``Partial`` whose leaves are its kept coefficients). Multiplies only around
+    it, so the operator transposes like any other. The coefficients ride as ARGUMENTS of the compiled apply (not
+    constants baked into it) and move to the solving device once. ``diag_fn`` is called on the first ``A.diag()``.
     """
     from .placement import to_solve_device
     from .solver_api import LinearOperator
 
-    n = int(zeros.shape[0])
-
-    def free(u):
-        return jnp.asarray(residual(u)).reshape(-1)
-
-    r0, lin = jax.linearize(free, zeros)  # lin: a Partial whose leaves are the kept coefficients
-    b = -r0
-    diag = jnp.asarray(jacobian(zeros, 0.0, None, diag=True)).reshape(-1)
-    mask = jnp.ones(n, b.dtype)
-    pin = jnp.zeros(n, b.dtype)
-    if dirichlet_pairs:
-        dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
-        vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=b.dtype)
-        d0 = jnp.abs(diag[dofs])
-        s = jnp.where(d0 > 0.0, d0, jnp.mean(jnp.abs(diag))).astype(b.dtype)
-        mask = mask.at[dofs].set(0.0)
-        pin = pin.at[dofs].set(s)  # the pinned rows' diagonal, zero elsewhere
-        b = (b - lin(jnp.zeros(n, b.dtype).at[dofs].set(vals))).at[dofs].set(vals * s)
-        diag = diag.at[dofs].set(s)
-
-    # Multiplies only around the linear map, so the operator transposes like any other. The coefficients ride
-    # as ARGUMENTS of the compiled apply (not constants baked into it) and move to the solving device once.
     @jax.jit
     def _apply(lin_, mask_, pin_, v):
         return mask_ * lin_(mask_ * v) + pin_ * v
@@ -1319,6 +1289,7 @@ def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
         return mask_ * out + pin_ * v
 
     state: list = []
+    diag: list = []
 
     def _state():
         if not state:
@@ -1331,12 +1302,121 @@ def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
     def t_mv(v):
         return _apply_t(*_state(), jnp.asarray(v))
 
+    def _diag():
+        if not diag:
+            diag.append(jnp.asarray(diag_fn()).reshape(-1))
+        return diag[0]
+
     # No ``dense_fn``: a direct solver or a matrix-based preconditioner then raises instead of quietly building
     # the dense matrix this operator exists to avoid. ``fem.A`` (dense by contract) builds it when asked.
-    A = LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=lambda: diag, shape=(n, n))
+    A = LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=_diag, shape=(n, n))
     A.matrix_free = True
+    A.dtype = mask.dtype  # read where a stored matrix's would be (row detection, step diagonals)
     A.coefficient_bytes = int(sum(getattr(leaf, "nbytes", 0) for leaf in jax.tree_util.tree_leaves(lin)))
-    return A, b
+    return A
+
+
+def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
+    """``(A, b)`` of a linear form whose operator is applied, never stored (``jno.fem(matrix_free=True)``).
+
+    The residual is linearised ONCE (``jax.linearize``): its pass over the cells is partially evaluated, so the
+    geometry, the quadrature weights and the coefficients are computed here and kept, and ``A v`` is what is
+    left -- gather, the gradient contractions (sum-factorised on a Q_k quadrilateral / hexahedron), a scaling
+    per quadrature point, the transposed contractions, scatter-add. Differentiating at every apply instead
+    (``jax.jvp``) recomputes the whole primal pass beside the tangent: measured 6x the apply on Q5 hexahedra.
+    The memory is the kept coefficients, tens of numbers per quadrature point, where the assembled operator
+    holds ``O(k^d)`` entries per DOF (measured, Q5 hexahedra: 322).
+
+    Essential conditions are eliminated as :func:`fem_1d._apply_dirichlet_symmetric` does on a stored matrix:
+    known columns moved to the load, constrained rows and columns zeroed, the pinned row kept at the local
+    diagonal scale. The diagonal (for Jacobi) comes from the assembler's own matrix-free ``diag=True`` pass; with
+    no essential condition it is computed only when something asks for it (an explicit march never does).
+    ``residual`` is ``u -> R(u)``.
+    """
+    n = int(zeros.shape[0])
+
+    def free(u):
+        return jnp.asarray(residual(u)).reshape(-1)
+
+    r0, lin = jax.linearize(free, zeros)  # lin: a Partial whose leaves are the kept coefficients
+    b = -r0
+    mask = jnp.ones(n, b.dtype)
+    pin = jnp.zeros(n, b.dtype)
+
+    def raw_diag():
+        return jnp.asarray(jacobian(zeros, 0.0, None, diag=True)).reshape(-1)
+
+    diag_fn = raw_diag
+    if dirichlet_pairs:
+        diag = raw_diag()
+        dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
+        vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=b.dtype)
+        d0 = jnp.abs(diag[dofs])
+        s = jnp.where(d0 > 0.0, d0, jnp.mean(jnp.abs(diag))).astype(b.dtype)
+        mask = mask.at[dofs].set(0.0)
+        pin = pin.at[dofs].set(s)  # the pinned rows' diagonal, zero elsewhere
+        b = (b - lin(jnp.zeros(n, b.dtype).at[dofs].set(vals))).at[dofs].set(vals * s)
+        diag = diag.at[dofs].set(s)
+        diag_fn = lambda: diag  # noqa: E731
+    return _unstored_operator(lin, mask, pin, diag_fn, n), b
+
+
+def diagonal_entries(apply, n, dtype):
+    """The diagonal of the linear map ``apply`` when the map IS diagonal, else ``None``.
+
+    ``apply(1)`` is the diagonal of a diagonal map, one application. Whether the map is diagonal is decided on its
+    values, by applying it to a random vector ``r``: ``A r = (A 1) * r`` holds for a diagonal ``A`` and, for any
+    other, fails on all but a measure-zero set of ``r``. Two applications in all, where reading a diagonal off an
+    unstored operator otherwise costs a pass per local DOF. The GLL rule at a Q_k field's own GLL nodes gives
+    such a mass (``jno.fem(quadrature="gll")``)."""
+    with jax.ensure_compile_time_eval():
+        d = jnp.asarray(apply(jnp.ones(n, dtype))).reshape(-1)
+        r = jnp.asarray(np.random.default_rng(0).standard_normal(n), dtype)
+        Ar = jnp.asarray(apply(r)).reshape(-1)
+        gap = float(jnp.linalg.norm(Ar - d * r))
+        scale = float(jnp.linalg.norm(Ar))
+    return d if gap <= 1e2 * float(jnp.finfo(dtype).eps) * max(scale, 1e-300) else None
+
+
+def diagonal_bcoo(d):
+    """``diag(d)`` as a BCOO of ``n`` entries."""
+    import jax.experimental.sparse as jsparse
+
+    n = int(d.shape[0])
+    rows = jnp.arange(n, dtype=jnp.int32)
+    return jsparse.BCOO((d, jnp.stack([rows, rows], axis=1)), shape=(n, n))
+
+
+def _matrix_free_mass(mass_residual, mass_jacobian, zeros, zero_dofs=None):
+    """The mass of a matrix-free march, ``M`` with the rows and columns of ``zero_dofs`` zeroed (constrained
+    DOFs carry no time derivative).
+
+    Stored as its diagonal when it is diagonal (:func:`diagonal_entries`; the GLL rule at a Q_k field's own GLL
+    nodes), so every time scheme reads it as it reads an assembled diagonal mass: explicit Runge-Kutta divides by
+    it entry by entry, and an implicit step adds it to the stiffness's diagonal for Jacobi. Otherwise it is an
+    unstored operator like the stiffness, its diagonal from the assembler's ``diag=True`` pass. ``mass_residual``
+    is ``u -> M u``.
+    """
+    n = int(zeros.shape[0])
+
+    def free(u):
+        return jnp.asarray(mass_residual(u)).reshape(-1)
+
+    _r0, lin = jax.linearize(free, zeros)
+    dtype = zeros.dtype
+    mask = jnp.ones(n, dtype)
+    if zero_dofs is not None and int(jnp.size(zero_dofs)):
+        mask = mask.at[jnp.asarray(zero_dofs)].set(0.0)
+    d = diagonal_entries(lin, n, dtype)
+    if d is not None:
+        return diagonal_bcoo(d * mask)
+    return _unstored_operator(
+        lin,
+        mask,
+        jnp.zeros(n, dtype),
+        lambda: mask * jnp.asarray(mass_jacobian(zeros, 0.0, None, diag=True)).reshape(-1),
+        n,
+    )
 
 
 def assemble_fem_native(
@@ -1351,6 +1431,7 @@ def assemble_fem_native(
     evolution: Optional[Dict[Any, Any]] = None,
     bounded: bool = False,
     tv_dirichlet_external: bool = False,
+    dirichlet_pairs_only: bool = False,
     dynamic_topology: bool = False,
 ) -> Tuple[Any, str]:
     """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
@@ -5627,7 +5708,11 @@ def assemble_fem_native(
         mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal]
         # Mass matrix: volume only (no boundary); spatial residual: volume + boundary
         _mass_jac = _make_jacobian(mass_terms)
-        M = _mass_jac(zeros)
+        from .fem_utils import _MATRIX_FREE
+
+        # `jno.fem(matrix_free=True)` builds no mass matrix on the linear march it covers (below); every other
+        # branch assembles it as before.
+        M = None if _MATRIX_FREE[0] else _mass_jac(zeros)
         spatial_res = _make_residual(spatial, boundary_terms)
         spatial_jac = _make_jacobian(spatial, boundary_terms)
 
@@ -5863,6 +5948,42 @@ def assemble_fem_native(
         # A mass-only nonlinearity (state-dependent mass) also requires the nonlinear step path, even when
         # every spatial term is linear — the mass action lives in the residual there (``mass_residual``).
         nonlinear = _nonlinear_mass or any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
+        _mf_linear = (
+            _MATRIX_FREE[0]
+            and not nonlinear
+            and not _parametric_mass
+            and tv_dofs is None
+            and not (runtime_parameter_tags or neural_param_names or _dir_args_dependent or _ic_static_args or _coord_specs)
+        )
+        if _mf_linear:
+            # ---- matrix-free linear march (``jno.fem(matrix_free=True)``): the same block as the linear branch
+            # at the end, ``M u̇ + A u = c (+ f(t))``, with nothing stored but coefficients. ``A`` is the spatial
+            # residual linearised once, Dirichlet eliminated symmetrically; ``M`` its diagonal when the mass is
+            # diagonal (GLL quadrature), else unstored too. An explicit scheme (``jno.solve.erk``) then costs one
+            # apply per stage; an implicit one solves its step by Krylov iterations on ``M + θ dt A``.
+            mf_mass_res = _make_residual(mass_terms)
+            A, c = _matrix_free_system(lambda u: spatial_res(u, 0.0), spatial_jac, zeros, dirichlet_pairs)
+            M = _matrix_free_mass(lambda u: mf_mass_res(u, 0.0), _mass_jac, zeros, d_dofs)
+            mf_meta = {} if d_dofs is None else {"held_rows": (d_dofs, d_vals)}  # see `_ERKScheme.stepper`
+            if temporal_tags:
+                c0 = -jnp.asarray(spatial_res(zeros, 0.0)).reshape(-1)
+                free_mask = jnp.ones((total,), dtype=zeros.dtype)
+                if d_dofs is not None:
+                    free_mask = free_mask.at[d_dofs].set(0.0)
+
+                def forcing_vector_fn(t, args=None, _c0=c0, _mask=free_mask):
+                    return _mask * (-spatial_res(zeros, t) - _c0)
+
+                return (
+                    SemidiscreteTimeBlock(
+                        M=M, A=A, affine_bias=c, forcing_vector_fn=forcing_vector_fn, metadata=mf_meta, **common
+                    ),
+                    "transient",
+                    offs,
+                )
+            return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, metadata=mf_meta, **common), "transient", offs
+        if M is None:
+            M = _mass_jac(zeros)
         if nonlinear:
             # (A net- or parameter-valued initial condition threads here too: every march re-forms the
             # start from ``state0_fn(args)``, linear or Newton step alike.)
@@ -6113,6 +6234,8 @@ def assemble_fem_native(
 
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()
+    if dirichlet_pairs_only:  # the caller wants the essential conditions stashed on the domain, no operator
+        return None, "dirichlet_pairs", offs
     # τ-dependent essential values (`u(top) - delta*tau`): collected as (dofs, node, coords) rather than
     # constant pairs, because their held value changes every load step. The march threads them below.
     _tv_dirichlet = list(getattr(domain, "_fem_native_dirichlet_tv", []) or [])

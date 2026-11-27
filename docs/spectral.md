@@ -82,7 +82,20 @@ sol = fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
 | `order=k`, k > 2, on quads / hexes | GLL nodes (`gll_warped`), no option needed |
 | `quadrature="gll"` | the GLL rule at those nodes (`k + 1` points per axis, exact to degree `2k - 1`): the mass matrix is diagonal (exact lumping, total mass to round-off) and an affine cell's stiffness stays exact |
 | sum factorisation (automatic, k > 2) | a field's values and gradients at the quadrature points are 1-D contractions along each axis of the cell's DOF tensor, `O(k^(d+1))` per cell where the dense basis tables cost `O(k^(2d))`. Every residual (linear, nonlinear, transient) and the element tangent use it |
-| `matrix_free=True` | a steady linear operator is linearised once and applied through the cells: `fem.operator` is `(A, b)` with `A` a matvec (`A @ v`, `A.T`, `A.diag()`); solved by Jacobi-BiCGStab or the Krylov slot you pass. A direct solver or a matrix-based preconditioner has nothing to factor and raises |
+| `matrix_free=True` | a linear form's operator is linearised once and applied through the cells, never stored. Steady: `fem.operator` is `(A, b)` with `A` a matvec (`A @ v`, `A.T`, `A.diag()`), solved by Jacobi-BiCGStab or the Krylov slot you pass. Transient (`u.t` or `u.tt`, constant boundary values): every `jno.solve` time scheme marches it; the mass is stored as its diagonal when it is diagonal (`quadrature="gll"`), so `jno.solve.erk()` costs one stiffness apply per stage and no solve. A direct solver or a matrix-based preconditioner has nothing to factor and raises; a nonlinear or parametric form is assembled as before |
+
+An explicit wave march, the standard use of spectral elements:
+
+```python
+d = jno.shape.box(0, 0, 0, 1, 1, 1).structured(n=16).quad().domain(time=(0.0, 0.05, 51))
+u, v = d.fem_symbols(order=8)                                    # 2.1M DOFs
+...
+fem = jno.fem([ui.tt * vi + ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, u(xb, yb, zb) - 0.0,
+               u(x0, y0, z0) - u0], quadrature="gll", matrix_free=True)
+traj = fem.solve(time=jno.solve.erk("rk4"), save_ts=np.linspace(0, 0.05, 6))
+```
+
+The step is the explicit (CFL) limit: about `h / k^2`.
 
 A curved boundary is meshed with straight-sided cells (`shape.curved()` is for order-2 simplices and refuses
 quadrilaterals): its `O(h²)` geometry error is not reduced by the degree.
@@ -113,6 +126,7 @@ float64.
     | spectral elements off a box, Q3 / Q5 / Q8, `matrix_free=True`, GLL rule | L-shape (12 quads) 9.3e-5 / 6.4e-8 / 1.5e-12; unstructured polygon (33 quads) 1.8e-4 / 3.0e-7 / 8.7e-12 |
     | one Q_k Poisson apply, hand-written sum-factorised kernel against the assembled matvec (227k / 69k / 36k DOFs; Q3 / Q5 / Q8) | i5-13600K f64: 4.6x / 16x / 30x faster; RTX 3070 f64: 0.53x / 1.7x / 3.5x; f32: 1.1x / 3.5x / 6.0x; operator memory 205 / 128 / 140 MB against 25 / 5.5 / 2.3 MB |
     | `jno.fem(matrix_free=True)`, 3-D Poisson, 2.0-2.1M DOFs, RTX 3070, f64, Q3 / Q5 / Q8 | build 11 / 15 / 33 s; apply 31 / 20 / 17 ms (1.7x / 2.5x / 3.0x the hand-written kernel); Jacobi-CG solve 1.1 / 1.3 / 1.6 s (10 / 29 / 61 iterations, a single-mode right-hand side); max error 1.3e-10 / 2.0e-12 / 5.7e-12; 0.63 GB peak on the card |
+    | 3-D wave `u.tt = Δu`, `matrix_free=True`, GLL mass, RK4, 2.0-2.1M DOFs, RTX 3070, Q3 / Q5 / Q8 | float64: 131 / 95 / 83 ms a step (33 / 24 / 21 ms a stage), build 17 / 11 / 10 s, 0.85 GB peak, max error after 50 steps 3.0e-10 / 5.9e-12 / 5.3e-13 against the exact standing wave; float32: 51 / 42 / 46 ms a step, 0.46-0.58 GB, error 1-2e-6 |
     | same, f32 | apply 9.3 / 7.1 / 5.9 ms (4.1x / 3.0x / 3.9x the hand-written kernel); CG stalls at a true residual of 6e-4 / 7e-4 / 1e-3 and is refused |
 
 ## Limits

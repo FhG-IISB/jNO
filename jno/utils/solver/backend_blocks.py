@@ -43,6 +43,10 @@ def _algebraic_rows(M, n, dtype):
 
     if hasattr(M, "todense"):  # BCOO: duplicates are summed, so a row is zero iff its |data| sums to zero
         mass = jnp.zeros((n,), dtype).at[M.indices[:, 0]].add(jnp.abs(M.data).astype(dtype))
+    elif getattr(M, "matrix_free", False):
+        # an unstored mass (``jno.fem(matrix_free=True)``): positive semidefinite with the constrained rows AND
+        # columns zeroed, so a row is zero exactly where its diagonal is
+        mass = jnp.abs(jnp.asarray(M.diag(), dtype))
     else:
         mass = jnp.sum(jnp.abs(jnp.asarray(M, dtype)), axis=1)
     return mass == 0
@@ -58,6 +62,8 @@ def _index2_rows(M, A, n, dtype):
     if hasattr(A, "todense"):  # BCOO: duplicates are summed
         i, j = A.indices[:, 0], A.indices[:, 1]
         diag = jnp.zeros((n,), dtype).at[i].add(jnp.where(i == j, jnp.abs(A.data), 0).astype(dtype))
+    elif getattr(A, "matrix_free", False):  # an unstored operator knows its diagonal
+        diag = jnp.abs(jnp.asarray(A.diag())).astype(dtype)
     else:
         diag = jnp.abs(jnp.diagonal(jnp.asarray(A))).astype(dtype)
     return _algebraic_rows(M, n, dtype) & (diag == 0)
@@ -573,7 +579,9 @@ class SemidiscreteTimeBlock:
 
         # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
         def _operand(x):
-            return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
+            if hasattr(x, "todense") or getattr(x, "matrix_free", False):  # applied, never densified
+                return x
+            return jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
             from .newton_krylov import newton_krylov
