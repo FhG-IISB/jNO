@@ -1782,7 +1782,9 @@ def assemble_fem_native(
             raise NotImplementedError(
                 f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components and is "
                 "used whole in a scalar form. Index it, k[i] for component i (e.g. "
-                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component."
+                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component. For one value "
+                "per cell or node, declare it on an FE space instead, a FIELD parameter: "
+                "`jno.np.parameter(s0)` with `_, s0 = d.fem_symbols(space='P0')` (P1 for nodes)."
             )
     vector_parameter_tags: Tuple[str, ...] = tuple(sorted(_vector_param_sizes))
     # A nodal field parameter on a VECTOR / tensor symbol holds `value_shape` values per vertex, rows by vertex. Its
