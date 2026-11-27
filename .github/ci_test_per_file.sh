@@ -56,11 +56,16 @@ else
 fi
 echo "Running ${#files[@]} test files, one process each (memory released between files)."
 
+# A file that hangs (a deadlock leaves the process asleep, so no per-test timeout would fire either) is
+# killed after this long: exit 137, which the signal branch below reruns once and flags. The slowest file
+# of a recent run took 19 min (tests/test_coupling_gradients.py), so the default leaves room above that.
+file_timeout="${CI_FILE_TIMEOUT:-30m}"
+
 failed=()
 for f in "${files[@]}"; do
   echo "::group::${f}"
   start=$SECONDS
-  pytest "$f" -m 'not slow' "${cov[@]}" --durations=15 --tb=short -q
+  timeout -s KILL "$file_timeout" pytest "$f" -m 'not slow' "${cov[@]}" --durations=15 --tb=short -q
   code=$?
   # Killed by a signal (exit > 128) before pytest could report anything: a native library crashed
   # (PETSc, for one, turns a crash into an MPI abort, i.e. SIGTERM, and the captured message is lost).
@@ -68,7 +73,7 @@ for f in "${files[@]}"; do
   # flake and is flagged as a warning, not hidden.
   if [ "$code" -gt 128 ]; then
     echo "::warning::${f} was killed by signal $((code - 128)); running it once more without capture"
-    pytest "$f" -m 'not slow' "${cov[@]}" --tb=short -q -s
+    timeout -s KILL "$file_timeout" pytest "$f" -m 'not slow' "${cov[@]}" --tb=short -q -s
     code=$?
   fi
   printf '%s\t%s\n' "$f" "$((SECONDS - start))" >> ci-file-times.tsv
