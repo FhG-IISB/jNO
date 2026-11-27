@@ -307,3 +307,25 @@ def test_a_second_build_with_the_same_coordinates_maps_the_same():
     first = np.asarray(jno.fem([_grad_dot(wi, vi, x, y) + wi * vi - d.f * vi, bc]).solve(linear=jno.solve.lu()))
     second = np.asarray(jno.fem([_grad_dot(wi, vi, x, y) + wi * vi - d.f * vi, bc]).solve(linear=jno.solve.lu()))
     np.testing.assert_allclose(second, first, rtol=1e-12, atol=1e-14)
+
+
+def test_a_map_inverts_its_jacobian_in_closed_form():
+    """J^-T and det J are small closed-form expressions, not a batched dense LU: JAX's CPU LU factorises a batch on the
+    client's own thread pool and waits there for its sub-tasks, so on a process limited to as few CPUs as the pool has
+    threads (a 4-core CI runner) it deadlocks."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.domain.mapping import _Map
+
+    d = rect(0, 0, 1, 1).sized(0.5).domain()
+    x, y, _ = d.variable("interior", split=True)
+    m = _Map(inversion(1.0), [x, y], "shell")
+    pts = jnp.array([1.2, 1.5, 1.9]), jnp.array([0.1, 0.3, 0.2])
+    for fn in [m.ginv[0][0].fn, m.ginv[0][1].fn, m.ginv[1][0].fn, m.ginv[1][1].fn, m.det.fn]:
+        assert "lu" not in str(jax.make_jaxpr(fn)(*pts)).split()
+    J = jax.vmap(jax.jacfwd(m.g))(jnp.stack(pts, axis=1))
+    want = jnp.linalg.inv(jnp.swapaxes(J, 1, 2))
+    got = jnp.stack([jnp.stack([m.ginv[i][j].fn(*pts) for j in range(2)], -1) for i in range(2)], -2)
+    np.testing.assert_allclose(got, want, rtol=1e-12)
+    np.testing.assert_allclose(m.det.fn(*pts), jnp.linalg.det(J), rtol=1e-12)

@@ -34,6 +34,7 @@ import numpy as np
 
 from ..trace import BinaryOp, FunctionCall, Jacobian, Literal, Placeholder, TestFunction, Variable
 from ..utils.sets import unique_values
+from ..utils.solver.small_linalg import small_det, small_inv
 
 _BINARY = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv, "**": operator.pow}
 
@@ -125,13 +126,13 @@ class _Map:
         def ginv(i, j):
             def fn(*xs):
                 J, shape = geom(*xs)
-                return jnp.linalg.inv(jnp.swapaxes(J, 1, 2))[:, i, j].reshape(shape)  # (J^-T)_ij
+                return small_inv(jnp.swapaxes(J, 1, 2))[:, i, j].reshape(shape)  # (J^-T)_ij
 
             return fn
 
         def det(*xs):
             J, shape = geom(*xs)
-            return jnp.linalg.det(J).reshape(shape)
+            return small_det(J).reshape(shape)
 
         self.ginv = [
             [FunctionCall(ginv(i, j), self.coords, name=f"map_JinvT_{i}{j}") for j in range(dim)] for i in range(dim)
