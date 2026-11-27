@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import os
 import warnings
 from collections import OrderedDict
 from typing import Any
@@ -99,6 +100,16 @@ def _factor_worker():
 
         _FACTOR_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jno-host-lu")
     return _FACTOR_WORKER
+
+
+def _forget_factor_worker():
+    """A forked child inherits the executor but not its thread, so its first submit would wait forever."""
+    global _FACTOR_WORKER
+    _FACTOR_WORKER = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_factor_worker)
 
 
 _FACTOR_CACHE: "_FactorCache" = _FactorCache()
