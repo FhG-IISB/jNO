@@ -1132,7 +1132,7 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
 
 @jax.tree_util.register_pytree_node_class
 class Solution:
-    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name.
+    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name::
 
         u = fem.solve()
         u.T, u.A, u.I          # nodal T, complex nodal A (from its two real halves), a constant unknown's value
@@ -1144,6 +1144,13 @@ class Solution:
     the same name: ``u.T`` is the field ``T``, not the transpose (``u.flat.T`` is). The fields are slices of
     the vector, so they are differentiable. It is a pytree of the one vector, so it passes through ``jit``,
     ``grad`` and ``vmap``.
+
+    Args:
+        flat: The solved DOF vector, ``(n_dofs,)``, or ``(n_steps, n_dofs)`` for a trajectory.
+        layout: Where each field sits in ``flat``: a tuple of ``(name, parts, shape)``, with ``parts`` the
+            ``(start, stop)`` slice of the last axis (two slices for a complex field, its real and imaginary
+            halves) and ``shape`` the per-node shape (``()`` for a constant unknown, otherwise ``(-1, ...)``).
+            ``FEM`` builds it from the problem; it is the static part of the pytree.
     """
 
     __slots__ = ("flat", "_layout", "__weakref__")
@@ -1155,10 +1162,12 @@ class Solution:
 
     # -- pytree
     def tree_flatten(self):
+        """Pytree flattening: the DOF vector is the one child, the field layout the static auxiliary data."""
         return (self.flat,), self._layout
 
     @classmethod
     def tree_unflatten(cls, layout, children):
+        """Rebuild a ``Solution`` from the field ``layout`` (auxiliary data) and ``children == (flat,)``."""
         return cls(children[0], layout)
 
     # -- fields

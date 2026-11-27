@@ -39,7 +39,12 @@ from .enclosure import STEFAN_BOLTZMANN, radiosity_irradiation, radiosity_resolv
 
 
 class Irradiation(Placeholder):
-    """``d.irradiation(T)``: the incident radiation on the radiating faces (lowered by ``jno.fem``)."""
+    """``d.irradiation(T)``: the incident radiation on the radiating faces (lowered by ``jno.fem``).
+
+    Args:
+        domain: The domain whose enclosures the radiation is exchanged in.
+        field: The temperature field the incident radiation is a function of.
+    """
 
     def __init__(self, domain, field):
         self._domain = domain
