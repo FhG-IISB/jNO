@@ -751,10 +751,21 @@ def test_uniform_aniso_mu_one_reduces_to_iso_fast_path():
 
 
 def test_uniform_aniso_conserves_energy_lossless():
-    """A lossless anisotropic slab conserves energy (T + R == 1)."""
-    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (8.0, 0.0, 0.0, 4.0, 6.0))], orders=41, formulation="FFT")
-    res = st.solve(validate=False)
-    assert abs(float(res.T) + float(res.R) - 1.0) < 1e-6
+    """A lossless anisotropic slab conserves energy (T + R == 1): to roundoff in complex128,
+    and within the complex64 floor (measured 3e-7 to 7e-6 on this and similar slabs, on every
+    S-matrix path tried) in complex64."""
+    layers = [(0.3, (8.0, 0.0, 0.0, 4.0, 6.0))]
+    res = StateStack(1.0, PERIOD, 1.0, 1.0, layers, orders=41, formulation="FFT").solve(validate=False)
+    assert abs(float(res.T) + float(res.R) - 1.0) < 1e-5
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        res = StateStack(1.0, PERIOD, 1.0, 1.0, layers, orders=41, formulation="FFT", dtype=jnp.complex128).solve(
+            validate=False
+        )
+        assert abs(float(res.T) + float(res.R) - 1.0) < 1e-12
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def test_uniform_aniso_is_differentiable_in_eps():
