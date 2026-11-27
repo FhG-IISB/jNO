@@ -123,6 +123,8 @@ class Participant:
     """What the driver needs of one problem; subclasses implement it per discretisation."""
 
     kind = "?"
+    #: Can it receive a flux condition (a Neumann data field)? A side that cannot takes the value condition.
+    takes_flux = True
 
     def __init__(self, problem):
         self.problem = problem
@@ -584,7 +586,12 @@ class FEMParticipant(Participant):
 
         from .. import solve as _solve
 
-        out = problem.solve(linear=_solve.lu(), **self._args(problem, data, params))
+        op = getattr(problem, "_op", None)
+        mf = getattr(op[0] if isinstance(op, tuple) and op else op, "matrix_free", False)
+        # an unstored operator (jno.fem(matrix_free=True)) has nothing to factor: a Krylov solve to round-off level
+        linear = _solve.bicgstab(tol=1e-13) if mf else _solve.lu()
+        kw = {"precond": __import__("jno").precond.jacobi()} if mf else {}
+        out = problem.solve(linear=linear, **kw, **self._args(problem, data, params))
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
@@ -799,6 +806,158 @@ class SpectralParticipant(_StrongForm):
         return jnp.asarray(vals)[np.asarray(iface.nodes), 0]
 
 
+class FEMHighOrderParticipant(FEMParticipant):
+    """A ``jno.fem`` problem whose one scalar field is of order >= 2 (P2, the GLL spectral elements Q_k): its
+    interface is the field's own nodes on the tagged edges (:class:`EdgeInterface`), what it sends is read with the
+    edge's Lagrange basis (:meth:`edge_interp`) and a flux by the field's nodal quadrature, and what it receives
+    is a value per field node. It takes the VALUE condition of a Dirichlet-Neumann pair (a received flux would
+    need a data field in the field's own space). 2-D."""
+
+    takes_flux = False
+
+    def __init__(self, problem):
+        super().__init__(problem)
+        if self.dim != 2:
+            raise NotImplementedError(
+                "coupling: a high-order (order >= 2) jno.fem side couples in 2-D only so far (its interface edges "
+                "carry the field's nodes; faces in 3-D are not built). Use a P1 field for this side."
+            )
+        self.points = np.asarray(problem.field_points[0], dtype=float)[:, : self.dim]
+        self._order = int(problem._native_field_orders[0])
+        self._cells = np.asarray(problem._native_cells_all[0])
+
+    def _reference_edges(self):
+        """Per reference edge of the cell: its local nodes in order, with their positions ``s`` in [0, 1]."""
+        import basix
+
+        from ..utils.solver.fem_lagrange import _lagrange_basix, basix_cell
+
+        cell, _tdim = basix_cell(self.problem._native_cell_type)
+        X = np.asarray(_lagrange_basix(cell, self._order).points, float)
+        V = np.asarray(basix.geometry(cell), float)
+        out = []
+        for a, b in basix.topology(cell)[1]:
+            d = V[b] - V[a]
+            t = (X - V[a]) @ d / (d @ d)
+            on = np.linalg.norm(X - V[a] - t[:, None] * d[None, :], axis=1) < 1e-10
+            on &= (t > -1e-10) & (t < 1 + 1e-10)
+            idx = np.flatnonzero(on)
+            order = np.argsort(t[idx])
+            out.append((idx[order], t[idx][order]))
+        return out
+
+    def interface(self, tag, measure=None):
+        from scipy.spatial import cKDTree
+
+        from .transfer import EdgeInterface
+
+        if measure is not None:
+            raise NotImplementedError("coupling: a high-order jno.fem side takes no interface measure= yet.")
+        key = (tag, None)
+        if key in self._interfaces:
+            return self._interfaces[key]
+        facets = self.domain.tag_facets(tag)
+        if facets is None:
+            raise ValueError(f"interface: the domain has no boundary facets tagged {tag!r}.")
+        mesh_pts = np.asarray(self.domain.mesh_connectivity["points"], dtype=float)[:, : self.dim]
+        tree = cKDTree(self.points)
+        dist, vnode = tree.query(mesh_pts[np.unique(np.asarray(facets))])
+        vmap = dict(zip(np.unique(np.asarray(facets)).tolist(), vnode.tolist()))
+        wanted = {frozenset((vmap[int(a)], vmap[int(b)])) for a, b in np.asarray(facets)}
+        found = {}
+        for loc, s_ref in self._reference_edges():
+            ends = self._cells[:, [loc[0], loc[-1]]]
+            for c in range(self._cells.shape[0]):
+                k = frozenset(ends[c].tolist())
+                if k in wanted and k not in found:
+                    found[k] = (self._cells[c, loc], s_ref)
+        if len(found) != len(wanted):
+            raise ValueError(
+                f"coupling: {len(wanted) - len(found)} of the {len(wanted)} edges tagged {tag!r} are not edges of the "
+                "high-order field's cells (a hanging node?)."
+            )
+        nodes = np.unique(np.concatenate([g for g, _ in found.values()]))
+        pos = {int(n): i for i, n in enumerate(nodes)}
+        edges = [np.array([pos[int(n)] for n in g]) for g, _ in found.values()]
+        s = [sr for _, sr in found.values()]
+        iface = EdgeInterface.from_edges(nodes, self.points[nodes], edges, s)
+        self._interfaces[key] = iface
+        return iface
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        import jax.numpy as jnp
+
+        vals = super().sample(problem, state, expr, tag, iface, data, params)
+        if not has_derivative(expr, self.owns):
+            return vals
+        # Where the interface meets the rest of the boundary (the end nodes of its polyline), the reaction also holds
+        # what that boundary imposes: a Dirichlet row's constraint force, or its own flux load. Measured: 0.87 off
+        # at a Dirichlet corner, which the edge's Lagrange basis then carried along the whole interface (1e-3 at
+        # every degree). Their density is the edge's interpolant through its other nodes instead.
+        ends, coeff, others = self._end_fix(iface)
+        if ends.size == 0:
+            return vals
+        v = jnp.asarray(vals)
+        return v.at[jnp.asarray(ends)].set(jnp.sum(jnp.asarray(coeff) * v[jnp.asarray(others)], axis=1))
+
+    def _end_fix(self, iface):
+        """``(ends, coeff, others)``: each polyline end node, and the weights of its edge's other nodes that
+        interpolate a value there. Cached on the interface."""
+        from .transfer import _lagrange_values
+
+        hit = iface.__dict__.get("_end_fix")
+        if hit is not None:
+            return hit
+        count = np.zeros(iface.points.shape[0], dtype=int)
+        for e in iface.edges:
+            count[e[[0, -1]]] += 1
+        ends, coeff, others = [], [], []
+        for e, se in zip(iface.edges, iface.s):
+            for j in (0, len(e) - 1):
+                if count[e[j]] == 1 and len(e) > 2:
+                    keep = [m for m in range(len(e)) if m != j]
+                    ends.append(int(e[j]))
+                    coeff.append(_lagrange_values(se[keep], se[j]))
+                    others.append(e[keep])
+        hit = (
+            np.asarray(ends, dtype=np.int64),
+            np.asarray(coeff) if coeff else np.zeros((0, 0)),
+            np.asarray(others, dtype=np.int64) if others else np.zeros((0, 0), dtype=np.int64),
+        )
+        object.__setattr__(iface, "_end_fix", hit)
+        return hit
+
+    def edge_interp(self, tag, points):
+        """``(m, n_iface)``: this side's interface values read at ``points`` with each edge's Lagrange basis."""
+        return self.interface(tag).interp(points).toarray()
+
+    def data(self, name):
+        import jno
+
+        n = int(self.points.shape[0])
+        node = jno.np.parameter((n,), name=name)  # one value per field node; no optimizer: data
+        node.model._runtime_field = True  # an essential value reads it per solve (gathered at its boundary nodes)
+        self.__dict__.setdefault("_data_names", set()).add(name)
+
+        def setter(values, problem=None):
+            import jax.numpy as jnp
+
+            return {name: jnp.asarray(values)}
+
+        return node, setter
+
+    def _field_nodal(self, problem, state, field):
+        import jax.numpy as jnp
+
+        sl = problem.blocks[problem.block_index(field)]
+        vals = jnp.asarray(state).reshape(-1)[sl.start : sl.stop]
+        if vals.size != self.points.shape[0]:
+            raise NotImplementedError(
+                f"coupling: the high-order field has {vals.size} DOFs on {self.points.shape[0]} nodes (a vector field?)."
+            )
+        return vals
+
+
 def participant(problem) -> Participant:
     """The adapter for a ``jno.fem``, ``jno.fdm``, ``jno.fvm`` or ``jno.spectral`` problem."""
     from .._fem import FEM
@@ -809,6 +968,15 @@ def participant(problem) -> Participant:
     if isinstance(problem, _TraceSpectral):
         return SpectralParticipant(problem)
     if isinstance(problem, FEM):
+        orders = list(getattr(problem, "_native_field_orders", None) or ())
+        vecs = list(getattr(problem, "_block_vecs", None) or ())
+        if (
+            len(orders) == 1
+            and orders[0] >= 2
+            and (not vecs or vecs[0] == 1)
+            and getattr(problem, "_native_cells_all", None) is not None
+        ):
+            return FEMHighOrderParticipant(problem)
         return FEMParticipant(problem)
     if isinstance(problem, _TraceFVM):
         return FVMParticipant(problem)

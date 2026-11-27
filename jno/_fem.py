@@ -8713,6 +8713,12 @@ def _fem_impl(
         fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
         _all = getattr(domain, "_fem_native_dof_points_all", None)
         fem_obj._native_dof_points_all = list(_all) if _all is not None else None
+        # ...and the per-field assembly cells (local DOF order) and orders: a coupling reads a high-order field's
+        # interface edges from them (jno/_coupling/participant.py, `FEMHighOrderParticipant`)
+        _cells_all = getattr(domain, "_fem_native_assembly_cells_all", None)
+        fem_obj._native_cells_all = list(_cells_all) if _cells_all is not None else None
+        fem_obj._native_field_orders = list(getattr(domain, "_fem_native_field_orders", None) or ())
+        fem_obj._native_cell_type = getattr(domain, "_fem_native_cell_type", None)
         # Box constraints, resolved to DOF-space vectors lazily at solve time (they need the assembled
         # field layout, which only exists now). Kept raw here so a `u.i(-1)` bound can read the warm start.
         fem_obj._bound_specs = dict(_bounds)

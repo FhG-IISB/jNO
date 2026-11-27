@@ -60,6 +60,12 @@ A spectral problem is a participant of `jno.core([...])`'s partitioned coupling 
 cross by spectral interpolation along the face, so the coupled solution keeps spectral accuracy whatever the two
 node counts; to or from a mesh side they cross by the usual consistent and conservative maps.
 
+A high-order `jno.fem` side (one scalar field of order >= 2: P2, or the GLL spectral elements below, assembled or
+`matrix_free=True`) couples on its own nodes in 2-D: its interface is the field's nodes on the tagged edges, it
+sends values with each edge's Lagrange basis and fluxes by the field's nodal quadrature, and it takes the value
+condition of the pair. Spectral slab + Q_k slab, the sinh/cosh x sin(πy) problem: max error 6.6e-5 / 2.3e-9 /
+5.7e-12 at Q3 / Q6 / Q8 (a P1 side: 2e-3). Two high-order sides, or a 3-D high-order side, are refused.
+
 ## Spectral elements in `jno.fem`
 
 A Lagrange element of degree > 2 on a quadrilateral or hexahedron (`fem_symbols(order=k)` on a `.quad()` mesh) uses

@@ -1762,6 +1762,7 @@ def assemble_fem_native(
     domain._fem_native_assembly_order = int(fields[0]["order"])
     domain._fem_native_assembly_cells_all = [np.asarray(cf) for cf in cells_f_all]
     domain._fem_native_field_orders = [int(f["order"]) for f in fields]
+    domain._fem_native_cell_type = _cell_type
     domain._fem_native_field_keys = [f["field_key"] for f in fields]
     domain._fem_native_field_shapes = [tuple(f["value_shape"]) for f in fields]
     domain._fem_native_field_constant = [bool(f.get("constant")) for f in fields]

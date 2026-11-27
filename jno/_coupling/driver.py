@@ -348,6 +348,14 @@ class Coupled:
                 if given is self.parts[i].problem:
                     return i
             raise ValueError("jno.solve.coupling(dirichlet=...): pass one of the coupled problems.")
+        takes = {i: getattr(self.parts[i], "takes_flux", True) for i in (a, b)}
+        if not takes[a] and not takes[b]:
+            raise NotImplementedError(
+                "jno.core([...]): neither coupled side can receive a flux condition (two high-order jno.fem sides). "
+                "Make one of them P1, or couple a high-order side to a jno.spectral / jno.fdm / jno.fvm / P1 one."
+            )
+        if takes[a] != takes[b]:  # the side that cannot take the flux takes the value
+            return a if not takes[a] else b
         s = {i: self._stiffness(i, kv, kf) for i in (a, b)}
         return a if s[a] <= s[b] else b
 
@@ -768,7 +776,7 @@ class Coupled:
         key = (d.receiver, d.receiver_tag, d.sender, d.sender_tag, d.flux)
         if key not in cache:
             send, recv = self.parts[d.sender], self.parts[d.receiver]
-            interp = getattr(send, "spectral_interp", None)
+            interp = getattr(send, "spectral_interp", None) or getattr(send, "edge_interp", None)
             if interp is not None and (not d.flux or getattr(recv, "kind", None) == "spectral"):
                 # a spectral sender's interpolant read at the receiver's nodes: spectrally accurate (a flux too, when
                 # the receiver is spectral: both sides hold it pointwise)
