@@ -1,17 +1,21 @@
-"""Owned lattice/expansion utilities for the RCWA backend.
+"""The Fourier basis of a doubly periodic unit cell.
 
-This is jNO's own implementation of the fmmax basis-convention subset that
-``jno.rcwa`` consumes: lattice vectors, expansion generation and transverse
-wavevectors. The math and conventions -- expansion sort order (stable |G|
-sort, zeroth order first), the reciprocal-lattice convention and the index
-semantics of `transverse_wavevectors` -- match fmmax 1.7.1 exactly, so the
-seam swap keeps parity; numerical parity is pinned by
-``tests/test_rcwa_backend_basis.py`` with fmmax as a test-only oracle.
+A cell with primitive lattice vectors ``a1``, ``a2`` has the reciprocal basis ``b1``, ``b2`` with
+``a_i . b_j = delta_ij``, so every Floquet-Bloch harmonic has the transverse wavevector
 
-Unlike fmmax, which runs part of the expansion generation through jnp,
-`generate_expansion` is entirely eager host-side numpy: the lattice vectors
-are concrete at engine build and the resulting coefficient grid is cached, so
-the traced solve path never touches numpy control flow.
+    k_mn = k_in + 2 pi (m b1 + n b2)
+
+for integers ``(m, n)``. An :class:`Expansion` is the truncated, ordered set of those integer pairs: sorted by
+``|m b1 + n b2|`` with the zeroth order first, so that index 0 is always the specular order. Two truncations are
+offered:
+
+* circular (the default): all orders inside the k-space circle whose area holds the requested number of terms
+  (each order occupies one reciprocal cell of area ``|b1 x b2|``); this keeps the resolution isotropic;
+* parallelogramic: ``|m| <= M``, ``|n| <= N`` with ``(2M + 1)(2N + 1)`` close to the requested count and
+  ``M |b1| ~ N |b2|``, the set most other RCWA codes use (needed to compare with them).
+
+The expansion is built eagerly on the host from the concrete lattice and is a static pytree node, so the traced
+solve never sees it as data. The lattice vectors themselves are an ordinary (differentiable) pytree.
 """
 
 import dataclasses
@@ -23,100 +27,91 @@ import jax
 import jax.numpy as jnp
 import numpy as onp
 
+#: Tie tolerance on |G|, relative to the larger reciprocal vector. Orders whose |G| differ by less are treated as
+#: tied: they keep the enumeration order (m major, then n, both ascending). Symmetry-equivalent orders then tie
+#: exactly also when the lattice was given in float32 (0.7 is 0.69999999 there, which moves |G| by about 1e-7), so
+#: the order is the same in c64 and c128; orders that close are interchangeable for the truncation anyway.
+_TIE = 1e-6
+
 
 @dataclasses.dataclass
 class LatticeVectors:
-    """A pair of 2-vectors, for the real-space or the reciprocal-space lattice.
-
-    Attributes:
-        u: The first primitive lattice vector, shape ``(..., 2)``.
-        v: The second primitive lattice vector, same shape as ``u``.
-    """
+    """The two primitive vectors ``u``, ``v`` of a 2-D lattice (each of shape ``(..., 2)``)."""
 
     u: jnp.ndarray
     v: jnp.ndarray
 
     def __post_init__(self) -> None:
-        _validate_lattice_vector(self.u, "u")
-        _validate_lattice_vector(self.v, "v")
+        for name, x in (("u", self.u), ("v", self.v)):
+            shape = jnp.shape(x)
+            if len(shape) == 0 or shape[-1] != 2:
+                raise ValueError(f"`{name}` must have a trailing dimension of 2, but got shape {shape}.")
 
     @property
     def reciprocal(self) -> "LatticeVectors":
-        """The reciprocal lattice (jnp, differentiable in the lattice)."""
-        return _reciprocal(self)
+        """The reciprocal basis ``(b1, b2)`` with ``a_i . b_j = delta_ij`` (without the factor ``2 pi``)."""
+        area = self.u[..., 0] * self.v[..., 1] - self.u[..., 1] * self.v[..., 0]
+        b1 = jnp.stack([self.v[..., 1], -self.v[..., 0]], axis=-1) / area[..., None]
+        b2 = jnp.stack([-self.u[..., 1], self.u[..., 0]], axis=-1) / area[..., None]
+        return LatticeVectors(u=b1, v=b2)
 
 
 @enum.unique
 class Truncation(enum.Enum):
-    """How Fourier orders are truncated."""
+    """How the set of Fourier orders is truncated."""
 
-    #: Orders within a circle whose area matches the requested term count.
     CIRCULAR = "circular"
-
-    #: Orders within a parallelogram matched to the reciprocal spacing.
     PARALLELOGRAMIC = "parallelogramic"
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class Expansion:
-    """The integer reciprocal-lattice coefficients of the Fourier expansion.
-
-    `basis_coefficients` is stored as a plain numpy int array so that it can
-    serve as a static pytree aux node (hashable/equatable) -- the expansion is
-    a property of the truncation geometry, fixed at engine build.
+    """The ordered integer orders ``(m, n)`` of a truncated Fourier expansion.
 
     Attributes:
-        basis_coefficients: Integer coefficients ``(num_terms, 2)`` of the
-            primitive reciprocal-lattice vectors, sorted by magnitude with the
-            zeroth order first.
-        num_terms: The number of terms in the expansion.
+        basis_coefficients: ``(num_terms, 2)`` integers, sorted by ``|m b1 + n b2|``, the zeroth order first.
     """
 
     basis_coefficients: onp.ndarray
 
     def __post_init__(self) -> None:
-        coeffs = self.basis_coefficients
-        if onp.asarray(coeffs).ndim != 2 or onp.asarray(coeffs).shape[-1] != 2:
-            raise ValueError(f"`basis_coefficients` must have shape (num_terms, 2) but got {onp.shape(coeffs)}.")
-        if not onp.issubdtype(onp.asarray(coeffs).dtype, onp.integer):
-            raise ValueError(f"`basis_coefficients` must be an integer array but got dtype {onp.asarray(coeffs).dtype}.")
+        c = onp.asarray(self.basis_coefficients)
+        if c.ndim != 2 or c.shape[-1] != 2:
+            raise ValueError(f"`basis_coefficients` must have shape (num_terms, 2) but got {c.shape}.")
+        if not onp.issubdtype(c.dtype, onp.integer):
+            raise ValueError(f"`basis_coefficients` must be an integer array but got dtype {c.dtype}.")
+        self.basis_coefficients = c
 
     def __hash__(self) -> int:
-        return hash(self.basis_coefficients.tobytes())
+        return hash((self.basis_coefficients.shape, self.basis_coefficients.tobytes()))
 
     def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, Expansion):
-            return False
-        if self.basis_coefficients.shape != other.basis_coefficients.shape:
-            return False
-        return bool(onp.all(self.basis_coefficients == other.basis_coefficients))
+        return (
+            isinstance(other, Expansion)
+            and self.basis_coefficients.shape == other.basis_coefficients.shape
+            and bool(onp.all(self.basis_coefficients == other.basis_coefficients))
+        )
 
     @property
     def num_terms(self) -> int:
-        """The number of terms in the expansion."""
-        return self.basis_coefficients.shape[-2]
+        """The number of orders."""
+        return self.basis_coefficients.shape[0]
 
 
 def min_array_shape_for_expansion(expansion: Expansion) -> Tuple[int, int]:
-    """The minimum grid shape ``(nx, ny)`` whose FFT resolves every term.
-
-    A grid with fewer points than ``2 * max|coefficient| + 1`` per axis cannot
-    represent the highest requested order without aliasing.
-    """
-    coeffs = expansion.basis_coefficients
-    return (
-        int(2 * onp.amax(onp.abs(coeffs[:, 0])) + 1),
-        int(2 * onp.amax(onp.abs(coeffs[:, 1])) + 1),
-    )
+    """The smallest real-space grid ``(nx, ny)`` that represents every order without aliasing: an FFT of ``N``
+    points holds the harmonics ``-floor(N/2) .. floor((N-1)/2)``, so ``N >= 2 max|m| + 1``."""
+    c = expansion.basis_coefficients
+    return int(2 * onp.max(onp.abs(c[:, 0])) + 1), int(2 * onp.max(onp.abs(c[:, 1])) + 1)
 
 
 def validate_shape_for_expansion(shape: Tuple[int, ...], expansion: Expansion) -> None:
-    """Raises if `shape`'s final two axes are insufficient for `expansion`."""
-    min_shape = min_array_shape_for_expansion(expansion)
-    if len(shape) < 2 or any(d < dmin for d, dmin in zip(shape[-2:], min_shape)):
+    """Raises if the last two axes of ``shape`` are too small for ``expansion``."""
+    need = min_array_shape_for_expansion(expansion)
+    if len(shape) < 2 or any(d < dmin for d, dmin in zip(shape[-2:], need)):
         raise ValueError(
-            f"`shape` with final two axes {shape[-2:]} is insufficient for "
-            f"`expansion`; the minimum final-two shape is {min_shape}."
+            f"`shape` with final two axes {shape[-2:]} is insufficient for `expansion`; the minimum final-two "
+            f"shape is {need}."
         )
 
 
@@ -125,75 +120,40 @@ def generate_expansion(
     approximate_num_terms: int,
     truncation: Truncation = Truncation.CIRCULAR,
 ) -> Expansion:
-    """Generates the expansion for the specified real-space lattice.
+    """The truncated order set for a concrete real-space lattice (host-side numpy, at build).
 
-    Runs eagerly on the host with pure numpy; `approximate_num_terms` must be
-    an integer and the lattice vectors must be concrete. The returned
-    coefficients are sorted by magnitude (stable sort), with the zeroth order
-    first. To keep the expansion symmetric the term count may differ from
-    `approximate_num_terms`.
-
-    Args:
-        primitive_lattice_vectors: The primitive vectors of the real-space
-            lattice, each of shape ``(2,)``.
-        approximate_num_terms: The approximate number of terms.
-        truncation: The truncation scheme, CIRCULAR by default.
-
-    Returns:
-        The ``Expansion``.
-
-    Note:
-        Bit-for-bit ordering parity with fmmax is guaranteed except for a
-        single order sitting exactly on the truncation circle of a skewed,
-        non-axis-aligned lattice: there numpy's interop with jnp arrays can
-        round the boundary magnitude differently within fmmax itself. The
-        engine's axis-aligned lattices are unaffected, and the term set is
-        always identical.
+    Both truncations are symmetric under ``(m, n) -> (-m, -n)``, so the term count may differ slightly from
+    ``approximate_num_terms``.
     """
     try:
-        approximate_num_terms = operator.index(approximate_num_terms)
+        count = operator.index(approximate_num_terms)
     except TypeError as e:
         raise ValueError(f"`approximate_num_terms` must be an integer, got {approximate_num_terms!r}.") from e
-    if approximate_num_terms <= 0:
-        raise ValueError(f"`approximate_num_terms` must be positive, got {approximate_num_terms}.")
-
-    # The coefficient generators work with the reciprocal lattice, as in fmmax.
-    # Convert to host numpy: `generate_expansion` is an eager build-time step.
-    reciprocal_vectors = primitive_lattice_vectors.reciprocal
-    u = onp.asarray(reciprocal_vectors.u)
-    v = onp.asarray(reciprocal_vectors.v)
-    if u.ndim != 1 or u.shape != (2,) or v.ndim != 1 or v.shape != (2,):
+    if count <= 0:
+        raise ValueError(f"`approximate_num_terms` must be positive, got {count}.")
+    rec = primitive_lattice_vectors.reciprocal
+    b1 = onp.asarray(rec.u, dtype=onp.float64)
+    b2 = onp.asarray(rec.v, dtype=onp.float64)
+    if b1.shape != (2,) or b2.shape != (2,):
         raise ValueError(
-            f"generate_expansion requires lattice vectors of shape (2,), but got "
-            f"{u.shape} and {v.shape}. An expansion is generated once per concrete "
-            f"lattice at engine build."
+            f"generate_expansion requires lattice vectors of shape (2,), but got {b1.shape} and {b2.shape}. An "
+            "expansion is generated once per concrete lattice at engine build."
         )
-
     if truncation == Truncation.CIRCULAR:
-        basis_coefficients = _basis_coefficients_circular(u, v, approximate_num_terms)
+        # count reciprocal cells of area |b1 x b2| fill the circle of radius sqrt(count |b1 x b2| / pi); an order
+        # within the tie tolerance of the circle counts as on it and is left out, whatever the precision
+        half = count // 2
+        m, n = _grid(half, half)
+        radius = onp.sqrt(count * abs(b1[0] * b2[1] - b1[1] * b2[0]) / onp.pi)
+        keep = _magnitude(m, n, b1, b2) < radius - _TIE * max(onp.linalg.norm(b1), onp.linalg.norm(b2))
+        m, n = m[keep], n[keep]
     elif truncation == Truncation.PARALLELOGRAMIC:
-        basis_coefficients = _basis_coefficients_parallelogramic(u, v, approximate_num_terms)
+        # (2M+1)(2N+1) ~ count with M |b1| = N |b2|: M = r N, r = |b2|/|b1|
+        ratio = onp.linalg.norm(b2) / onp.linalg.norm(b1)
+        m, n = _grid(_parallelogram_extent(count, ratio), _parallelogram_extent(count, 1.0 / ratio))
     else:
         raise ValueError(f"Unknown `truncation`, got {truncation}.")
-    return Expansion(basis_coefficients)
-
-
-def _grid_float_dtype(lattice_dtype: onp.dtype) -> onp.dtype:
-    """The dtype fmmax's grid arithmetic ends up in.
-
-    fmmax multiplies its integer coefficient grid by the (float) reciprocal
-    lattice through JAX promotion: with x64 disabled an int64 grid is
-    canonicalized to int32 first (so a ``float32`` lattice gives float32
-    products), while with x64 enabled int64 promotes with any float to
-    float64. The magnitude ordering depends on the last ulp of these rounded
-    values (exactly-tied lattice vectors differ only by rounding), so the
-    ordered coefficient grid is identical only when this dtype is reproduced.
-
-    NumPy's own ``promote_types`` cannot be used here: NEP 50 raises
-    ``int32 + float32`` to float64, whereas JAX keeps float32, and matching
-    that last-ulp behavior is what guarantees ordering parity.
-    """
-    return onp.dtype(jnp.promote_types(onp.int64, onp.dtype(lattice_dtype)))
+    return Expansion(onp.stack([m, n], axis=-1)[_sorted_with_ties(_magnitude(m, n, b1, b2), b1, b2)])
 
 
 def transverse_wavevectors(
@@ -201,198 +161,58 @@ def transverse_wavevectors(
     primitive_lattice_vectors: LatticeVectors,
     expansion: Expansion,
 ) -> jnp.ndarray:
-    """The transverse wavevectors for all expansion terms.
+    """``k_in + 2 pi (m b1 + n b2)`` for every order, shape ``batch + (num_terms, 2)``.
 
-    The zeroth-order term sits at `in_plane_wavevector`; each other term is
-    shifted by the corresponding reciprocal-lattice vector.
-
-    Args:
-        in_plane_wavevector: The zeroth-order transverse wavevector, shape
-            ``(..., 2)``.
-        primitive_lattice_vectors: The real-space lattice vectors.
-        expansion: The expansion defining the term ordering.
-
-    Returns:
-        The transverse wavevectors, shape ``batch + (num_terms, 2)`` where
-        ``batch`` is the broadcast of the leading dims of `in_plane_wavevector`
-        and the lattice vectors.
+    ``batch`` broadcasts the leading axes of ``in_plane_wavevector`` (shape ``(..., 2)``) and the lattice vectors.
     """
-    reciprocal_vectors = primitive_lattice_vectors.reciprocal
-    kx = in_plane_wavevector[..., 0, jnp.newaxis] + 2 * jnp.pi * (
-        expansion.basis_coefficients[:, 0] * reciprocal_vectors.u[..., 0, jnp.newaxis]
-        + expansion.basis_coefficients[:, 1] * reciprocal_vectors.v[..., 0, jnp.newaxis]
-    )
-    ky = in_plane_wavevector[..., 1, jnp.newaxis] + 2 * jnp.pi * (
-        expansion.basis_coefficients[:, 0] * reciprocal_vectors.u[..., 1, jnp.newaxis]
-        + expansion.basis_coefficients[:, 1] * reciprocal_vectors.v[..., 1, jnp.newaxis]
-    )
-    batch_shape = jnp.broadcast_shapes(
-        in_plane_wavevector.shape[:-1],
-        primitive_lattice_vectors.u.shape[:-1],
-    )
-    assert kx.shape == batch_shape + (expansion.num_terms,)
-    return jnp.stack([kx, ky], axis=-1)
+    rec = primitive_lattice_vectors.reciprocal
+    c = jnp.asarray(expansion.basis_coefficients)
+    g = c[:, 0, None] * rec.u[..., None, :] + c[:, 1, None] * rec.v[..., None, :]  # (..., num_terms, 2)
+    return in_plane_wavevector[..., None, :] + 2 * jnp.pi * g
 
 
-# ------------------------------------------------------------------------------
-# Basis-coefficient generation (eager host-side numpy).
-# ------------------------------------------------------------------------------
+def _sorted_with_ties(mag: onp.ndarray, b1, b2) -> onp.ndarray:
+    """Indices sorting ``mag`` ascending, where runs of values within the tie tolerance of their neighbour form one
+    tied group that keeps the input (enumeration) order. Grouping by consecutive gaps, not by rounding, so that no
+    pair of nearly equal values is split by a rounding boundary."""
+    idx = onp.argsort(mag, kind="stable")
+    gaps = onp.diff(mag[idx]) > _TIE * max(onp.linalg.norm(b1), onp.linalg.norm(b2))
+    group = onp.concatenate([[0], onp.cumsum(gaps)])
+    return idx[onp.lexsort((idx, group))]
 
 
-def _basis_coefficients_circular(u: onp.ndarray, v: onp.ndarray, approximate_num_terms: int) -> onp.ndarray:
-    """Coefficients of reciprocal vectors inside the area-matched circle.
-
-    All vectors with magnitude below ``sqrt(num_terms * |u x v| / pi)`` are
-    kept, so the set has approximately `approximate_num_terms` members. The
-    grid arithmetic runs in fmmax's promoted dtype (see `_grid_float_dtype`),
-    and the magnitudes use plain numpy norms as fmmax's ``np.linalg.norm`` on
-    the jnp grid does (it does not dispatch into jnp). Rounding-sensitive ties
-    in the sort therefore match fmmax bit for bit.
-    """
-    dtype = _grid_float_dtype(u.dtype)
-    g = onp.arange(-(approximate_num_terms // 2), approximate_num_terms // 2 + 1)
-    G1, G2 = onp.meshgrid(g, g, indexing="ij")
-    G1 = G1.flatten()
-    G2 = G2.flatten()
-    # Magnitudes run in fmmax's promoted dtype; the coefficient grid stays integer.
-    G1f = G1.astype(dtype)
-    G2f = G2.astype(dtype)
-    u = u.astype(dtype)
-    v = v.astype(dtype)
-
-    vectors = G1f[:, onp.newaxis] * u[onp.newaxis, :] + G2f[:, onp.newaxis] * v[onp.newaxis, :]
-    magnitude = onp.linalg.norm(vectors, axis=-1)
-
-    # fmmax divides by ``np.pi`` inside jnp, which treats the numpy scalar as a
-    # weak type: with x64 disabled the whole ``max_magnitude`` chain stays
-    # float32 (numpy would instead promote to float64). Matching that dtype is
-    # what decides a coincidentally-boundary order, so use a dtype-matched pi.
-    pi = onp.float32(onp.pi) if dtype == onp.float32 else onp.float64(onp.pi)
-    max_magnitude = onp.sqrt(approximate_num_terms * onp.abs(_cross(u, v)) / pi)
-    mask = magnitude < max_magnitude
-
-    G1 = G1[mask]
-    G2 = G2[mask]
-    magnitude = magnitude[mask]
-    G = onp.stack([G1, G2], axis=-1)
-
-    order = onp.argsort(magnitude, kind="stable")
-    return G[order, :]
+def _grid(m_max: int, n_max: int) -> Tuple[onp.ndarray, onp.ndarray]:
+    m, n = onp.meshgrid(onp.arange(-m_max, m_max + 1), onp.arange(-n_max, n_max + 1), indexing="ij")
+    return m.ravel(), n.ravel()
 
 
-def _basis_coefficients_parallelogramic(u: onp.ndarray, v: onp.ndarray, approximate_num_terms: int) -> onp.ndarray:
-    """Coefficients of reciprocal vectors inside the matched parallelogram.
-
-    Chooses ``(nu, nv)`` with ``(2*nu + 1) * (2*nv + 1) ~= approximate_num_terms``
-    and ``nu / nv = |v| / |u|`` (in the reciprocal basis), so that the sides of
-    the parallelogram of lattice points have equal length in k-space. Grid
-    arithmetic runs in fmmax's promoted dtype as in `_basis_coefficients_circular`.
-    """
-    dtype = _grid_float_dtype(u.dtype)
-    u = u.astype(dtype)
-    v = v.astype(dtype)
-
-    ku_spacing = onp.sqrt(onp.sum(onp.abs(u) ** 2))
-    kv_spacing = onp.sqrt(onp.sum(onp.abs(v) ** 2))
-
-    def _solve_quadratic(ratio):
-        a = 4 * ratio
-        b = 2 * (ratio + 1)
-        c = 1 - approximate_num_terms
-        nu = (-b + onp.sqrt(b**2 - 4 * a * c)) / (2 * a)
-        return int(onp.around(nu))
-
-    nu = _solve_quadratic(ku_spacing / kv_spacing)
-    nv = _solve_quadratic(kv_spacing / ku_spacing)
-
-    G1, G2 = onp.meshgrid(
-        onp.arange(-nu, nu + 1),
-        onp.arange(-nv, nv + 1),
-        indexing="ij",
-    )
-    G1 = G1.flatten()
-    G2 = G2.flatten()
-    G = onp.stack([G1, G2], axis=-1)
-
-    G1f = G1.astype(dtype)
-    G2f = G2.astype(dtype)
-    vectors = G1f[:, onp.newaxis] * u[onp.newaxis, :] + G2f[:, onp.newaxis] * v[onp.newaxis, :]
-    magnitude = onp.linalg.norm(vectors, axis=-1)
-
-    order = onp.argsort(magnitude, kind="stable")
-    return G[order, :]
+def _magnitude(m, n, b1, b2) -> onp.ndarray:
+    return onp.linalg.norm(m[:, None] * b1[None, :] + n[:, None] * b2[None, :], axis=-1)
 
 
-def _cross(x: jnp.ndarray, y: jnp.ndarray) -> jnp.ndarray:
-    """The signed area spanned by the 2-vectors `x` and `y` (``x[0]y[1]-x[1]y[0]``)."""
-    return x[..., 0] * y[..., 1] - x[..., 1] * y[..., 0]
+def _parallelogram_extent(count: int, ratio: float) -> int:
+    """The half-width ``M`` (rounded) solving ``(2M + 1)(2M / ratio + 1) = count``, i.e.
+    ``4 M^2 + 2 (ratio + 1) M + ratio (1 - count) = 0`` after multiplying by ``ratio``."""
+    a, b, c = 4.0, 2.0 * (ratio + 1.0), ratio * (1.0 - count)
+    return int(onp.around((-b + onp.sqrt(b * b - 4 * a * c)) / (2 * a)))
 
 
-def _reciprocal(lattice_vectors: LatticeVectors) -> LatticeVectors:
-    """Computes the reciprocal lattice pair (jnp, differentiable in the lattice).
-
-    Follows the fmmax convention: ``u' = (v_y, -v_x) / (u x v)`` and
-    ``v' = (-u_y, u_x) / (u x v)`` with the 2-D cross product, giving the two
-    vectors that generate the reciprocal lattice.
-    """
-    cross_product = _cross(lattice_vectors.u, lattice_vectors.v)
-    uprime = jnp.stack([lattice_vectors.v[..., 1], -lattice_vectors.v[..., 0]], axis=-1) / cross_product[..., jnp.newaxis]
-    vprime = jnp.stack([-lattice_vectors.u[..., 1], lattice_vectors.u[..., 0]], axis=-1) / cross_product[..., jnp.newaxis]
-    return LatticeVectors(u=uprime, v=vprime)
+# -- pytree registration: the lattice is a differentiable leaf pair, the truncation and expansion are static. --
 
 
-def _validate_lattice_vector(x, name: str) -> None:
-    """Checks that `x` has a trailing dimension of 2 (allowing leading batch axes)."""
-    shape = jnp.shape(x)
-    if len(shape) == 0 or shape[-1] != 2:
-        raise ValueError(f"`{name}` must have a trailing dimension of 2, but got shape {shape}.")
+class _Static:
+    """A static pytree aux holder comparing and hashing like the expansion it carries."""
 
-
-# ------------------------------------------------------------------------------
-# Pytree registration: LatticeVectors is a (differentiable) leaf container,
-# Truncation and Expansion are static aux nodes.
-# ------------------------------------------------------------------------------
-
-
-class _HashableArray:
-    """Hashable wrapper for a numpy array, used as a static pytree aux node."""
-
-    def __init__(self, value: onp.ndarray):
-        self.value = value
+    def __init__(self, expansion: Expansion):
+        self.expansion = expansion
 
     def __hash__(self) -> int:
-        return hash((self.value.shape, self.value.dtype, self.value.tobytes()))
+        return hash(self.expansion)
 
     def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, _HashableArray):
-            return False
-        return (
-            self.value.shape == other.value.shape
-            and self.value.dtype == other.value.dtype
-            and bool(onp.all(self.value == other.value))
-        )
+        return isinstance(other, _Static) and self.expansion == other.expansion
 
 
-def _unflatten_expansion(aux_tuple: Tuple[_HashableArray], leaves: Tuple) -> Expansion:
-    """Reconstructs an `Expansion` from its static aux node."""
-    del leaves
-    return Expansion(basis_coefficients=aux_tuple[0].value)
-
-
-jax.tree_util.register_pytree_node(
-    LatticeVectors,
-    lambda lv: ((lv.u, lv.v), None),
-    lambda _, uv: LatticeVectors(*uv),
-)
-
-jax.tree_util.register_pytree_node(
-    Truncation,
-    lambda x: ((), x.value),
-    lambda value, _: Truncation(value),
-)
-
-jax.tree_util.register_pytree_node(
-    Expansion,
-    lambda e: ((), (_HashableArray(e.basis_coefficients),)),
-    unflatten_func=_unflatten_expansion,
-)
+jax.tree_util.register_pytree_node(LatticeVectors, lambda lv: ((lv.u, lv.v), None), lambda _, uv: LatticeVectors(*uv))
+jax.tree_util.register_pytree_node(Truncation, lambda t: ((), t.value), lambda value, _: Truncation(value))
+jax.tree_util.register_pytree_node(Expansion, lambda e: ((), _Static(e)), lambda aux, _: aux.expansion)

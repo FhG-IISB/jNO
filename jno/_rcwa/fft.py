@@ -1,52 +1,66 @@
-"""Fourier-domain transforms for the RCWA backend.
+"""Fourier coefficients of a sampled unit cell, and the convolution matrices built from them.
 
-Owned implementation of the fmmax-convention Fourier-convolution matrix and
-the expansion-aware forward/inverse FFT pair used by the RCWA seam. The
-centered-coordinate phase convention, the normalization and the gather order
-match fmmax 1.7.1 so that downstream matrices agree bit-for-bit; numerical
-parity is pinned by ``tests/test_rcwa_backend_basis.py``.
+A grid of ``Nx x Ny`` samples ``f_ij`` covers one cell. With *centred* coordinates the sample ``(i, j)`` sits at
+the pixel centre ``r_ij = ((i + 1/2)/Nx) a1 + ((j + 1/2)/Ny) a2``, the natural reading of a rasterised design;
+with corner coordinates at ``(i/Nx) a1 + (j/Ny) a2``. The Fourier coefficient of order ``(m, n)`` is
 
-"Centered coordinates" means the physical sample ``(0, 0)`` sits at the center
-of array element ``(0, 0)`` (i.e. at ``du/2 + dv/2``), so the transform
-carries an extra linear phase ``exp(+/- 2 pi i (ki/2 + kj/2))``.
+    f_mn = (1 / (Nx Ny)) sum_ij f_ij exp(-2 pi i (m (i + s)/Nx + n (j + s)/Ny)),   s = 1/2 (centred) or 0,
+
+that is the plain DFT times the phase ``exp(-pi i (m/Nx + n/Ny))`` in the centred case. The phase is evaluated in
+the working precision of the data (a single-precision phase would cap a float64 solve at 1e-7).
+
+Laurent's rule represents multiplication by ``f`` in the truncated basis by the Toeplitz matrix
+``[[f]]_{ij} = f_{G_i - G_j}`` (Li, JOSA A 13, 1870 (1996); Liu & Fan, Comput. Phys. Commun. 183, 2233 (2012),
+eq. 8): :func:`fourier_convolution_matrix`.
 """
 
 from typing import Tuple
 
 import jax.numpy as jnp
+import numpy as onp
 
-from . import basis, utils
+from . import basis
 
 
-def fourier_convolution_matrix(
-    x: jnp.ndarray,
-    expansion: basis.Expansion,
-) -> jnp.ndarray:
-    """The Fourier convolution (Toeplitz) matrix for the real-space field `x`.
+def _real_dtype(x) -> jnp.dtype:
+    return jnp.real(jnp.zeros((), jnp.result_type(x, jnp.float32))).dtype
 
-    Entry ``(i, j)`` is the Fourier coefficient of the lattice vector
-    ``G_i - G_j`` (equation 8 of [2012 Liu]); the row/column ordering follows
-    the expansion ordering. Computed as an FFT of the real-space grid followed
-    by a gather at the Toeplitz index pairs.
 
-    Args:
-        x: The real-space field, with spatial dimensions as its final two
-            axes, at least `min_array_shape_for_expansion(expansion)` large.
-        expansion: The expansion describing the coefficient ordering.
+def _centring_phase(shape: Tuple[int, int], sign: float, dtype) -> jnp.ndarray:
+    """``exp(sign pi i (m/Nx + n/Ny))`` on the DFT frequency grid (``m``, ``n`` in DFT index order)."""
+    fx = jnp.fft.fftfreq(shape[0]).astype(dtype)[:, None]
+    fy = jnp.fft.fftfreq(shape[1]).astype(dtype)[None, :]
+    return jnp.exp(sign * 1j * jnp.pi * (fx + fy))
 
-    Returns:
-        The convolution matrix, shape ``x.shape[:-2] + (nt, nt)``.
+
+def _coefficients(x: jnp.ndarray, axes: Tuple[int, int], centered: bool) -> jnp.ndarray:
+    """All DFT coefficients ``f_mn`` of ``x`` over ``axes`` (normalised by ``Nx Ny``), in DFT index order."""
+    y = jnp.fft.fft2(x, axes=axes, norm="forward")
+    if centered:
+        shape = (x.shape[axes[0]], x.shape[axes[1]])
+        phase = _centring_phase(shape, -1.0, _real_dtype(x))
+        y = y * phase.reshape(phase.shape + (1,) * (x.ndim - axes[1] - 1))
+    return y
+
+
+def _absolute_axes(axes, ndim: int) -> Tuple[int, ...]:
+    out = tuple(a % ndim for a in axes)
+    if len(set(out)) != len(out) or any(not -ndim <= a < ndim for a in axes):
+        raise ValueError(f"invalid axes {axes} for an array of rank {ndim}.")
+    return out
+
+
+def fourier_convolution_matrix(x: jnp.ndarray, expansion: basis.Expansion) -> jnp.ndarray:
+    """Laurent's-rule matrix ``[[x]]_{ij} = x_{G_i - G_j}`` of the grid ``x`` (last two axes spatial, centred).
+
+    Returns shape ``x.shape[:-2] + (num_terms, num_terms)``. The difference orders index the DFT grid modulo its
+    size (negative orders wrap), so the grid only needs to resolve the orders themselves; differences beyond
+    that alias, which is the usual RCWA convention.
     """
     basis.validate_shape_for_expansion(x.shape, expansion)
-
-    x_fft = _fft2(x, axes=(-2, -1), norm="backward", centered_coordinates=True)
-    # Normalize by the grid size. The divisor is an exact integer, so the real
-    # (vs complex) dtype choice here is numerically inert; using the real dtype
-    # avoids a float64->float32 truncation warning from ``astype(complex)`` when
-    # x64 is disabled and `x` is float64.
-    x_fft = x_fft / jnp.prod(jnp.asarray(x.shape[-2:])).astype(jnp.real(x).dtype)
-    idx = _standard_toeplitz_indices(expansion)
-    return x_fft[..., idx[..., 0], idx[..., 1]]
+    c = onp.asarray(expansion.basis_coefficients)
+    d = c[:, None, :] - c[None, :, :]  # (n, n, 2) difference orders
+    return _coefficients(x, (x.ndim - 2, x.ndim - 1), centered=True)[..., d[..., 0], d[..., 1]]
 
 
 def fft(
@@ -55,41 +69,14 @@ def fft(
     axes: Tuple[int, int] = (-2, -1),
     centered_coordinates: bool = True,
 ) -> jnp.ndarray:
-    """The expansion-aware 2-D Fourier transform of `x`.
-
-    Returns the Fourier coefficients gathered at the expansion's lattice
-    vectors, so the spatial axes shrink to the expansion size.
-
-    Args:
-        x: The array to transform, with spatial axes large enough for
-            `expansion`.
-        expansion: The expansion specifying which coefficients to keep.
-        axes: The two axes to transform, default ``(-2, -1)``.
-        centered_coordinates: Whether the coordinates lie at element centers
-            (default) or at element corners.
-
-    Returns:
-        The gathered coefficients, shape ``x.shape[:a0] + (nt,) + x.shape[a1+1:]``
-        (the two spatial axes collapse into the term axis).
-    """
-    axes = utils.absolute_axes(axes, x.ndim)
+    """The coefficients ``f_mn`` of ``x`` at the expansion's orders; the two spatial ``axes`` collapse into one
+    order axis at the position of the first."""
+    axes = _absolute_axes(axes, x.ndim)
     basis.validate_shape_for_expansion(tuple(x.shape[a] for a in axes), expansion)
-
-    x_fft = _fft2(
-        x,
-        axes=axes,
-        norm="forward",
-        centered_coordinates=centered_coordinates,
-    )
-
-    leading_dims = len(x.shape[: axes[0]])
-    trailing_dims = len(x.shape[axes[1] + 1 :])
-    slices = (
-        [slice(None)] * leading_dims
-        + [expansion.basis_coefficients[:, 0], expansion.basis_coefficients[:, 1]]
-        + [slice(None)] * trailing_dims
-    )
-    return x_fft[tuple(slices)]
+    y = _coefficients(x, axes, centered_coordinates)
+    c = expansion.basis_coefficients
+    index = [slice(None)] * axes[0] + [c[:, 0], c[:, 1]] + [slice(None)] * (x.ndim - axes[1] - 1)
+    return y[tuple(index)]
 
 
 def ifft(
@@ -99,98 +86,19 @@ def ifft(
     axis: int = -1,
     centered_coordinates: bool = True,
 ) -> jnp.ndarray:
-    """The expansion-aware 2-D inverse Fourier transform of `y`.
-
-    Scatters the Fourier coefficients back onto the full grid at the lattice
-    vectors given by `expansion`, then inverse-transforms.
-
-    Args:
-        y: The Fourier coefficients, with the term axis of length
-            ``expansion.num_terms``.
-        expansion: The expansion describing where the coefficients sit on the
-            grid.
-        shape: The output spatial shape ``(nx, ny)``, large enough for
-            `expansion`.
-        axis: The axis of `y` holding the coefficients, default ``-1``.
-        centered_coordinates: As in `fft`.
-
-    Returns:
-        The real-space array of shape ``y.shape[:axis] + shape + y.shape[axis+1:]``.
-    """
-    (axis,) = utils.absolute_axes((axis,), y.ndim)
+    """The grid ``x`` of the given spatial ``shape`` whose coefficients at the expansion's orders are ``y`` (along
+    ``axis``) and zero elsewhere: the inverse of :func:`fft`. The order axis expands into the two spatial axes."""
+    (axis,) = _absolute_axes((axis,), y.ndim)
     if y.shape[axis] != expansion.num_terms:
         raise ValueError(
             f"`y` has {y.shape[axis]} coefficients on its axis {axis}, but the expansion has {expansion.num_terms} terms."
         )
-    x_shape = y.shape[:axis] + tuple(shape) + y.shape[axis + 1 :]
-
     basis.validate_shape_for_expansion(shape, expansion)
-
-    leading_dims = len(y.shape[:axis])
-    trailing_dims = len(y.shape[axis + 1 :])
-    slices = (
-        [slice(None)] * leading_dims
-        + [expansion.basis_coefficients[:, 0], expansion.basis_coefficients[:, 1]]
-        + [slice(None)] * trailing_dims
-    )
-
-    x = jnp.zeros(x_shape, y.dtype)
-    x = x.at[tuple(slices)].set(y)
-    return _ifft2(
-        x,
-        axes=(leading_dims, leading_dims + 1),
-        norm="forward",
-        centered_coordinates=centered_coordinates,
-    )
-
-
-def _fft2(
-    x: jnp.ndarray,
-    axes: Tuple[int, int] = (-2, -1),
-    norm: str = "forward",
-    centered_coordinates: bool = True,
-) -> jnp.ndarray:
-    """The 2-D FFT, with the centered-coordinate phase applied when requested."""
-    y = jnp.fft.fft2(x, axes=axes, norm=norm)
+    c = expansion.basis_coefficients
+    full = jnp.zeros(y.shape[:axis] + tuple(shape) + y.shape[axis + 1 :], y.dtype)
+    index = [slice(None)] * axis + [c[:, 0], c[:, 1]] + [slice(None)] * (y.ndim - axis - 1)
+    full = full.at[tuple(index)].set(y)
     if centered_coordinates:
-        axes = utils.absolute_axes(axes, ndim=x.ndim)
-        ki = 0.5 * jnp.fft.fftfreq(x.shape[axes[0]], dtype=jnp.float32)[:, jnp.newaxis]
-        kj = 0.5 * jnp.fft.fftfreq(x.shape[axes[1]], dtype=jnp.float32)[jnp.newaxis, :]
-        phase = jnp.exp(-1j * 2 * jnp.pi * (ki + kj))
-        phase = phase.reshape(phase.shape + (1,) * (x.ndim - axes[1] - 1))
-        y = y * phase
-    return y
-
-
-def _ifft2(
-    x: jnp.ndarray,
-    axes: Tuple[int, int] = (-2, -1),
-    norm: str = "forward",
-    centered_coordinates: bool = True,
-) -> jnp.ndarray:
-    """The 2-D IFFT, with the centered-coordinate phase applied when requested."""
-    if centered_coordinates:
-        axes = utils.absolute_axes(axes, ndim=x.ndim)
-        ki = 0.5 * jnp.fft.fftfreq(x.shape[axes[0]], dtype=jnp.float32)[:, jnp.newaxis]
-        kj = 0.5 * jnp.fft.fftfreq(x.shape[axes[1]], dtype=jnp.float32)[jnp.newaxis, :]
-        phase = jnp.exp(1j * 2 * jnp.pi * (ki + kj))
-        phase = phase.reshape(phase.shape + (1,) * (x.ndim - axes[1] - 1))
-        x = x * phase
-    return jnp.fft.ifft2(x, axes=axes, norm=norm)
-
-
-def _standard_toeplitz_indices(expansion: basis.Expansion) -> jnp.ndarray:
-    """Index pairs ``(nt, nt, 2)`` of ``G_i - G_j`` for the Toeplitz gather.
-
-    The difference indices index into a standard FFT grid, where negative
-    values wrap around (frequency-major ordering), giving the convolution
-    matrix of Laurent's rule.
-    """
-    i, j = jnp.meshgrid(
-        jnp.arange(expansion.num_terms),
-        jnp.arange(expansion.num_terms),
-        indexing="ij",
-    )
-    basis_coefficients = jnp.asarray(expansion.basis_coefficients)
-    idx = basis_coefficients[i, :] - basis_coefficients[j, :]
-    return idx
+        phase = _centring_phase(tuple(shape), 1.0, _real_dtype(y))
+        full = full * phase.reshape(phase.shape + (1,) * (y.ndim - axis - 1))
+    return jnp.fft.ifft2(full, axes=(axis, axis + 1), norm="forward")

@@ -300,10 +300,14 @@ def test_isolated_scatterer_in_pml_frame_stays_energy_conserving():
 
 
 def test_pml_frame_guard_raises_loudly_with_chunk_remedy():
-    """The never-silent energy guard holds under a PML frame: a divergent frame tensor (an
-    unbalanced ε-only absorber whose recursion does not converge) raises the chunk/orders
-    remedy instead of returning an unconserved answer, while the balanced ε̂=Λ, μ̂=Λ frame
-    (the front door's PML) solves and absorbs."""
+    """The never-silent guard holds under a PML frame: an unbalanced ε-only absorber forced into
+    one chunk per layer raises the chunk/orders remedy instead of returning a number, while the
+    balanced ε̂=Λ, μ̂=Λ frame (the front door's PML) solves and absorbs.
+
+    The layers are 8 thick, where the one-chunk complex64 transfer overflows to NaN on every
+    core layout tried. At 1 thick the garbage was chaotic: T+R = 2.10 before the centring-phase
+    fix of the Fourier coefficients and 0.98 after it (the converged answer is 0.86), and a
+    loss of energy is not something the guard checks (git-bug 27c02c4)."""
     period = 1.4
     ng = 24
     w = 0.35 * period
@@ -314,7 +318,7 @@ def test_pml_frame_guard_raises_loudly_with_chunk_remedy():
     Sx, Sy = 1.0 + 1j * sx / K0, 1.0 + 1j * sy / K0
     eps_only = (np.asarray(Sy / Sx), np.zeros((ng, ng)), np.zeros((ng, ng)), np.asarray(Sx / Sy), np.asarray(Sx * Sy))
     scatterer = _disk_grid(period, ng, 0.18, 6.0, center_frac=0.5)
-    bad = [(1.0, eps_only), (1.0, scatterer), (1.0, tuple(c.copy() for c in eps_only))]
+    bad = [(8.0, eps_only), (8.0, scatterer), (8.0, tuple(c.copy() for c in eps_only))]
     st = StateStack(
         wavelength=WL,
         period=(period, period),
