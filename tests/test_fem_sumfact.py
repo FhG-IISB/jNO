@@ -64,18 +64,23 @@ def _distorted(dim, n=2):
     return d
 
 
-def _scalar(dim, order, quadrature):
+def _scalar_problem(dim, order, quadrature, **kw):
     d = _distorted(dim)
     u, v = d.fem_symbols(order=order)
     X = d.variable("interior", split=True)[:dim]
     ui, vi = u.bind(**dict(zip("xyz", X))), v.bind(**dict(zip("xyz", X)))
     grad = sum(getattr(ui, a) * getattr(vi, a) for a in "xyz"[:dim])
     kappa = 1.0 + X[0] * X[1]
-    prob = jno.fem([kappa * grad + X[0] * ui.x * vi + 3.0 * ui * vi - jnn.sin(3 * X[0]) * vi], quadrature=quadrature)
+    form = kappa * grad + X[0] * ui.x * vi + 3.0 * ui * vi - jnn.sin(3 * X[0]) * vi
+    return jno.fem([form], quadrature=quadrature, **kw)
+
+
+def _scalar(dim, order, quadrature):
+    prob = _scalar_problem(dim, order, quadrature)
     return np.asarray(prob.A), np.asarray(prob.b)
 
 
-def _vector(order, quadrature):
+def _vector_problem(order, quadrature, **kw):
     d = _distorted(2)
     u, v = d.fem_symbols(order=order, value_shape=(2,))
     x, y, _ = d.variable("interior", split=True)
@@ -84,7 +89,11 @@ def _vector(order, quadrature):
     form = 2.0 * jnn.inner(jnn.symgrad(ui, X), jnn.symgrad(vi, X), 2)  # the whole-field gradient rule
     form = form + 1.5 * (ui[0].d(x) + ui[1].d(y)) * (vi[0].d(x) + vi[1].d(y))  # the component-gradient rule
     form = form + jnn.inner(ui, vi, 1)  # the value rule
-    prob = jno.fem([form - y * vi[0] + x * vi[1]], quadrature=quadrature)
+    return jno.fem([form - y * vi[0] + x * vi[1]], quadrature=quadrature, **kw)
+
+
+def _vector(order, quadrature):
+    prob = _vector_problem(order, quadrature)
     return np.asarray(prob.A), np.asarray(prob.b)
 
 
@@ -219,3 +228,44 @@ def test_the_matrix_free_apply_is_one_contraction_per_axis_each_way(dim, order):
     n_cells, n_local = 2**dim, (order + 1) ** dim
     largest = max(int(np.prod(o.aval.shape)) for e in eqns for o in e.outvars)
     assert largest < n_cells * n_local * n_local  # nothing table-sized: at most (cells, n_quad, dim, dim)
+
+
+@pytest.mark.parametrize("case", ["scalar2d", "scalar3d", "vector2d"])
+@pytest.mark.parametrize("quadrature", [None, "gll"])
+def test_the_matrix_free_diagonal_is_summed_by_factors_and_exact(case, quadrature, monkeypatch):
+    """The diagonal of an unstored operator, by sum factorisation (``_vol_elem_diag``: the integrand's bilinear
+    coefficients per point against squared 1-D tables), against the assembled matrix's: variable coefficient,
+    advection (non-symmetric), reaction, distorted cells, and a vector form with symgrad and divergence terms."""
+    from jno.utils.solver import fem_native as fn
+
+    build = {
+        "scalar2d": lambda **kw: _scalar_problem(2, 4, quadrature, **kw),
+        "scalar3d": lambda **kw: _scalar_problem(3, 3, quadrature, **kw),
+        "vector2d": lambda **kw: _vector_problem(4, quadrature, **kw),
+    }[case]
+    verdicts, real = [], fn._fast_diag_agrees
+    monkeypatch.setattr(fn, "_fast_diag_agrees", lambda *a, **k: verdicts.append(real(*a, **k)) or verdicts[-1])
+    A, _b = build(matrix_free=True).operator
+    d = np.asarray(A.diag())
+    assert verdicts and all(verdicts), "the diagonal did not take the sum-factorised route"
+    exact = np.diag(np.asarray(build().A))
+    assert np.abs(d - exact).max() < 1e-11 * np.abs(exact).max()
+
+
+def test_a_diagonal_the_fast_route_cannot_read_keeps_the_exact_pass(monkeypatch):
+    """A term the factored route evaluates wrongly is caught by the check against the exact pass on sample cells."""
+    from jno.utils.solver import fem_native as fn
+
+    verdicts, agrees = [], fn._fast_diag_agrees
+    monkeypatch.setattr(
+        fn,
+        "_fast_diag_agrees",
+        lambda fast, exact, *a, **k: (
+            verdicts.append(agrees(lambda c, la: 2.0 * fast(c, la), exact, *a, **k)) or verdicts[-1]
+        ),
+    )
+    A, _b = _scalar_problem(2, 4, "gll", matrix_free=True).operator
+    d = np.asarray(A.diag())
+    assert verdicts and not any(verdicts)
+    exact = np.diag(np.asarray(_scalar_problem(2, 4, "gll").A))
+    assert np.abs(d - exact).max() < 1e-11 * np.abs(exact).max()

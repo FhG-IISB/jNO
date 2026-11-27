@@ -173,6 +173,24 @@ _VOLUME_BLOCKS = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedro
 
 #: The cells whose reference map is NOT affine, so the Jacobian must be formed per quadrature point.
 TENSOR_PRODUCT_CELLS = ("quad", "hexahedron")
+
+
+class _PointData:
+    """Stands in for :class:`fem_lagrange.TensorFactors` with a field's values and gradients at the quadrature points
+    given directly, so the integrand can be differentiated in them (see ``_vol_elem_diag``)."""
+
+    __slots__ = ("U", "G")
+
+    def __init__(self, U, G):
+        self.U, self.G = U, G
+
+    def values(self, cell_sol):
+        return self.U
+
+    def grads(self, cell_sol, K):
+        return self.G
+
+
 # Arrays of ``n_quad x components x dim`` numbers a sum-factorised residual keeps per cell (a bound for the
 # chunk size, see ``_residual_chunk``).
 _SUMFACT_RESIDUAL_ARRAYS = 32
@@ -1269,6 +1287,30 @@ def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
     return merged, interior
 
 
+def _fast_diag_agrees(fast, exact, cells, local, *, rtol=1e-9):
+    """Whether the sum-factorised element diagonal ``fast(c, la)`` equals the exact one ``exact(c, la)`` on the
+    first, a middle and the last cell. Decided on concrete values only: under a trace (the cells' data are tracers)
+    it answers no, and the exact pass runs."""
+    if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((cells, local))):
+        return False
+    n = int(np.shape(cells)[0])
+    if n == 0:
+        return False
+    try:
+        with jax.ensure_compile_time_eval():
+            for i in sorted({0, n // 2, n - 1}):
+                f = fast(cells[i], local[i])
+                if f is None:
+                    return False
+                e = np.asarray(exact(cells[i], local[i]))
+                f = np.asarray(f)
+                if f.shape != e.shape or not np.allclose(f, e, rtol=rtol, atol=rtol * max(float(np.abs(e).max()), 1e-300)):
+                    return False
+    except Exception:  # noqa: BLE001 -- any term the fast route cannot evaluate keeps the exact pass
+        return False
+    return True
+
+
 def _unstored_operator(lin, mask, pin, diag_fn, n):
     """``v -> mask * lin(mask * v) + pin * v`` as a :class:`LinearOperator` that stores no matrix.
 
@@ -1303,8 +1345,9 @@ def _unstored_operator(lin, mask, pin, diag_fn, n):
         return _apply_t(*_state(), jnp.asarray(v))
 
     def _diag():
-        if not diag:
-            diag.append(jnp.asarray(diag_fn()).reshape(-1))
+        if not diag:  # cached, so computed on concrete values even when first asked for inside a trace
+            with jax.ensure_compile_time_eval():
+                diag.append(jnp.asarray(diag_fn()).reshape(-1))
         return diag[0]
 
     # No ``dense_fn``: a direct solver or a matrix-based preconditioner then raises instead of quietly building
@@ -3364,20 +3407,9 @@ def assemble_fem_native(
         un = jax.lax.dynamic_slice(u_flat, (offs[fidx],), (n_geom * vt,)).reshape(n_geom, vt)
         return _face_normals_jax(pts.at[:, :dim].add(un[:, :dim]), _facet_verts_j, _facet_sign_j)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
-                      seeded=True, cell_sols=None):  # fmt: skip
-        """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
-        all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
-        element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
-        O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
-        per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
-        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh).
-        ``cell_sols`` (per-field local vectors) stands in for ``local_all``: one input per field, which is how
-        :func:`input_dependencies` tells the fields a term reads apart."""
-        if cell_sols is None:
-            cell_sols = _split_cell_local(local_all)
-        else:
-            local_all = cell_sols[0]  # only its dtype is read below
+    def _vol_loc(c, cell_sols, local_dtype, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
+        """``(per, loc, w)`` of one volume term group on cell ``c``: the per-field cell data, the evaluation context
+        and the quadrature weights. Shared by :func:`_vol_elem_res` and :func:`_vol_elem_diag`."""
         per, xq, meas, _J = _cell_fields(c, cell_sols, pts_j if pts is None else pts, cells, cells_f)
         # The `dom.cell_size` / `dom.cell_metric` geometry symbols a stabilized form reads.
         h_qp, G_qp = _cell_geometry_symbols(meas, _J)
@@ -3393,7 +3425,7 @@ def assemble_fem_native(
             "runtime_parameter_tags": runtime_parameter_tags,
             "vector_parameter_tags": vector_parameter_tags,
             "region_mask_names": rnames,
-            "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + cell_masks,
+            "volume_vars": _runtime_vals(c, t, args, local_dtype) + cell_masks,
             "trial_value_shape": fields[tfi]["value_shape"],
             "trial_vec": vecs[tfi],
         }
@@ -3417,9 +3449,25 @@ def assemble_fem_native(
             if hbuf:
                 loc["qp_history"] = {k: hbuf[k][c] for k in history_specs if k in hbuf}
         _add_loadpath_fields(loc, c, args)  # per-step load-path field slices -> loc["frozen_fields"]
+        return per, loc, qw_shared * meas
+
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None,
+                      seeded=True, cell_sols=None):  # fmt: skip
+        """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
+        all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
+        element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
+        O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
+        per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
+        region_mask...]). ``pts`` is the coordinate-parameter-scattered geometry (``None`` -> static mesh).
+        ``cell_sols`` (per-field local vectors) stands in for ``local_all``: one input per field, which is how
+        :func:`input_dependencies` tells the fields a term reads apart."""
+        if cell_sols is None:
+            cell_sols = _split_cell_local(local_all)
+        else:
+            local_all = cell_sols[0]  # only its dtype is read below
+        per, loc, w = _vol_loc(c, cell_sols, local_all.dtype, tfi, rnames, t, args, pts, cells, cells_f)
         # One test field, one mask: every piece integrates against this same `loc` and has the same
         # (n_test,) layout, so their sum is the group's element residual.
-        w = qw_shared * meas
         pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
         # The TANGENT is forward over this SEEDED evaluation. Forward-over-reverse is symmetric only to
         # round-off (3e-17 measured), so its element block is averaged within the solver's symmetry gate
@@ -3472,6 +3520,102 @@ def assemble_fem_native(
             return jax.grad(total)(s0).reshape(-1)
         except _NotSeedable:
             return None
+
+    def _vol_elem_diag(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
+        """The diagonal of one volume term's own-field element block on cell ``c``, ``(n_test,)``, by sum
+        factorisation; ``None`` where it does not apply (no tensor factors, a term that is not seeded).
+
+        A weak term is, per quadrature point, a bilinear form in the trial field's value and gradient there and the
+        test function's: ``I_q = X_q^T C_q Y_q`` (for a nonlinear term, its linearisation at the state). The
+        diagonal entry of node ``n`` is ``Σ_q w_q ψ_n(q)^T C_q ψ_n(q)`` with ``ψ_n = (φ_n, ∇φ_n)``. ``C_q`` is
+        read off the integrand itself, ``(1 + dim)·vec`` forward-over-reverse passes of the POINTWISE integrand with
+        the field's point data put in directly. In reference coordinates every product ``ψ_a ψ_b`` is a product of
+        1-D tables per axis (``B∘B``, ``B∘D``, ``D∘D``), so the sum over the points is one contraction per axis per
+        pair: ``O((1 + d)² k^(d+1))`` per cell, where differentiating the element residual for every local DOF
+        costs ``O(k^(2d+1))`` (measured at Q8, 2M DOFs: most of a matrix-free build). A term that reads the field
+        some other way (a second derivative) is caught by the caller, which checks this against that exact pass."""
+        cell_sols = _split_cell_local(local_all)
+        per, loc, w = _vol_loc(c, cell_sols, local_all.dtype, tfi, rnames, t, args, pts, cells, cells_f)
+        base = per[tfi]
+        if base.get("sumfact") is None or base.get("cell_sol") is None:
+            return None
+        from .fem_utils import _field_slot_or_none
+
+        pieces = tuple(coeff) if isinstance(coeff, _FusedVolumeTerms) else (coeff,)
+        seeds = [_seeded_piece(pc) for pc in pieces]
+        if any(sd is None for sd in seeds) or any(
+            _field_slot_or_none(loc, tt) != tfi for _rw, tests in seeds for tt in tests
+        ):
+            return None
+        factors, Kq = base["sumfact"]
+        cs = base["cell_sol"]
+        dtype = jnp.result_type(cs, w)
+        X0 = (jnp.asarray(factors.values(cs), dtype), jnp.asarray(factors.grads(cs, Kq), dtype))
+        Y0 = (jnp.zeros_like(X0[0]), jnp.zeros_like(X0[1]))
+        n_q, vec, dim = X0[1].shape
+        slot = len(per)
+        index = {**loc["field_index"], _SEED_KEY: slot}
+        dummy = jnp.zeros(jnp.shape(cs), dtype)
+        hess = getattr(base, "_hess_fn", None)
+
+        def total(X, Y):
+            trial = _CellFieldData({**base, "cell_sol": dummy, "sumfact": (_PointData(*X), Kq)}, hess)
+            test = _CellFieldData({**base, "cell_sol": dummy, "sumfact": (_PointData(*Y), Kq)}, hess)
+            fields_ = list(per)
+            fields_[tfi] = trial
+            loc2 = {**loc, "fields": fields_ + [test], "field_index": index}
+            acc = 0.0
+            for rewritten, _tests in seeds:
+                val = _eval_integrand(domain, rewritten, loc2)
+                if jnp.iscomplexobj(val) or jnp.ndim(val) == 0 or val.size != w.shape[0]:
+                    raise _NotSeedable
+                acc = acc + jnp.sum(val.reshape(-1) * w)
+            return acc
+
+        grad_Y = jax.grad(total, argnums=1)
+
+        def column(dX):  # ∂²(Σ_q w_q I_q)/∂X∂Y along the trial tangent dX: (dV, dH)
+            return jax.jvp(lambda X: grad_Y(X, Y0), (X0,), (dX,))[1]
+
+        try:
+            # one tangent per (component, value-or-gradient-direction): (vec * (1 + dim)) of them
+            eye = jnp.eye(vec * (1 + dim), dtype=dtype).reshape(vec * (1 + dim), vec, 1 + dim)
+            dU = jnp.broadcast_to(eye[:, None, :, 0], (eye.shape[0], n_q, vec))
+            dG = jnp.broadcast_to(eye[:, None, :, 1:], (eye.shape[0], n_q, vec, dim))
+            dV, dH = jax.vmap(column)((dU, dG))  # (T, n_q, vec), (T, n_q, vec, dim)
+        except _NotSeedable:
+            return None
+        # C[comp, q, a, b]: trial slot a (value, ∂/∂x_d) against test slot b, same component
+        Ct = jnp.concatenate([dV[..., None], dH], axis=-1).reshape(vec, 1 + dim, n_q, vec, 1 + dim)
+        C = jnp.stack([Ct[k, :, :, k, :] for k in range(vec)])  # (vec, 1+dim, n_q, 1+dim)
+        C = jnp.moveaxis(C, 2, 1)  # (vec, n_q, 1+dim trial, 1+dim test)
+        # to reference coordinates: the physical gradient is ∂u/∂ξ · K (K = J⁻¹ per point)
+        K = jnp.broadcast_to(factors.per_point(Kq)[:, 0], (n_q,) + tuple(jnp.shape(factors.per_point(Kq))[-2:]))
+        tdim = int(K.shape[-2])
+        T = jnp.zeros((n_q, 1 + tdim, 1 + dim), dtype).at[:, 0, 0].set(1.0).at[:, 1:, 1:].set(K)
+        Cr = jnp.einsum("qae,kqef,qbf->kqab", T, C, T, precision=jax.lax.Precision.HIGHEST)
+        B, D = factors.B, factors.D
+
+        def table(slot_, axis):
+            return D[axis] if slot_ == axis + 1 else B[axis]
+
+        def lex_points(flat):  # (n_q,) in the rule's order -> the lexicographic point tensor
+            if factors.quad is not None:
+                flat = jnp.zeros_like(flat).at[jnp.asarray(factors.quad)].set(flat)
+            return flat.reshape(factors.m)
+
+        out = []
+        for k in range(vec):
+            acc = 0.0
+            for a in range(1 + tdim):
+                for b in range(1 + tdim):
+                    Tq = lex_points(Cr[k, :, a, b])
+                    for axis in range(tdim):
+                        F = jnp.asarray(table(a, axis) * table(b, axis), dtype)  # (m, p)
+                        Tq = factors._along(F.T, Tq, axis)
+                    acc = acc + Tq
+            out.append(jnp.zeros((int(np.prod(factors.p)),), dtype).at[jnp.asarray(factors.dof)].set(acc.reshape(-1)))
+        return jnp.stack(out, axis=-1).reshape(-1)  # node-major, as the test DOFs are laid out
 
     def _vol_readout_loc(c, local_all, t=0.0, args=None, pts=None, rnames=()):
         """The per-cell ``loc`` a TEST-FREE volume expression is evaluated in, plus the geometric measure
@@ -4789,6 +4933,20 @@ def assemble_fem_native(
                         same = _rt[c][:, None] == cad_d[c][_s][None, :]  # (n_test, n_term_cols)
                         return jnp.sum(jnp.where(same, _k(c, la), 0.0), axis=1)
 
+                    # By sum factorisation when the term allows it (``_vol_elem_diag``), checked against this exact
+                    # pass on a few cells first, so a term the fast route reads wrongly keeps the exact one.
+                    def _kf(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
+                        return _vol_elem_diag(c, la, _e, _t, _r, t, args, _p, cl_d, clf_d)
+
+                    if _fast_diag_agrees(_kf, _kd, _cells_t, _la_t):
+                        _kd = _kf
+                        _chunk_v = (
+                            _chunk_v
+                            if _sf_residual_bytes is None
+                            else cell_chunk(
+                                _n_t, 1, 1, _chunk_setting, per_bytes=_sf_residual_bytes * vecs[tfi] * (1 + dim)
+                            )
+                        )
                     _dacc[0] = _elem_map(_kd, (_cells_t, _la_t), _chunk_v, scatter=(_dacc[0], _cd_t))
                     continue
                 if _plan is not None:
