@@ -97,8 +97,12 @@ traj = fem.solve(time=jno.solve.erk("rk4"), save_ts=np.linspace(0, 0.05, 6))
 
 The step is the explicit (CFL) limit: about `h / k^2`.
 
-A curved boundary is meshed with straight-sided cells (`shape.curved()` is for order-2 simplices and refuses
-quadrilaterals): its `O(h²)` geometry error is not reduced by the degree.
+A curved boundary needs `shape.quad().curved()`. Without it the cells are straight-sided, the domain is a polygon, and
+its `O(h²)` geometry error is not reduced by the degree. With it, the nodes of each boundary cell are put on the true
+boundary at the field's degree: edge nodes by the shape's signed distance, the cell's interior by transfinite
+blending (Gordon-Hall), so the map stays smooth. Holes and boolean shapes work; interfaces between regions and
+hexahedra stay straight. A cell with two boundary edges meeting at a smooth point of the boundary would open to 180°
+when curved and is refused with a hint to mesh finer there.
 
 The default `fem.solve()` is an iterative solve to a relative residual of 1e-8, which is coarser than a
 high-degree discretisation: a Q8 solution good to 6e-11 came back at 1.2e-6. Pass `linear=jno.solve.lu()` or a
@@ -123,6 +127,7 @@ float64.
     | 2-D NS, ETDRK4, 3/2 dealiasing, RTX 3070, against a hand-written JAX solver | 256²: 1.9 ms f64 (0.99x), 0.29 ms f32 (0.89x); 512²: 8.9 ms (1.05x), 1.6 ms (0.93–1.00x); 1024²: 29.6 ms (0.97x), 8.8 ms (0.81x); 0.5 GB peak at 1024² f64 |
     | same problem, 128², against Dedalus 3 (RK443) | relative L2 difference 1.1e-4 at dt 1e-3, 2.6e-5 at Dedalus dt/4: the gap is Dedalus' own time error |
     | spectral elements, 3-D Poisson, 2³ hexahedra, Q2 / Q3 / Q4 / Q5 / Q6 | max error 2.3e-2 / 4.5e-4 / 3.4e-5 / 8.9e-7 / 7.9e-8 |
+    | `-Δu = 1` on the unit disk, 52 quadrilaterals, Q2 / Q4 / Q8, straight against `shape.quad().curved()` | straight 5.1e-3 / 5.1e-3 / 5.1e-3 (the polygon's error); curved 8.8e-5 / 2.3e-7 / 2.1e-12 |
     | spectral elements off a box, Q3 / Q5 / Q8, `matrix_free=True`, GLL rule | L-shape (12 quads) 9.3e-5 / 6.4e-8 / 1.5e-12; unstructured polygon (33 quads) 1.8e-4 / 3.0e-7 / 8.7e-12 |
     | one Q_k Poisson apply, hand-written sum-factorised kernel against the assembled matvec (227k / 69k / 36k DOFs; Q3 / Q5 / Q8) | i5-13600K f64: 4.6x / 16x / 30x faster; RTX 3070 f64: 0.53x / 1.7x / 3.5x; f32: 1.1x / 3.5x / 6.0x; operator memory 205 / 128 / 140 MB against 25 / 5.5 / 2.3 MB |
     | `jno.fem(matrix_free=True)`, 3-D Poisson, 2.0-2.1M DOFs, RTX 3070, f64, Q3 / Q5 / Q8 | build 6.8 / 6.0 / 6.4 s; apply 19 / 11 / 11 ms (1.03x / 1.34x / 1.94x the hand-written kernel); Jacobi-CG solve 0.8 / 0.9 / 1.2 s (10 / 29 / 61 iterations, a single-mode right-hand side); max error 1.3e-10 / 2.0e-12 / 5.6e-12; 1.1 / 0.9 / 0.7 GB peak on the card, of which 0.56 / 0.40 / 0.36 GB kept coefficients (14 numbers per quadrature point) |

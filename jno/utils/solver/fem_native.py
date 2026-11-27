@@ -264,6 +264,12 @@ def _ek(domain) -> bool:
     return any(_is_nonconforming_side(t) for t in (getattr(domain, "_interface_registry", {}) or {}))
 
 
+def _curved_quads(domain, cell_type) -> bool:
+    """Whether a quadrilateral mesh is to carry its high-order nodes on the true boundary (``shape.quad().curved()``)."""
+    plan = getattr(domain, "_shape_plan", None)
+    return cell_type == "quad" and plan is not None and int(getattr(plan, "_mesh_order", 1)) > 1
+
+
 def _get_mesh(domain, dim: int, order: int):
     """P1 base mesh + optionally promoted P{order} mesh, both as NumPy arrays.
 
@@ -287,6 +293,10 @@ def _get_mesh(domain, dim: int, order: int):
         pts_f, cells_f = _promote_to_degree(
             pts_all, cells_b, lagrange_interp_points(dim, order, cell_type), cell_type, entity_keys=_ek(domain)
         )
+        if _curved_quads(domain, cell_type):
+            from .fem_curved import curve_boundary_nodes
+
+            pts_f = curve_boundary_nodes(domain._shape_plan, pts_f, cells_b, cells_f, order)
         # Both arrays share one id space, as on the curved path: `_promote_to_degree` keeps the
         # original vertices at ids 0..nv-1, so the P1 connectivity still indexes `pts_f` correctly.
         # That matters because the geometry gather reads the ASSEMBLY connectivity against `pts_p1`
@@ -1671,7 +1681,8 @@ def assemble_fem_native(
     # Whether a FACET of this cell is curved. A quadrilateral's edge is straight (a bilinear map
     # restricted to an edge is linear), so only a hexahedron's bilinear face needs a normal that
     # varies across it.
-    _curved_facet = _cell_type in ("hexahedron", "hex")
+    # A curved quadrilateral's edge (``shape.quad().curved()``) is a curve too: its normal turns along it.
+    _curved_facet = _cell_type in ("hexahedron", "hex") or _curved_quads(domain, _cell_type)
     _curved = {1: "line3", 2: "triangle6"}.get(dim, "tetra10") in domain.mesh.cells_dict
     _nonaffine = _curved or _tensor_product
     _geom_field = 0

@@ -1213,7 +1213,12 @@ class shape:
 
         Worth pairing with a matching element order (``jno.fem(..., order=2)``); a curved mesh under a
         P1 basis buys only the geometry, not the convergence rate. Meshing is a property of the shape,
-        which is why this lives here beside :meth:`sized` rather than on the solve."""
+        which is why this lives here beside :meth:`sized` rather than on the solve.
+
+        On quadrilaterals (``shape.quad().curved()``) the mesh stays bilinear, and the boundary is curved at the
+        DEGREE OF THE FIELD put on it, any degree: the nodes of each boundary cell are moved onto the boundary
+        (by the shape's signed distance, the cell's interior by transfinite blending), so the Q_k spectral
+        elements keep their rate on a round domain (``fem_curved.curve_boundary_nodes``)."""
         if int(order) not in (1, 2):
             raise ValueError(f"shape.curved: only order 1 (straight) or 2 is supported, got {order!r}.")
         return replace(self, _mesh_order=int(order))
