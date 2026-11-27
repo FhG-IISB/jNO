@@ -35,6 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..trace import Placeholder
+from ..utils.sets import unique_values
 from .enclosure import STEFAN_BOLTZMANN, radiosity_irradiation, radiosity_resolvent
 
 
@@ -282,7 +283,7 @@ def _lower(term, nodes):
     # an m x m solve): with t = (u_a + u_b)/2 and G(t) = F J, M J = e sigma t^4, M = I - diag(1-e) F,
     #   M dJ = diag(h) dt,  h = d(e sigma t^4)/dt - e'(t) G   ->   dG/dt = F M^-1 diag(h),
     # and the term is pointwise in the face, so its partials in t and G are one JVP each along the ones vector.
-    S = np.unique(elements)
+    S = unique_values(elements)
     k = int(S.size)
     la, lb = np.searchsorted(S, elements[:, 0]), np.searchsorted(S, elements[:, 1])
 

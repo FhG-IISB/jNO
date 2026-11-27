@@ -1243,7 +1243,7 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     if unknown:
         raise ValueError(f"d.irradiation: {unknown} are not volume regions of this mesh; known: {sorted(regions)}.")
     cells2, _cell_type = _area_cells(mesh)
-    nodes = {m: set(np.unique(cells2[regions[m]]).tolist()) for m in medium_regions}
+    nodes = {m: set(unique_values(cells2[regions[m]]).tolist()) for m in medium_regions}
 
     # connected media: regions sharing a node belong to one medium
     parent = {m: m for m in medium_regions}

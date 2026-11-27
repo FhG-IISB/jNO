@@ -859,7 +859,7 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
         if m.shape[0] != cells.shape[0] or not m.any():
             raise ValueError(f"jno.fem: p.pin() on a field of region={region!r} found no cell of that region.")
         outside = _np.ones(len(pts), dtype=bool)
-        outside[_np.unique(cells[m > 0])] = False
+        outside[unique_values(cells[m > 0])] = False
         d2 = _np.where(outside, _np.inf, d2)
     nid = int(d2.argmin())
     if ties:
@@ -7728,7 +7728,7 @@ def _coupling_support(couplings, slices):
         if sup is None:
             return None
         parts.append(lo + np.asarray(sup, dtype=np.int64).reshape(-1))
-    return np.unique(np.concatenate(parts)) if parts else None
+    return unique_values(np.concatenate(parts)) if parts else None
 
 
 def _analytic_blocks(couplings, slices, pick=lambda args: args):

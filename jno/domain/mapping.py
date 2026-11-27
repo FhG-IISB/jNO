@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ..trace import BinaryOp, FunctionCall, Jacobian, Literal, Placeholder, TestFunction, Variable
+from ..utils.sets import unique_values
 
 _BINARY = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv, "**": operator.pow}
 
@@ -262,7 +263,7 @@ def _check_identity_on_interfaces(domain, region, f):
     for r, m in regions.items():
         if r not in maps:
             others |= np.asarray(m, bool)
-    shared = np.intersect1d(np.unique(cells[inside]), np.unique(cells[others]))
+    shared = np.intersect1d(unique_values(cells[inside]), unique_values(cells[others]))
     if shared.size == 0:
         return
     pts = np.asarray(mesh.points)[shared, : int(domain.dimension)]
