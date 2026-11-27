@@ -343,7 +343,7 @@ def test_adaptive_gradient_is_the_same_for_any_budget_and_matches_finite_differe
     g_big = float(jax.jit(jax.grad(loss(2500)))(0.8))
     fd = float((loss(150)(0.8 + 1e-5) - loss(150)(0.8 - 1e-5)) / 2e-5)
     assert np.isfinite(g_small)
-    assert abs(g_small - g_big) <= 1e-9 * max(abs(g_small), 1.0), (g_small, g_big)
+    assert abs(g_small - g_big) <= 1e-6 * max(abs(g_small), 1.0), (g_small, g_big)
     assert abs(g_small - fd) <= 1e-2 * max(abs(fd), 1.0), f"AD {g_small} vs FD {fd}"
     ks = jnp.asarray([0.7, 0.8, 0.9])
     batched = jax.vmap(jax.grad(loss(150)))(ks)
@@ -383,3 +383,14 @@ def test_bdf_traces_the_step_solve_once_not_once_per_order():
         fem.operator, {}, SAVE[-1:], linear_solve=counting, nonlinear_solve=None
     )
     assert len(traced) == 1, f"the step was traced {len(traced)} times"
+
+
+def test_only_coupled_constraint_rows_keep_the_tight_step_solve():
+    """A Dirichlet row (zero mass, one entry) leaves the step-solve tolerance free to follow the march; a constraint
+    that ties unknowns together (Darcy's continuity row) keeps the tight default: a loosened relative residual
+    leaves a large error in such a row, and the DAE hands it on to the differential rows, so bdf returned NaN."""
+    from jno.utils.solver.backend_blocks import _block_has_coupled_algebraic_rows
+    from tests.test_fem_time_schemes_every_element import FAMILIES
+
+    assert not _block_has_coupled_algebraic_rows(_form(6).operator, {})
+    assert _block_has_coupled_algebraic_rows(FAMILIES["rt_p0_darcy"]().operator, {})

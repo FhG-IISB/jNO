@@ -69,9 +69,9 @@ def _index2_rows(M, A, n, dtype):
     return _algebraic_rows(M, n, dtype) & (diag == 0)
 
 
-def _block_index2_rows(block, args=None, state=None):
-    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
-    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+def _block_mass_and_operator(block, args=None, state=None):
+    """The mass and the operator (the tangent at ``state``, or at the initial state, for a nonlinear block) a time
+    block's step uses, as ``(M, A)``; ``None`` when the block has neither."""
     import jax.numpy as jnp
 
     args = {} if args is None else args
@@ -85,7 +85,6 @@ def _block_index2_rows(block, args=None, state=None):
         return None
     if M is None or not hasattr(M, "shape") or len(M.shape) != 2:
         return None
-    n = M.shape[0]
     # the runtime operator when the arguments are at hand; else the assembled one (same sparsity and zero
     # pattern -- the static placeholder of a parametric block)
     if getattr(block, "operator_fn", None) is not None and args:
@@ -101,7 +100,45 @@ def _block_index2_rows(block, args=None, state=None):
         A = block.jacobian(jnp.asarray(u).reshape(-1), block.t0, args)
     else:
         return None
-    return _index2_rows(M, A, n, jnp.zeros((), M.dtype).real.dtype)
+    return M, A
+
+
+def _block_index2_rows(block, args=None, state=None):
+    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
+    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+    import jax.numpy as jnp
+
+    MA = _block_mass_and_operator(block, args, state)
+    if MA is None:
+        return None
+    M, A = MA
+    return _index2_rows(M, A, M.shape[0], jnp.zeros((), M.dtype).real.dtype)
+
+
+def _block_has_coupled_algebraic_rows(block, args=None, state=None):
+    """``True`` when the block has a zero-mass row that is more than a Dirichlet-type row (more than one entry
+    in the operator): a constraint tying unknowns together (Darcy's continuity row, a saddle problem's pressure
+    row). A relative residual of the step solve measured against the whole right-hand side leaves a much larger
+    error in such a row, and the DAE passes it on to the differential rows divided by the step, so these blocks
+    keep the tight default solve. Also ``True`` when it cannot be decided (no mass or operator, or values that
+    are traced), so the tight default is the one kept by doubt."""
+    import jax
+    import jax.numpy as jnp
+
+    MA = _block_mass_and_operator(block, args, state)
+    if MA is None:
+        return True
+    M, A = MA
+    n = M.shape[0]
+    try:
+        alg = _algebraic_rows(M, n, jnp.float32)
+        if hasattr(A, "todense"):
+            count = jnp.zeros((n,), jnp.int32).at[A.indices[:, 0]].add((A.data != 0).astype(jnp.int32))
+        else:
+            count = jnp.sum(jnp.asarray(A) != 0, axis=1)
+        return bool(jnp.any(alg & (count > 1)))
+    except jax.errors.ConcretizationTypeError:
+        return True
 
 
 def _row_scaled(A, w):
