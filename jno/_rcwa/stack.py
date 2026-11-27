@@ -1,36 +1,23 @@
-"""The stack solve: chunked layers, their S-matrices, and the admittance recursion.
+"""The stack solve: every film one S-matrix, one sweep through them.
 
-The plane-wave solve (``_solve_core``) builds each layer's S-matrix in one
-fixed reference medium from its chunk's (the chunk transfer converted, then
-doubled up to the layer: ``jno/_rcwa/smatrix.py``), joins the layers by star
-products and closes the problem at the two analytic ambients. The interior
-fields and the internal sources still use the chunk-by-chunk admittance
-recursion described below (until they move onto partial S-matrices):
-
-* Each layer is split into same-material sub-slabs (chunks) at BUILD time; the
+* Each film is split into same-material sub-slabs (chunks) at BUILD time; the
   chunk count is a static integer from the concrete spectral bound
   ``|q|_max * d`` (``q`` = modal wavenumber, bounded by
-  ``sqrt(|omega^2 eps|_max + max|k+G|^2)``). Same-material chunking is exact
-  (``expm(i M d) == prod_k expm(i M d_c)``); an un-chunked thick evanescent
-  layer breaks *by design* -- that is the stress the recursion exists for.
-* Chunks are combined by the impedance (R-matrix) recursion of Li 1996: with
-  the half-space below an interface represented by its surface admittance
-  ``Y`` (``v = Y u``), a chunk with transfer ``T = [[A, B], [C, D]]`` (mapping
-  top -> bottom) pushes the admittance upward:
-
-      Y_top = (D - Y_bottom B)^{-1} (Y_bottom A - C).
-
-  All quantities stay O(1); growing exponentials never appear as matrix
-  entries -- they are absorbed by the transfer combined with the admittance.
-* The only analytic plane-wave splits are at the two ambients: per-order
-  ``kz = sqrt(eps*omega^2 - |k+G|^2)`` with the ``Im(kz) >= 0`` branch, the
-  per-order surface admittance, and the backward-wave sign flip
-  ``v_ref = -Y_sup u_ref``. Then
-
-      u_ref = (Y_stack + Y_sup)^{-1} (Y_sup - Y_stack) u_inc ,
-
-  and the transmitted state is obtained by propagating the STATE VECTOR chunk
-  by chunk (never forming the full 4n transfer product).
+  ``sqrt(|omega^2 eps|_max + max|k+G|^2)``), rounded up to a power of two. A
+  chunk's growth is then at most ``e``, so its transfer (``layer.py``) is
+  accurate and well conditioned.
+* The chunk transfer becomes a symmetric S-matrix in one fixed lossy reference
+  medium, which is doubled up to the film (``jno/_rcwa/smatrix.py``). The film
+  S-matrices stay bounded however thick or evanescent the film is.
+* One sweep from the substrate up gives the reflection in front of every film,
+  ``R_j = r + t R_{j+1} (I - r R_{j+1})^-1 t`` (Li's R-matrix recursion on
+  S-matrices); the superstrate closes the problem and the downward amplitude is
+  carried back down. The only analytic plane-wave splits are at the two
+  ambients: per-order ``kz = sqrt(eps*omega^2 - |k+G|^2)`` with the
+  ``Im(kz) >= 0`` branch and the per-order admittances.
+* Interior fields run the same sweep over the films cut at the plane depths;
+  internal sources (``sources.py``) run it from both ambients to the source
+  plane.
 
 Readouts follow jNO's conventions exactly: signed per-order Poynting
 ``S_z = 0.5 Re(u1 conj(v1) + u2 conj(v2))`` summed over orders, ``T`` from the
@@ -106,7 +93,7 @@ def _energy_guard(res, auto_chunks):
     actionable message. Eager host-side only -- callers gate on ``_concrete``.
 
     ``auto_chunks`` is the build-time per-layer chunk count, reported so the
-    T+R>1 cliff (the un-chunked impedance recursion) points at its remedy.
+    T+R>1 cliff (an under-chunked layer) points at its remedy.
     """
     if not (math.isfinite(float(res.T)) and math.isfinite(float(res.R))):
         raise ValueError(
@@ -219,7 +206,7 @@ class _LayerRecord:
     ``transfer(d)`` is the block tuple ``(A, B, C, D)`` of the transfer over
     a depth ``d`` (the builder the plane-wave solve uses at the chunk
     thickness, evaluated at any sub-chunk depth); ``blocks`` is that tuple at
-    the chunk thickness (the impedance recursion) and ``load`` the layer's
+    the chunk thickness (the chunk S-matrix) and ``load`` the layer's
     build-budget diagnostic there. ``z_eps`` / ``z_mu`` are the inverse-rule zz Fourier matrices
     of a patterned layer (``None`` for uniform / analytic layers, where
     per-order scalar division applies); ``eps_zz`` / ``mu_zz`` are the scalar
@@ -504,7 +491,7 @@ class StateStack:
         Returns a :class:`_LayerRecord` whose ``transfer(d)`` gives the four
         ``2n x 2n`` blocks of the transfer over any depth ``d`` (the chunk,
         or a sub-chunk depth for an interior plane), whose ``blocks`` are
-        those at the chunk thickness ``d_c`` (the impedance recursion; ``None``
+        those at the chunk thickness ``d_c`` (the chunk S-matrix; ``None``
         when ``d_c`` is not given), whose ``load`` is the layer's share of the
         solve's build-budget diagnostic at ``d_c``, and which carries
         ``z_eps``/``z_mu`` (``None`` when uniform) for the ez/hz readouts.
@@ -578,81 +565,44 @@ class StateStack:
             **rec,
         )
 
-    def _solve_states(self, omega, twv, records, amb_sup, amb_sub, pol):
-        """The impedance recursion, reflection solve and stable chunk sweep.
+    def _slab(self, rec, li, thickness, chunks: int, y_r, z_r):
+        """The symmetric S-matrix ``(r, t)`` of film ``li`` over ``thickness`` (may be traced): the transfer over
+        ``thickness / chunks`` turned into a chunk S-matrix, then doubled up (``chunks`` static)."""
+        blocks = rec.blocks if thickness is None else rec.transfer(thickness / chunks)
+        return smatrix.layer_smatrix(*smatrix.chunk_smatrix(blocks, y_r, z_r), chunks)
 
-        Shared by the plane-wave core (which reads T/R off the end states) and
-        the interior-field core (which also keeps every chunk-top state). This
-        is exactly the state-space solve of the original ``_solve_core``,
-        unchanged numerically.
+    def _gap_chunks(self, li, gap: float) -> int:
+        """Static chunk count for a sub-thickness ``gap`` of film ``li``: no chunk thicker than the film's own
+        build chunk (so its series and growth bounds hold), rounded up to a power of two."""
+        c = max(1, int(math.ceil(gap / (self._thick[li] / self._chunks[li]) - 1e-9)))
+        return 1 << (c - 1).bit_length()
 
-        Returns:
-            A dict with ``kz_sup/kz_sub``, ``y_sup/y_sub``, ``u_inc``,
-            ``u_ref/v_ref``, the substrate end state ``u_sub/v_sub``, the
-            per-chunk top-side admittances ``y_stack_bottom_up`` (top-first)
-            and the per-chunk top states ``chunk_top``.
-        """
+    def _frame(self, wl, kin, amb_sup, amb_sub):
+        """Per-solve ``omega``, wavevectors, the reference medium and the two ambients' per-order admittances."""
+        cdt = self._cdt
+        omega = layer_matrices_omega(wl).astype(cdt)
+        twv = basis_mod.transverse_wavevectors(
+            in_plane_wavevector=jnp.asarray(kin),
+            primitive_lattice_vectors=self._lv,
+            expansion=self.expansion,
+        ).astype(cdt)
+        y_r, z_r = smatrix.reference(twv, omega, cdt)
+        kz_sup = layer.ambient_kz(twv, amb_sup, omega, dtype=cdt)
+        kz_sub = layer.ambient_kz(twv, amb_sub, omega, dtype=cdt)
+        y_sup = layer.ambient_admittance(twv, kz_sup, omega, dtype=cdt)
+        y_sub = layer.ambient_admittance(twv, kz_sub, omega, dtype=cdt)
+        return dict(omega=omega, twv=twv, y_r=y_r, z_r=z_r, kz_sup=kz_sup, kz_sub=kz_sub, y_sup=y_sup, y_sub=y_sub)
+
+    def _incident(self, pol):
         n = self._n
-        two_n = 2 * n
-        kz_sub = layer.ambient_kz(twv, amb_sub, omega, dtype=self._cdt)
-        kz_sup = layer.ambient_kz(twv, amb_sup, omega, dtype=self._cdt)
-        y_sub = layer.ambient_admittance_matrix(twv, kz_sub, omega, dtype=self._cdt)
-        y_sup = layer.ambient_admittance_matrix(twv, kz_sup, omega, dtype=self._cdt)
-
-        u_inc = jnp.zeros(two_n, dtype=self._cdt)
-        u_inc = u_inc.at[0].set(-pol[1])
-        u_inc = u_inc.at[n].set(pol[0])
-
-        # 1) Impedance recursion bottom -> top, collecting the top-side
-        #    admittance of every chunk in bottom->top order.
-        y = y_sub
-        y_stack_bottom_up = []
-        for li in range(len(records) - 1, -1, -1):
-            a, b, c, d = records[li].blocks
-            for _ in range(self._chunks[li]):
-                y = jnp.linalg.solve(d - y @ b, y @ a - c)
-                y_stack_bottom_up.append(y)
-        y_stack_bottom_up.reverse()  # top-side admittance per chunk, top-first
-        # A stack with no finite films (a single homogenized medium: superstrate == substrate) is
-        # trivial -- the "stack" admittance is the substrate's own.
-        y_stack = y_stack_bottom_up[0] if y_stack_bottom_up else y_sub
-
-        # 2) Reflection solve at the superstrate interface.
-        u_ref = jnp.linalg.solve(y_stack + y_sup, (y_sup - y_stack) @ u_inc)
-        v_ref = -y_sup @ u_ref
-
-        # 3) Stable propagation of the tangential-E state only: at the top of
-        #    every chunk v = Y u, so u_bottom = (A + B Y_top) u_top. Growing
-        #    evanescent modes live inside v = Y u and never appear as
-        #    standalone growing quantities (the classic S-matrix stabilization,
-        #    here in state space).
-        u = u_inc + u_ref
-        chunk_top = []
-        k = 0
-        for li in range(len(records)):
-            a, b, c, d = records[li].blocks
-            for _ in range(self._chunks[li]):
-                chunk_top.append(u)
-                u = (a + b @ y_stack_bottom_up[k]) @ u
-                k += 1
-        v_sub = y_sub @ u
-
-        return {
-            "kz_sup": kz_sup,
-            "kz_sub": kz_sub,
-            "y_sup": y_sup,
-            "y_sub": y_sub,
-            "u_inc": u_inc,
-            "u_ref": u_ref,
-            "v_ref": v_ref,
-            "u_sub": u,
-            "v_sub": v_sub,
-            "y_stack_bottom_up": y_stack_bottom_up,
-            "chunk_top": chunk_top,
-        }
+        return jnp.zeros(2 * n, dtype=self._cdt).at[0].set(-pol[1]).at[n].set(pol[0])
 
     def _solve_core(self, grids, wl, kin, pol, amb_sup, amb_sub, thick=None):
         """jitted core: static chunk and doubling counts mean no data-dependent flow.
+
+        Every film is one slab: its S-matrix in the reference modes, built from a chunk's by doublings. The sweep
+        from the substrate up gives the stack's reflection, the superstrate closes the problem, and the downward
+        amplitude is carried to the substrate (``jno/_rcwa/smatrix.py``).
 
         ``twv`` derives from the *per-solve* ``kin`` inside the trace (the seam
         sweeps the incidence angle through the compiled core), and the ambient
@@ -663,38 +613,23 @@ class StateStack:
         ``load`` says how far the solve is from those margins.
         """
         n = self._n
-        omega = layer_matrices_omega(wl).astype(self._cdt)
-        twv = basis_mod.transverse_wavevectors(
-            in_plane_wavevector=jnp.asarray(kin),
-            primitive_lattice_vectors=self._lv,
-            expansion=self.expansion,
-        ).astype(self._cdt)
-        records = self._records(grids, omega, twv, thick, count=True)
+        fr = self._frame(wl, kin, amb_sup, amb_sub)
+        y_r, z_r, y_sup, y_sub = fr["y_r"], fr["z_r"], fr["y_sup"], fr["y_sub"]
+        records = self._records(grids, fr["omega"], fr["twv"], thick, count=True)
         load = jnp.max(jnp.stack([jnp.real(r.load) for r in records])) if records else jnp.asarray(0.0)
-        cdt = self._cdt
 
-        # 1) Each layer's symmetric S-matrix in the reference modes (chunk S-matrix, then doublings), and the
-        #    films' S-matrix by star products top to bottom (jno/_rcwa/smatrix.py).
-        y_r, z_r = smatrix.reference(twv, omega, cdt)
-        s = None
-        for li, rec in enumerate(records):
-            r, t = smatrix.layer_smatrix(*smatrix.chunk_smatrix(rec.blocks, y_r, z_r), self._chunks[li])
-            s = (r, t, t, r) if s is None else smatrix.star(s, (r, t, t, r))
-        if s is None:  # no finite films: the "stack" is the reference medium itself
-            eye, zero = jnp.eye(2 * n, dtype=cdt), jnp.zeros((2 * n, 2 * n), dtype=cdt)
-            s = (zero, eye, eye, zero)
+        slabs = [self._slab(rec, li, None, self._chunks[li], y_r, z_r) for li, rec in enumerate(records)]
+        rho_sub = smatrix.ambient_reflection(y_r, y_sub)
+        rs, xs = smatrix.sweep(slabs, smatrix.dense(rho_sub))
+        u_inc = self._incident(pol)
+        u_ref, a_top = smatrix.reflect_plane_wave(rs[0], y_sup, z_r, u_inc)
+        a_bot = smatrix.carry(xs, a_top)[-1]
+        u_sub = a_bot + smatrix.apply(rho_sub, a_bot)
+        v_ref = -smatrix.apply(y_sup, u_ref)
+        v_sub = smatrix.apply(y_sub, u_sub)
 
-        # 2) The two analytic ambients close the problem.
-        y_sup = layer.ambient_admittance(twv, layer.ambient_kz(twv, amb_sup, omega, dtype=cdt), omega, dtype=cdt)
-        y_sub = layer.ambient_admittance(twv, layer.ambient_kz(twv, amb_sub, omega, dtype=cdt), omega, dtype=cdt)
-        u_inc = jnp.zeros(2 * n, dtype=cdt).at[0].set(-pol[1]).at[n].set(pol[0])
-        u_ref, u_sub = smatrix.close(s, y_sup, y_sub, y_r, z_r, u_inc)
-        v_ref = -smatrix.left(y_sup, u_ref[:, None])[:, 0]
-        v_sub = smatrix.left(y_sub, u_sub[:, None])[:, 0]
-        st = {"u_inc": u_inc, "u_ref": u_ref, "v_ref": v_ref, "u_sub": u_sub, "v_sub": v_sub}
-
-        # 3) Readouts (signed per-order Poynting, jNO convention).
-        flux_inc = layer.sz_flux(u_inc, smatrix.left(y_sup, u_inc[:, None])[:, 0], n)
+        # Readouts (signed per-order Poynting, jNO convention).
+        flux_inc = layer.sz_flux(u_inc, smatrix.apply(y_sup, u_inc), n)
         flux_trn = layer.sz_flux(u_sub, v_sub, n)
         flux_rfl = layer.sz_flux(u_ref, v_ref, n)
         pin = jnp.sum(flux_inc)
@@ -705,10 +640,10 @@ class StateStack:
             flux_trn,
             flux_rfl,
             flux_inc,
-            st["u_sub"],
-            st["v_sub"],
-            st["u_ref"],
-            st["v_ref"],
+            u_sub,
+            v_sub,
+            u_ref,
+            v_ref,
             load,
         )
 
@@ -721,7 +656,7 @@ class StateStack:
         ]
 
     # ------------------------------------------------------------------
-    # Interior field reconstruction (stage 2d): per-plane Fourier fields.
+    # Interior field reconstruction: per-plane Fourier fields.
     # ------------------------------------------------------------------
 
     def interior_field_amplitudes(self, grids, wl, kin, pol, amb_sup, amb_sub, planes, thick=None):
@@ -735,14 +670,15 @@ class StateStack:
           ``exp(i kz_sup * offset)`` is referenced to the interface);
         * ``("sub", z)`` -- analytic substrate plane at depth `z` below the
           substrate interface;
-        * ``("film", film_idx, chunk, zeta)`` -- inside film `film_idx`, `zeta`
-          below the top of its `chunk`.
+        * ``("film", film_idx, zeta)`` -- inside film `film_idx`, `zeta` below
+          its top.
 
-        The field core re-derives the layer transfers and the impedance
-        recursion exactly as the plane-wave solve does, then propagates the
-        boundary state to each plane via ``u = (A + B Y_top) u_top`` -- the
-        stable per-chunk form, so evanescent-heavy interior probes never form
-        standalone growing quantities.
+        Every film is cut at its plane depths into slabs, and the same sweep as
+        the plane-wave solve runs over that finer sequence: the state at a cut
+        is ``a+`` carried down to it and ``a- = R a+`` with the reflection of
+        everything below, so evanescent-heavy interior probes never form
+        growing quantities. The thicknesses are concrete here (``thick``,
+        default the build ones) and part of the compiled program.
 
         Returns:
             ``(ex, ey, ez, hx, hy, hz)``, each ``(P, n)`` complex Fourier
@@ -750,7 +686,8 @@ class StateStack:
         """
         fn = self.__dict__.get("_field_core_jit")
         if fn is None:
-            fn = self._field_core_jit = jax.jit(self._field_core, static_argnums=(6,))
+            fn = self._field_core_jit = jax.jit(self._field_core, static_argnums=(6, 7))
+        thick = self._thick if thick is None else thick
         return fn(
             tuple(grids),
             jnp.asarray(wl),
@@ -759,39 +696,50 @@ class StateStack:
             jnp.asarray(amb_sup),
             jnp.asarray(amb_sub),
             tuple(planes),
-            tuple(jnp.asarray(t) for t in (self._thick if thick is None else thick)),
+            tuple(float(jnp.real(jnp.asarray(t))) for t in thick),
         )
 
     def _field_core(self, grids, wl, kin, pol, amb_sup, amb_sub, planes, thick):
         """jitted interior-field core: ``(ex, ey, ez, hx, hy, hz)`` per plane.
 
-        `planes` is static (a Python tuple baked into the trace), so the
-        compiled program has no data-dependent indexing: every plane's layer,
-        chunk and depth are constants, and the only traced inputs are the
-        materials (design), wavelength, incidence and ambients.
+        `planes` and `thick` are static (Python values baked into the trace),
+        so every cut, slab and chunk count is a constant, and the only traced
+        inputs are the materials (design), wavelength, incidence and ambients.
         """
         n = self._n
         cdt = self._cdt
-        omega = layer_matrices_omega(wl).astype(cdt)
-        twv = basis_mod.transverse_wavevectors(
-            in_plane_wavevector=jnp.asarray(kin),
-            primitive_lattice_vectors=self._lv,
-            expansion=self.expansion,
-        ).astype(cdt)
+        fr = self._frame(wl, kin, amb_sup, amb_sub)
+        y_r, z_r, y_sup, y_sub = fr["y_r"], fr["z_r"], fr["y_sup"], fr["y_sub"]
+        omega, twv = fr["omega"], fr["twv"]
         records = self._records(grids, omega, twv, thick, count=False)
-        st = self._solve_states(omega, twv, records, amb_sup, amb_sub, pol)
-        # global chunk offset of each layer's first chunk (film planes give
-        # per-layer chunk indices; the recursion lists every chunk top-first).
-        chunk_starts = []
-        _acc = 0
-        for c in self._chunks:
-            chunk_starts.append(_acc)
-            _acc += c
+
+        # Cut every film at its plane depths; key the cuts so that a plane finds its interface.
+        def key(z, t):
+            return round(min(max(z, 0.0), t) / t, 12)
+
+        slabs, iface, idx, cache = [], {}, 0, {}
+        for f, (rec, t) in enumerate(zip(records, thick)):
+            cuts = sorted({0.0, 1.0} | {key(spec[2], t) for spec in planes if spec[0] == "film" and spec[1] == f})
+            iface[(f, cuts[0])] = idx
+            for lo, hi in zip(cuts[:-1], cuts[1:]):
+                gap = (hi - lo) * t
+                k = (f, round(gap, 12))
+                if k not in cache:
+                    cache[k] = self._slab(rec, f, gap, self._gap_chunks(f, gap), y_r, z_r)
+                slabs.append(cache[k])
+                idx += 1
+                iface[(f, hi)] = idx
+
+        rho_sub = smatrix.ambient_reflection(y_r, y_sub)
+        rs, xs = smatrix.sweep(slabs, smatrix.dense(rho_sub))
+        u_inc = self._incident(pol)
+        u_ref, a_top = smatrix.reflect_plane_wave(rs[0], y_sup, z_r, u_inc)
+        a_plus = smatrix.carry(xs, a_top)
+        u_sub = a_plus[-1] + smatrix.apply(rho_sub, a_plus[-1])
+
         kx = twv[:, 0]
         ky = twv[:, 1]
         e_om = 1.0 / omega
-        y_stack_bottom_up = st["y_stack_bottom_up"]
-        chunk_top = st["chunk_top"]
 
         def _rep(ph):  # per-order phase -> the (u1 | u2) component-major state order
             return jnp.concatenate([ph, ph])
@@ -799,26 +747,21 @@ class StateStack:
         exs, eys, ezs, hxs, hys, hzs = [], [], [], [], [], []
         for spec in planes:
             if spec[0] == "sup":
-                ph_f = _rep(jnp.exp(1j * st["kz_sup"] * spec[1]))
-                ph_b = _rep(jnp.exp(-1j * st["kz_sup"] * spec[1]))
-                u = st["u_inc"] * ph_f + st["u_ref"] * ph_b
-                v = st["y_sup"] @ (st["u_inc"] * ph_f - st["u_ref"] * ph_b)
+                ph_f = _rep(jnp.exp(1j * fr["kz_sup"] * spec[1]))
+                ph_b = _rep(jnp.exp(-1j * fr["kz_sup"] * spec[1]))
+                u = u_inc * ph_f + u_ref * ph_b
+                v = smatrix.apply(y_sup, u_inc * ph_f - u_ref * ph_b)
                 eps_zz = amb_sup
                 mu_zz = jnp.asarray(1.0, dtype=cdt)
             elif spec[0] == "sub":
-                ph = _rep(jnp.exp(1j * st["kz_sub"] * spec[1]))
-                u = st["u_sub"] * ph
-                v = st["y_sub"] @ u
+                u = u_sub * _rep(jnp.exp(1j * fr["kz_sub"] * spec[1]))
+                v = smatrix.apply(y_sub, u)
                 eps_zz = amb_sub
                 mu_zz = jnp.asarray(1.0, dtype=cdt)
             else:
                 rec = records[spec[1]]
-                a, b, c_block, d = rec.transfer(spec[3])
-                gk = chunk_starts[spec[1]] + spec[2]
-                y_top = y_stack_bottom_up[gk]
-                u_top = chunk_top[gk]
-                u = (a + b @ y_top) @ u_top
-                v = (c_block + d @ y_top) @ u_top
+                j = iface[(spec[1], key(spec[2], thick[spec[1]]))]
+                u, v = smatrix.state(a_plus[j], rs[j] @ a_plus[j], y_r)
                 eps_zz = rec.eps_zz
                 mu_zz = rec.mu_zz
             ex = u[n:]

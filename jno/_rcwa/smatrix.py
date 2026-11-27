@@ -132,36 +132,74 @@ def star(sa, sb):
     )
 
 
-def close(s, y_sup, y_sub, y_r, z_r, u_inc):
-    """The plane-wave solve of a stack ``s`` (full 4-tuple, in the reference modes) between two ambients.
+def ambient_reflection(y_r: jnp.ndarray, y_amb: jnp.ndarray) -> jnp.ndarray:
+    """``(Y_r + Y)^-1 (Y_r - Y)`` per order, ``(n, 2, 2)``: how a semi-infinite ambient with admittance ``Y``
+    reflects in the reference modes.
 
-    Below the stack only the transmitted wave exists, ``v = Y_sub u``, which in the reference modes reads
-    ``a- = rho a+`` with the block-diagonal ``rho = (Y_r + Y_sub)^-1 (Y_r - Y_sub)``. The stack with that
-    substrate reflects ``R = S11 + S12 rho (I - S22 rho)^-1 S21``. At the top, ``u = u_inc + u_ref`` and
-    ``v = Y_sup (u_inc - u_ref)`` must satisfy ``a- = R a+``, i.e. ``(I - R) u = (I + R) Z_r v``: one solve for
-    ``u_ref``, without ever inverting ``I + R``.
+    Below the stack only the transmitted wave exists, ``v = Y_sub u``, so ``a- = rho a+``; above it only the
+    outgoing wave, ``v = -Y_sup u``, so ``a+ = rho a-``. Both give the same formula.
+    """
+    return jnp.einsum("oab,obc->oac", inverse_2x2(y_r + y_amb), y_r - y_amb)
 
-    Args:
-        s: ``(S11, S12, S21, S22)`` of the films.
-        y_sup, y_sub: Per-order ambient admittances, ``(n, 2, 2)``.
-        y_r, z_r: The reference admittance and its inverse, ``(n, 2, 2)``.
-        u_inc: The incident tangential state, ``(2n,)``.
+
+def dense(y: jnp.ndarray) -> jnp.ndarray:
+    """The ``2n x 2n`` component-major matrix of per-order ``(n, 2, 2)`` blocks."""
+    return jnp.block([[jnp.diag(y[:, 0, 0]), jnp.diag(y[:, 0, 1])], [jnp.diag(y[:, 1, 0]), jnp.diag(y[:, 1, 1])]])
+
+
+def sweep(slabs, rho: jnp.ndarray):
+    """Reflections of a terminated slab sequence, and the factors that carry a wave through it.
+
+    ``slabs`` are symmetric ``(r, t)`` listed from the near end to the far end, where the sequence is closed by
+    the reflection ``rho`` (dense ``2n x 2n``). Going from the far end back, the reflection seen in front of slab
+    ``j`` is ``R_j = r + t R_{j+1} X_j`` with ``X_j = (I - r R_{j+1})^-1 t`` (Li's R-matrix recursion, here on
+    S-matrices in the reference modes). A wave travelling toward the far end with amplitude ``a`` in front of slab
+    ``j`` has ``X_j a`` behind it: inside the slab ``a_behind = t a + r R_{j+1} a_behind``. Every quantity stays
+    bounded, however evanescent the orders are. One solve with ``2n`` right-hand sides and two matmuls per slab.
 
     Returns:
-        ``(u_ref, u_sub)``: the reflected state at the top and the transmitted state at the substrate interface.
+        ``(R, X)``: ``R[j]`` for ``j = 0..len(slabs)`` (``R[-1] = rho``) and ``X[j]`` per slab.
     """
-    s11, s12, s21, s22 = s
-    two_n = s11.shape[-1]
-    eye = jnp.eye(two_n, dtype=s11.dtype)
-    rho = jnp.einsum("oab,obc->oac", inverse_2x2(y_r + y_sub), y_r - y_sub)  # (n, 2, 2)
-    x = jnp.linalg.solve(eye - right(s22, rho), s21)  # (I - S22 rho)^-1 S21
-    big_r = s11 + right(s12, rho) @ x
-    zy = jnp.einsum("oab,obc->oac", z_r, y_sup)  # Z_r Y_sup, block-diagonal
-    i_plus_r_zy = right(eye + big_r, zy)
+    eye = jnp.eye(rho.shape[-1], dtype=rho.dtype)
+    big_r = rho
+    rs, xs = [rho], []
+    for r, t in reversed(list(slabs)):
+        x = jnp.linalg.solve(eye - r @ big_r, t)
+        big_r = r + t @ (big_r @ x)
+        rs.append(big_r)
+        xs.append(x)
+    return rs[::-1], xs[::-1]
+
+
+def carry(xs, a0: jnp.ndarray):
+    """The amplitude in front of every slab and behind the last: ``[a0, X_0 a0, X_1 X_0 a0, ...]``."""
+    out = [a0]
+    for x in xs:
+        out.append(x @ out[-1])
+    return out
+
+
+def reflect_plane_wave(big_r: jnp.ndarray, y_sup: jnp.ndarray, z_r: jnp.ndarray, u_inc: jnp.ndarray):
+    """The superstrate side of a plane-wave solve, given the stack's reflection ``R`` seen from above.
+
+    ``u = u_inc + u_ref`` and ``v = Y_sup (u_inc - u_ref)`` must satisfy ``a- = R a+``, i.e.
+    ``(I - R) u = (I + R) Z_r v``: one solve for ``u_ref``, without ever inverting ``I + R``.
+
+    Returns:
+        ``(u_ref, a_plus)``: the reflected state and the downward reference amplitude at the top of the stack.
+    """
+    eye = jnp.eye(big_r.shape[-1], dtype=big_r.dtype)
+    i_plus_r_zy = right(eye + big_r, jnp.einsum("oab,obc->oac", z_r, y_sup))
     u_ref = jnp.linalg.solve((eye - big_r) + i_plus_r_zy, (i_plus_r_zy - (eye - big_r)) @ u_inc)
-    u_top = u_inc + u_ref
-    v_top = left(y_sup, (u_inc - u_ref)[:, None])[:, 0]
-    a_plus_top = 0.5 * (u_top + left(z_r, v_top[:, None])[:, 0])
-    a_plus_bot = x @ a_plus_top
-    rho_a = left(rho, a_plus_bot[:, None])[:, 0]
-    return u_ref, a_plus_bot + rho_a
+    v = apply(y_sup, u_inc - u_ref)
+    return u_ref, 0.5 * (u_inc + u_ref + apply(z_r, v))
+
+
+def apply(y: jnp.ndarray, x: jnp.ndarray) -> jnp.ndarray:
+    """``Y @ x`` for a block-diagonal ``Y`` given as ``(n, 2, 2)`` and a state vector ``x`` of length ``2n``."""
+    return left(y, x[:, None])[:, 0]
+
+
+def state(a_plus: jnp.ndarray, a_minus: jnp.ndarray, y_r: jnp.ndarray):
+    """The tangential state ``(u, v) = (a+ + a-, Y_r (a+ - a-))`` of reference amplitudes."""
+    return a_plus + a_minus, apply(y_r, a_plus - a_minus)

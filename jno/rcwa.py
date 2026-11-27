@@ -25,8 +25,9 @@ Two entry points, both on `jno.rcwa`:
   this is what the front door constructs internally.
 
 Built on the eig-free, state-space RCWA backend in :mod:`jno._rcwa` (self-owned, no fmmax import at
-runtime): each layer is solved by a first-order state transfer ``d/dz ψ = i M_L ψ`` (``expm``, never a
-dense eigendecomposition) and stacked with a chunked R-matrix/impedance recursion. The previous fmmax
+runtime): each layer is solved by a first-order state transfer ``d/dz ψ = i M_L ψ`` (two power series,
+never a dense eigendecomposition), turned into an S-matrix in a fixed reference medium and stacked by an
+R-matrix sweep. The previous fmmax
 backend remains only as a *test-only oracle* (the cross-check suite and committed golden references).
 It **never fails silently**: every inference (periodicity, layer invariance, order/grid Nyquist,
 wavelength, energy balance, a recognisable source) is validated and raises :class:`RcwaError` with a
@@ -132,9 +133,9 @@ def _efficiency_problem(T, R, orders, period, wl, load=None):
         return (
             f"energy not conserved: T+R={total:.4f} > 1 at orders={orders}. "
             "The state-space solve is not converged: raise orders= for more Fourier orders, or "
-            "-- for a thick high-contrast layer -- thin the sub-slab chunking (the T+R>1 cliff "
-            "is the un-chunked impedance recursion; auto chunking is fixed at build, so rebuild "
-            "the Rcwa if chunking is the culprit), or the structure is unphysical."
+            "-- for a thick high-contrast layer -- the sub-slab chunking may be too coarse "
+            "(auto chunking is fixed at build, so rebuild the Rcwa if chunking is the culprit), "
+            "or the structure is unphysical."
         )
     return None
 
@@ -384,7 +385,7 @@ class _Sol:
         neighbouring layers, cumulative from the superstrate top surface).
 
         The interior reconstruction lives in the backend (``jno/_rcwa/fields.py``): the boundary
-        state is propagated to every plane through the stack's own chunked/impedance machinery and
+        state is propagated to every plane through the stack's own S-matrix sweep and
         inverse-Fourier-transformed here. Lossless anchors and the absorbed-power/z-profile tests
         pin the energy balance through ``|E|^2``.
         """
@@ -414,7 +415,7 @@ class _Sol:
                 roles.append(film_count)
                 film_count += 1
         stack = eng._stack
-        planes = _fields_mod.field_planes(thicknesses, znums, roles, stack._chunks)
+        planes = _fields_mod.field_planes(thicknesses, znums, roles)
         try:
             _fields_mod.validate_grid_resolution(nx, eng._ex, "field3d")
         except ValueError as e:

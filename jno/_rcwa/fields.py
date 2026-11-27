@@ -4,19 +4,15 @@ The readouts that only touch the two ambients (efficiency, per-order fluxes,
 order readouts, the incident/reflected states) live in ``stack.py``. Interior
 field reconstruction -- propagating the surface state to ``z`` offsets inside a
 layer and inverse-Fourier-transforming to ``|E|^2`` volumes and z-profiles --
-lives here, on top of the stack's chunked/impedance machinery.
+lives here, on top of the stack's S-matrix sweep.
 
-The propagation is stable by construction: within a chunk the tangential state
-at depth ``zeta`` below the chunk top is
-
-    u(zeta) = (A(zeta) + B(zeta) Y_top) u_top ,   v(zeta) = (C(zeta) + D(zeta) Y_top) u_top ,
-
-with ``A..D`` the blocks of the chunk transfer ``expm(i M_L zeta)`` and
-``Y_top`` the chunk's top-side admittance from the impedance recursion. Growing
-evanescent modes live inside ``v = Y u`` and never appear as standalone
-growing quantities -- the same S-matrix stabilization the plane-wave solve
-uses, evaluated at the requested depth (the per-plane transfer is the
-chunk's own thin-slice series, at a no-larger depth).
+The propagation is stable by construction: every film is cut at its plane
+depths, and the stack's sweep runs over those cuts (``jno/_rcwa/smatrix.py``).
+At a cut, the downward reference amplitude ``a+`` is carried from the top and
+``a- = R a+`` with ``R`` the reflection of everything below, so growing
+evanescent modes never appear as standalone growing quantities -- the same
+S-matrix stabilization the plane-wave solve uses, evaluated at the requested
+depth.
 
 The algebraic ``ez``/``hz`` follow the fmmax conventions (Liu 2012 eq. 11/14,
 state-space form): for a tangential state the Maxwell curl equations give, per
@@ -88,26 +84,23 @@ def field_planes(
     thicknesses: Sequence[float],
     znums: Sequence[int],
     layer_roles: Sequence[object],
-    chunk_counts: Sequence[int],
 ) -> Tuple[object, ...]:
     """Resolve per-plane probes to the backend's static plane specs.
 
     Each layer's own sample planes keep their layer's identity (unlike a raw
     global-depth lookup, this keeps the two samples sharing a z interface
     distinct -- the superstrate's end plane uses the analytic ambient field,
-    the film's start plane its own), then a film plane is mapped to its chunk
-    and sub-chunk depth with the build-time chunk count.
+    the film's start plane its own).
 
     Args:
         thicknesses: Full per-layer thicknesses.
         znums: Per-layer sample counts (:func:`layer_z_sampling`).
         layer_roles: Per-layer role: ``"sup"``/``"sub"`` for the analytic
             ambients, else the backend film index.
-        chunk_counts: Per-film chunk counts (``stack._chunks``).
 
     Returns:
         The static planes tuple: ``("sup", offset)`` / ``("sub", z)`` /
-        ``("film", film_idx, chunk, zeta)`` -- the backend's spec format.
+        ``("film", film_idx, zeta)`` -- the backend's spec format.
     """
     planes = []
     for t, zn, role in zip(thicknesses, znums, layer_roles):
@@ -118,10 +111,7 @@ def field_planes(
             elif role == "sub":
                 planes.append(("sub", zl))
             else:
-                film_idx = role
-                d_c = float(t) / chunk_counts[film_idx]
-                kc = min(chunk_counts[film_idx] - 1, int(zl // d_c))
-                planes.append(("film", film_idx, kc, zl - kc * d_c))
+                planes.append(("film", role, zl))
     return tuple(planes)
 
 

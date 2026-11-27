@@ -111,9 +111,8 @@ def test_slab_e2_matches_golden():
     nx = 16
     thicknesses = [1.0, float(spec["layers"][0][0]), 1.0]  # sup / film / sub
     roles = ["sup", 0, "sub"]
-    chunk_counts = st._chunks
     # 3 film planes (z=0, mid, full) + 2 each in sup/sub -> 7 planes
-    planes = jf.field_planes(thicknesses, [2, 3, 2], roles, chunk_counts)
+    planes = jf.field_planes(thicknesses, [2, 3, 2], roles)
     grids = [jnp.asarray([[spec["layers"][0][1]]])]  # uniform [[4.0]]
     ex, ey, ez, _, _, _ = jf.interior_field_amplitudes(
         st,

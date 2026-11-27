@@ -7,8 +7,8 @@ solve is closed directly on the **Maxwell jump conditions** at the source plane,
 in state space, with no eigendecomposition anywhere:
 
 * The stack is split at the source plane into an upper (toward the superstrate)
-  and lower (toward the substrate) half-stack, each chunked and transferred by
-  the same ``_rcwa.stack`` machinery as a plane-wave solve.
+  and lower (toward the substrate) half-stack, each a sequence of film S-matrices
+  in the reference modes (``_rcwa.smatrix``), as in a plane-wave solve.
 * Maxwell's tangential jump conditions for a surface current ``j`` at the split
   plane become, in the state ``psi = (u, v) = ((-E_y, E_x), (H_x, H_y))``:
 
@@ -21,13 +21,13 @@ in state space, with no eigendecomposition anywhere:
   wavevectors and ``omega`` the angular frequency. ``u_U``/``v_U`` are the
   states at the source plane on the superstrate side, ``u_L``/``v_L`` on the
   substrate side.
-* Each half-stack is linear and outgoing at its ambient: ``v = Y u`` at every
-  internal plane, with the substrate-side admittance from the plane-wave
-  bottom-up recursion and the superstrate-side from the same recursion pushed
-  top-down from the ``v = -Y_sup u`` radiation condition. The two half-stack
-  admittances ``Y_L``, ``Y_U`` at the source plane close the source-plane solve
-  (a single ``2n x 2n`` linear system), and the emitted power is the flux of the
-  propagated states at the two ambients.
+* Each half-stack is outgoing at its ambient. The sweep from the substrate up
+  gives the reflection ``R_L`` seen downward from the source plane
+  (``a- = R_L a+``), the sweep from the superstrate down gives ``R_U`` seen
+  upward (``a+ = R_U a-``). In the reference modes the jump is
+  ``a_U - a_L = W^-1 s``, which with the two reflections is one ``2n x 2n``
+  solve; the emitted powers are the fluxes of the amplitudes carried to the two
+  ambients.
 
 The model is anchored against fmmax's ``amplitudes_for_source`` in the engine
 (test) geometry to ~1e-14 (complex128), including off-center sources, z-dipoles,
@@ -289,6 +289,7 @@ def _make_emission_core(stack, si, kind):
     k_in, ambs and the source parameters are traced."""
     from . import fft as fft_mod
     from . import layer as layer_mod
+    from . import smatrix
 
     n = stack._n
     two_n = 2 * n
@@ -297,18 +298,6 @@ def _make_emission_core(stack, si, kind):
     expansion = stack.expansion
     chunks = list(stack._chunks)
     nfilm = len(chunks)
-
-    # ---- static half-stack chunk layouts: top-first (li, part) per chunk, where part is "full" for a
-    # whole film's chunk and "up"/"lo" for the source film's slabs above/below the source plane ----
-    n_up = max(1, chunks[si])
-    upper_specs = []
-    for li in range(si):
-        upper_specs.extend([(li, "full")] * chunks[li])
-    upper_specs.extend([(si, "up")] * n_up)
-    n_lo = max(1, chunks[si])
-    lower_specs = [(si, "lo")] * n_lo
-    for li in range(si + 1, nfilm):
-        lower_specs.extend([(li, "full")] * chunks[li])
 
     def core(grids, wl, kin, amb_sup, amb_sub, tu, tl, loc, orient, amp, fwhm, thick):
         omega = (2 * jnp.pi / jnp.asarray(wl)).astype(cdt)
@@ -330,59 +319,32 @@ def _make_emission_core(stack, si, kind):
         amp = jnp.asarray(amp + 0.0j)
         jx, jy, jz = amp * orient[0] * base, amp * orient[1] * base, amp * orient[2] * base
 
-        # ---- one material record per film, one block tuple per distinct chunk thickness ----
-        records = {}
-        blocks = {}
+        # ---- the two half-stacks as slabs in the reference modes, split at the source plane ----
+        fr = stack._frame(wl, kin, amb_sup, amb_sub)
+        y_r, z_r = fr["y_r"], fr["z_r"]
+        records = []
+        for li in range(nfilm):
+            entry = grids[li] if isinstance(grids[li], tuple) else (grids[li],)
+            if len(entry) > 1:  # an anisotropic layer is outside the source solve's scope
+                raise ValueError(
+                    "internal-source solves support scalar-isotropic layers "
+                    f"only; got {len(entry)}-component material at layer {li}."
+                )
+            records.append(stack._layer_material(li, grids[li], omega, twv, count=False))
 
-        def chunk_blocks(li, part):
-            """(A, B, C, D) of one chunk of film `li`: a whole-film chunk, or a slab of the source film."""
-            if (li, part) not in blocks:
-                if li not in records:
-                    entry = grids[li] if isinstance(grids[li], tuple) else (grids[li],)
-                    if len(entry) > 1:  # an anisotropic layer is outside the source solve's scope
-                        raise ValueError(
-                            "internal-source solves support scalar-isotropic layers "
-                            f"only; got {len(entry)}-component material at layer {li}."
-                        )
-                    records[li] = stack._layer_material(li, grids[li], omega, twv, count=False)
-                d = {"full": thick[li] / chunks[li], "up": tu / n_up, "lo": tl / n_lo}[part]
-                blocks[(li, part)] = records[li].transfer(d)
-            return blocks[(li, part)]
+        def slab(li, d):
+            return stack._slab(records[li], li, d, chunks[li], y_r, z_r)
 
-        upper, lower = upper_specs, lower_specs
+        upper = [slab(li, thick[li]) for li in range(si)] + [slab(si, tu)]  # top first
+        lower = [slab(si, tl)] + [slab(li, thick[li]) for li in range(si + 1, nfilm)]  # top first
 
-        # ---- ambient admittances -------------------------------------------
-        kz_sub = layer_mod.ambient_kz(twv, amb_sub, omega, dtype=cdt)
-        kz_sup = layer_mod.ambient_kz(twv, amb_sup, omega, dtype=cdt)
-        y_sub = layer_mod.ambient_admittance_matrix(twv, kz_sub, omega, dtype=cdt)
-        y_sup = layer_mod.ambient_admittance_matrix(twv, kz_sup, omega, dtype=cdt)
-
-        # ---- upper half-stack admittance at the source plane ----------------
-        # Push top-down from the radiation condition v = -y_sup u at the top;
-        # chunk transfer maps top->bottom, and at each chunk top v = y u:
-        #   y_bot = (C + D y_top) (A + B y_top)^{-1}
-        # The application is a RIGHT inverse, so use the conjugate-transpose solve
-        # form (solve(M^H, X^H)^H == X M^{-1}) instead of an explicit `inv` -- same
-        # accuracy/consistency discipline as the sibling solve sites below.
-        y = -y_sup
-        up_ytops = []
-        for li, part in upper:
-            A, B, C, D = chunk_blocks(li, part)
-            up_ytops.append(y)
-            y = jnp.linalg.solve((A + B @ y).conj().T, (C + D @ y).conj().T).conj().T
-        YU = y if upper else -y_sup
-
-        # ---- lower half-stack admittance at the source plane ----------------
-        # Push bottom-up from the substrate: each step maps a chunk's bottom
-        # admittance to its top: y_top = (D - y_bot B)^{-1}(y_bot A - C).
-        y = y_sub
-        lo_ytops = []
-        for li, part in reversed(lower):
-            A, B, C, D = chunk_blocks(li, part)
-            y = jnp.linalg.solve(D - y @ B, y @ A - C)
-            lo_ytops.append(y)
-        lo_ytops.reverse()  # top-first
-        YL = lo_ytops[0] if lo_ytops else y_sub
+        # Reflections at the source plane: looking down, everything below closed by the substrate (a- = R_L a+);
+        # looking up, everything above closed by the superstrate (a+ = R_U a-).
+        rho_sub = smatrix.ambient_reflection(y_r, fr["y_sub"])
+        rho_sup = smatrix.ambient_reflection(y_r, fr["y_sup"])
+        rs_lo, xs_lo = smatrix.sweep(lower, smatrix.dense(rho_sub))
+        rs_up, xs_up = smatrix.sweep(upper[::-1], smatrix.dense(rho_sup))  # from the source plane upward
+        r_l, r_u = rs_lo[0], rs_up[0]
 
         # ---- source jump vector (the source film's own inverse-z eta) --------
         scr_entry = grids[si]
@@ -393,30 +355,22 @@ def _make_emission_core(stack, si, kind):
         else:
             eta = fft_mod.fourier_convolution_matrix(1.0 / scr, expansion)
         s = polarization_terms(jx, jy, jz, eta, twv, omega)
-        s_u = s[:two_n]
-        s_v = s[two_n:]
 
-        # ---- source-plane solve --------------------------------------------
-        u_L = jnp.linalg.solve(YU - YL, s_v - YU @ s_u)
-        u_U = u_L + s_u
+        # ---- source-plane solve: psi_U - psi_L = s, i.e. a_U - a_L = W^-1 s = (sig+, sig-) ----------------
+        # With a-_L = R_L a+_L and a+_U = R_U a-_U: (I - R_U R_L) a+_L = R_U sig- - sig+.
+        zs_v = smatrix.apply(z_r, s[two_n:])
+        sig_p, sig_m = 0.5 * (s[:two_n] + zs_v), 0.5 * (s[:two_n] - zs_v)
+        eye = jnp.eye(two_n, dtype=cdt)
+        a_plus_l = jnp.linalg.solve(eye - r_u @ r_l, r_u @ sig_m - sig_p)
+        a_minus_u = r_l @ a_plus_l + sig_m
 
-        # ---- down: propagate to the substrate (y-assisted, stable) ----------
-        u = u_L
-        for (li, part), yt in zip(lower, lo_ytops):
-            A, B, C, D = chunk_blocks(li, part)
-            u = (A + B @ yt) @ u
-        v = y_sub @ u
-        down = jnp.abs(jnp.sum(layer_mod.sz_flux(u, v, n)))
-
-        # ---- up: propagate from the source plane to the superstrate ---------
-        u = u_U
-        for idx in range(len(upper) - 1, -1, -1):
-            li, part = upper[idx]
-            A, B, C, D = chunk_blocks(li, part)
-            yt = up_ytops[idx]
-            u = jnp.linalg.solve(A + B @ yt, u)
-        v = -y_sup @ u
-        up = jnp.abs(jnp.sum(layer_mod.sz_flux(u, v, n)))
+        # ---- down: carry a+ to the substrate; up: carry a- to the superstrate ----
+        a_bot = smatrix.carry(xs_lo, a_plus_l)[-1]
+        u = a_bot + smatrix.apply(rho_sub, a_bot)
+        down = jnp.abs(jnp.sum(layer_mod.sz_flux(u, smatrix.apply(fr["y_sub"], u), n)))
+        a_top = smatrix.carry(xs_up, a_minus_u)[-1]
+        u = a_top + smatrix.apply(rho_sup, a_top)
+        up = jnp.abs(jnp.sum(layer_mod.sz_flux(u, -smatrix.apply(fr["y_sup"], u), n)))
 
         return up, down
 

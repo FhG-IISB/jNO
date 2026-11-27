@@ -6,7 +6,7 @@ gradient-vs-FD), this file stresses the interior-field machinery that task T31 l
 * **Chunk invariance** -- the same geometry solved with different internal sub-slab
   chunk counts must give the same physics: ``T/R`` and the per-plane interior field
   amplitudes agree to tight tolerance (the interior probe re-derives the boundary
-  state from the chunked/impedance recursion, so the chunk bookkeeping must be
+  state from the chunked S-matrix sweep, so the chunk bookkeeping must be
   invisible to field readouts).
 * **Anisotropic layers** -- patterned 5-component and uniform-anisotropic layers go
   through the ``ez``/``hz`` algebraic paths (inverse-rule Fourier solve vs scalar
@@ -110,7 +110,7 @@ def _check_chunk_invariance():
         )
         res = st.solve(polarization="x")
         znums, _z = rcwa_fields.layer_z_sampling([1.0, 0.8, 1.0], 40.0)
-        planes = rcwa_fields.field_planes([1.0, 0.8, 1.0], znums, ["sup", 0, "sub"], [chunks])
+        planes = rcwa_fields.field_planes([1.0, 0.8, 1.0], znums, ["sup", 0, "sub"])
         # interior amplitudes over every plane (ambients + the film)
         ex, ey, ez, _hx, _hy, _hz = rcwa_fields.interior_field_amplitudes(
             st, planes, st._prototype, WL, (0.0, 0.0), (1.0, 0.0), 1.0, 1.0

@@ -1,4 +1,4 @@
-"""Tests for ``jno._rcwa.stack``: the chunked impedance recursion and the
+"""Tests for ``jno._rcwa.stack``: chunked layers, the S-matrix sweep and the
 plane-wave solve, plus readouts.
 
 Anchors (always run): analytic Fresnel/Airy slabs (normal + oblique TE/TM),
@@ -337,7 +337,7 @@ def test_interior_fields_reconstruct_boundary_state(slab_stack):
     st = slab_stack
     st.solve(validate=False)
     znums, _z = fields.layer_z_sampling([1.0, 0.5, 1.0], 40.0)
-    planes = fields.field_planes([1.0, 0.5, 1.0], znums, ["sup", 0, "sub"], [st._chunks[0]])
+    planes = fields.field_planes([1.0, 0.5, 1.0], znums, ["sup", 0, "sub"])
     ex, ey, ez, hx, hy, hz = fields.interior_field_amplitudes(
         st, planes, st._prototype, 1.0, (0.0, 0.0), (1.0, 0.0), 1.0, 1.0
     )
