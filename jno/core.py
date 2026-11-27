@@ -3719,8 +3719,8 @@ class core:
         full_context = self.domain_data.context
 
         if offload_data:
-            # full_context holds CPU-pinned JAX arrays (prepare_domain_data never goes to GPU).
-            # Convert to numpy so the host_context is plain numpy for per-batch streaming.
+            # full_context holds host arrays: numpy as given, anything else CPU-pinned (prepare_domain_data
+            # never goes to the GPU). Convert to numpy so the host_context is plain numpy for per-batch streaming.
             # Lazy handles stay handles -- np.asarray would read the whole dataset, which is the
             # one thing attaching one is meant to avoid. `_host_batch` slices them per step.
             host_context = {k: (v if _is_lazy_source(v) else np.asarray(v)) for k, v in full_context.items()}
