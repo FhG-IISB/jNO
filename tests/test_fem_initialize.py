@@ -12,7 +12,18 @@ from jax import config
 
 import jno
 
-config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 NEWTON = dict(direct=True, rtol=1e-12, atol=0.0, max_steps=40)
 
 

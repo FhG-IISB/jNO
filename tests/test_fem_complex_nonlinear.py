@@ -17,7 +17,18 @@ from scipy.special import jv
 
 import jno
 
-config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 MU0 = 4e-7 * np.pi
 F, SIG, RAD, K, L, T_COIL = 5e4, 1e5, 0.02, 1000.0, 0.01, 0.002
 W_ = 2 * np.pi * F

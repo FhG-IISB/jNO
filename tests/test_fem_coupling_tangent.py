@@ -18,7 +18,17 @@ import jno
 from jno._fem import Coupling
 from jno.domain.enclosure import build_enclosure
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIGMA = 5.670374419e-8
 

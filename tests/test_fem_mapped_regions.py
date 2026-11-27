@@ -17,7 +17,18 @@ from scipy.special import ellipe, ellipk, hankel1, j1
 
 import jno
 
-config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 disk, rect = jno.shape.disk, jno.shape.rect
 MU0 = 4e-7 * np.pi
 
