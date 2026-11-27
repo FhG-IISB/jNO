@@ -507,29 +507,33 @@ def test_magnetic_10comp_ambient_raises_not_silently_folded():
         )
 
 
-def test_traced_per_solve_thickness_raises_loudly():
-    """A traced (JAX) thickness on solve(layers=...) must raise a clear RcwaError -- not a raw
-    TracerBoolConversionError -- because the eig-free backend fixes thickness at build (chunking
-    depends on it). Regression for iss_mwxlsuz80ba3rp."""
+def test_traced_per_solve_thickness_is_differentiable():
+    """A traced thickness on solve(layers=...) flows through the compiled core (it used to raise: the old
+    backend fixed thickness at build). Its gradient under jit equals a central difference."""
     import jax
     import jax.numpy as jnp
 
-    from jno.rcwa import Rcwa, RcwaError
+    from jno.rcwa import Rcwa
 
     P, ng, h = 0.85, 16, 0.4
+    grid = np.ones((ng, ng))
+    grid[4:12, 3:9] = 4.0
     rc = Rcwa(
-        [(INF, 1.0), (h, jnp.ones((ng, ng))), (INF, 1.0)],
+        [(INF, 1.0), (h, grid), (INF, 2.25)],
         period=(P, P),
-        orders=5,
+        orders=9,
         wavelength=WL,
         assume_periodic=True,
     )
 
     def T(thick):  # traced thickness flowing through the per-solve layer stack
-        return rc.solve(layers=[(INF, 1.0), (thick, jnp.ones((ng, ng))), (INF, 1.0)]).efficiency("T")
+        return rc.solve(layers=[(INF, 1.0), (thick, jnp.asarray(grid)), (INF, 2.25)]).efficiency("T")
 
-    with pytest.raises(RcwaError, match="traced"):
-        jax.jit(T)(0.4)
+    g = float(jax.jit(jax.grad(T))(h))
+    d = 1e-3
+    fd = (float(T(h + d)) - float(T(h - d))) / (2 * d)
+    assert abs(fd) > 1e-2
+    assert g == pytest.approx(fd, rel=1e-4)
 
 
 def test_order_evanescent_gate_reports_exact_zero():

@@ -191,6 +191,7 @@ def emission_solve(
     amb_sup=None,
     amb_sub=None,
     validate: bool = True,
+    thick=None,
 ):
     """Internal-source (dipole / Gaussian) emission solve on a built ``StateStack``.
 
@@ -214,7 +215,9 @@ def emission_solve(
             prototype grids); traced design grids are allowed.
         k_in: Transverse wavevector override.
         amb_sup, amb_sub: Ambient permittivity overrides.
-        validate: Run the core eagerly first so the never-silent guards fire.
+        validate: Raise on a non-finite concrete emission.
+        thick: Per-film thicknesses overriding the build ones (the source film's
+            own split is ``t_upper``/``t_lower``).
 
     Returns:
         ``(up, down)``: the power radiated into the superstrate and substrate
@@ -267,6 +270,7 @@ def emission_solve(
         source["orient"],
         source["amp"],
         source.get("fwhm", 0.0),
+        tuple(jnp.asarray(t) for t in (stack._thick if thick is None else thick)),
     )
     up, down = res
     if validate and _concrete(up):
@@ -285,54 +289,28 @@ def _make_emission_core(stack, si, kind):
     k_in, ambs and the source parameters are traced."""
     from . import fft as fft_mod
     from . import layer as layer_mod
-    from . import matrices as matrices_mod
 
     n = stack._n
     two_n = 2 * n
     cdt = stack._cdt
     lv = stack._lv
     expansion = stack.expansion
-    formulation = stack.formulation
     chunks = list(stack._chunks)
-    thick = list(stack._thick)
-    mixed_guard = list(stack._mixed_guard)
-    squarings = stack._squarings
+    nfilm = len(chunks)
 
-    # ---- static half-stack chunk layouts (top-first (li, d_c) lists) ------
-    d_c_full = [thick[li] / chunks[li] for li in range(len(thick))]
-    # upper half: films [0..si) full + source film's upper slab (t_upper / n_up)
+    # ---- static half-stack chunk layouts: top-first (li, part) per chunk, where part is "full" for a
+    # whole film's chunk and "up"/"lo" for the source film's slabs above/below the source plane ----
     n_up = max(1, chunks[si])
     upper_specs = []
     for li in range(si):
-        upper_specs.extend([(li, d_c_full[li])] * chunks[li])
-    upper_specs.extend([(si, None)] * n_up)  # tuple thickness set per-solve
-    # lower half: source film's lower slab (t_lower / n_lo) + films [si+1..]
+        upper_specs.extend([(li, "full")] * chunks[li])
+    upper_specs.extend([(si, "up")] * n_up)
     n_lo = max(1, chunks[si])
-    lower_specs = [(si, None)] * n_lo
-    for li in range(si + 1, len(thick)):
-        lower_specs.extend([(li, d_c_full[li])] * chunks[li])
+    lower_specs = [(si, "lo")] * n_lo
+    for li in range(si + 1, nfilm):
+        lower_specs.extend([(li, "full")] * chunks[li])
 
-    def chunk_blocks(grid_entry, li, d_c, omega, twv):
-        """(A, B, C, D) blocks of one chunk of backend layer `li`, thickness ``d_c``."""
-        # Normalize the per-solve layer material to a component list (the backend
-        # accepts a plain grid or a (comps,) tuple for scalar layers).
-        entry = grid_entry if isinstance(grid_entry, tuple) else (grid_entry,)
-        comps = [jnp.asarray(c).astype(cdt) for c in entry]
-        if len(comps) > 1:  # an anisotropic source layer is stage-2a's scope
-            raise ValueError(
-                "internal-source solves support scalar-isotropic source layers "
-                f"only; got {len(comps)}-component material at layer {li}."
-            )
-        grid = comps[0]
-        if tuple(jnp.shape(grid)) == (1, 1):
-            t = layer_mod.uniform_layer_transfer(omega, twv, jnp.reshape(grid, ()), d_c, dtype=cdt)
-        else:
-            _, z_eps, e_t, _ = matrices_mod.transverse_matrices_isotropic(grid, expansion, formulation, lv)
-            m_l = layer_mod.assemble_M_L(omega, twv, z_eps, e_t)
-            t = layer_mod.layer_transfer_exp(m_l, d_c, squarings=squarings, guard_norm=mixed_guard[li])
-        return t[:two_n, :two_n], t[:two_n, two_n:], t[two_n:, :two_n], t[two_n:, two_n:]
-
-    def core(grids, wl, kin, amb_sup, amb_sub, tu, tl, loc, orient, amp, fwhm):
+    def core(grids, wl, kin, amb_sup, amb_sub, tu, tl, loc, orient, amp, fwhm, thick):
         omega = (2 * jnp.pi / jnp.asarray(wl)).astype(cdt)
         twv = basis_mod.transverse_wavevectors(
             in_plane_wavevector=jnp.asarray(kin),
@@ -352,9 +330,26 @@ def _make_emission_core(stack, si, kind):
         amp = jnp.asarray(amp + 0.0j)
         jx, jy, jz = amp * orient[0] * base, amp * orient[1] * base, amp * orient[2] * base
 
-        # per-solve chunk thicknesses
-        upper = [(li, (tu / n_up) if d_c is None else d_c) for (li, d_c) in upper_specs]
-        lower = [(li, (tl / n_lo) if d_c is None else d_c) for (li, d_c) in lower_specs]
+        # ---- one material record per film, one block tuple per distinct chunk thickness ----
+        records = {}
+        blocks = {}
+
+        def chunk_blocks(li, part):
+            """(A, B, C, D) of one chunk of film `li`: a whole-film chunk, or a slab of the source film."""
+            if (li, part) not in blocks:
+                if li not in records:
+                    entry = grids[li] if isinstance(grids[li], tuple) else (grids[li],)
+                    if len(entry) > 1:  # an anisotropic layer is outside the source solve's scope
+                        raise ValueError(
+                            "internal-source solves support scalar-isotropic layers "
+                            f"only; got {len(entry)}-component material at layer {li}."
+                        )
+                    records[li] = stack._layer_material(li, grids[li], omega, twv, count=False)
+                d = {"full": thick[li] / chunks[li], "up": tu / n_up, "lo": tl / n_lo}[part]
+                blocks[(li, part)] = records[li].transfer(d)
+            return blocks[(li, part)]
+
+        upper, lower = upper_specs, lower_specs
 
         # ---- ambient admittances -------------------------------------------
         kz_sub = layer_mod.ambient_kz(twv, amb_sub, omega, dtype=cdt)
@@ -371,8 +366,8 @@ def _make_emission_core(stack, si, kind):
         # accuracy/consistency discipline as the sibling solve sites below.
         y = -y_sup
         up_ytops = []
-        for li, d_c in upper:
-            A, B, C, D = chunk_blocks(grids[li], li, d_c, omega, twv)
+        for li, part in upper:
+            A, B, C, D = chunk_blocks(li, part)
             up_ytops.append(y)
             y = jnp.linalg.solve((A + B @ y).conj().T, (C + D @ y).conj().T).conj().T
         YU = y if upper else -y_sup
@@ -382,8 +377,8 @@ def _make_emission_core(stack, si, kind):
         # admittance to its top: y_top = (D - y_bot B)^{-1}(y_bot A - C).
         y = y_sub
         lo_ytops = []
-        for li, d_c in reversed(lower):
-            A, B, C, D = chunk_blocks(grids[li], li, d_c, omega, twv)
+        for li, part in reversed(lower):
+            A, B, C, D = chunk_blocks(li, part)
             y = jnp.linalg.solve(D - y @ B, y @ A - C)
             lo_ytops.append(y)
         lo_ytops.reverse()  # top-first
@@ -407,8 +402,8 @@ def _make_emission_core(stack, si, kind):
 
         # ---- down: propagate to the substrate (y-assisted, stable) ----------
         u = u_L
-        for (li, d_c), yt in zip(lower, lo_ytops):
-            A, B, C, D = chunk_blocks(grids[li], li, d_c, omega, twv)
+        for (li, part), yt in zip(lower, lo_ytops):
+            A, B, C, D = chunk_blocks(li, part)
             u = (A + B @ yt) @ u
         v = y_sub @ u
         down = jnp.abs(jnp.sum(layer_mod.sz_flux(u, v, n)))
@@ -416,8 +411,8 @@ def _make_emission_core(stack, si, kind):
         # ---- up: propagate from the source plane to the superstrate ---------
         u = u_U
         for idx in range(len(upper) - 1, -1, -1):
-            li, d_c = upper[idx]
-            A, B, C, D = chunk_blocks(grids[li], li, d_c, omega, twv)
+            li, part = upper[idx]
+            A, B, C, D = chunk_blocks(li, part)
             yt = up_ytops[idx]
             u = jnp.linalg.solve(A + B @ yt, u)
         v = -y_sup @ u

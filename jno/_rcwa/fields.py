@@ -15,8 +15,8 @@ with ``A..D`` the blocks of the chunk transfer ``expm(i M_L zeta)`` and
 ``Y_top`` the chunk's top-side admittance from the impedance recursion. Growing
 evanescent modes live inside ``v = Y u`` and never appear as standalone
 growing quantities -- the same S-matrix stabilization the plane-wave solve
-uses, evaluated at the requested depth (the per-plane transfer uses the
-chunk's own Pade/squaring guard, at a no-larger argument).
+uses, evaluated at the requested depth (the per-plane transfer is the
+chunk's own thin-slice series, at a no-larger depth).
 
 The algebraic ``ez``/``hz`` follow the fmmax conventions (Liu 2012 eq. 11/14,
 state-space form): for a tangential state the Maxwell curl equations give, per
@@ -134,6 +134,7 @@ def interior_field_amplitudes(
     pol,
     amb_sup,
     amb_sub,
+    thick=None,
 ) -> Tuple[jnp.ndarray, ...]:
     """Per-plane Fourier field amplitudes through the stack's compiled core.
 
@@ -146,12 +147,14 @@ def interior_field_amplitudes(
         kin: Transverse incident wavevector (may be traced).
         pol: The incident Jones pair ``(px, py)``.
         amb_sup, amb_sub: The analytic ambient permittivities.
+        thick: The per-film thicknesses of the solve (default: the build ones);
+            they must match the thicknesses the planes were resolved with.
 
     Returns:
         ``(ex, ey, ez, hx, hy, hz)``: per-plane complex Fourier coefficients,
         each ``(len(planes), n)``, in plane order.
     """
-    return stack.interior_field_amplitudes(grids, wl, kin, pol, amb_sup, amb_sub, tuple(planes))
+    return stack.interior_field_amplitudes(grids, wl, kin, pol, amb_sup, amb_sub, tuple(planes), thick=thick)
 
 
 def volume_intensity(

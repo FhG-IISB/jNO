@@ -33,10 +33,12 @@ Readouts follow jNO's conventions exactly: signed per-order Poynting
 transmitted state, ``R`` from the reflected state with the sign flip,
 normalized by the incident power.
 
-Jit hygiene: chunk counts, Pade squaring counts, uniform/patterned flags and
-thicknesses are static Python values decided at build from the concrete
-prototype grids; the grids themselves flow through pure JAX inside the traced
-core (native JVPs). There are no data-dependent loops in the compiled program.
+Jit hygiene: chunk counts, series doubling counts and uniform/patterned flags
+are static Python values decided at build from the concrete prototype grids and
+thicknesses; the grids and the thicknesses themselves flow through pure JAX
+inside the traced core (native JVPs). There are no data-dependent loops in the
+compiled program. How far a solve's grids and thicknesses are from what the
+static counts were sized for is returned as ``load`` (<= 1 is within budget).
 """
 
 from __future__ import annotations
@@ -61,6 +63,37 @@ _DEFAULT_FORMULATION = Formulation.JONES_DIRECT_FOURIER
 
 def _concrete(x) -> bool:
     return not isinstance(x, jax.core.Tracer)
+
+
+def _load_guard(res):
+    """Never-silent check that the solve stayed inside the static budget fixed at build (eager only).
+
+    ``res.load`` is the largest over the layers of the thin-slice series bound ``||P h0^2|| / theta`` and of
+    ``(d / (THICKNESS_MARGIN d_build))^2``: above 1, a thickness or a permittivity has moved further from the
+    build prototype than the static doubling and chunk counts allow for.
+    """
+    load = float(res.load)
+    if not load <= 1.0 + 1e-9:
+        raise ValueError(
+            f"_rcwa: a layer left the range this stack was built for (load {load:.3g} > 1): a thickness beyond "
+            f"{layer.THICKNESS_MARGIN:g}x the built one, or a permittivity much larger than the build grid's. "
+            "Build a fresh stack (a new Rcwa) at the new thickness or design."
+        )
+
+
+def _largest_components(comps, is_mu):
+    """The per-component largest-magnitude values of a tensor layer, as ``(eps5, mu5 or None)`` scalars.
+
+    They size the static doubling count of the per-order uniform path for any constant the grids may
+    collapse to within the prototype's range (host-side)."""
+    import numpy as onp
+
+    def big(c):
+        a = onp.asarray(c).reshape(-1)
+        return complex(a[onp.argmax(onp.abs(a))])
+
+    vals = [big(c) for c in comps]
+    return tuple(vals[:5]), (tuple(vals[5:]) if is_mu else None)
 
 
 def _energy_guard(res, auto_chunks):
@@ -102,7 +135,7 @@ _PATTERNED_SOLVES = [0]
 
 
 def patterned_solve_count() -> int:
-    """The number of patterned-layer expm solves since the last reset."""
+    """The number of patterned-layer transfers traced since the last reset."""
     return _PATTERNED_SOLVES[0]
 
 
@@ -177,17 +210,17 @@ def chunk_blocks(t: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray,
 class _LayerRecord:
     """Traced material record of one layer for the interior-field core.
 
-    ``transfer(d)`` is the 4n x 4n chunk transfer at thickness ``d`` (the
-    same-material expm/analytic builder the plane-wave solve uses at the
-    chunk thickness, evaluated at any sub-chunk depth); ``blocks`` is the
-    chunk-transfer block tuple at the chunk thickness (the impedance
-    recursion). ``z_eps`` / ``z_mu`` are the inverse-rule zz Fourier matrices
+    ``transfer(d)`` is the block tuple ``(A, B, C, D)`` of the transfer over
+    a depth ``d`` (the builder the plane-wave solve uses at the chunk
+    thickness, evaluated at any sub-chunk depth); ``blocks`` is that tuple at
+    the chunk thickness (the impedance recursion) and ``load`` the layer's
+    build-budget diagnostic there. ``z_eps`` / ``z_mu`` are the inverse-rule zz Fourier matrices
     of a patterned layer (``None`` for uniform / analytic layers, where
     per-order scalar division applies); ``eps_zz`` / ``mu_zz`` are the scalar
     zz components used by the uniform paths and the analytic ambients.
     """
 
-    __slots__ = ("mode", "eps_zz", "mu_zz", "z_eps", "z_mu", "transfer", "blocks")
+    __slots__ = ("mode", "eps_zz", "mu_zz", "z_eps", "z_mu", "transfer", "blocks", "load")
 
     def __init__(self, **kw):
         for k, v in kw.items():
@@ -214,7 +247,7 @@ class StateStack:
             factorization; defaults to ``JONES_DIRECT_FOURIER`` like ``jno.rcwa``.
         theta: Per-chunk growth bound for the static chunking policy.
         chunk_override: Optional per-layer chunk counts (tests / stress).
-        squarings_override: Optional fixed Pade squaring count for all
+        doublings_override: Optional fixed series doubling count for all
             patterned layers (tests / stress).
         dtype: The complex dtype of the solve (``complex64`` default).
     """
@@ -231,7 +264,7 @@ class StateStack:
         formulation: Formulation | str = _DEFAULT_FORMULATION,
         theta: float = _CHUNK_THETA,
         chunk_override: Optional[Sequence[Optional[int]]] = None,
-        squarings_override: Optional[int] = None,
+        doublings_override: Optional[int] = None,
         dtype=None,
     ):
         if dtype is None:
@@ -273,7 +306,6 @@ class StateStack:
         )
         self._twv = twv.astype(self._cdt)
         self._omega = layer_matrices_omega(self.wavelength).astype(self._cdt)
-        self._squarings = squarings_override
         # Cache the jitted core ONCE: `jax.jit(bound_method)` misses JAX's function cache when the
         # Jit is rebuilt per call, so a warm `solve()` used to re-trace/recompile (~4x wall time, the
         # stage-0 bench's 4505ms-vs-1142ms at 2n=2402). Same caching as the jNO seam's `_core_jit`.
@@ -287,16 +319,12 @@ class StateStack:
         self._comp_shapes = []  # per-layer tuple of per-component shapes
         self._uniform = []
         self._chunks = []
-        self._mixed_guard = []
+        self._doublings = []  # per layer position: the static series doubling count of the patterned path
         self._prototype = []
         nl = len(self.layers)
-        # One entry per layer POSITION (0 for a non-aniso layer), not one per
-        # aniso layer: the traced consumer at `_layer_material` indexes by the
-        # ABSOLUTE layer index. Appending only per-aniso-layer breaks mixed
-        # iso/aniso stacks (IndexError on iso-above-aniso; silently-shifted
-        # squaring counts when an iso layer sits above two aniso layers) --
-        # the same position-indexing family as `_mixed_guard` (iss_mwurllzvaj6pf4).
-        self._aniso_squarings = [0] * nl
+        # One entry per layer POSITION (0 for a non-aniso layer): the traced consumer at
+        # `_layer_material` indexes by the ABSOLUTE layer index (iss_mwurllzvaj6pf4).
+        self._uniform_doublings = [0] * nl
         if chunk_override is not None and len(chunk_override) < nl:
             raise ValueError(f"`chunk_override` must have one entry per layer ({nl}), got {len(chunk_override)}.")
 
@@ -352,51 +380,39 @@ class StateStack:
             if chunk_override is not None and chunk_override[li]:
                 nc = int(chunk_override[li])
             self._chunks.append(nc)
-            if not uniform and ncomp == 1:
-                # The guard norm is a build-time static bound; the traced core
-                # recomputes E_t (and the tangent field) from the solve grids.
-                _, z_eps, e_t, _ = matrices.transverse_matrices_isotropic(
-                    comps[0],
-                    expansion,
-                    formulation,
-                    lv,
-                )
-                m_l = layer.assemble_M_L(self._omega, twv, z_eps, e_t)
-                self._mixed_guard.append(layer.matrix_inf_norm(m_l) * (self._thick[-1] / self._chunks[-1]))
-            else:
-                # The uniform-aniso fast path needs a STATIC Pade squaring count
-                # for its per-order transfers, fixed at build from a spectral
-                # bound of the per-order 4x4 blocks of the prototype (the same
-                # stability-margin discipline as the patterned expm guard). This
-                # is needed for ANY aniso layer: a build-PATTERNED tensor layer
-                # that a per-solve concrete collapse makes uniform must still
-                # hand the traced core a static count.
-                if ncomp > 1:
-                    d_c = self._thick[-1] / self._chunks[-1]
-                    norm = layer.uniform_aniso_spectral_norm(
-                        tuple(comps[:5]),
-                        tuple(comps[5:]) if is_mu else None,
-                        twv,
-                        self._omega,
-                        d_c,
-                        self._cdt,
-                    )
-                    self._aniso_squarings[li] = layer.squarings_for_spectral_norm(norm)
-                if not uniform:  # a patterned anisotropic layer
-                    mu_comps = comps[5:] if is_mu else None
-                    (_, z_eps, e_t, _, z_mu, m_t, _) = matrices.transverse_matrices_anisotropic(
-                        tuple(comps[:5]),
-                        tuple(mu_comps) if mu_comps is not None else None,
-                        expansion,
-                        formulation,
-                        lv,
-                    )
-                    m_l = layer.assemble_M_L(self._omega, twv, z_eps, e_t, transverse_permeability=m_t, z_permeability=z_mu)
-                    self._mixed_guard.append(layer.matrix_inf_norm(m_l) * (self._thick[-1] / self._chunks[-1]))
-                else:
-                    # Keep `_mixed_guard` indexed by layer position so mixed
-                    # stacks (uniform layers above/below patterned ones) work.
-                    self._mixed_guard.append(None)
+            d_c = self._thick[-1] / self._chunks[-1]
+            k_patterned = 0
+            if not uniform:
+                # A build-time static bound from the prototype; the traced core rebuilds B and C from the
+                # solve grids and reports in `load` how close they come to it.
+                b_mat, c_mat, _, _ = self._patterned_bc(comps, self._omega, self._twv)
+                k_patterned = layer.series_doublings(layer.matrix_inf_norm(b_mat @ c_mat), d_c)
+            if ncomp > 1:
+                # A tensor layer whose solve grids collapse to constants takes the per-order uniform path,
+                # which needs its own static count (sized on the prototype's largest component values).
+                eps5, mu5 = _largest_components(comps, is_mu)
+                b_u, c_u = layer.uniform_aniso_bc(self._omega, self._twv, eps5, mu5, dtype=self._cdt)
+                self._uniform_doublings[li] = layer.series_doublings(layer.matrix_inf_norm(b_u @ c_u), d_c)
+            if doublings_override is not None:
+                k_patterned = int(doublings_override)
+            self._doublings.append(k_patterned)
+
+    def _patterned_bc(self, comps, omega, twv):
+        """``(B, C, z_eps, z_mu)`` of a patterned layer from its component grids (one grid when isotropic)."""
+        if len(comps) > 1:
+            mu_comps = comps[5:] if len(comps) == 10 else None
+            (_, z_eps, e_t, _, z_mu, m_t, _) = matrices.transverse_matrices_anisotropic(
+                tuple(comps[:5]),
+                tuple(mu_comps) if mu_comps is not None else None,
+                self.expansion,
+                self.formulation,
+                self._lv,
+            )
+            b, c = layer.layer_bc(omega, twv, z_eps, e_t, transverse_permeability=m_t, z_permeability=z_mu)
+            return b, c, z_eps, z_mu
+        _, z_eps, e_t, _ = matrices.transverse_matrices_isotropic(comps[0], self.expansion, self.formulation, self._lv)
+        b, c = layer.layer_bc(omega, twv, z_eps, e_t)
+        return b, c, z_eps, None
 
     # -- solve -------------------------------------------------------------
 
@@ -409,6 +425,7 @@ class StateStack:
         k_in=None,
         amb_sup=None,
         amb_sub=None,
+        thick=None,
     ):
         """Solve for plane-wave incidence at the stack's ``k_in`` (or an override).
 
@@ -418,15 +435,18 @@ class StateStack:
                 or ``(nx, ny)`` arrays, one per layer; may be traced). These
                 are the design items and flow through the compiled core.
             polarization: ``"x"``/``"y"`` or a Jones pair.
-            validate: Runs the core eagerly on concrete results first so the
-                never-silent guards (expm bound, energy) fire (house style);
-                structural checks run regardless.
+            validate: On a concrete result, raises if energy is not conserved or
+                a layer left the build budget (``load > 1``); structural checks
+                run regardless.
             k_in: Overrides the build incidence wavevector ``(kx, ky)`` (may be
-                traced). The chunking/squaring guards were fixed at build from
+                traced). The chunk and doubling counts were fixed at build from
                 the build ``k_in``; a shifted incidence is handled by the core
                 exactly, with the build's (conservative) stability decisions.
             amb_sup, amb_sub: Overrides of the uniform ambient permittivities
                 (may be traced scalars or single-grid values).
+            thick: Per-layer thicknesses overriding the build ones (may be
+                traced; the static counts allow up to ``THICKNESS_MARGIN`` x
+                the build thickness, see ``load``).
 
         Returns:
             A ``_Result`` with ``T``/``R`` efficiencies, per-order fluxes and
@@ -465,128 +485,91 @@ class StateStack:
         amb_sup = self.amb_sup if amb_sup is None else amb_sup
         amb_sub = self.amb_sub if amb_sub is None else amb_sub
 
-        if validate and all(_concrete(g) for g in grids) and _concrete(wl):
-            # The eager pre-run exists so the expm-bound/energy guards fire before
-            # the compiled core returns; it is NOT a traced execution, so the
-            # counting hook (traces only) must not see it.
-            before = _PATTERNED_SOLVES[0]
-            res = _Result.from_tuple(self._solve_core(tuple(grids), wl, kin, pol, amb_sup, amb_sub))
-            _PATTERNED_SOLVES[0] = before
-            if _concrete(res.T):
-                _energy_guard(res, self._chunks)
-        core = self._solve_core_jit
-        res = _Result.from_tuple(core(tuple(grids), wl, kin, pol, amb_sup, amb_sub))
-        # The returned value comes from the COMPILED core, which for a chaotic
-        # (un-chunked, c64) solve can diverge from the eager pre-run: guard the
-        # final result too, so a direct backend user never receives a silently
-        # unconserved answer (the seam has its own equivalent checks).
+        thick = tuple(self._thick) if thick is None else tuple(thick)
+        res = _Result.from_tuple(self._solve_core_jit(tuple(grids), wl, kin, pol, amb_sup, amb_sub, thick))
         if validate and _concrete(res.T):
             _energy_guard(res, self._chunks)
+            _load_guard(res)
         return res
 
-    def _layer_material(self, li, layer_grid, omega, twv, count: bool):
+    def _layer_material(self, li, layer_grid, omega, twv, count: bool, d_c=None):
         """The traced material record of layer `li` for the per-solve grids.
 
-        Returns a :class:`_LayerRecord` whose ``transfer(d)`` computes the
-        4n x 4n chunk transfer at any thickness ``d <= d_c`` (the per-plane
-        interior probe reuses the chunk's own builder at sub-chunk depths),
-        whose ``blocks()`` are the chunk-transfer blocks at ``d_c`` (the
-        impedance recursion), and which carries ``z_eps``/``z_mu`` (``None``
-        when uniform) for the algebraic ez/hz readouts.
+        Returns a :class:`_LayerRecord` whose ``transfer(d)`` gives the four
+        ``2n x 2n`` blocks of the transfer over any depth ``d`` (the chunk,
+        or a sub-chunk depth for an interior plane), whose ``blocks`` are
+        those at the chunk thickness ``d_c`` (the impedance recursion; ``None``
+        when ``d_c`` is not given), whose ``load`` is the layer's share of the
+        solve's build-budget diagnostic at ``d_c``, and which carries
+        ``z_eps``/``z_mu`` (``None`` when uniform) for the ez/hz readouts.
 
-        ``count`` gates the patterned-eigensolve counting oracle: the plane-
-        wave solve counts patterned expms, the interior-field core does not
-        (it would double-count the same transfers it re-derives).
+        ``count`` gates the patterned-solve counting oracle: the plane-wave
+        solve counts patterned layers, the interior-field core does not.
 
         ``uniform_now`` is a per-solve SHAPE decision (static under trace);
         the uniform shortcut is a property of the per-solve permittivity,
         never a structure decision.
         """
-        d_c = self._thick[li] / self._chunks[li]
         entry = layer_grid if isinstance(layer_grid, tuple) else (layer_grid,)
         comps = [jnp.asarray(c).astype(self._cdt) for c in entry]
         shapes = tuple(tuple(jnp.shape(c)) for c in comps)
         uniform_now = shapes == ((1, 1),) or all(s == (1, 1) for s in shapes)
-        if len(comps) > 1:  # an anisotropic (tensor) layer
-            if uniform_now:
-                if count:
-                    _PATTERNED_SOLVES[0] += 0  # analytic per-order path, not a patterned expm
-                mu_comps = comps[5:] if len(comps) == 10 else None
-                eps_scalars = tuple(jnp.reshape(c, ()) for c in comps[:5])
-                mu_scalars = tuple(jnp.reshape(c, ()) for c in mu_comps) if mu_comps is not None else None
-                squarings = self._aniso_squarings[li] if self._aniso_squarings else 0
+        degree = layer.series_degree(self._cdt)
+        d_c_build = self._thick[li] / self._chunks[li]
 
-                def transfer(d, omega=omega, twv=twv, eps=eps_scalars, mu=mu_scalars, s=squarings):
-                    return layer.uniform_anisotropic_layer_transfer(omega, twv, eps, mu, d, squarings=s, dtype=self._cdt)
+        def thickness_load(d):
+            return (jnp.abs(jnp.real(d)) / (layer.THICKNESS_MARGIN * d_c_build)) ** 2
 
-                return _LayerRecord(
-                    mode="uniform-aniso",
-                    eps_zz=eps_scalars[4],
-                    mu_zz=mu_scalars[4] if mu_scalars is not None else jnp.asarray(1.0, dtype=self._cdt),
-                    z_eps=None,
-                    z_mu=None,
-                    transfer=transfer,
-                    blocks=chunk_blocks(transfer(d_c)),
-                )
-            if count:
-                _PATTERNED_SOLVES[0] += 1  # counting oracle (traces only)
+        if len(comps) > 1 and uniform_now:  # a uniform anisotropic (tensor) layer: per-order 4x4 transfers
             mu_comps = comps[5:] if len(comps) == 10 else None
-            (_, z_eps, e_t, _, z_mu, m_t, _) = matrices.transverse_matrices_anisotropic(
-                tuple(comps[:5]),
-                tuple(mu_comps) if mu_comps is not None else None,
-                self.expansion,
-                self.formulation,
-                self._lv,
-            )
-            m_l = layer.assemble_M_L(omega, twv, z_eps, e_t, transverse_permeability=m_t, z_permeability=z_mu)
-            guard_norm = self._mixed_guard[li]
-            squarings = self._squarings
+            eps_scalars = tuple(jnp.reshape(c, ()) for c in comps[:5])
+            mu_scalars = tuple(jnp.reshape(c, ()) for c in mu_comps) if mu_comps is not None else None
+            k = self._uniform_doublings[li]
+            b_u, c_u = layer.uniform_aniso_bc(omega, twv, eps_scalars, mu_scalars, dtype=self._cdt)
+            p_u = b_u @ c_u
 
-            def transfer(d, m_l=m_l, guard_norm=guard_norm, squarings=squarings):
-                return layer.layer_transfer_exp(m_l, d, squarings=squarings, guard_norm=guard_norm)
+            def transfer(d, omega=omega, twv=twv, eps=eps_scalars, mu=mu_scalars, k=k):
+                return chunk_blocks(
+                    layer.uniform_anisotropic_layer_transfer(omega, twv, eps, mu, d, doublings=k, dtype=self._cdt)
+                )
 
-            return _LayerRecord(
-                mode="patterned",
-                eps_zz=None,
-                mu_zz=None,
-                z_eps=z_eps,
-                z_mu=z_mu,
-                transfer=transfer,
-                blocks=chunk_blocks(transfer(d_c)),
+            def load(d, p_u=p_u, k=k):
+                return jnp.maximum(layer.series_load(p_u, d, k), thickness_load(d))
+
+            rec = dict(
+                mode="uniform-aniso",
+                eps_zz=eps_scalars[4],
+                mu_zz=mu_scalars[4] if mu_scalars is not None else jnp.asarray(1.0, dtype=self._cdt),
+                z_eps=None,
+                z_mu=None,
             )
-        if uniform_now:
+        elif uniform_now:  # a uniform isotropic layer: the closed form
             eps = jnp.reshape(comps[0], ())
 
             def transfer(d, omega=omega, twv=twv, eps=eps):
-                return layer.uniform_layer_transfer(omega, twv, eps, d, dtype=self._cdt)
+                return chunk_blocks(layer.uniform_layer_transfer(omega, twv, eps, d, dtype=self._cdt))
 
-            return _LayerRecord(
-                mode="uniform",
-                eps_zz=eps,
-                mu_zz=jnp.asarray(1.0, dtype=self._cdt),
-                z_eps=None,
-                z_mu=None,
-                transfer=transfer,
-                blocks=chunk_blocks(transfer(d_c)),
-            )
-        if count:
-            _PATTERNED_SOLVES[0] += 1  # counting oracle (traces only)
-        _, z_eps, e_t, _ = matrices.transverse_matrices_isotropic(comps[0], self.expansion, self.formulation, self._lv)
-        m_l = layer.assemble_M_L(omega, twv, z_eps, e_t)
-        guard_norm = self._mixed_guard[li]
-        squarings = self._squarings
+            load = thickness_load
+            rec = dict(mode="uniform", eps_zz=eps, mu_zz=jnp.asarray(1.0, dtype=self._cdt), z_eps=None, z_mu=None)
+        else:  # a patterned layer, isotropic or tensor: the thin-slice series in P = B C
+            if count:
+                _PATTERNED_SOLVES[0] += 1  # counting oracle (traces only)
+            b, c, z_eps, z_mu = self._patterned_bc(comps, omega, twv)
+            p = b @ c
+            k = self._doublings[li]
 
-        def transfer(d, m_l=m_l, guard_norm=guard_norm, squarings=squarings):
-            return layer.layer_transfer_exp(m_l, d, squarings=squarings, guard_norm=guard_norm)
+            def transfer(d, b=b, c=c, p=p, k=k):
+                return layer.slice_transfer(b, c, p, d, k, degree)
 
+            def load(d, p=p, k=k):
+                return jnp.maximum(layer.series_load(p, d, k), thickness_load(d))
+
+            rec = dict(mode="patterned", eps_zz=None, mu_zz=None, z_eps=z_eps, z_mu=z_mu)
         return _LayerRecord(
-            mode="patterned",
-            eps_zz=None,
-            mu_zz=None,
-            z_eps=z_eps,
-            z_mu=None,
             transfer=transfer,
-            blocks=chunk_blocks(transfer(d_c)),
+            blocks=None if d_c is None else transfer(d_c),
+            load=None if d_c is None else load(d_c),
+            **rec,
         )
 
     def _solve_states(self, omega, twv, records, amb_sup, amb_sub, pol):
@@ -662,14 +645,16 @@ class StateStack:
             "chunk_top": chunk_top,
         }
 
-    def _solve_core(self, grids, wl, kin, pol, amb_sup, amb_sub):
-        """jitted core: static chunking/squaring means no data-dependent flow.
+    def _solve_core(self, grids, wl, kin, pol, amb_sup, amb_sub, thick=None):
+        """jitted core: static chunk and doubling counts mean no data-dependent flow.
 
         ``twv`` derives from the *per-solve* ``kin`` inside the trace (the seam
         sweeps the incidence angle through the compiled core), and the ambient
         split uses the per-solve ``amb_sup``/``amb_sub``. The chunk counts,
-        Pade squaring counts and uniform/patterned flags stay static from the
-        build, which only set stability margins -- never correctness.
+        series doubling counts and uniform/patterned flags stay static from the
+        build, which only set stability margins -- never correctness; ``thick``
+        (default: the build thicknesses) may be traced, and the returned
+        ``load`` says how far the solve is from those margins.
         """
         n = self._n
         omega = layer_matrices_omega(wl).astype(self._cdt)
@@ -678,8 +663,9 @@ class StateStack:
             primitive_lattice_vectors=self._lv,
             expansion=self.expansion,
         ).astype(self._cdt)
-        records = [self._layer_material(li, layer_grid, omega, twv, count=True) for li, layer_grid in enumerate(grids)]
+        records = self._records(grids, omega, twv, thick, count=True)
         st = self._solve_states(omega, twv, records, amb_sup, amb_sub, pol)
+        load = jnp.max(jnp.stack([jnp.real(r.load) for r in records])) if records else jnp.asarray(0.0)
 
         # 4) Readouts (signed per-order Poynting, jNO convention).
         flux_inc = layer.sz_flux(st["u_inc"], st["y_sup"] @ st["u_inc"], n)
@@ -697,13 +683,22 @@ class StateStack:
             st["v_sub"],
             st["u_ref"],
             st["v_ref"],
+            load,
         )
+
+    def _records(self, grids, omega, twv, thick, count):
+        """Per-layer material records at the per-solve chunk thickness ``thick[li] / chunks[li]``."""
+        thick = self._thick if thick is None else thick
+        return [
+            self._layer_material(li, g, omega, twv, count=count, d_c=thick[li] / self._chunks[li])
+            for li, g in enumerate(grids)
+        ]
 
     # ------------------------------------------------------------------
     # Interior field reconstruction (stage 2d): per-plane Fourier fields.
     # ------------------------------------------------------------------
 
-    def interior_field_amplitudes(self, grids, wl, kin, pol, amb_sup, amb_sub, planes):
+    def interior_field_amplitudes(self, grids, wl, kin, pol, amb_sup, amb_sub, planes, thick=None):
         """Per-plane Fourier field amplitudes inside the stack.
 
         `planes` is a static tuple of per-plane specs (Python values, resolved
@@ -738,9 +733,10 @@ class StateStack:
             jnp.asarray(amb_sup),
             jnp.asarray(amb_sub),
             tuple(planes),
+            tuple(jnp.asarray(t) for t in (self._thick if thick is None else thick)),
         )
 
-    def _field_core(self, grids, wl, kin, pol, amb_sup, amb_sub, planes):
+    def _field_core(self, grids, wl, kin, pol, amb_sup, amb_sub, planes, thick):
         """jitted interior-field core: ``(ex, ey, ez, hx, hy, hz)`` per plane.
 
         `planes` is static (a Python tuple baked into the trace), so the
@@ -756,7 +752,7 @@ class StateStack:
             primitive_lattice_vectors=self._lv,
             expansion=self.expansion,
         ).astype(cdt)
-        records = [self._layer_material(li, layer_grid, omega, twv, count=False) for li, layer_grid in enumerate(grids)]
+        records = self._records(grids, omega, twv, thick, count=False)
         st = self._solve_states(omega, twv, records, amb_sup, amb_sub, pol)
         # global chunk offset of each layer's first chunk (film planes give
         # per-layer chunk indices; the recursion lists every chunk top-first).
@@ -791,7 +787,7 @@ class StateStack:
                 mu_zz = jnp.asarray(1.0, dtype=cdt)
             else:
                 rec = records[spec[1]]
-                a, b, c_block, d = chunk_blocks(rec.transfer(spec[3]))
+                a, b, c_block, d = rec.transfer(spec[3])
                 gk = chunk_starts[spec[1]] + spec[2]
                 y_top = y_stack_bottom_up[gk]
                 u_top = chunk_top[gk]
@@ -853,6 +849,8 @@ class _Result:
         u_sub, v_sub: Tangential state ``(u, v) = ((-E_y, E_x), (H_x, H_y))`` at
             the substrate interface (through-put state).
         u_ref, v_ref: Reflected state at the superstrate interface.
+        load: The build-budget diagnostic (``<= 1``: the thicknesses and grids
+            are within what the static doubling and chunk counts were sized for).
     """
 
     __slots__ = (
@@ -866,6 +864,7 @@ class _Result:
         "v_sub",
         "u_ref",
         "v_ref",
+        "load",
     )
 
     def __init__(
@@ -880,6 +879,7 @@ class _Result:
         v_sub,
         u_ref,
         v_ref,
+        load=0.0,
     ):
         self.T = t
         self.R = r
@@ -891,6 +891,7 @@ class _Result:
         self.v_sub = v_sub
         self.u_ref = u_ref
         self.v_ref = v_ref
+        self.load = load
 
     @classmethod
     def from_tuple(cls, vals):

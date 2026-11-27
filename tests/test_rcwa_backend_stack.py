@@ -791,12 +791,12 @@ def test_uniform_aniso_singular_tensor_raises_loudly():
         StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, (-4.0, 0.0, 0.0, -4.0, 6.0))], orders=41)
 
 
-def test_aniso_squarings_indexed_per_layer_position():
-    """``_aniso_squarings`` holds one entry per LAYER POSITION (0 for a non-aniso
+def test_aniso_doublings_indexed_per_layer_position():
+    """``_uniform_doublings`` holds one entry per LAYER POSITION (0 for a non-aniso
     layer), so the traced consumer's absolute-layer read is safe. Regression for
     the gate-2 blocker (iss_mwwg9iydi654q6): appending only per-aniso-layer
     crashed iso-above-aniso stacks with IndexError (and, with two aniso films,
-    silently handed the first the SECOND's Pade squaring count)."""
+    silently handed the first the SECOND's static count)."""
     comps_a = (8.0, 0.0, 0.0, 4.0, 6.0)
     comps_b = (14.0, 0.0, 0.0, 9.0, 5.0)
     st = StateStack(
@@ -808,15 +808,15 @@ def test_aniso_squarings_indexed_per_layer_position():
         orders=41,
         formulation="FFT",
     )
-    assert len(st._aniso_squarings) == 3  # one per layer position
-    assert st._aniso_squarings[0] == 0  # the iso film carries None/zero
+    assert len(st._uniform_doublings) == 3  # one per layer position
+    assert st._uniform_doublings[0] == 0  # the iso film carries None/zero
     # Each aniso film receives ITS OWN build-time count (= its single-layer count):
     # pre-fix, position 1 silently held comps_b's count (0) under the same layout.
     single_a = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps_a)], orders=41, formulation="FFT")
     single_b = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.4, comps_b)], orders=41, formulation="FFT")
-    assert st._aniso_squarings[1] == single_a._aniso_squarings[0]
-    assert st._aniso_squarings[2] == single_b._aniso_squarings[0]
-    assert st._aniso_squarings[1] != st._aniso_squarings[2]  # genuinely different counts
+    assert st._uniform_doublings[1] == single_a._uniform_doublings[0]
+    assert st._uniform_doublings[2] == single_b._uniform_doublings[0]
+    assert st._uniform_doublings[1] != st._uniform_doublings[2]  # genuinely different counts
 
 
 def test_iso_film_above_aniso_films_solves_and_conserves():

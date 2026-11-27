@@ -109,9 +109,17 @@ class RcwaWarning(UserWarning):
 _ENERGY_TOL = 5e-3
 
 
-def _efficiency_problem(T, R, orders, period, wl):
-    """Host-side check of plane-wave efficiencies: the message for a non-finite or energy-violating result,
-    or ``None``. ``T``/``R`` may be batched (a vmapped solve): one bad member is enough."""
+def _efficiency_problem(T, R, orders, period, wl, load=None):
+    """Host-side check of plane-wave efficiencies: the message for a non-finite or energy-violating result, or
+    for a solve outside the stack's build budget (``load > 1``), or ``None``. The values may be batched (a
+    vmapped solve): one bad member is enough."""
+    if load is not None and not np.all(np.asarray(load, float) <= 1.0 + 1e-9):
+        return (
+            f"a layer left the range this Rcwa was built for (load {float(np.max(load)):.3g} > 1): a "
+            "thickness beyond 2x the construction value, or a permittivity much larger than the construction "
+            "grid's. The static slice and chunk counts are sized at construction; build a fresh Rcwa with "
+            "the new thickness or design."
+        )
     t, r = np.asarray(T, float), np.asarray(R, float)
     if not (np.all(np.isfinite(t)) and np.all(np.isfinite(r))):
         return (
@@ -131,9 +139,9 @@ def _efficiency_problem(T, R, orders, period, wl):
     return None
 
 
-def _warn_on_efficiency_problem(T, R, *, orders, period, wl):
+def _warn_on_efficiency_problem(T, R, load, *, orders, period, wl):
     """The traced counterpart of the eager guard: a host callback that warns (see :class:`RcwaWarning`)."""
-    msg = _efficiency_problem(T, R, orders, period, wl)
+    msg = _efficiency_problem(T, R, orders, period, wl, load)
     if msg is not None:
         warnings.warn(msg, RcwaWarning, stacklevel=2)
 
@@ -421,6 +429,7 @@ class _Sol:
             self._pol,
             sup,
             sub,
+            thick=eng._film_thick(self._thick),
         )
         inten, x, y = _fields_mod.volume_intensity(ex, ey, ez, eng._ex, eng._prepared_kin, self._period, nx)
         if _concrete(inten) and not np.all(np.isfinite(np.asarray(inten))):  # never a silent NaN field (#313)
@@ -1088,20 +1097,12 @@ class Rcwa:
             return _collapse(_grid(e))
 
         grids = [prepare(e) for _, e in layers_spec]
-        for k, (t, _) in enumerate(layers_spec):
-            # A TRACED per-solve thickness hits `t == np.inf` below and raises a raw
-            # TracerBoolConversionError. The eig-free backend fixes thickness at build
-            # (chunking and the expm squaring guards depend on it), so a traced thickness
-            # is an API regression vs main -- raise the same loud RcwaError as the
-            # concrete-mismatch branch instead of a confusing tracer crash.
-            if t is not None and not _concrete(t):
-                raise RcwaError(
-                    f"per-solve thickness for layer {k} is a traced JAX value: the eig-free "
-                    "state-space backend fixes thickness at build (chunking depends on it), so a "
-                    "traced thickness is not supported. Pass a concrete thickness, or create a "
-                    "fresh Rcwa for a new thickness."
-                )
-        thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
+        # A traced thickness is a design variable (the compiled core takes it as an input); only the
+        # semi-infinite ambients' None/inf, which are concrete, map to the unit slab.
+        thick = [
+            jnp.asarray(1.0 if t is None or (_concrete(t) and np.all(np.asarray(t) == np.inf)) else t)
+            for t, _ in layers_spec
+        ]
         return grids, thick
 
     def _backend_materials(self, grids):
@@ -1218,24 +1219,18 @@ class Rcwa:
                     f"layer {li + 1} grid shape {gshape} differs from the engine's "
                     f"{build_shapes[li]} (structure fixed at build) -- create a fresh Rcwa."
                 )
-        for li, t in enumerate(thick[1:-1]):
-            # The built thickness may live in float32/complex64 storage (e.g. stored as a complex64
-            # scalar) or be reached through a float32 per-solve JAX array: 0.35 -> 0.35000002 in
-            # float32, so a 1e-9 comparison against the exact float64 value fails spuriously. Compare
-            # with a float32-safe relative tolerance (float32 eps ~1.2e-7, so 1e-6 rel. gives ~10x
-            # margin) while keeping the guard's spirit: a genuinely different thickness still raises.
-            # With FOLDED ambients (in-plane PML) the engine inserts the ambient slices as the
-            # outermost films, so film index == full-layer index (``li + 1`` here); without a fold
-            # the films are the central slices, shifted by one from the full grid.
-            f = (li + 1) if fold_top else li
-            tb = float(np.real(st.layers[f][0]))
-            if _concrete(t) and abs(float(t) - tb) > 1e-6 * max(1.0, abs(tb)):
-                raise RcwaError(
-                    f"per-solve thickness {float(t):.6g} for layer {li + 1} differs from the engine's "
-                    f"built {tb:.6g}; chunking is fixed at build -- create a fresh Rcwa for a new "
-                    "thickness."
-                )
         return st
+
+    def _film_thick(self, thick):
+        """The backend films' thicknesses from the full stack's (``thick[0]``/``thick[-1]`` are the ambients):
+        a folded ambient is a unit-thick film, as at build."""
+        fold_top, fold_bot = getattr(self, "_fold_amb", (False, False))
+        films = list(thick[1:-1])
+        if fold_top:
+            films.insert(0, jnp.asarray(1.0))
+        if fold_bot:
+            films.append(jnp.asarray(1.0))
+        return tuple(films)
 
     def _solve_core(self, grids, thick, wl, kin, pol):
         """Backend layer solves + chunked R-matrix stack assembly + incident state/flux at k_in -- the
@@ -1249,7 +1244,7 @@ class Rcwa:
 
             def core(grids, thick, wl, kin, pol):
                 films, sup, sub = self._backend_materials(grids)
-                return stack._solve_core(films, wl, kin, pol, sup, sub)
+                return stack._solve_core(films, wl, kin, pol, sup, sub, self._film_thick(thick))
 
             fn = self._core_jit = jax.jit(core)
         return _Result.from_tuple(
@@ -1271,11 +1266,10 @@ class Rcwa:
         solve time -- pass JAX permittivity grids here to differentiate the solve in the design (the
         construction-time shape guards run once, eagerly, so the solve itself stays trace-clean).
 
-        Thickness is STRUCTURAL: the eig-free backend fixes each layer's thickness at build (the chunked
-        R-matrix recursion and its expm squaring guards depend on it), so per-solve thicknesses must be
-        CONCRETE and equal to the built ones. A traced thickness on ``solve(layers=...)`` raises
-        ``RcwaError`` (differentiable thickness is not supported by the eig-free backend; create a fresh
-        ``Rcwa`` for a new thickness).
+        Thickness may be traced (``jax.grad`` in a layer thickness works). The slice and chunk counts are
+        sized at construction for up to twice each construction thickness; beyond that, or for a
+        permittivity far above the construction grid's, the solve raises (eagerly) or warns (under a
+        trace) instead of returning an inaccurate answer.
 
         ``source`` (a dict built by the front door) drives an **internal-source** emission solve instead of
         plane-wave incidence -- see :meth:`_solve_source`; it returns an :class:`_EmitterSol`.
@@ -1316,8 +1310,8 @@ class Rcwa:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
         sol = _Sol(self, res, self._ex, nt, res.pin, wl, thick=thick, period=self.period, pol=pol)
         T, R = sol.efficiency("T"), sol.efficiency("R")
-        if _concrete(T) and _concrete(R):  # eager: never-silent, raise
-            msg = _efficiency_problem(T, R, self.orders, self.period, wl)
+        if _concrete(T) and _concrete(R) and _concrete(res.load):  # eager: never-silent, raise
+            msg = _efficiency_problem(T, R, self.orders, self.period, wl, res.load)
             if msg is not None:
                 raise RcwaError(msg)
         else:  # under jit/grad/vmap: the same check on the host, as a warning
@@ -1326,6 +1320,7 @@ class Rcwa:
                 functools.partial(_warn_on_efficiency_problem, orders=self.orders, period=self.period, wl=wl_shown),
                 jnp.real(T),
                 jnp.real(R),
+                jnp.real(res.load),
             )
         return sol
 
@@ -1375,6 +1370,7 @@ class Rcwa:
                 k_in=kin,
                 amb_sup=sup,
                 amb_sub=sub,
+                thick=self._film_thick(thick),
             )
         except ValueError as e:
             raise RcwaError(str(e)) from e

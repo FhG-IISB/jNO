@@ -126,3 +126,26 @@ def test_the_grazing_message_names_the_order():
     eng._prepared_kin = jnp.asarray([k0 - 2 * np.pi / 2.1, 0.0])  # (1, 0): kx = k0 exactly in the air layer
     msg = sol._nonfinite_field_message()
     assert "order (1, 0) in layer 2" in msg, msg
+
+
+def _film_T(rc, grid):
+    return lambda d: rc.solve(layers=[(np.inf, 1.0), (d, grid), (np.inf, 2.25)]).efficiency("T")
+
+
+def test_a_thickness_beyond_the_build_margin_raises():
+    """The slice and chunk counts are sized for up to 2x the construction thickness: beyond, an eager solve
+    raises instead of returning an answer of unknown accuracy."""
+    rc = _rc(121)
+    _film_T(rc, DISK)(1.9)  # inside the margin: fine
+    with pytest.raises(RcwaError, match="left the range"):
+        _film_T(rc, DISK)(2.5)
+
+
+def test_a_traced_thickness_beyond_the_build_margin_warns():
+    rc = _rc(121)
+    T = jax.jit(_film_T(rc, jnp.asarray(DISK)))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RcwaWarning)
+        jax.block_until_ready(T(1.5))
+    with pytest.warns(RcwaWarning, match="left the range"):
+        jax.block_until_ready(T(2.5))

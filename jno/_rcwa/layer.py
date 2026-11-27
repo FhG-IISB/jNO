@@ -1,4 +1,4 @@
-"""The state-space layer operator ``M_L``, its eig-free exponential, and the
+"""The state-space layer operator ``M_L``, its eig-free transfer, and the
 analytic ambient layer pieces.
 
 Physics (Liu 2012 eqs. 15--28, the same assembly fmmax uses): with the
@@ -19,11 +19,23 @@ modal picture, and the exact uniform-isotropic spectrum ``eig(M_L) = +-q``,
 ``script_K`` uses the inverse-rule (Toeplitz-inverse) Fourier factorization, as
 in fmmax. For nonmagnetic media ``M_t = I`` and ``K = K_E^T K_E``.
 
-``expm`` is a fixed-degree [13/13] Pade with a *static* scaling-squaring count
-chosen eagerly at build from the concrete spectral bound (Higham's
-``Theta_13 ~ 5.3719``); under trace the guard steps aside and the build-time
-count is reused, so the compiled program has no data-dependent control flow and
-the whole chain is plain matmul/solve -- native JVP, no eig and no custom VJP.
+The transfer ``expm(i M_L h)`` is never formed as a ``4n x 4n`` exponential.
+Since ``M_L^2 = diag(B C, C B)``, it is a pair of matrix functions of the
+``2n x 2n`` product ``P = B C`` alone (see :func:`slice_transfer`)::
+
+    expm(i M_L h) = [[ I - P s2,   i s B          ],
+                     [ i C s,      I - C s2 B     ]],
+    s  = sin(sqrt(P) h) / sqrt(P),   s2 = (1 - cos(sqrt(P) h)) / P,
+
+both entire power series in ``P h^2`` (no square root is ever taken). They are
+summed on a thin slice ``h / 2^k`` and brought back to ``h`` by ``k``
+double-angle steps, ``s(2h) = 2 s (I - P s2)`` and ``s2(2h) = 2 s^2``: the
+matrix-cosine analogue of scaling and squaring (Higham & Smith, Numer.
+Algorithms 34, 13 (2003)), carried in the ``1 - cos`` form so that a thin layer
+keeps full relative accuracy. Every product is ``2n x 2n``, 8x cheaper than a
+``4n`` exponential. ``k`` is static, fixed at build from the concrete norm of
+``P``, while ``h`` may be traced, so the compiled program does not depend on the
+thickness and ``jax.grad`` in the thickness is native.
 
 Uniform media never need the expm: their per-order ``M_L`` blocks are
 simultaneously diagonalizable and ``expm(i M_L d)`` is the closed form
@@ -42,24 +54,28 @@ import jax.numpy as jnp
 
 from . import matrices
 
-# Fixed Pade degree [m/m] and Higham's accuracy threshold for ||X||.
-PADE_DEGREE = 13
-THETA_13 = 5.371919
-# Covers ||M_L d||_infty up to ~5.37 * 2**16 ~ 3.5e5 before the eager chunking
-# guard refuses (thick evanescent layers must be chunked thinner instead).
-MAX_SQUARINGS = 16
+#: Bound on ``||P h0^2||_inf`` for the thin-slice series, and the series degree per real precision. The
+#: truncation error is about ``SERIES_THETA^(m+1) / (2m+2)!``: 3e-17 at degree 11 (float64) and 2e-7 at
+#: degree 6 (float32).
+SERIES_THETA = 4.0
+_SERIES_DEGREE = {8: 11, 4: 6}
+#: The static doubling count is chosen for this multiple of the build thickness, so that a traced
+#: thickness may grow by up to this factor without leaving the accuracy bound (one doubling, three
+#: ``2n`` matmuls, per factor of two).
+THICKNESS_MARGIN = 2.0
 
 
-def _pade_coefficients(m: int) -> Tuple[float, ...]:
-    """``b_k = (2m-k)! m! / ((2m)! k! (m-k)!)`` for k = 0..m (Pade [m/m])."""
-    fac = math.factorial
-    return tuple(
-        float(fac(2 * m - k)) * float(fac(m)) / (float(fac(2 * m)) * float(fac(k)) * float(fac(m - k)))
-        for k in range(m + 1)
-    )
+def series_degree(dtype) -> int:
+    """The thin-slice series degree for a complex ``dtype`` (float32 or float64 parts)."""
+    return _SERIES_DEGREE[jnp.finfo(jnp.dtype(dtype)).bits // 8]
 
 
-_PADE_B = _pade_coefficients(PADE_DEGREE)
+def series_doublings(p_norm: float, thickness: float, theta: float = SERIES_THETA) -> int:
+    """Smallest static ``k`` with ``p_norm * (THICKNESS_MARGIN * thickness / 2^k)^2 <= theta`` (host-side)."""
+    x = float(p_norm) * (THICKNESS_MARGIN * float(thickness)) ** 2 / theta
+    if not math.isfinite(x):
+        raise ValueError(f"_rcwa: the layer operator has a non-finite norm ({p_norm!r}); check the permittivity.")
+    return max(0, int(math.ceil(0.5 * math.log2(x)))) if x > 1.0 else 0
 
 
 def _concrete(x) -> bool:
@@ -81,15 +97,15 @@ def pair_matrix(x: jnp.ndarray) -> jnp.ndarray:
 # -----------------------------------------------------------------------------
 
 
-def assemble_M_L(
+def layer_bc(
     omega,
     transverse_wavevectors: jnp.ndarray,
     z_permittivity: jnp.ndarray,
     transverse_permittivity: jnp.ndarray,
     transverse_permeability: Optional[jnp.ndarray] = None,
     z_permeability: Optional[jnp.ndarray] = None,
-) -> jnp.ndarray:
-    """The ``4n x 4n`` operator ``M_L`` for a patterned layer.
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """The ``2n x 2n`` blocks ``(B, C)`` of ``M_L = [[0, B], [C, 0]]`` for a patterned layer.
 
     Args:
         omega: Angular frequency ``2 pi / wavelength`` (c == 1).
@@ -103,7 +119,7 @@ def assemble_M_L(
             ``None`` means nonmagnetic (``K = K_E^T K_E``).
 
     Returns:
-        ``M_L`` of shape ``(4n, 4n)`` in the ``(u | v)`` block layout.
+        ``(B, C)``, each ``(2n, 2n)``, in the ``(u | v)`` block layout.
     """
     n = transverse_wavevectors.shape[-2]
     dtype = z_permittivity.dtype
@@ -116,166 +132,133 @@ def assemble_M_L(
         m_t = jnp.eye(two_n, dtype=dtype)
     else:
         m_t = transverse_permeability
-    b_mat = omega * m_t - script_k / omega
-    c_mat = omega * transverse_permittivity - k_mat / omega
-    z = jnp.zeros((two_n, two_n), dtype=dtype)
+    return omega * m_t - script_k / omega, omega * transverse_permittivity - k_mat / omega
+
+
+def assemble_M_L(
+    omega,
+    transverse_wavevectors,
+    z_permittivity,
+    transverse_permittivity,
+    transverse_permeability=None,
+    z_permeability=None,
+) -> jnp.ndarray:
+    """The full ``4n x 4n`` operator ``M_L`` (tests and diagnostics; the solve uses :func:`layer_bc`)."""
+    b_mat, c_mat = layer_bc(
+        omega, transverse_wavevectors, z_permittivity, transverse_permittivity, transverse_permeability, z_permeability
+    )
+    z = jnp.zeros_like(b_mat)
     return block2x2(z, b_mat, c_mat, z)
 
 
 # -----------------------------------------------------------------------------
-# expm: fixed-degree Pade + static scaling-squaring.
+# The thin-slice transfer: two series in P = B C, then double-angle steps.
 # -----------------------------------------------------------------------------
 
 
-def expm_pade_scaling_squaring(x: jnp.ndarray, squarings: int) -> jnp.ndarray:
-    """``exp(x)`` with Pade [13/13] on ``x / 2**squarings`` then `squarings` squarings.
+def _paterson_stockmeyer_pair(x: jnp.ndarray, a: Tuple[float, ...], b: Tuple[float, ...]):
+    """``(sum_k a_k x^k, sum_k b_k x^k)`` with shared powers (Paterson & Stockmeyer, SIAM J. Comput. 2, 60 (1973)).
 
-    `squarings` is a Python int (static), so jit sees a static program; the
-    norm of the scaled argument must be <= ``THETA_13``, guaranteed by the
-    eager spectral-bound guard (``squarings_for_spectral_norm``) at build.
+    The powers ``x^1 .. x^q`` are formed once and both polynomials are run by Horner's rule in ``x^q``, so two
+    degree-``m`` series cost ``(q - 1) + 2 (ceil((m + 1) / q) - 1)`` matmuls; ``q`` minimises that. Works on
+    batches ``(..., m, m)``.
     """
-    x_scaled = x / (2**squarings)
-    n = x_scaled.shape[-1]
-    b = _PADE_B
-    # Numerator/denominator of the [13/13] approximant via Horner matrix powers.
-    eye = jnp.eye(n, dtype=x_scaled.dtype)
-    num = b[0] * eye
-    den = b[0] * eye
-    x_pow = x_scaled
-    sign = -1.0
-    for k in range(1, PADE_DEGREE + 1):
-        num = num + b[k] * x_pow
-        den = den + sign * b[k] * x_pow
-        sign = -sign
-        x_pow = x_pow @ x_scaled
-    r = jnp.linalg.solve(den, num)
-    for _ in range(squarings):
-        r = r @ r
-    return r
+    m = len(a) - 1
+    q = min(range(1, m + 2), key=lambda q: (q - 1) + 2 * (-(-(m + 1) // q) - 1))
+    eye = jnp.broadcast_to(jnp.eye(x.shape[-1], dtype=x.dtype), x.shape)
+    pw = [eye, x]
+    for _ in range(q - 1):
+        pw.append(pw[-1] @ x)
+    y = pw[q]
+
+    def horner(c):
+        blocks = [sum(pw[i] * c[j + i] for i in range(min(q, m + 1 - j))) for j in range(0, m + 1, q)]
+        r = blocks[-1]
+        for blk in reversed(blocks[:-1]):
+            r = r @ y + blk
+        return r
+
+    return horner(a), horner(b)
 
 
-def squarings_for_spectral_norm(norm_x: float, max_squarings: int = MAX_SQUARINGS) -> int:
-    """Smallest static squaring count with ``norm_x / 2**s <= THETA_13``."""
-    if norm_x <= THETA_13:
-        return 0
-    s = int(math.ceil(math.log2(norm_x / THETA_13)))
-    if s > max_squarings:
-        raise ValueError(
-            f"_rcwa: expm spectral norm {norm_x:.3g} requires {s} squarings "
-            f"(cap {max_squarings}) -- chunk the layer thinner."
-        )
-    return s
+def slice_transfer(b: jnp.ndarray, c: jnp.ndarray, p: jnp.ndarray, h, doublings: int, degree: int):
+    """The four ``2n x 2n`` blocks ``(A, B~, C~, D)`` of ``expm(i M_L h)``, ``M_L = [[0, b], [c, 0]]``.
 
+    With ``P = b c`` (passed in, it is shared by every thickness of the layer)::
 
-def layer_transfer_exp(
-    m_l: jnp.ndarray,
-    thickness: float,
-    squarings: Optional[int] = None,
-    guard_norm: Optional[float] = None,
-) -> jnp.ndarray:
-    """The chunk transfer ``expm(i * M_L * d)`` with the static squaring guard.
+        A = I - P s2,   B~ = i s b,   C~ = i c s,   D = I - c s2 b,
 
-    ``guard_norm`` is an eager estimate of ``||M_L * d||_infty`` used to pick
-    the static squaring count when `squarings` is not given; under trace the
-    count must be provided or the guard fails loudly. When an explicit
-    `squarings` is given, the eager bound check still runs on concrete values
-    and raises if the Pade accuracy budget would be exceeded.
+    where ``s = sin(sqrt(P) h)/sqrt(P)`` and ``s2 = (1 - cos(sqrt(P) h))/P``. On the slice ``h0 = h / 2^k``,
+    ``s = h0 sum_j (-P h0^2)^j / (2j+1)!`` and ``s2 = h0^2 sum_j (-P h0^2)^j / (2j+2)!``; then ``k`` double-angle
+    steps ``s <- 2 s (I - P s2)``, ``s2 <- 2 s^2`` (both are functions of ``P`` and commute with it). Accurate to
+    the series' truncation while ``||P h0^2||_inf <= SERIES_THETA``, which :func:`series_doublings` arranges
+    and :func:`series_load` reports.
+
+    Args:
+        b, c: The blocks of ``M_L``, ``(..., m, m)`` (``m = 2n``, or 2 for the per-order uniform path).
+        p: ``b @ c``.
+        h: Thickness; may be traced.
+        doublings: Static ``k``.
+        degree: Static series degree (:func:`series_degree`).
     """
-    x = 1j * m_l * thickness
-    if squarings is None:
-        if guard_norm is not None:
-            squarings = squarings_for_spectral_norm(float(guard_norm))
-        elif _concrete(x):
-            # Same norm family as the build-time static count (inf-norm): the
-            # max-abs-entry norm is weaker and can under-budget a row-concentrated
-            # matrix past the Pade accuracy threshold.
-            squarings = squarings_for_spectral_norm(matrix_inf_norm(x))
-        else:
-            raise ValueError("layer_transfer_exp needs `guard_norm` or `squarings` under trace")
-    if _concrete(x):
-        actual = matrix_inf_norm(x)
-        if actual > THETA_13 * 2**squarings * (1 + 1e-4):
-            raise ValueError(
-                f"_rcwa: expm argument bound exceeded (||X||_inf={actual:.3g} > "
-                f"{THETA_13 * 2**squarings:.3g}) -- re-chunk or shrink the layer."
-            )
-    return expm_pade_scaling_squaring(x, squarings)
+    h0 = h / (2.0**doublings)
+    x = -p * (h0 * h0)
+    fac = math.factorial
+    sig, tau = _paterson_stockmeyer_pair(
+        x,
+        tuple(1.0 / fac(2 * j + 1) for j in range(degree + 1)),
+        tuple(1.0 / fac(2 * j + 2) for j in range(degree + 1)),
+    )
+    s, s2 = h0 * sig, (h0 * h0) * tau
+    for _ in range(doublings):
+        ps2 = p @ s2
+        s2 = 2.0 * (s @ s)
+        s = 2.0 * (s - s @ ps2)
+    eye = jnp.broadcast_to(jnp.eye(p.shape[-1], dtype=p.dtype), p.shape)
+    return eye - p @ s2, 1j * (s @ b), 1j * (c @ s), eye - c @ (s2 @ b)
+
+
+def series_load(p: jnp.ndarray, h, doublings: int) -> jnp.ndarray:
+    """``||P h0^2||_inf / SERIES_THETA`` for the slice of :func:`slice_transfer` (traceable; <= 1 is accurate)."""
+    h0 = jnp.abs(h) / (2.0**doublings)
+    return jnp.max(jnp.sum(jnp.abs(p), axis=-1)) * h0 * h0 / SERIES_THETA
 
 
 def matrix_inf_norm(x) -> float:
-    """Host-side Inf-norm (max absolute row sum), the static build norm."""
+    """Host-side Inf-norm (max absolute row sum) over the last axis, maximised over any batch axes."""
     import numpy as onp
 
     return float(onp.max(onp.sum(onp.abs(onp.asarray(x)), axis=-1)))
 
 
-def uniform_aniso_spectral_norm(
-    eps_comps,
-    mu_comps,
-    transverse_wavevectors: jnp.ndarray,
-    omega,
-    thickness: float,
-    dtype: jnp.dtype = jnp.complex64,
-) -> float:
-    """Host-side bound on ``||expm(i M_L d)``'s argument for a *uniform* aniso layer.
+def uniform_aniso_bc(omega, transverse_wavevectors, eps_comps, mu_comps, dtype=jnp.complex64):
+    """Per-order ``(n, 2, 2)`` blocks ``(B_i, C_i)`` of a uniform anisotropic layer's block-diagonal ``M_L``.
 
-    The uniform-aniso transfer is a per-order problem: ``M_L`` is block-diagonal
-    over orders with ``4x4`` blocks ``[[0, B_i], [C_i, 0]]``. The Pade squaring
-    count must be static, so at build we bound ``max_i ||i M_L^{(i)} d||_infty``
-    from the CONCRETE prototype components -- the same stability-margin
-    discipline as ``squarings_for_spectral_norm`` on patterned layers. Returns
-    the norm (not the squaring count); the eager caller picks the count and the
-    traced core reuses it.
+    The zz Toeplitz matrices of a uniform layer are ``eps_zz I`` and ``mu_zz I``, so ``script_K`` and ``K``
+    decouple per order and every order evolves by its own ``[[0, B_i], [C_i, 0]]``, with
+    ``B_i = omega M_t - script_K_i / omega`` and ``C_i = omega E_t - K_i / omega``.
     """
-    import numpy as onp
-
-    n = transverse_wavevectors.shape[0]
-    kx = onp.asarray(transverse_wavevectors[:, 0])
-    ky = onp.asarray(transverse_wavevectors[:, 1])
-
-    def _scalar(c):
-        """The tensor component as a complex scalar for the norm bound.
-
-        Uniform layers carry scalar/(1,1) values; a build-PATTERNED tensor layer
-        (which may collapse to a constant per-solve) contributes its max-abs
-        value -- a conservative upper bound on the per-order block norm, so the
-        static squaring count stays valid for any constant collapse within the
-        prototype's magnitude range."""
-        a = onp.asarray(c)
-        if a.ndim == 0:
-            return complex(a)
-        return complex(a.reshape(-1)[onp.argmax(onp.abs(a.reshape(-1)))])
-
-    ee = [_scalar(c) for c in eps_comps]
-    eps_xx, eps_xy, eps_yx, eps_yy, eps_zz = ee
+    omega = jnp.asarray(omega, dtype=dtype)
+    eps_xx, eps_xy, eps_yx, eps_yy, eps_zz = (jnp.asarray(c, dtype=dtype) for c in eps_comps)
     if mu_comps is None:
-        mu_xx = mu_yy = mu_zz = 1.0
-        mu_xy = mu_yx = 0.0
+        one, zero = jnp.asarray(1.0, dtype=dtype), jnp.asarray(0.0, dtype=dtype)
+        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = one, zero, zero, one, one
     else:
-        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = [_scalar(c) for c in mu_comps]
-    om = complex(omega)
-    cdt_eps = onp.result_type(*[onp.asarray(c).dtype for c in ee], dtype)
-    x = onp.zeros((n, 4, 4), cdt_eps)
+        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = (jnp.asarray(c, dtype=dtype) for c in mu_comps)
+    n = transverse_wavevectors.shape[0]
+    kx = transverse_wavevectors[:, 0]
+    ky = transverse_wavevectors[:, 1]
+
+    def mat2(a, b_, c_, d):
+        return jnp.stack([jnp.stack([a, b_], -1), jnp.stack([c_, d], -1)], -2)
+
+    full = lambda v: jnp.full(n, v)  # noqa: E731
+    e_t = mat2(full(eps_yy), full(-eps_yx), full(-eps_xy), full(eps_xx))
+    m_t = mat2(full(mu_xx), full(mu_xy), full(mu_yx), full(mu_yy))
     kx2, ky2, kxky = kx * kx, ky * ky, kx * ky
-    # Per-order 2x2 blocks, transposed mirror of the JAX path (only used for the norm).
-    b = onp.stack(
-        [
-            onp.stack([om * mu_xx - ky2 / (eps_zz * om), om * mu_xy + kxky / (eps_zz * om)], -1),
-            onp.stack([om * mu_yx + kxky / (eps_zz * om), om * mu_yy - kx2 / (eps_zz * om)], -1),
-        ],
-        -2,
-    )
-    c = onp.stack(
-        [
-            onp.stack([om * eps_yy - kx2 / (mu_zz * om), om * (-eps_yx) - kxky / (mu_zz * om)], -1),
-            onp.stack([om * (-eps_xy) - kxky / (mu_zz * om), om * eps_xx - ky2 / (mu_zz * om)], -1),
-        ],
-        -2,
-    )
-    x[:, 0:2, 2:4] = b
-    x[:, 2:4, 0:2] = c
-    x = 1j * x * thickness
-    return float(onp.max(onp.sum(onp.abs(x), axis=-1)))
+    script_k = mat2(ky2, -kxky, -kxky, kx2) / eps_zz
+    k_mat = mat2(kx2, kxky, kxky, ky2) / mu_zz
+    return omega * m_t - script_k / omega, omega * e_t - k_mat / omega
 
 
 # -----------------------------------------------------------------------------
@@ -451,23 +434,14 @@ def uniform_anisotropic_layer_transfer(
     eps_comps,
     mu_comps,
     thickness: float,
-    squarings: int,
+    doublings: int,
     dtype: jnp.dtype = jnp.complex64,
 ) -> jnp.ndarray:
     """The ``4n x 4n`` transfer ``expm(i M_L d)`` of a *uniform* anisotropic layer.
 
-    A uniform layer (all 5/10 component grids constant) has a **block-diagonal**
-    ``M_L`` over diffraction orders: the zz Toeplitz matrices are diagonal
-    ``eps_zz I`` / ``mu_zz I``, ``script_K`` and ``K`` decouple per order, and
-    each order's state evolves by its own ``4x4`` block
-
-        M_L^{(i)} = [[0, B_i], [C_i, 0]],
-
-    with ``B_i = omega M_t^{(i)} - script_K_i/omega`` and
-    ``C_i = omega E_t^{(i)} - K_i/omega``. So the layer transfer is n small
-    independent ``4x4`` state transfers assembled block-diagonally -- the
-    uniform-anisotropic fast path (fmmax dense-eigs a ``2n`` matrix for the same
-    physics). Differective in traced ε̂/μ̂, no dense eig.
+    ``M_L`` is block-diagonal over the orders (:func:`uniform_aniso_bc`), so the transfer is n independent
+    ``4 x 4`` transfers, each from :func:`slice_transfer` on its ``2 x 2`` blocks, assembled into the
+    component-major state order. Differentiable in the tensor and the thickness, no eig.
 
     Args:
         omega: Angular frequency.
@@ -475,92 +449,21 @@ def uniform_anisotropic_layer_transfer(
         eps_comps: ``(eps_xx, eps_xy, eps_yx, eps_yy, eps_zz)`` scalars.
         mu_comps: ``(mu_xx, mu_xy, mu_yx, mu_yy, mu_zz)`` scalars, or ``None``
             for nonmagnetic (identity).
-        thickness: The (sub-slab) chunk thickness.
-        squarings: Static Pade scaling-squaring count (from the build-time
-            spectral bound; the caller guards it eagerly).
+        thickness: The (sub-slab) chunk thickness; may be traced.
+        doublings: Static double-angle count (from :func:`series_doublings` on the per-order blocks).
         dtype: Output complex dtype.
 
     Returns:
         The ``4n x 4n`` transfer matrix.
     """
-    omega = jnp.asarray(omega, dtype=dtype)
-    eps_xx, eps_xy, eps_yx, eps_yy, eps_zz = (jnp.asarray(c, dtype=dtype) for c in eps_comps)
-    if mu_comps is None:
-        mu_xx = jnp.asarray(1.0, dtype=dtype)
-        mu_xy = jnp.asarray(0.0, dtype=dtype)
-        mu_yx = jnp.asarray(0.0, dtype=dtype)
-        mu_yy = jnp.asarray(1.0, dtype=dtype)
-        mu_zz = jnp.asarray(1.0, dtype=dtype)
-    else:
-        mu_xx, mu_xy, mu_yx, mu_yy, mu_zz = (jnp.asarray(c, dtype=dtype) for c in mu_comps)
-    n = transverse_wavevectors.shape[0]
-    kx = transverse_wavevectors[:, 0]
-    ky = transverse_wavevectors[:, 1]
+    b, c = uniform_aniso_bc(omega, transverse_wavevectors, eps_comps, mu_comps, dtype=dtype)
+    ta, tb, tc, td = slice_transfer(b, c, b @ c, thickness, doublings, series_degree(dtype))  # (n, 2, 2) each
 
-    # Per-order 2x2 blocks: E_t and M_t from the constant tensor, script_K and
-    # K from the scalar zz components (the decoupling that makes this cheap).
-    e_t = jnp.stack(
-        [
-            jnp.stack([jnp.full(n, eps_yy), jnp.full(n, -eps_yx)], -1),
-            jnp.stack([jnp.full(n, -eps_xy), jnp.full(n, eps_xx)], -1),
-        ],
-        -2,
-    )  # (n, 2, 2)
-    m_t = jnp.stack(
-        [
-            jnp.stack([jnp.full(n, mu_xx), jnp.full(n, mu_xy)], -1),
-            jnp.stack([jnp.full(n, mu_yx), jnp.full(n, mu_yy)], -1),
-        ],
-        -2,
-    )
-    kx2, ky2, kxky = kx * kx, ky * ky, kx * ky
-    script_k = (
-        1.0
-        / eps_zz
-        * jnp.stack(
-            [
-                jnp.stack([ky2, -kxky], -1),
-                jnp.stack([-kxky, kx2], -1),
-            ],
-            -2,
-        )
-    )
-    k_mat = (
-        1.0
-        / mu_zz
-        * jnp.stack(
-            [
-                jnp.stack([kx2, kxky], -1),
-                jnp.stack([kxky, ky2], -1),
-            ],
-            -2,
-        )
-    )
+    def diag_block(t):
+        return block2x2(jnp.diag(t[:, 0, 0]), jnp.diag(t[:, 0, 1]), jnp.diag(t[:, 1, 0]), jnp.diag(t[:, 1, 1]))
 
-    b = omega * m_t - script_k / omega  # (n, 2, 2)
-    c = omega * e_t - k_mat / omega  # (n, 2, 2)
-    zeros = jnp.zeros((n, 2, 2), dtype=dtype)
-    m_l = jnp.block([[zeros, b], [c, zeros]])  # (n, 4, 4) per-order blocks
-
-    t = expm_pade_scaling_squaring(1j * m_l * thickness, squarings)  # (n, 4, 4)
-
-    def diag_block(a, b_, c_, d):
-        return block2x2(
-            jnp.diag(a),
-            jnp.diag(b_),
-            jnp.diag(c_),
-            jnp.diag(d),
-        )
-
-    # Assemble per-order 4x4 blocks into the component-major 4n state order
-    # (u1 over orders | u2 over orders | v1 | v2), matching the isotropic
-    # uniform transfer's block layout.
-    return block2x2(
-        diag_block(t[:, 0, 0], t[:, 0, 1], t[:, 1, 0], t[:, 1, 1]),
-        diag_block(t[:, 0, 2], t[:, 0, 3], t[:, 1, 2], t[:, 1, 3]),
-        diag_block(t[:, 2, 0], t[:, 2, 1], t[:, 3, 0], t[:, 3, 1]),
-        diag_block(t[:, 2, 2], t[:, 2, 3], t[:, 3, 2], t[:, 3, 3]),
-    )
+    # (u1 over orders | u2 over orders | v1 | v2), matching the isotropic uniform transfer's block layout.
+    return block2x2(diag_block(ta), diag_block(tb), diag_block(tc), diag_block(td))
 
 
 # -----------------------------------------------------------------------------

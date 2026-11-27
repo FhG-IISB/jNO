@@ -1,11 +1,13 @@
-"""Tests for ``jno._rcwa.layer``: the state-space operator, its eig-free expm,
-the uniform-isotropic analytic shortcut, and the ambient split.
+"""Tests for ``jno._rcwa.layer``: the state-space operator, its eig-free thin-slice
+transfer, the uniform-isotropic analytic shortcut, and the ambient split.
 
-All anchors run without fmmax. expm accuracy is anchored against
-``jax.scipy.linalg.expm`` (itself eig-based, but used here only as a test
-oracle), and the uniform shortcut is anchored against the full block expm and
-the analytic uniform spectrum ``eig(M_L) = +-q``.
+All anchors run without fmmax. The transfer is anchored against
+``jax.scipy.linalg.expm`` of the full ``4n`` operator (used here only as a test
+oracle), and the uniform shortcut against the same expm and the analytic
+uniform spectrum ``eig(M_L) = +-q``.
 """
+
+import contextlib
 
 import jax
 import jax.numpy as jnp
@@ -37,67 +39,120 @@ def twv(expansion):
 
 
 # -----------------------------------------------------------------------------
-# expm: fixed-degree Pade + static scaling-squaring.
+# The thin-slice transfer: series in P = B C plus double-angle steps.
 # -----------------------------------------------------------------------------
 
 
-def test_expm_pade_matches_jax_expm():
-    """[13/13] Pade with a static squaring count reproduces ``expm`` (c64)."""
-    key = jax.random.PRNGKey(0)
-    x = (jax.random.normal(key, (12, 12)) + 1j * jax.random.normal(jax.random.PRNGKey(1), (12, 12))).astype(jnp.complex64)
-    squarings = layer.squarings_for_spectral_norm(float(np.max(np.abs(x))))
-    ours = layer.expm_pade_scaling_squaring(x, squarings)
-    ref = jsp.linalg.expm(x)
-    np.testing.assert_allclose(ours, ref, rtol=1e-4, atol=1e-4)
+@contextlib.contextmanager
+def _x64():
+    """float64 for one block; the flag is process-wide, so it is restored afterwards (see tests/conftest.py)."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
-def test_expm_pade_scaling_squaring_static(twv):
-    """The squaring count is a static Python int; jit compiles the loop away."""
-    key = jax.random.PRNGKey(3)
-    x = (jax.random.normal(key, (16, 16)) + 0j).astype(jnp.complex64)
-    squarings = 2
-    traced = jax.jit(lambda x: layer.expm_pade_scaling_squaring(x, squarings))
-    np.testing.assert_allclose(traced(x), layer.expm_pade_scaling_squaring(x, squarings), rtol=1e-6)
-    assert isinstance(squarings, int)
+def _random_bc(m, seed, dtype=jnp.complex128):
+    """A non-normal ``(B, C)`` pair: random complex blocks, so ``P = B C`` has no structure to lean on."""
+    k = jax.random.split(jax.random.PRNGKey(seed), 4)
+    rnd = lambda a, b: (jax.random.normal(a, (m, m)) + 1j * jax.random.normal(b, (m, m))) / np.sqrt(m)  # noqa: E731
+    return (3.0 * jnp.eye(m) + rnd(k[0], k[1])).astype(dtype), (2.0 * jnp.eye(m) + rnd(k[2], k[3])).astype(dtype)
 
 
-def test_squarings_guard_raises():
-    with pytest.raises(ValueError, match="squarings"):
-        layer.squarings_for_spectral_norm(layer.THETA_13 * 2 ** (layer.MAX_SQUARINGS + 1))
+def _full_transfer(blocks):
+    a, b, c, d = (np.asarray(x) for x in blocks)
+    return np.block([[a, b], [c, d]])
 
 
-def test_layer_transfer_exp_guard_on_concrete():
-    """The eager never-silent guard fires when the bound is exceeded."""
-    m = (jnp.eye(6, dtype=jnp.complex64) * 1000).at[0, 1].set(1000)
-    with pytest.raises(ValueError, match="expm argument bound"):
-        layer.layer_transfer_exp(m, 1.0, squarings=1)
+def _expm_ref(b, c, h):
+    z = jnp.zeros_like(b)
+    return np.asarray(jsp.linalg.expm(1j * h * jnp.block([[z, b], [c, z]])))
 
 
-def test_layer_transfer_exp_eager_guard_uses_inf_norm():
-    """The eager expm-bound guard must use the INF-norm (the norm of the static
-    squaring count, ||.||_max <= ||.||_inf): a matrix whose largest entry stays
-    under the Pade budget but whose row-sum exceeds it must still raise -- the
-    max-entry check silently steps aside exactly there."""
-    n = 8
-    m = jnp.zeros((n, n), dtype=jnp.complex64).at[0].set(1.0 + 1j)
-    # ||x||_max ~ 1.41 < THETA_13, but ||x||_inf = 8*sqrt(2) ~ 11.3 > THETA_13.
-    assert layer.matrix_inf_norm(1j * m) > layer.THETA_13  # the danger is real
-    assert float(np.max(np.abs(np.asarray(1j * m)))) < layer.THETA_13  # max-entry misses it
-    with pytest.raises(ValueError, match="expm argument bound"):
-        layer.layer_transfer_exp(m, 1.0, squarings=0)
+@pytest.mark.parametrize("h", [1e-3, 0.1, 0.7, 2.0])
+def test_slice_transfer_equals_the_exponential_of_the_full_operator(h):
+    """All four blocks equal ``expm(i M_L h)`` of the ``4n`` operator, in float64, from thin to several growth
+    lengths thick, with the build rule's doubling count."""
+    with _x64():
+        b, c = _random_bc(12, 0)
+        p = b @ c
+        k = layer.series_doublings(layer.matrix_inf_norm(p), h)
+        ours = _full_transfer(layer.slice_transfer(b, c, p, h, k, layer.series_degree(jnp.complex128)))
+        ref = _expm_ref(b, c, h)
+        assert np.max(np.abs(ours - ref)) <= 1e-12 * np.max(np.abs(ref))
 
 
-def test_layer_transfer_exp_fallback_squarings_from_inf_norm():
-    """Without guard_norm/squarings, the eager fallback derives the squaring count
-    from the SAME inf-norm as the build-time static count (never the weaker max
-    entry norm), and the guard then passes consistently for the row-concentrated
-    matrix."""
-    n = 8
-    m = jnp.zeros((n, n), dtype=jnp.complex64).at[0].set(1.0)
-    s = layer.squarings_for_spectral_norm(layer.matrix_inf_norm(1j * m))
-    assert s == 1  # ||1j m||_inf = 8 in (THETA_13, 2*THETA_13]
-    out = layer.layer_transfer_exp(m, 1.0)
-    assert jnp.isfinite(out).all()
+def test_slice_transfer_complex64_reaches_single_precision():
+    with _x64():
+        b, c = _random_bc(12, 1)
+        ref = _expm_ref(b, c, 0.5)
+    b64, c64 = b.astype(jnp.complex64), c.astype(jnp.complex64)
+    p = b64 @ c64
+    k = layer.series_doublings(layer.matrix_inf_norm(p), 0.5)
+    ours = _full_transfer(layer.slice_transfer(b64, c64, p, 0.5, k, layer.series_degree(jnp.complex64)))
+    assert np.max(np.abs(ours - ref)) <= 2e-6 * np.max(np.abs(ref))
+
+
+@pytest.mark.parametrize("doublings", [0, 6, 14])
+def test_extra_doublings_do_not_amplify_roundoff(doublings):
+    """The steps are carried in the ``1 - cos`` form (``s2``), not ``cos(2x) = 2 cos^2 x - 1``: in the cosine form
+    each step multiplies the error by about 4, so 14 steps would cost 4^14 ~ 3e8 of float64's 1e-16. Here the
+    result stays at roundoff however many steps a thin slice is doubled by."""
+    with _x64():
+        b, c = _random_bc(10, 2)
+        p = b @ c
+        h = 0.3
+        k = max(doublings, layer.series_doublings(layer.matrix_inf_norm(p), h))
+        ours = _full_transfer(layer.slice_transfer(b, c, p, h, k, layer.series_degree(jnp.complex128)))
+        ref = _expm_ref(b, c, h)
+        assert np.max(np.abs(ours - ref)) <= 1e-13 * np.max(np.abs(ref))
+
+
+def test_the_doubling_count_is_static_and_the_thickness_traced():
+    """One compiled program serves every thickness: ``h`` is an input, ``k`` a Python int."""
+    with _x64():
+        b, c = _random_bc(10, 3)
+        p = b @ c
+        k = layer.series_doublings(layer.matrix_inf_norm(p), 0.4)
+        deg = layer.series_degree(jnp.complex128)
+        f = jax.jit(lambda h: layer.slice_transfer(b, c, p, h, k, deg))
+        for h in (0.1, 0.4, 0.8):
+            np.testing.assert_allclose(
+                _full_transfer(f(h)), _expm_ref(b, c, h), rtol=0, atol=1e-12 * np.max(np.abs(_expm_ref(b, c, h)))
+            )
+        # d/dh of the transfer is i M_L T(h): autodiff through the series and the doublings
+        dA = jax.jacfwd(lambda h: f(h)[0])(0.4)
+        z = jnp.zeros_like(b)
+        m = jnp.block([[z, b], [c, z]])
+        ref = np.asarray(1j * m @ jnp.asarray(_expm_ref(b, c, 0.4)))[:10, :10]
+        np.testing.assert_allclose(np.asarray(dA), ref, rtol=0, atol=1e-11 * np.max(np.abs(ref)))
+
+
+def test_series_doublings_is_the_smallest_count_within_the_bound():
+    for p_norm, h in [(1.0, 0.1), (13.2, 1.0), (4e4, 0.3), (2.0, 1e-4)]:
+        k = layer.series_doublings(p_norm, h)
+        x = lambda k: p_norm * (layer.THICKNESS_MARGIN * h / 2**k) ** 2  # noqa: E731
+        assert x(k) <= layer.SERIES_THETA * (1 + 1e-12)
+        assert k == 0 or x(k - 1) > layer.SERIES_THETA
+
+
+def test_series_load_is_a_quarter_at_the_build_thickness():
+    """The doubling count is sized for twice the build thickness, so the build itself sits at load <= 1/4 and
+    the load reaches 1 only at the margin."""
+    with _x64():
+        b, c = _random_bc(10, 4)
+        p = b @ c
+        h = 0.9
+        k = layer.series_doublings(layer.matrix_inf_norm(p), h)
+        assert float(layer.series_load(p, h, k)) <= 0.25 + 1e-12
+        assert float(layer.series_load(p, layer.THICKNESS_MARGIN * h, k)) <= 1.0 + 1e-12
+
+
+def test_series_doublings_refuses_a_non_finite_operator():
+    with pytest.raises(ValueError, match="non-finite"):
+        layer.series_doublings(float("inf"), 1.0)
 
 
 # -----------------------------------------------------------------------------
@@ -149,8 +204,7 @@ def test_uniform_transfer_matches_block_expm():
 
     ours = layer.uniform_layer_transfer(omega, twv, eps, d)
     m_l = layer.assemble_M_L(omega, twv, z_eps, e_t)
-    squarings = layer.squarings_for_spectral_norm(float(np.max(np.abs(1j * m_l * d))))
-    ref = layer.expm_pade_scaling_squaring(1j * m_l * d, squarings)
+    ref = jsp.linalg.expm(1j * m_l * d)
     np.testing.assert_allclose(ours, ref, rtol=1e-3, atol=1e-3)
 
 

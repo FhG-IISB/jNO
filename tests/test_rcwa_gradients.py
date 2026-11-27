@@ -146,3 +146,63 @@ def test_gradient_of_a_grid_without_edges_is_finite(formulation):
     h = 1e-5
     fd = (float(T(jnp.asarray(base + h))) - float(T(jnp.asarray(base - h)))) / (2 * h)
     assert float(grad.sum()) == pytest.approx(fd, rel=1e-4, abs=1e-9)
+
+
+def _three_layer_T(formulation="JONES_DIRECT_FOURIER"):
+    """``T(d1, d2, d3)`` of a uniform film, a patterned film and a tensor film, all thicknesses traced."""
+    film = np.asarray(_disk(0.3))
+    tensor = (2.5, 0.2, 0.2, 3.0, 2.8)
+    rc = Rcwa(
+        [(np.inf, 1.0), (0.25, 2.1), (D_FILM, film), (0.2, tensor), (np.inf, EPS_SUB)],
+        period=(0.8, 0.8),
+        orders=25,
+        wavelength=1.0,
+        k_in=(0.4, 0.1),
+        formulation=formulation,
+        assume_periodic=True,
+        polarization="x",
+    )
+
+    def T(d):
+        layers = [(np.inf, 1.0), (d[0], 2.1), (d[1], jnp.asarray(film)), (d[2], tensor), (np.inf, EPS_SUB)]
+        return rc.solve(layers=layers).efficiency("T")
+
+    return T, jnp.asarray([0.25, D_FILM, 0.2])
+
+
+@pytest.mark.parametrize("formulation", ["FFT", "JONES_DIRECT_FOURIER"])
+def test_gradient_in_every_layer_thickness_matches_finite_differences(formulation):
+    """dT/dd for a uniform, a patterned and a tensor film at once, autodiff under jit against central
+    differences: the thickness is an input of the compiled core, the slice and chunk counts are static."""
+    T, d0 = _three_layer_T(formulation)
+    g = np.asarray(jax.jit(jax.grad(T))(d0))
+    h = 1e-5
+    for i in range(3):
+        e = np.zeros(3)
+        e[i] = h
+        fd = (float(T(d0 + e)) - float(T(d0 - e))) / (2 * h)
+        assert abs(fd) > 1e-3, f"layer {i}: the case must have a gradient worth comparing"
+        assert g[i] == pytest.approx(fd, rel=1e-6), f"layer {i}: autodiff {g[i]} vs finite difference {fd}"
+
+
+def test_a_thickness_inside_the_margin_equals_a_fresh_build():
+    """Solving a stack at 1.8x its construction thickness gives what a stack built at that thickness gives."""
+    T, d0 = _three_layer_T()
+    d1 = d0 * jnp.asarray([1.8, 1.8, 0.5])
+    film = np.asarray(_disk(0.3))
+    fresh = Rcwa(
+        [
+            (np.inf, 1.0),
+            (float(d1[0]), 2.1),
+            (float(d1[1]), film),
+            (float(d1[2]), (2.5, 0.2, 0.2, 3.0, 2.8)),
+            (np.inf, EPS_SUB),
+        ],
+        period=(0.8, 0.8),
+        orders=25,
+        wavelength=1.0,
+        k_in=(0.4, 0.1),
+        assume_periodic=True,
+        polarization="x",
+    )
+    assert float(T(d1)) == pytest.approx(float(fresh.solve().efficiency("T")), rel=1e-11)
