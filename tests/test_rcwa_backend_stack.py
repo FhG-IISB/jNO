@@ -154,18 +154,22 @@ def test_energy_conservation_lossless_disk():
 
 @pytest.mark.parametrize("chunks", [1, 8, 64])
 def test_chunk_invariance_uniform_slab(chunks):
-    """Same-material sub-slabs: the chunk count is numerically inert."""
-    st = StateStack(
-        1.0,
-        PERIOD,
-        1.0,
-        1.0,
-        [(0.5, jnp.asarray([[4.0]]))],
-        orders=60,
-        chunk_override=[chunks],
-    )
-    ref = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.5, jnp.asarray([[4.0]]))], orders=60)
-    assert abs(float(st.solve(validate=False).T) - float(ref.solve(validate=False).T)) < 1e-5
+    """Same-material sub-slabs: the chunk count is numerically inert. In complex128 to
+    roundoff; in complex64 every count stays within 3e-5 of the complex128 answer (the
+    measured floor of the doubled S-matrix is 7e-6 at 64 chunks, 1e-6 at 8)."""
+
+    def T(dtype, chunks):
+        st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.5, jnp.asarray([[4.0]]))], orders=60, chunk_override=chunks, dtype=dtype)
+        return float(st.solve(validate=False).T)
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        exact = T(jnp.complex128, None)
+        assert abs(T(jnp.complex128, [chunks]) - exact) < 1e-12
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+    assert abs(T(jnp.complex64, [chunks]) - exact) < 3e-5
 
 
 @pytest.mark.parametrize("chunks", [8, 64])
@@ -394,10 +398,14 @@ def test_energy_guard_raises_on_nonfinite(monkeypatch):
 
 def test_chunk_cliff_c64_chunks_one_raises_loudly():
     """Prototype task O4 port: a THICK patterned disk forced into ONE sub-slab is the
-    recursion-condition cliff (condition ~ exp(2 rho d)). At complex64 the impedance
-    recursion loses it: the compiled answer is garbage and T+R > 1+5e-3, which the
-    energy guard must reject loudly -- the never-silent mandate of the chunking
-    design (an un-chunked solve is *meant* to fail, not to return numbers)."""
+    conditioning cliff (the chunk transfer grows like exp(rho d)). At complex64 its
+    S-matrix is garbage and T+R > 1+5e-3, which the energy guard must reject loudly.
+
+    The layer is 4 thick, where the one-chunk complex64 transfer overflows to NaN on
+    every core layout tried, so the guard's verdict is deterministic. Thinner, the
+    garbage is chaotic: at 0.35 and 0.7 T+R landed above 1 in one process and below 1
+    in another (thread layout changes the rounding), and the T+R > 1 guard cannot see
+    a loss (git-bug 27c02c4); chunking at build is what keeps real solves away."""
     from jno._rcwa import stack as smod
 
     dg = _disk_grid(64)
@@ -406,11 +414,11 @@ def test_chunk_cliff_c64_chunks_one_raises_loudly():
         (0.6, 0.6),
         1.0,
         1.0,
-        [(0.35, jnp.asarray(dg))],
+        [(4.0, jnp.asarray(dg))],
         orders=80,
         chunk_override=[1],
     )
-    auto_chunks = smod.StateStack(1.0, (0.6, 0.6), 1.0, 1.0, [(0.35, jnp.asarray(dg))], orders=80)._chunks[0]
+    auto_chunks = smod.StateStack(1.0, (0.6, 0.6), 1.0, 1.0, [(4.0, jnp.asarray(dg))], orders=80)._chunks[0]
     assert auto_chunks > 1, "the auto chunking must actually chunk this thick layer"
     with pytest.raises(ValueError, match="energy guard|non-finite|negative"):
         st.solve(validate=True)
@@ -798,7 +806,7 @@ def test_aniso_doublings_indexed_per_layer_position():
     crashed iso-above-aniso stacks with IndexError (and, with two aniso films,
     silently handed the first the SECOND's static count)."""
     comps_a = (8.0, 0.0, 0.0, 4.0, 6.0)
-    comps_b = (14.0, 0.0, 0.0, 9.0, 5.0)
+    comps_b = (14.0, 0.0, 0.0, 9.0, 0.5)  # a small eps_zz: a larger per-order block norm, so a larger count
     st = StateStack(
         1.0,
         PERIOD,

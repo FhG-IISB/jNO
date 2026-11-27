@@ -23,6 +23,7 @@ gradient-vs-FD), this file stresses the interior-field machinery that task T31 l
 
 import math
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -75,12 +76,24 @@ def _absorbed_fraction(sol, im_eps, nx=8, density=200.0, period=(0.6, 0.6)):
 def test_chunked_solve_and_interior_amplitudes_are_chunk_invariant():
     """Field readouts must not see the internal sub-slab bookkeeping: a geometry solved with
     the build-time auto chunking and with twice as many same-material sub-slabs gives T/R and
-    per-plane interior amplitudes agreeing to the c64 rounding floor. (Both chunkings keep the
-    per-chunk growth at/below the design bound; the un-chunked recursion is a separate,
-    deliberately-avoided stress covered by the guard tests.)"""
+    per-plane interior amplitudes agreeing to roundoff, in complex128 (the complex64 floor of
+    the doubled S-matrix is about 1e-5 and is a property of the precision, not of the
+    bookkeeping). Both chunkings keep the per-chunk growth at/below the design bound; the
+    un-chunked recursion is a separate, deliberately-avoided stress covered by the guard tests."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        _check_chunk_invariance()
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _check_chunk_invariance():
     period = (0.6, 0.6)
     layers = [(0.8, 2.5 + 0.3j)]  # lossy slab, chunked >= ceil(rho d / theta) ~ 8, then 16
-    base = StateStack(wavelength=WL, period=period, amb_sup=1.0, amb_sub=1.0, layers=layers, orders=15)
+    base = StateStack(
+        wavelength=WL, period=period, amb_sup=1.0, amb_sub=1.0, layers=layers, orders=15, dtype=jnp.complex128
+    )
     auto = base._chunks[0]
     assert auto >= 4  # the geometry is genuinely chunked by the policy
 
@@ -93,6 +106,7 @@ def test_chunked_solve_and_interior_amplitudes_are_chunk_invariant():
             layers=layers,
             orders=15,
             chunk_override=[chunks],
+            dtype=jnp.complex128,
         )
         res = st.solve(polarization="x")
         znums, _z = rcwa_fields.layer_z_sampling([1.0, 0.8, 1.0], 40.0)
@@ -105,15 +119,15 @@ def test_chunked_solve_and_interior_amplitudes_are_chunk_invariant():
 
     r_a, ex_a, ey_a, ez_a = solve_and_probe(auto)
     r_b, ex_b, ey_b, ez_b = solve_and_probe(2 * auto)
-    # Physics invariant: efficiencies agree to the c64 rounding floor.
-    assert float(r_a.T) == pytest.approx(float(r_b.T), rel=2e-5)
-    assert float(r_a.R) == pytest.approx(float(r_b.R), abs=2e-5)
+    # Physics invariant: efficiencies agree to roundoff.
+    assert float(r_a.T) == pytest.approx(float(r_b.T), rel=1e-12)
+    assert float(r_a.R) == pytest.approx(float(r_b.R), abs=1e-12)
     # Interior amplitudes agree plane by plane (the boundary-state propagation is
     # chunk-independent up to rounding in the recursion).
     scale = float(np.max(np.abs(np.concatenate([ex_a, ey_a, ez_a]))))
-    assert float(np.max(np.abs(ex_a - ex_b))) < 1e-4 * scale
-    assert float(np.max(np.abs(ey_a - ey_b))) < 1e-4 * scale
-    assert float(np.max(np.abs(ez_a - ez_b))) < 1e-4 * scale
+    assert float(np.max(np.abs(ex_a - ex_b))) < 1e-11 * scale
+    assert float(np.max(np.abs(ey_a - ey_b))) < 1e-11 * scale
+    assert float(np.max(np.abs(ez_a - ez_b))) < 1e-11 * scale
 
 
 def test_field3d_energy_anchor_tightens_with_density():

@@ -4,8 +4,8 @@
 canonical case being an extruded metasurface unit cell (a patterned dielectric slab between two
 semi-infinite ambients). Unlike [`jno.fem`](fem/index.md), which discretises the whole volume, RCWA is
 *semi-analytic in the propagation direction*: each layer is expanded in a truncated in-plane Fourier
-basis, propagated by an eig-free state-space transfer (chunked, with no dense eigen-decomposition), and
-the layers are stitched with a scattering matrix. For a periodic slab that is far cheaper than a full
+basis, propagated by an eig-free state-space transfer (no dense eigen-decomposition), and the layers
+are stitched with scattering matrices. For a periodic slab that is far cheaper than a full
 3-D complex-Helmholtz solve.
 
 It is built on **jNO's own eig-free, state-space RCWA engine** (``jno/_rcwa``) — a self-owned
@@ -327,9 +327,13 @@ sol = rc.solve()
 ```
 
 **The engine.** `jno.Rcwa` is jNO's own **eig-free, state-space** Fourier Modal solver
-(`jno/_rcwa`): each layer is reduced to a first-order state transfer `d/dz ψ = i M_L ψ` and advanced
-by a chunked matrix exponential (R-matrix/impedance recursion) — **no dense eigendecomposition**
-(no host-bound `eig`, no spectral-degeneracy broadening), with native JVPs for differentiation. It
+(`jno/_rcwa`): each layer is reduced to a first-order state transfer `d/dz ψ = i M_L ψ`. Its transfer
+over a thin chunk is two power series in the `2n × 2n` product `P = B C` (summed on a thin slice, then
+brought back by double-angle steps); the chunk's scattering matrix in a fixed lossy reference medium is
+then doubled up to the layer thickness, and the layers are joined by Redheffer star products —
+**no dense eigendecomposition** (no host-bound `eig`, no spectral-degeneracy broadening), with native
+JVPs for differentiation. The layer **thickness is differentiable** too: pass a traced thickness in
+`solve(layers=...)` and `jax.grad` flows through it. It
 imports no external RCWA library. Seven vector formulations plus an `FFT` and a callable hook are
 supported, anisotropic 5/10-component layers (including the uniaxial PML material) take an analytic
 per-order fast path, and internal sources are handled by Maxwell jump conditions. Numerical parity is
@@ -370,6 +374,7 @@ concrete fix:
 | no source / forcing in the problem | raises — nothing to illuminate with |
 | forcing spread over a z-range, not one face | raises — put the incident wave on one ambient |
 | energy `T + R > 1`, or a non-finite efficiency, after a solve | raises — raise `orders`; inside `jax.jit` / `grad` / `vmap` the same check runs on the host and issues an `RcwaWarning` (a compiled program cannot raise) |
+| a per-solve thickness beyond 2× the construction value, or a permittivity far above the construction grid's | raises (`RcwaWarning` under a trace) — the static slice and chunk counts are sized at construction; build a fresh `Rcwa` |
 
 Two field conventions are baked in so callers never rediscover them: the Poynting flux is summed
 *with sign* (an `abs()` sum over-counts and can report `T+R>1`), and the `JONES_DIRECT_FOURIER`

@@ -1,7 +1,11 @@
-"""Chunked R-matrix/impedance recursion (Li 1996) and the stack solve.
+"""The stack solve: chunked layers, their S-matrices, and the admittance recursion.
 
-The stack is solved entirely in state space -- no directional decomposition
-anywhere but the two analytic uniform ambients:
+The plane-wave solve (``_solve_core``) builds each layer's S-matrix in one
+fixed reference medium from its chunk's (the chunk transfer converted, then
+doubled up to the layer: ``jno/_rcwa/smatrix.py``), joins the layers by star
+products and closes the problem at the two analytic ambients. The interior
+fields and the internal sources still use the chunk-by-chunk admittance
+recursion described below (until they move onto partial S-matrices):
 
 * Each layer is split into same-material sub-slabs (chunks) at BUILD time; the
   chunk count is a static integer from the concrete spectral bound
@@ -50,7 +54,7 @@ import jax
 import jax.numpy as jnp
 
 from . import basis as basis_mod
-from . import layer, matrices
+from . import layer, matrices, smatrix
 from .matrices import Formulation
 
 #: Per-chunk growth measure kept <= this by the build-time chunking.
@@ -178,8 +182,10 @@ def spectral_bound(eps_layer, twv, omega) -> float:
 
 
 def chunk_count(thickness: float, rho: float, theta: float = _CHUNK_THETA) -> int:
-    """Static same-material sub-slab count: ``ceil(rho * d / theta)``, >= 1."""
-    return max(1, int(math.ceil(rho * thickness / theta)))
+    """Static same-material sub-slab count: ``ceil(rho * d / theta)`` rounded up to a power of two, so that the
+    plane-wave solve builds the layer's S-matrix from the chunk's by doublings alone."""
+    c = max(1, int(math.ceil(rho * thickness / theta)))
+    return 1 << (c - 1).bit_length()
 
 
 def _polarization_vector(polarization) -> Tuple[complex, complex]:
@@ -664,13 +670,33 @@ class StateStack:
             expansion=self.expansion,
         ).astype(self._cdt)
         records = self._records(grids, omega, twv, thick, count=True)
-        st = self._solve_states(omega, twv, records, amb_sup, amb_sub, pol)
         load = jnp.max(jnp.stack([jnp.real(r.load) for r in records])) if records else jnp.asarray(0.0)
+        cdt = self._cdt
 
-        # 4) Readouts (signed per-order Poynting, jNO convention).
-        flux_inc = layer.sz_flux(st["u_inc"], st["y_sup"] @ st["u_inc"], n)
-        flux_trn = layer.sz_flux(st["u_sub"], st["v_sub"], n)
-        flux_rfl = layer.sz_flux(st["u_ref"], st["v_ref"], n)
+        # 1) Each layer's symmetric S-matrix in the reference modes (chunk S-matrix, then doublings), and the
+        #    films' S-matrix by star products top to bottom (jno/_rcwa/smatrix.py).
+        y_r, z_r = smatrix.reference(twv, omega, cdt)
+        s = None
+        for li, rec in enumerate(records):
+            r, t = smatrix.layer_smatrix(*smatrix.chunk_smatrix(rec.blocks, y_r, z_r), self._chunks[li])
+            s = (r, t, t, r) if s is None else smatrix.star(s, (r, t, t, r))
+        if s is None:  # no finite films: the "stack" is the reference medium itself
+            eye, zero = jnp.eye(2 * n, dtype=cdt), jnp.zeros((2 * n, 2 * n), dtype=cdt)
+            s = (zero, eye, eye, zero)
+
+        # 2) The two analytic ambients close the problem.
+        y_sup = layer.ambient_admittance(twv, layer.ambient_kz(twv, amb_sup, omega, dtype=cdt), omega, dtype=cdt)
+        y_sub = layer.ambient_admittance(twv, layer.ambient_kz(twv, amb_sub, omega, dtype=cdt), omega, dtype=cdt)
+        u_inc = jnp.zeros(2 * n, dtype=cdt).at[0].set(-pol[1]).at[n].set(pol[0])
+        u_ref, u_sub = smatrix.close(s, y_sup, y_sub, y_r, z_r, u_inc)
+        v_ref = -smatrix.left(y_sup, u_ref[:, None])[:, 0]
+        v_sub = smatrix.left(y_sub, u_sub[:, None])[:, 0]
+        st = {"u_inc": u_inc, "u_ref": u_ref, "v_ref": v_ref, "u_sub": u_sub, "v_sub": v_sub}
+
+        # 3) Readouts (signed per-order Poynting, jNO convention).
+        flux_inc = layer.sz_flux(u_inc, smatrix.left(y_sup, u_inc[:, None])[:, 0], n)
+        flux_trn = layer.sz_flux(u_sub, v_sub, n)
+        flux_rfl = layer.sz_flux(u_ref, v_ref, n)
         pin = jnp.sum(flux_inc)
         return (
             jnp.sum(flux_trn) / pin,
