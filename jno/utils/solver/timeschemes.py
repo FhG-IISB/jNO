@@ -25,6 +25,7 @@ to a second-order step is far cheaper per digit than the first-order default —
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
@@ -914,6 +915,7 @@ class _AdaptiveScheme(_TimeScheme):
             dense_degree=base.step_order,
             embedded=embedded,
             error_rows=_error_rows(block, args, u0),
+            tight_step_solve=_tight_step_solve(block, args),
         )
 
     def __repr__(self):
@@ -991,6 +993,7 @@ class _BDFScheme(_TimeScheme):
             vary_order=self.order is None,
             ndf=self.ndf,
             error_rows=_error_rows(block, args, u0),
+            tight_step_solve=_tight_step_solve(block, args),
         )
 
     def __repr__(self):
@@ -1077,6 +1080,7 @@ def bdf_march(
     vary_order=True,
     ndf=True,
     error_rows=None,
+    tight_step_solve=False,
     safety=0.9,
     min_factor=0.2,
     max_factor=2.0,
@@ -1247,7 +1251,11 @@ def bdf_march(
     from .backend_blocks import _step_solve_tolerance
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
-    with _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt):
+    with (
+        nullcontext()
+        if tight_step_solve
+        else _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt)
+    ):
         (t_end, *_), (ts, us) = _budgeted_scan(
             body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[2][0])
         )
@@ -1256,6 +1264,14 @@ def bdf_march(
     out = _dense_sample(jnp.asarray(save_ts, rt), ts, us, K)
     reached = t_end >= t1 - 2.0 * dt_min
     return out * jnp.where(reached, jnp.asarray(1.0, rt), jnp.asarray(jnp.nan, rt))
+
+
+def _tight_step_solve(block, args):
+    """Whether the march keeps the tight default step solve (a block with coupled constraint rows, see
+    ``backend_blocks._block_has_coupled_algebraic_rows``) instead of tying it to the march's tolerance."""
+    from .backend_blocks import _block_has_coupled_algebraic_rows
+
+    return _block_has_coupled_algebraic_rows(block, args)
 
 
 def _error_rows(block, args, u0):
@@ -1338,6 +1354,7 @@ def adaptive_march(
     dense_degree=1,
     embedded=None,
     error_rows=None,
+    tight_step_solve=False,
     safety=0.9,
     min_factor=0.2,
     max_factor=5.0,
@@ -1434,7 +1451,11 @@ def adaptive_march(
     from .backend_blocks import _step_solve_tolerance
 
     # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
-    with _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt):
+    with (
+        nullcontext()
+        if tight_step_solve
+        else _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt)
+    ):
         (t_end, *_), (ts, us) = _budgeted_scan(
             body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[1])
         )
