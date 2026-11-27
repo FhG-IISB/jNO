@@ -103,7 +103,10 @@ Keyword options: `name=`, `order=`, `space=`, `complex=` (and `symmetric=` on `m
 unknown is the trial function and `u.test()` its test function; the result is bit-identical to the same
 problem written with `u, v = d.fem_symbols(...)`, which keeps working. `jno.fdm` solves for the values of
 a real P1 nodal unknown with full storage; any other combination (`order=2`, a non-nodal space,
-`complex=True`, `symmetric=True`) is FEM-only and `jno.fdm` refuses it.
+`complex=True`, `symmetric=True`) is FEM-only and `jno.fdm` refuses it. `space="spectral"` with
+`order=(nx, ny)` (nodes per axis) is a spectral unknown, solved by `jno.spectral([...])` (and by `jno.fdm`,
+which forwards it); `u.basis` gives its nodes, coefficients and interpolation — see
+[Spectral Methods](spectral.md).
 
 ::: jno.domain.domain_class._UnknownNamespace
     options:
@@ -302,6 +305,7 @@ Every differential operator (`.d`, `.diff`, `.d2`, `.dd`, `.laplacian`,
 | `"finite_difference"` | central-difference stencils on mesh (with `:lsq` / `:uniform` / `:inverse_distance` / `:cotangent` sub-schemes) |
 | `"spectral"` | FFT along the grid axes — exact for band-limited periodic fields; **uniform grid only** |
 | `"spectral:cosine"` | even (mirror) extension — for fields with vanishing odd derivatives at both ends |
+| `jno.sp(dealias=…)` | a spectral unknown's own basis (`domain.unknown(space="spectral")`, the default there): Fourier / Chebyshev / Legendre on any node set, `dealias=3/2` pads the equation — see [Spectral Methods](spectral.md) |
 | `jno.fd(order=4)`, `jno.fd(points=…)`, `jno.fd(weights=…)`, `boundary=`, `upwind=`, `average=`, `fit=`, `rings=` | any finite-difference stencil: on a structured grid by its order or its points (Fornberg weights), on an unstructured mesh by a local polynomial fit; also `u.bind(x=x, y=y, scheme=jno.fd(...))` for every `.x`/`.xx` of that binding |
 
 Forward-mode is typically cheaper when the input dim (≤ 3 spatial dims for
@@ -344,7 +348,7 @@ precond=…, time=…)` composes (see the [FEM guide](fem/index.md)). The famili
 | **Eigenproblem** | `eigs` (generalized `Kx = λMx`) — dense reduction, preconditioned LOBPCG with `precond=`, interior modes nearest a shift with `sigma=`, or every eigenvalue inside a circle with `contour` (`FEM.eigs(contour=jno.solve.contour(...))`) |
 | **Singular values** | `svd` (partial SVD of a **rectangular**, matrix-free operator — POD bases, inverse-problem ill-posedness) |
 | **Matrix functions** (stochastic Lanczos, matrix-free) | `logdet`, `trace`, `applyfun` (`f(A)·v`), `diagonal` |
-| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `bdf` (variable-step, variable-order BDF/NDF 1–5), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size) |
+| **Time integration** | `theta` (θ-method), `bdf2` (2nd-order **and** L-stable), `bdf` (variable-step, variable-order BDF/NDF 1–5), `sdirk` (L-stable SDIRK, order 2/3), `rosenbrock` (linearly implicit, order 3/2 — no Newton), `exponential` (exponential integrator), `adaptive` (step-doubling adaptive step size), `etdrk4` (4th-order exponential time differencing for a `jno.spectral` problem that is Fourier on every axis) |
 
 ### Matrix functions — what `Ax = b` cannot express
 
@@ -736,11 +740,19 @@ iteration count, not from the DOF count.
 and the gather of `x` dominates, so halving precision buys about a quarter of the memory and none of
 the time. Reach for a coarser mesh or a better preconditioner instead.
 
+**High-order quadrilaterals and hexahedra need no matrix at all.** A Q8 hexahedral operator stores 256 entries
+per DOF; `jno.fem([...], matrix_free=True)` stores none. The steady linear operator is linearised once and applied
+through the cells by sum factorisation (`O(k^(d+1))` per cell), `fem.operator` is `(A, b)` with `A` a matvec
+(`A @ v`, `A.T`, `A.diag()`), and any Krylov slot solves it; a direct solver or a matrix-based preconditioner has
+nothing to factor and raises. `quadrature="gll"` puts the quadrature at the element's own nodes, which makes the mass matrix diagonal. Measured at 2.1M DOFs (Q8, float64, RTX 3070): 33 s to build, 17 ms per apply,
+0.46 GB on the card, a Jacobi-CG solve in 1.6 s. See [Spectral methods](spectral.md#spectral-elements-in-jnofem).
+
 **Preconditioners** (`jno.precond`, for the iterative solvers):
 
 | Kind | `jno.precond` |
 | --- | --- |
 | **Diagonal / polynomial** | `jacobi`, `chebyshev` |
+| **Spectral** | `spectral` (for `jno.spectral`: the Fourier-mode block inverse, else fast diagonalisation of the separable part — exact for constant coefficients, 1–3 GMRES iterations) |
 | **Between `jacobi` and multigrid** | `nystrom` (randomized low-rank, SPD); `fsai` (factored sparse approximate inverse, SPD — applied as two sparse products, numeric setup in JAX; see [FSAI](solvers.md#fsai-jnoprecondfsai)) |
 | **Multigrid** | `amg` (algebraic, pyamg), `jaxamg` (GPU AmgX), `gmg` (geometric — a structured-grid V-cycle), `ams` (H(curl) auxiliary-space Maxwell), `hypre` (AMS / BoomerAMG via PETSc) |
 | **Domain decomposition** | `schwarz` (overlapping Schwarz on a METIS partition, two-level by default; needs the `[metis]` extra — see [Overlapping Schwarz](solvers.md#overlapping-schwarz-jnoprecondschwarz)) |

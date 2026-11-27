@@ -8,6 +8,9 @@ leaner than the assembler; and because the residual is a plain differentiable fu
 DOFs, the solve is **differentiable** (through `custom_root`) and composes into inverse problems just
 like `fem.solve()`.
 
+Given a spectral unknown (`d.unknown(space="spectral", order=(nx, ny))`), `jno.fdm` hands the problem to
+[`jno.spectral`](spectral.md): the same constraint list on Fourier, Chebyshev or Legendre nodes.
+
 ```python
 import jax
 jax.config.update("jax_enable_x64", True)     # the strong-form solve accumulates in float64
