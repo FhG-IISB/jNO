@@ -187,19 +187,31 @@ def _solve_matrix_free_operator(A, b, *, tol=1e-8, maxiter=20_000):
     from .utils.solver.krylov import bicgstab_counted
     from .utils.solver.solver_api import record_iterations
 
+    who = "Jacobi-preconditioned BiCGStab (matrix-free operator)"
     run = getattr(A, "_default_solve", None)
     if run is None:
         d = A.diag()
         inv = jnp.where(d != 0, 1.0 / jnp.where(d != 0, d, 1.0), 1.0)
 
+        def krylov(side):
+            def solve(mv, rhs):
+                x, k, broke = bicgstab_counted(mv, rhs, tol=tol, atol=0.0, maxiter=maxiter, M=lambda r: inv * r)
+                record_iterations(k, who, side=side, broke=broke)
+                return x
+
+            return solve
+
+        # In `custom_linear_solve`: the Krylov loop itself is not reverse-differentiable (a `while_loop`), so a
+        # gradient through the solve (by a source, a coefficient in the operator) is the transposed solve, the
+        # transpose of the unstored apply derived by JAX (the apply is linear in v). Jacobi serves both sides:
+        # the transpose has the same diagonal.
         @jax.jit
         def run(rhs):
-            return bicgstab_counted(A.mv, rhs, tol=tol, atol=0.0, maxiter=maxiter, M=lambda r: inv * r)
+            return jax.lax.custom_linear_solve(A.mv, rhs, krylov("forward"), transpose_solve=krylov("transpose"))
 
         A._default_solve = run
-    x, k, broke = run(b)
-    record_iterations(k, "Jacobi-preconditioned BiCGStab (matrix-free operator)", side="forward", broke=broke)
-    return _residual_check(A, b, x, "Jacobi-preconditioned BiCGStab (matrix-free operator)")
+    x = run(b)
+    return _residual_check(A, b, x, who)
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
