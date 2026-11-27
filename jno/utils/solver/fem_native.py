@@ -1301,28 +1301,57 @@ def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
 
 def _fast_diag_agrees(fast, exact, cells, local, *, rtol=1e-9):
     """Whether the sum-factorised element diagonal ``fast(c, la)`` equals the exact one ``exact(c, la)`` on the
-    first, a middle and the last cell. Decided on concrete values only: under a trace (the cells' data are tracers)
-    it answers no, and the exact pass runs."""
-    if any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves((cells, local))):
-        return False
+    first, a middle and the last cell (``cells``: their indices, on the host).
+
+    Compared at a probe state (cell values drawn in [0.25, 1), the same on every call) and, when ``local`` is
+    concrete, at the cells' own values too. The probe is what lets a Newton step decide inside its trace, where the
+    state is a tracer, and it is also the stronger test of a nonlinear term: at a zero state a term's linearisation
+    can vanish together with the part the fast route would misread. A state where the exact diagonal is not finite
+    (a logarithm of the probe) is skipped; at least one must be compared. Any failure answers no, and the exact pass
+    runs."""
     n = int(np.shape(cells)[0])
-    if n == 0:
+    if n == 0 or isinstance(cells, jax.core.Tracer):
         return False
+    traced = any(isinstance(x, jax.core.Tracer) for x in jax.tree_util.tree_leaves(local))
+    shape, dtype = tuple(np.shape(local))[1:], jnp.asarray(local).dtype if not traced else local.dtype
+    probe = np.random.default_rng(20261127).uniform(0.25, 1.0, size=shape)
+    compared = 0
     try:
         with jax.ensure_compile_time_eval():
             for i in sorted({0, n // 2, n - 1}):
-                f = fast(cells[i], local[i])
-                if f is None:
-                    return False
-                e = np.asarray(exact(cells[i], local[i]))
-                f = np.asarray(f)
-                # the two orders of summation agree to round-off of the working precision, not to 1e-9 in float32
-                tol = max(rtol, 1e3 * float(np.finfo(e.dtype).eps)) if np.issubdtype(e.dtype, np.floating) else rtol
-                if f.shape != e.shape or not np.allclose(f, e, rtol=tol, atol=tol * max(float(np.abs(e).max()), 1e-300)):
-                    return False
+                c = int(np.asarray(cells)[i])
+                states = [jnp.asarray(probe, dtype)] + ([] if traced else [local[i]])
+                for la in states:
+                    f = fast(c, la)
+                    if f is None:
+                        return False
+                    e = np.asarray(exact(c, la))
+                    f = np.asarray(f)
+                    if not np.all(np.isfinite(e)):
+                        continue
+                    # the two orders of summation agree to round-off of the working precision, not to 1e-9 in float32
+                    tol = max(rtol, 1e3 * float(np.finfo(e.dtype).eps)) if np.issubdtype(e.dtype, np.floating) else rtol
+                    scale = tol * max(float(np.abs(e).max()), 1e-300)
+                    if f.shape != e.shape or not np.allclose(f, e, rtol=tol, atol=scale):
+                        return False
+                    compared += 1
     except Exception:  # noqa: BLE001 -- any term the fast route cannot evaluate keeps the exact pass
         return False
-    return True
+    return compared > 0
+
+
+def _prime_diag_verdicts(jacobian, zeros):
+    """Decide, on concrete values, which volume terms ``jacobian(..., diag=True)`` reads by sum factorisation.
+
+    A Newton-Krylov solve asks for the diagonal inside its compiled loop, where the cells' data are tracers and the
+    check against the exact pass cannot run: its first call there kept the exact pass, measured 1.9 s a diagonal
+    at Q8 and 530k DOFs (the whole solve) against a JVP of 3.3 ms. Called once at build, the check only (no pass
+    over the cells), so every later call, traced or not, takes the verdict kept per term."""
+    try:
+        with jax.ensure_compile_time_eval():
+            jacobian(jnp.asarray(zeros), 0.0, None, diag=True, _verdicts_only=True)
+    except Exception:  # noqa: BLE001 -- a term the check cannot evaluate here keeps deciding at each call
+        pass
 
 
 def _unstored_operator(lin, mask, pin, diag_fn, n):
@@ -4835,6 +4864,8 @@ def assemble_fem_native(
             _plan_builders.append(_host_plan)
 
         _inv_blocks_cache: Dict[Tuple[int, int], Any] = {}
+        # per volume term: (term, whether its diagonal is read by sum factorisation), see `jacobian(diag=True)`
+        _diag_verdicts: Dict[Tuple, Any] = {}
 
         def _inv_block(plan, i, off, k, shape=None):
             """Block ``i`` of the plan's ``inverse`` -- the SAME object on every call for a host plan.
@@ -4857,7 +4888,7 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None, *, diag=False, elements=False):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False, elements=False, _verdicts_only=False):
             """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
 
             With ``elements=True`` nothing is summed: it returns the raw triplets ``(rows, cols, data, cell)``,
@@ -4962,15 +4993,28 @@ def assemble_fem_native(
                     def _kf(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn):
                         return _vol_elem_diag(c, la, _e, _t, _r, t, args, _p, cl_d, clf_d)
 
-                    if _fast_diag_agrees(_kf, _kd, _cells_t, _la_t):
+                    # Decided once per term and kept: the check is structural (does the fast route read this term?),
+                    # and repeating it cost a Newton step more than the diagonal itself. A "no" reached under a
+                    # trace is not kept, since a closed-over tracer (a runtime parameter) may be what refused it.
+                    _vkey = (id(coeff), tfi, tuple(rnames) if rnames else ())
+                    _hit = _diag_verdicts.get(_vkey)
+                    if _hit is None or _hit[0] is not coeff:
+                        _ok = _fast_diag_agrees(_kf, _kd, np.arange(n_cells) if _lc is None else np.asarray(_lc), _la_t)
+                        if _ok or not isinstance(_la_t, jax.core.Tracer):
+                            _diag_verdicts[_vkey] = (coeff, _ok)
+                    else:
+                        _ok = _hit[1]
+                    if _verdicts_only:
+                        continue
+                    if _ok:
                         _kd = _kf
-                        _chunk_v = (
-                            _chunk_v
-                            if _sf_residual_bytes is None
-                            else cell_chunk(
-                                _n_t, 1, 1, _chunk_setting, per_bytes=_sf_residual_bytes * vecs[tfi] * (1 + dim)
-                            )
-                        )
+                        _per = None if _sf_residual_bytes is None else _sf_residual_bytes * vecs[tfi] * (1 + dim)
+                        # one pass over the cells while it fits, as the sum-factorised residual (`_residual_chunk`):
+                        # a scan over chunks costs more than the arithmetic of this pass
+                        if _per is not None and _chunk_setting is None and _n_t * _per <= whole_pass_budget_bytes():
+                            _chunk_v = None
+                        elif _per is not None:
+                            _chunk_v = cell_chunk(_n_t, 1, 1, _chunk_setting, per_bytes=_per)
                     _dacc[0] = _elem_map(_kd, (_cells_t, _la_t), _chunk_v, scatter=(_dacc[0], _cd_t))
                     continue
                 if _plan is not None:
@@ -5004,6 +5048,8 @@ def assemble_fem_native(
                     lambda _K=Ke, _c=_cad_t: jnp.broadcast_to(_c[:, None, :], _K.shape).reshape(-1),
                     lambda _K=Ke, _ct=_cells_t: jnp.broadcast_to(_ct[:, None, None], _K.shape).reshape(-1),
                 )
+            if _verdicts_only:  # see `prime_diag_verdicts`
+                return None
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
@@ -6164,8 +6210,51 @@ def assemble_fem_native(
                     offs,
                 )
             return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, metadata=mf_meta, **common), "transient", offs
-        if M is None:
+        # ``jno.fem(matrix_free=True)`` on a nonlinear form with a constant mass and constant boundary values: the
+        # mass is its diagonal (GLL) or unstored, the tangent is never assembled -- each implicit step is
+        # Newton-Krylov on JVPs of the step residual, preconditioned by the step tangent's diagonal
+        # (``metadata["jacobian_diag"]``, see `SemidiscreteTimeBlock._step`); an explicit scheme applies the residual.
+        _mf_nonlinear = (
+            _MATRIX_FREE[0]
+            and nonlinear
+            and not _nonlinear_mass
+            and not _parametric_mass
+            and not _coord_specs
+            and tv_dofs is None
+            and not _dir_args_dependent
+        )
+        if M is None and not _mf_nonlinear:
             M = _mass_jac(zeros)
+        if _mf_nonlinear:
+            mf_mass_res = _make_residual(mass_terms)
+            M_mf = _matrix_free_mass(lambda u: mf_mass_res(u, 0.0), _mass_jac, zeros, d_dofs)
+
+            def res_mf(u, t, args=None, _d=d_dofs, _g=d_vals):
+                R = spatial_res(jnp.asarray(u), t, args)
+                return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+
+            def jac_diag_mf(u, t, args=None, _d=d_dofs):
+                # the diagonal of the row-replaced tangent: unit on the held rows
+                dg = spatial_jac(jnp.asarray(u), t, args, diag=True)
+                return dg if _d is None else dg.at[_d].set(1.0)
+
+            if not (runtime_parameter_tags or neural_param_names):  # a parametric term needs its args to be read
+                _prime_diag_verdicts(spatial_jac, zeros)
+            mf_meta = {"jacobian_diag": jac_diag_mf, **({} if d_dofs is None else {"held_rows": (d_dofs, d_vals)})}
+            if derived_specs:
+                mf_meta["derived_specs"] = derived_specs
+            return (
+                SemidiscreteTimeBlock(
+                    mass=lambda t, args=None, _M=M_mf: _M,
+                    residual=res_mf,
+                    jacobian=None,
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
+                    metadata=mf_meta,
+                    **common,
+                ),
+                "transient",
+                offs,
+            )
         if nonlinear:
             # (A net- or parameter-valued initial condition threads here too: every march re-forms the
             # start from ``state0_fn(args)``, linear or Newton step alike.)
@@ -6600,6 +6689,9 @@ def assemble_fem_native(
 
             _op = FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs))
             _op.jacobian_diag = jac_diag_p
+            from .fem_utils import _MATRIX_FREE
+
+            _op.matrix_free = bool(_MATRIX_FREE[0])  # the default Newton: JVPs + this diagonal, no tangent assembled
             # only where a prescribed value can be non-zero: a held (args- or time-dependent) value, or a
             # static one that is not all zeros. A homogeneous problem starts consistent and skips the step.
             if _constrained is not None and (
@@ -6610,6 +6702,7 @@ def assemble_fem_native(
                     lambda uu: jacobian(uu, 0.0, args),
                     lambda uu: _proj_p(uu, args, 0.0),
                     _constrained,
+                    diagonal_free=(lambda uu: jacobian(uu, 0.0, args, diag=True)) if _op.matrix_free else None,
                 )(u0)
             _op.linear_in_unknown = linear_in_unknown
             # Which DOFs carry an ESSENTIAL condition rather than an equation. A solver that extrapolates
@@ -6692,10 +6785,19 @@ def assemble_fem_native(
 
         _op_np = FemResidualOperator(_res_np, _jac_np, total)
         _op_np.jacobian_diag = _jac_diag_np
+        from .fem_utils import _MATRIX_FREE
+
+        _op_np.matrix_free = bool(_MATRIX_FREE[0])  # the default Newton: JVPs + this diagonal, no tangent assembled
+        if _op_np.matrix_free:
+            _prime_diag_verdicts(jacobian, zeros)
         if dirichlet_pairs and any(float(v) != 0.0 for _dof, v in dirichlet_pairs):
             _ld, _lv, _lproj = dirichlet_projection(dirichlet_pairs)
             _op_np.lift_start = lambda u0, args=None: dirichlet_lift_start(
-                lambda uu: residual(uu, 0.0, args), lambda uu: jacobian(uu, 0.0, args), _lproj, _ld
+                lambda uu: residual(uu, 0.0, args),
+                lambda uu: jacobian(uu, 0.0, args),
+                _lproj,
+                _ld,
+                diagonal_free=(lambda uu: jacobian(uu, 0.0, args, diag=True)) if _op_np.matrix_free else None,
             )(u0)
         _op_np.linear_in_unknown = linear_in_unknown
         # The essential-condition DOFs, as the parametric operator above declares them: an extrapolating

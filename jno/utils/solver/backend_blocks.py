@@ -662,6 +662,32 @@ class SemidiscreteTimeBlock:
                 g = (M_t @ (wn - u)) / dt + (r_next if w is None else w * r_next)
                 return g if r_now is None else g + r_now
 
+            # ``jno.fem(matrix_free=True)``: no tangent to assemble, only its diagonal. The step is Newton-Krylov on
+            # JVPs of G, preconditioned by diag(∂G/∂wn) = diag(M)/dt + w·diag(J_R(wn)).
+            _jd = (self.metadata or {}).get("jacobian_diag") if self.jacobian is None else None
+            if _jd is not None:
+                from .linear import matrix_diagonal
+                from .solver_api import step_form
+
+                d_m = jnp.asarray(matrix_diagonal(M_t), dtype).reshape(-1) / dt
+
+                def step_diag(wn):
+                    d_j = jnp.asarray(_jd(wn, t_next, args), dtype).reshape(-1)
+                    return d_m + (d_j if w is None else w * d_j)
+
+                if nonlinear_solve is None:
+                    return _verdict(G, u, newton_krylov(G, x0, jacobian_diag=step_diag), report)
+
+                def no_tangent(wn):
+                    raise ValueError(
+                        "jno.fem(matrix_free=True) assembles no step tangent for a direct solve: use "
+                        "jno.solve.newton() (direct=None or False), or leave matrix_free out."
+                    )
+
+                no_tangent.matrix_free, no_tangent.diag = True, step_diag
+                with step_form(1.0 / dt, thn, t_next):
+                    return _verdict(G, u, nonlinear_solve(G, x0, jacobian=no_tangent), report)
+
             if nonlinear_solve is not None:
                 # A sparse-direct Newton (``jno.solve.newton(direct=True)``) factorizes the ASSEMBLED
                 # step tangent each iteration rather than a matrix-free Krylov inner solve — it flags

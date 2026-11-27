@@ -769,7 +769,7 @@ def dirichlet_projection(dirichlet_pairs: List[Tuple[int, float]]):
     return dofs, vals, project
 
 
-def dirichlet_lift_start(residual_free, jacobian_free, project, dofs):
+def dirichlet_lift_start(residual_free, jacobian_free, project, dofs, diagonal_free=None):
     """The starting step for Newton on a Dirichlet-eliminated residual: ``u0 -> (res, jac, gap)``.
 
     The eliminated residual evaluates the free one at ``P(u)``, so Newton from a ``u0`` that violates the
@@ -787,19 +787,31 @@ def dirichlet_lift_start(residual_free, jacobian_free, project, dofs):
     caller decides statically whether to take the step).
 
     ``residual_free(u)``, ``jacobian_free(u)`` (an assembled BCOO) and ``project(u)`` take the state alone
-    (close over any runtime args); ``dofs`` are the constrained DOFs."""
+    (close over any runtime args); ``dofs`` are the constrained DOFs.
+
+    ``diagonal_free(u)`` (the free tangent's diagonal) makes the step matrix-free (``jno.fem(matrix_free=True)``):
+    nothing is assembled, and the tangent handed on is a handle flagged ``matrix_free`` that carries the
+    eliminated diagonal as ``.diag``, which a default Newton preconditions its JVPs with."""
     from .fem_utils import bcoo_eliminate_dirichlet
 
     def start(u0):
         u0 = jnp.asarray(u0)
         target = project(u0)
         r0, lin = jax.linearize(residual_free, u0)
-        j0 = bcoo_eliminate_dirichlet(jacobian_free(u0), dofs)
 
         def res(u):
             u = jnp.asarray(u)
             return (r0 + lin(project(u) - u0)).at[dofs].set(u[dofs] - target[dofs])
 
+        if diagonal_free is not None:
+            d0 = jnp.asarray(diagonal_free(u0)).reshape(-1).at[dofs].set(1.0)
+
+            def jac(u):
+                raise NotImplementedError("a matrix-free lift step assembles no tangent")  # pragma: no cover
+
+            jac.matrix_free, jac.diag = True, (lambda u: d0)
+            return res, jac, jnp.max(jnp.abs(target - u0))
+        j0 = bcoo_eliminate_dirichlet(jacobian_free(u0), dofs)
         return res, (lambda u: j0), jnp.max(jnp.abs(target - u0))
 
     return start

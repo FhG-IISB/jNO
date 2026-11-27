@@ -905,12 +905,15 @@ def newton_default(
     ``reuse`` / ``tangent0`` / ``info`` are :func:`newton_direct`'s (lagged tangent, carried across calls;
     the solve's own residual norms); without an assembled tangent there is none to keep and ``info`` stays
     empty."""
-    if jacobian is not None:
+    if jacobian is not None and not getattr(jacobian, "matrix_free", False):
         return newton_direct(
             residual_fn, jacobian, u0, linear_solve=assembled_krylov_solve(inner_tol, inner_maxit), reuse=reuse,
             tangent0=tangent0, info=info, **kw,
         )  # fmt: skip
-    return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, **kw)
+    # No tangent, or one that must not be assembled (``jno.fem(matrix_free=True)``): JVPs, preconditioned by the
+    # assembler's diagonal-only pass when it has one.
+    jdiag = getattr(jacobian, "diag", None) if jacobian is not None else None
+    return newton_krylov(residual_fn, u0, inner_tol=inner_tol, inner_maxit=inner_maxit, jacobian_diag=jdiag, **kw)
 
 
 #: The inexact-Newton forcing floor on a KEPT tangent (``newton_direct(reuse=True)``): the inner Krylov

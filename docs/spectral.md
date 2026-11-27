@@ -82,7 +82,7 @@ sol = fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
 | `order=k`, k > 2, on quads / hexes | GLL nodes (`gll_warped`), no option needed |
 | `quadrature="gll"` | the GLL rule at those nodes (`k + 1` points per axis, exact to degree `2k - 1`): the mass matrix is diagonal (exact lumping, total mass to round-off) and an affine cell's stiffness stays exact |
 | sum factorisation (automatic, k > 2) | a field's values and gradients at the quadrature points are 1-D contractions along each axis of the cell's DOF tensor, `O(k^(d+1))` per cell where the dense basis tables cost `O(k^(2d))`. Every residual (linear, nonlinear, transient) and the element tangent use it |
-| `matrix_free=True` | a linear form's operator is linearised once and applied through the cells, never stored. Steady: `fem.operator` is `(A, b)` with `A` a matvec (`A @ v`, `A.T`, `A.diag()`), solved by Jacobi-BiCGStab or the Krylov slot you pass. Transient (`u.t` or `u.tt`, constant boundary values): every `jno.solve` time scheme marches it; the mass is stored as its diagonal when it is diagonal (`quadrature="gll"`), so `jno.solve.erk()` costs one stiffness apply per stage and no solve. A direct solver or a matrix-based preconditioner has nothing to factor and raises; a nonlinear or parametric form is assembled as before |
+| `matrix_free=True` | a linear form's operator is linearised once and applied through the cells, never stored. Steady: `fem.operator` is `(A, b)` with `A` a matvec (`A @ v`, `A.T`, `A.diag()`), solved by Jacobi-BiCGStab or the Krylov slot you pass. Transient (`u.t` or `u.tt`, constant boundary values): every `jno.solve` time scheme marches it; the mass is stored as its diagonal when it is diagonal (`quadrature="gll"`), so `jno.solve.erk()` costs one stiffness apply per stage and no solve. A direct solver or a matrix-based preconditioner has nothing to factor and raises. Nonlinear: Newton-Krylov, the default of `fem.solve()` and of `jno.solve.newton()`. Each step applies the tangent as a JVP of the residual and preconditions it with the tangent's diagonal, sum-factorised as well, so no tangent is ever assembled (`jno.solve.newton(direct=True)` assembles it anyway on a steady form). A nonlinear transient form takes each implicit step the same way, with the diagonal mass |
 
 An explicit wave march, the standard use of spectral elements:
 
@@ -131,6 +131,7 @@ float64.
     | spectral elements off a box, Q3 / Q5 / Q8, `matrix_free=True`, GLL rule | L-shape (12 quads) 9.3e-5 / 6.4e-8 / 1.5e-12; unstructured polygon (33 quads) 1.8e-4 / 3.0e-7 / 8.7e-12 |
     | one Q_k Poisson apply, hand-written sum-factorised kernel against the assembled matvec (227k / 69k / 36k DOFs; Q3 / Q5 / Q8) | i5-13600K f64: 4.6x / 16x / 30x faster; RTX 3070 f64: 0.53x / 1.7x / 3.5x; f32: 1.1x / 3.5x / 6.0x; operator memory 205 / 128 / 140 MB against 25 / 5.5 / 2.3 MB |
     | `jno.fem(matrix_free=True)`, 3-D Poisson, 2.0-2.1M DOFs, RTX 3070, f64, Q3 / Q5 / Q8 | build 6.8 / 6.0 / 6.4 s; apply 19 / 11 / 11 ms (1.03x / 1.34x / 1.94x the hand-written kernel); Jacobi-CG solve 0.8 / 0.9 / 1.2 s (10 / 29 / 61 iterations, a single-mode right-hand side); max error 1.3e-10 / 2.0e-12 / 5.6e-12; 1.1 / 0.9 / 0.7 GB peak on the card, of which 0.56 / 0.40 / 0.36 GB kept coefficients (14 numbers per quadrature point) |
+    | `jno.fem(matrix_free=True)`, 3-D `-div((1 + u²) grad u) = f`, Newton-Krylov (5 steps), RTX 3070, f64, Q3 / Q5 / Q8 | 530k DOFs: solve 3.3 / 2.1 / 2.8 s, 270-370 inner Jacobi-BiCGStab iterations, one JVP 4.9 / 2.9 / 3.3 ms (the linear apply: 4.9 / 2.7 / 3.1 ms), the diagonal 58 / 36 / 32 ms, 0.4-0.55 GB peak; 2.1-2.2M DOFs: 36 / 14 / 14 s, 1.2-1.4 GB; 130k DOFs against the assembled Newton: 0.55 / 0.41 / 0.37 s vs 0.60 / 1.31 s / out of memory, peak 0.2 / 0.14 / 0.15 GB vs 1.0 / 2.4 GB / > 2.8 GB |
     | 3-D wave `u.tt = Δu`, `matrix_free=True`, GLL mass, RK4, 2.0-2.1M DOFs, RTX 3070, Q3 / Q5 / Q8 | float64: 114 / 54 / 52 ms a step (29 / 13 / 13 ms a stage), build 15 / 7 / 10 s, 1.1-1.3 GB peak, max error after 50 steps 3.0e-10 / 5.9e-12 / 5.3e-13 against the exact standing wave; float32: 31 / 40 / 43 ms a step, 0.7 GB, error 1-2e-6 |
     | same, f32 | build 8.5 / 7.4 / 7.8 s; apply 6.0 / 4.6 / 4.1 ms (2.6x / 1.9x / 2.7x the hand-written kernel); CG stalls at a true residual of 6e-4 / 7e-4 / 1e-3 and is refused |
 
@@ -139,3 +140,9 @@ float64.
 `jno.spectral`: box domains only (rect, box, a 1-D line); other geometry goes through the spectral elements of
 `jno.fem` above. `etdrk4` needs every axis Fourier. A transient equation must live on its
 unknown's own nodes. Second order in time (`u.tt`) is not supported yet.
+
+`jno.fem(matrix_free=True)`: Jacobi is the only preconditioner, so a Krylov solve takes more iterations as the degree
+and the mesh grow (a Newton step of the nonlinear Poisson above: 55-73 inner iterations at 530k DOFs, 77-104 at 2M).
+A parametric nonlinear form takes the exact diagonal pass (`O(k^(2d+1))` per cell, not the sum-factorised one); a
+nonlinear transient form with a state-dependent mass, a driven boundary `g(x, t)` or a parameter-valued boundary
+value assembles its step tangent as before. Periodic ties and complex fields are refused.

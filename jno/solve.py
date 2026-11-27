@@ -703,6 +703,13 @@ def _root_driver(
         # with reuse=True and an assembled tangent. `info` (a dict) receives the solve's own residual norms
         # and, with reuse, its last tangent; see newton_direct.
         carry = {"info": info} if jacobian is not None and direct is not False else {}
+        # (``reuse`` keeps an assembled tangent between steps; with none assembled it has nothing to keep, and a
+        # march's default Newton asks for it, so it is not refused.)
+        if direct is None and getattr(jacobian, "matrix_free", False) and ptc is not None:
+            raise ValueError(
+                f"jno.solve.{name}(ptc=...) shifts the ASSEMBLED tangent, and jno.fem(matrix_free=True) assembles "
+                f"none: pass direct=True to assemble it anyway, or drop ptc."
+            )
         if ptc is not None:
             if jacobian is None and not direct:
                 raise ValueError(
@@ -712,7 +719,7 @@ def _root_driver(
             carry["ptc"] = ptc
         if reuse and jacobian is not None and direct is not False:
             carry["tangent0"] = tangent0
-        if direct is None and jacobian is not None:
+        if direct is None and jacobian is not None and not getattr(jacobian, "matrix_free", False):
             # The default: Newton on the ASSEMBLED tangent, solved iteratively -- the composed
             # ``linear=``/``precond=`` slots if given, else Jacobi-BiCGStab (see newton_default).
             from .utils.solver.newton_krylov import assembled_krylov_solve, newton_direct

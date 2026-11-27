@@ -6072,6 +6072,8 @@ class FemResidualOperator:
 
         if self.jacobian_diag is not None:
             jac.diag = lambda u: self.jacobian_diag(u, args)
+        # ``jno.fem(matrix_free=True)``: a default Newton reads this and runs on JVPs and ``diag``, never ``jac(u)``
+        jac.matrix_free = bool(getattr(self, "matrix_free", False))
         return jac
 
     def solve(self, solve_fn=None, *, u0=None, values=None):

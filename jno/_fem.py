@@ -1795,7 +1795,9 @@ def _route_line(fem_obj, *, linear=None, precond=None, nonlinear=None, time=None
 
     mode = fem_obj._mode
     # The default Newton runs on the assembled tangent whenever the assembler provides one (newton_default).
-    _assembled = getattr(getattr(fem_obj, "_op", None), "jacobian", None) is not None
+    # ``jno.fem(matrix_free=True)``: the tangent is never assembled, the default Newton is Newton-Krylov.
+    _op_ = getattr(fem_obj, "_op", None)
+    _assembled = getattr(_op_, "jacobian", None) is not None and not getattr(_op_, "matrix_free", False)
     _newton = "newton (assembled tangent)" if _assembled else "newton-krylov (JFNK)"
     if mode == "transient":
         step = _nm(time, "theta(1) backward-Euler")
@@ -8240,7 +8242,12 @@ def fem(
             quadrilateral or hexahedral field of degree ``k >= 3`` the apply is sum-factorised, ``O(k^(d+1))``
             per cell, and the memory is the mesh: the stored matrix of a Q5 hexahedral Poisson holds 322
             entries per DOF. A direct solver or a matrix-based preconditioner has nothing to factor and
-            raises. Steady linear, non-parametric, non-periodic real problems only.
+            raises. A nonlinear form is solved by Newton-Krylov: each step applies the tangent as a JVP of the
+            residual and preconditions it with the tangent's diagonal (sum-factorised too), so no tangent is
+            ever assembled; ``jno.solve.newton(direct=True)`` assembles it anyway on a steady form. A transient
+            form with constant boundary values marches on every time scheme with the mass stored as its
+            diagonal (GLL) or applied, a nonlinear one by a Newton-Krylov solve per implicit step. Not for
+            periodic ties or complex fields.
 
     Returns:
         FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
