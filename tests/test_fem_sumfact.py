@@ -285,3 +285,20 @@ def test_a_matrix_free_operator_first_applied_inside_a_trace_still_applies(monke
     traced = jax.jit(A.mv)(v)
     assert np.allclose(np.asarray(A.mv(v)), np.asarray(traced))
     assert np.isfinite(np.asarray(A.diag())).all()
+
+
+def test_the_factored_diagonal_is_taken_in_single_precision_too(monkeypatch):
+    """The check against the exact pass compares at the working precision: at a fixed 1e-9 every float32 build fell
+    back to the exact pass (measured: a 2M-DOF Q8 build 9 -> 40 s)."""
+    from jno.utils.solver import fem_native as fn
+
+    verdicts, real = [], fn._fast_diag_agrees
+    monkeypatch.setattr(fn, "_fast_diag_agrees", lambda *a, **k: verdicts.append(real(*a, **k)) or verdicts[-1])
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        A, _b = _scalar_problem(2, 4, "gll", matrix_free=True).operator
+        d = np.asarray(A.diag())
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+    assert d.dtype == np.float32 and verdicts and all(verdicts)

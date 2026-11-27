@@ -745,8 +745,8 @@ per DOF; `jno.fem([...], matrix_free=True)` stores none. A linear form's operato
 through the cells by sum factorisation (`O(k^(d+1))` per cell), `fem.operator` is `(A, b)` with `A` a matvec
 (`A @ v`, `A.T`, `A.diag()`), and any Krylov slot solves it; a direct solver or a matrix-based preconditioner has
 nothing to factor and raises. On a time domain (`u.t`, `u.tt`) every time scheme marches it; with the diagonal GLL
-mass `jno.solve.erk()` takes one stiffness apply per stage (a 2.1M-DOF Q8 wave: 83 ms an RK4 step in float64). `quadrature="gll"` puts the quadrature at the element's own nodes, which makes the mass matrix diagonal. Measured at 2.1M DOFs (Q8, float64, RTX 3070): 33 s to build, 17 ms per apply,
-0.46 GB on the card, a Jacobi-CG solve in 1.6 s. See [Spectral methods](spectral.md#spectral-elements-in-jnofem).
+mass `jno.solve.erk()` takes one stiffness apply per stage (a 2.1M-DOF Q8 wave: 52 ms an RK4 step in float64). `quadrature="gll"` puts the quadrature at the element's own nodes, which makes the mass matrix diagonal. Measured at 2.1M DOFs (Q8, float64, RTX 3070): 6.4 s to build, 11 ms per apply,
+0.7 GB on the card, a Jacobi-CG solve in 1.2 s. See [Spectral methods](spectral.md#spectral-elements-in-jnofem).
 
 **Preconditioners** (`jno.precond`, for the iterative solvers):
 

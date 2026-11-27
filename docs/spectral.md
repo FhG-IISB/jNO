@@ -125,9 +125,9 @@ float64.
     | spectral elements, 3-D Poisson, 2³ hexahedra, Q2 / Q3 / Q4 / Q5 / Q6 | max error 2.3e-2 / 4.5e-4 / 3.4e-5 / 8.9e-7 / 7.9e-8 |
     | spectral elements off a box, Q3 / Q5 / Q8, `matrix_free=True`, GLL rule | L-shape (12 quads) 9.3e-5 / 6.4e-8 / 1.5e-12; unstructured polygon (33 quads) 1.8e-4 / 3.0e-7 / 8.7e-12 |
     | one Q_k Poisson apply, hand-written sum-factorised kernel against the assembled matvec (227k / 69k / 36k DOFs; Q3 / Q5 / Q8) | i5-13600K f64: 4.6x / 16x / 30x faster; RTX 3070 f64: 0.53x / 1.7x / 3.5x; f32: 1.1x / 3.5x / 6.0x; operator memory 205 / 128 / 140 MB against 25 / 5.5 / 2.3 MB |
-    | `jno.fem(matrix_free=True)`, 3-D Poisson, 2.0-2.1M DOFs, RTX 3070, f64, Q3 / Q5 / Q8 | build 11 / 15 / 33 s; apply 31 / 20 / 17 ms (1.7x / 2.5x / 3.0x the hand-written kernel); Jacobi-CG solve 1.1 / 1.3 / 1.6 s (10 / 29 / 61 iterations, a single-mode right-hand side); max error 1.3e-10 / 2.0e-12 / 5.7e-12; 0.63 GB peak on the card |
-    | 3-D wave `u.tt = Δu`, `matrix_free=True`, GLL mass, RK4, 2.0-2.1M DOFs, RTX 3070, Q3 / Q5 / Q8 | float64: 131 / 95 / 83 ms a step (33 / 24 / 21 ms a stage), build 17 / 11 / 10 s, 0.85 GB peak, max error after 50 steps 3.0e-10 / 5.9e-12 / 5.3e-13 against the exact standing wave; float32: 51 / 42 / 46 ms a step, 0.46-0.58 GB, error 1-2e-6 |
-    | same, f32 | apply 9.3 / 7.1 / 5.9 ms (4.1x / 3.0x / 3.9x the hand-written kernel); CG stalls at a true residual of 6e-4 / 7e-4 / 1e-3 and is refused |
+    | `jno.fem(matrix_free=True)`, 3-D Poisson, 2.0-2.1M DOFs, RTX 3070, f64, Q3 / Q5 / Q8 | build 6.8 / 6.0 / 6.4 s; apply 19 / 11 / 11 ms (1.03x / 1.34x / 1.94x the hand-written kernel); Jacobi-CG solve 0.8 / 0.9 / 1.2 s (10 / 29 / 61 iterations, a single-mode right-hand side); max error 1.3e-10 / 2.0e-12 / 5.6e-12; 1.1 / 0.9 / 0.7 GB peak on the card, of which 0.56 / 0.40 / 0.36 GB kept coefficients (14 numbers per quadrature point) |
+    | 3-D wave `u.tt = Δu`, `matrix_free=True`, GLL mass, RK4, 2.0-2.1M DOFs, RTX 3070, Q3 / Q5 / Q8 | float64: 114 / 54 / 52 ms a step (29 / 13 / 13 ms a stage), build 15 / 7 / 10 s, 1.1-1.3 GB peak, max error after 50 steps 3.0e-10 / 5.9e-12 / 5.3e-13 against the exact standing wave; float32: 31 / 40 / 43 ms a step, 0.7 GB, error 1-2e-6 |
+    | same, f32 | build 8.5 / 7.4 / 7.8 s; apply 6.0 / 4.6 / 4.1 ms (2.6x / 1.9x / 2.7x the hand-written kernel); CG stalls at a true residual of 6e-4 / 7e-4 / 1e-3 and is refused |
 
 ## Limits
 

@@ -94,6 +94,7 @@ from .fem_utils import (
     elem_map,
     input_dependencies,
     raw_pattern_from_blocks,
+    whole_pass_budget_bytes,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .sharding import element_mesh as _element_mesh
@@ -191,9 +192,10 @@ class _PointData:
         return self.G
 
 
-# Arrays of ``n_quad x components x dim`` numbers a sum-factorised residual keeps per cell (a bound for the
-# chunk size, see ``_residual_chunk``).
-_SUMFACT_RESIDUAL_ARRAYS = 32
+# Arrays of ``n_quad x components x dim`` numbers a sum-factorised residual keeps per cell, for its memory (see
+# ``_residual_chunk``). Measured: the linearised Q8 hexahedral Laplacian, 4096 cells in one pass, raised the
+# device peak by 270 MB, 3.8 such arrays per cell; 6 leaves a margin.
+_SUMFACT_RESIDUAL_ARRAYS = 6
 
 
 def mesh_cell_type(domain, dim: int) -> str:
@@ -1304,7 +1306,9 @@ def _fast_diag_agrees(fast, exact, cells, local, *, rtol=1e-9):
                     return False
                 e = np.asarray(exact(cells[i], local[i]))
                 f = np.asarray(f)
-                if f.shape != e.shape or not np.allclose(f, e, rtol=rtol, atol=rtol * max(float(np.abs(e).max()), 1e-300)):
+                # the two orders of summation agree to round-off of the working precision, not to 1e-9 in float32
+                tol = max(rtol, 1e3 * float(np.finfo(e.dtype).eps)) if np.issubdtype(e.dtype, np.floating) else rtol
+                if f.shape != e.shape or not np.allclose(f, e, rtol=tol, atol=tol * max(float(np.abs(e).max()), 1e-300)):
                     return False
     except Exception:  # noqa: BLE001 -- any term the fast route cannot evaluate keeps the exact pass
         return False
@@ -1357,6 +1361,7 @@ def _unstored_operator(lin, mask, pin, diag_fn, n):
     A.matrix_free = True
     A.dtype = mask.dtype  # read where a stored matrix's would be (row detection, step diagonals)
     A.coefficient_bytes = int(sum(getattr(leaf, "nbytes", 0) for leaf in jax.tree_util.tree_leaves(lin)))
+    A._linearised = lin  # the kept coefficients themselves, for inspection
     return A
 
 
@@ -4249,8 +4254,15 @@ def assemble_fem_native(
     )
 
     def _residual_chunk(n_items: int, n_test: int, n_local: int):
+        """Cells per chunk of a residual pass. A sum-factorised one runs as ONE pass over every cell while that
+        fits a quarter of the device (:func:`whole_pass_budget_bytes`): any split puts the cells in a sequential
+        ``lax.map``, and that cost more than all the arithmetic. Measured, Q8 Laplacian, 4096 hexahedra, 2.1M
+        DOFs, RTX 3070: 10.3 ms per apply in one pass (device peak 736 MB), 16.7 ms in the 6 chunks the
+        element-block policy chose (466 MB), 19.7 ms in 2; a hand-written kernel takes 5.5 ms."""
         if _sf_residual_bytes is None:
             return _cell_chunk(n_items, n_test, n_local)
+        if _chunk_setting is None and n_items * _sf_residual_bytes <= whole_pass_budget_bytes():
+            return None
         return cell_chunk(n_items, n_test, n_local, _chunk_setting, per_bytes=_sf_residual_bytes)
 
     _elem_map = elem_map

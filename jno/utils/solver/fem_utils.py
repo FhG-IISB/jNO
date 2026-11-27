@@ -4831,15 +4831,31 @@ _CHUNK_FLOOR_BYTES = 400 << 20
 _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
 
 
+def _device_bytes_limit():
+    """The default device's memory limit in bytes, ``None`` where it exposes none (a CPU backend)."""
+    try:
+        return jax.local_devices()[0].memory_stats().get("bytes_limit")
+    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
+        return None
+
+
 def chunk_budget_bytes():
     """Bytes one element chunk may occupy, taken from the device rather than tuned to one."""
-    try:
-        limit = jax.local_devices()[0].memory_stats().get("bytes_limit")
-    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
-        limit = None
+    limit = _device_bytes_limit()
     if not limit:
         return _CHUNK_FALLBACK_BYTES
     return max(_CHUNK_FALLBACK_BYTES // 2, int(limit * _CHUNK_MEMORY_FRACTION))
+
+
+#: Share of the device a residual pass with no element blocks (sum-factorised) may take in one piece.
+_WHOLE_PASS_FRACTION = 0.25
+_WHOLE_PASS_FALLBACK_BYTES = 1 << 30  # CPU / unknown device: host memory, 1 GiB
+
+
+def whole_pass_budget_bytes():
+    """Bytes a residual pass may use when it runs over every cell at once (see ``fem_native._residual_chunk``)."""
+    limit = _device_bytes_limit()
+    return _WHOLE_PASS_FALLBACK_BYTES if not limit else int(limit * _WHOLE_PASS_FRACTION)
 
 
 def _balanced_chunk(n_items: int, chunk: int) -> int:
