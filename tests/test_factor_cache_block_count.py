@@ -222,3 +222,31 @@ def test_outside_a_newton_solve_the_default_still_keeps():
         for _ in range(3):  # an explicit choice wins inside too
             _linear.host_lu_solve(_operator(n, 3.0), b, reuse=True)
     assert len(_linear._FACTOR_CACHE) == 2
+
+
+def test_a_forked_child_gets_a_working_factor_thread():
+    """The host factorizations run on one worker thread; a child forked after it started must not wait on a
+    thread that does not exist in the child."""
+    import os
+    import time
+
+    from jno.utils.solver import linear
+
+    assert linear._factor_worker().submit(lambda: 1).result() == 1
+    pid = os.fork()
+    if pid == 0:
+        try:
+            ok = linear._factor_worker().submit(lambda: 2).result(timeout=20) == 2
+        except BaseException:
+            ok = False
+        os._exit(0 if ok else 1)
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            assert os.waitstatus_to_exitcode(status) == 0
+            return
+        time.sleep(0.05)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    raise AssertionError("the forked child hung on the factor worker")
