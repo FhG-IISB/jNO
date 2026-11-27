@@ -84,7 +84,12 @@ sol = fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())
 | sum factorisation (automatic, k > 2) | a field's values and gradients at the quadrature points are 1-D contractions along each axis of the cell's DOF tensor, `O(k^(d+1))` per cell where the dense basis tables cost `O(k^(2d))`. Every residual (linear, nonlinear, transient) and the element tangent use it |
 | `matrix_free=True` | a steady linear operator is linearised once and applied through the cells: `fem.operator` is `(A, b)` with `A` a matvec (`A @ v`, `A.T`, `A.diag()`); solved by Jacobi-BiCGStab or the Krylov slot you pass. A direct solver or a matrix-based preconditioner has nothing to factor and raises |
 
-A curved boundary is still meshed with straight-sided cells: its `O(h²)` geometry error is not reduced by the degree.
+A curved boundary is meshed with straight-sided cells (`shape.curved()` is for order-2 simplices and refuses
+quadrilaterals): its `O(h²)` geometry error is not reduced by the degree.
+
+The default `fem.solve()` is an iterative solve to a relative residual of 1e-8, which is coarser than a
+high-degree discretisation: a Q8 solution good to 6e-11 came back at 1.2e-6. Pass `linear=jno.solve.lu()` or a
+Krylov tolerance (`jno.solve.cg(tol=1e-13)`) to see the spectral error.
 
 `matrix_free=True` pays from about Q5 on a GPU and at every degree on a CPU; at Q3 on a GPU the assembled matvec is
 the faster one and the gain is memory only. In float32 the matrix products run at full precision (a GPU's default
