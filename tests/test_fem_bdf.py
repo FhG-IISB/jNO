@@ -279,9 +279,7 @@ def test_tight_tolerance_march_reaches_the_end_and_is_accurate(make, gain):
     With the fixed 1e-10 step solve the solver noise (about 1e-10 max|u| per component) sat above atol, the error
     estimate never fell below 1 and bdf crawled on the step floor until the budget ran out (NaN).
 
-    bdf's gain is only asserted to be positive: its first steps sit on the step floor ``1e-4 * span`` and are accepted
-    there whatever the estimate says, which leaves a start-up error near 1e-6 that no rtol removes (a lower floor
-    does); sdirk3 starts with a third-order step and gains most of the 100x (its dense output limits the rest)."""
+    bdf's gain is asserted to be positive only (see ``test_bdf_error_follows_rtol_down_to_1e_9``); sdirk3 starts with a third-order step and gains most of the 100x (its dense output limits the rest)."""
     fem = _form(6)
     ref = _exact_semidiscrete(fem, SAVE)
     errs = []
@@ -394,3 +392,15 @@ def test_only_coupled_constraint_rows_keep_the_tight_step_solve():
 
     assert not _block_has_coupled_algebraic_rows(_form(6).operator, {})
     assert _block_has_coupled_algebraic_rows(FAMILIES["rt_p0_darcy"]().operator, {})
+
+
+@pytest.mark.parametrize("rtol", [1e-8, 1e-9])
+def test_bdf_error_follows_rtol_down_to_1e_9(rtol):
+    """The first backward-Euler steps of a stiff problem used to sit on the constant step floor ``1e-4 * span``,
+    accepted whatever the estimate said, which left a start-up error near 7e-7 at every rtol below 1e-7. The floor
+    now follows rtol, so the error against the exact semidiscrete solution scales with it."""
+    fem = _form(6)
+    ref = _exact_semidiscrete(fem, SAVE)
+    out = np.asarray(_run(jno.solve.bdf().adaptive(rtol=rtol, atol=1e-3 * rtol, max_steps=1500), fem))
+    assert not np.any(np.isnan(out))
+    assert _worst(out, ref) < 30 * rtol, f"rtol={rtol}: error {_worst(out, ref):.2e}"

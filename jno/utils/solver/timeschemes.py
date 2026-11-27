@@ -1114,7 +1114,12 @@ def bdf_march(
     rt = jnp.real(u0).dtype
     t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
     span = jnp.abs(t1 - t0)
-    dt_min, dt_max = 1e-4 * span, span
+    # The step floor follows the tolerance: a constant 1e-4 * span left the first (unchecked) backward-Euler steps of
+    # a stiff problem on the floor, accepted whatever the estimate, with a start-up error near 1e-6 that no rtol
+    # removed. ``rtol * span`` lets the controller reach the tolerance; the lower bound keeps ``M + dt A`` well
+    # conditioned and the step representable (1e-9 in double, 100 eps in single precision).
+    floor = max(1e-9, 100.0 * float(jnp.finfo(rt).eps))
+    dt_min, dt_max = min(1e-4, max(float(rtol), floor)) * span, span
     dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
     K = int(max_order)
     if not 1 <= K <= _BDF_MAX_ORDER:
