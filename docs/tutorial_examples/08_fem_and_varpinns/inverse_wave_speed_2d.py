@@ -28,12 +28,12 @@ import optax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
-from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate  # noqa: E402
 
 c2_true, c2_guess = 2.0, 1.0  # the unknown wave speed² to recover, and a deliberately wrong start
+t_end, n_t = 1.5, 60  # the time grid the trajectory is saved on
 
 # --- forward wave u_tt = c² Δu on a clamped square, plucked into its fundamental mode ---
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.14, time=(0.0, 1.5, 60))
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.14, time=(0.0, t_end, n_t))
 u, phi = d.fem_symbols()
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -45,9 +45,8 @@ c2 = jno.np.parameter((1,), name="c2")  # the unknown coefficient
 fem = jno.fem([ui.tt * vi + c2 * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(xi0, yi0) - u0, ui0.t - 0.0])
 
 # --- the "observed" seismogram: the forward wave at the true speed (the data) ---
-blk = fem.operator
-ts = np.asarray(_block_time_grid(blk))
-u_obs = np.asarray(_default_transient_integrate(blk, {"c2": c2_true}, ts))
+ts = np.linspace(0.0, t_end, n_t)
+u_obs = np.asarray(fem.solve(c2=jnp.array([c2_true])))  # fem.solve(parameter=value): the trajectory at that value
 
 # --- recover c² from the data through the differentiable transient solve ---
 c2.dtype(jnp.float64)
@@ -70,8 +69,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 n = fem.offsets[1]
 pts = np.asarray(fem.points)
 ci = int(np.argmin(np.sum((pts - 0.5) ** 2, axis=1)))  # a receiver near the (0.5, 0.5) antinode
-u_start = np.asarray(_default_transient_integrate(blk, {"c2": c2_guess}, ts))
-u_rec = np.asarray(_default_transient_integrate(blk, {"c2": rec}, ts))
+u_start = np.asarray(fem.solve(c2=jnp.array([c2_guess])))
+u_rec = np.asarray(fem.solve(c2=jnp.array([rec])))
 
 plt.rcParams.update({"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10})
 fig, ax = plt.subplots(figsize=(6.4, 3.0))

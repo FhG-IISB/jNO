@@ -43,19 +43,15 @@ def _x64():
 # absorbing top, absorbing bottom carrying a normally-incident wave. (Periodic variant of
 # code/opt3d.py from the metasurface project.)
 # ------------------------------------------------------------------------------------
-def _build_periodic_problem(dx=0.4):
+def _periodic_cell_domain(dx=0.4):
     import jax
 
     jax.config.update("jax_enable_x64", True)
-    import jax.numpy as jnp
 
     from jno.utils.solver.fem_adapt import _domain_from_arrays
 
-    K0 = 2 * np.pi
-    EMAX = 6.0
     Lx = Ly = 2.4  # keep opt3d's default extent (avoids the _domain_from_arrays "no trial fields" footgun)
     Lz = 3.2
-    ZL0, ZL1 = 0.8, 1.15
     Eb = 1e-6
     xs = np.linspace(0, Lx, int(round(Lx / dx)) + 1)
     ys = np.linspace(0, Ly, int(round(Ly / dx)) + 1)
@@ -89,6 +85,19 @@ def _build_periodic_problem(dx=0.4):
     d.tag("right", lambda x, y, z: x > Lx - Eb)
     d.tag("front", lambda x, y, z: y < Eb)
     d.tag("back", lambda x, y, z: y > Ly - Eb)
+    return d, (Lx, Ly, Lz)
+
+
+def _build_periodic_problem(dx=0.4):
+    import jax
+
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    K0 = 2 * np.pi
+    EMAX = 6.0
+    ZL0, ZL1 = 0.8, 1.15
+    d, _ = _periodic_cell_domain(dx)
 
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
@@ -142,6 +151,51 @@ def test_infer_spec_from_periodic_problem():
     # normally-incident source read off the bottom face
     assert s.k_in == (0.0, 0.0)
     assert s.source_face in ("bottom", "top")
+
+
+def _substrate_interface_problem(n_sub, z_if=1.2, dx=0.4):
+    """A bare interface: substrate of index ``n_sub`` (z < z_if) under air, plane wave launched from the bottom."""
+    import jax.numpy as jnp
+
+    K0 = 2 * np.pi
+    d, _ = _periodic_cell_domain(dx)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    bt, tp = d.variable("bottom", split=True), d.variable("top", split=True)
+    lf, rt = d.variable("left", split=True), d.variable("right", split=True)
+    fr, bk = d.variable("front", split=True), d.variable("back", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    ubt, vbt = u.bind(x=bt[0], y=bt[1], z=bt[2]), phi.bind(x=bt[0], y=bt[1], z=bt[2])
+    utp, vtp = u.bind(x=tp[0], y=tp[1], z=tp[2]), phi.bind(x=tp[0], y=tp[1], z=tp[2])
+    ulf, urt = u.bind(x=lf[0], y=lf[1], z=lf[2]), u.bind(x=rt[0], y=rt[1], z=rt[2])
+    ufr, ubk = u.bind(x=fr[0], y=fr[1], z=fr[2]), u.bind(x=bk[0], y=bk[1], z=bk[2])
+    eps = 1.0 + jno.fn(lambda x, y, z: jnp.where(z < z_if, n_sub**2 - 1.0, 0.0), [xi, yi, zi])
+    return [
+        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi),
+        -(1j * K0 * utp) * vtp,
+        -(1j * K0 * n_sub * ubt - 2j * K0 * n_sub) * vbt,  # the wave enters the substrate: k = n_sub * K0
+        ulf - urt,
+        ufr - ubk,
+    ]
+
+
+@needs_fmmax
+def test_wavelength_is_the_vacuum_one_when_light_enters_from_a_substrate():
+    """#246: the source on a substrate of index n must not make the reported wavelength lambda/n.
+
+    The solve only sees k0^2*eps, so T and R were right; the spec (and the layer permittivities)
+    were scaled by the substrate index. Checked against the bare-interface Fresnel answer.
+    """
+    n = 1.56
+    rc = jno.rcwa(_substrate_interface_problem(n), orders=5, grid=8, nz=33)
+    s = rc.spec
+    assert abs(s.wavelength - 1.0) < 1e-3, s.wavelength
+    eps = [float(np.real(e).mean()) for _, e in s.layers]
+    assert abs(eps[0] - n**2) < 1e-2 and abs(eps[-1] - 1.0) < 1e-2, eps  # incident = substrate, exit = air
+    sol = rc.solve()
+    T, R = sol.efficiency("T"), sol.efficiency("R")
+    assert abs(R - ((n - 1) / (n + 1)) ** 2) < 2e-3
+    assert abs(T - 4 * n / (n + 1) ** 2) < 2e-3
 
 
 def test_explicit_wavelength_override():
@@ -710,6 +764,30 @@ def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
     balance = 1.0 - float(sol.efficiency("R")) - float(sol.efficiency("T"))
     assert 0.1 < balance < 0.9
     assert absorbed == pytest.approx(balance, rel=1e-3)
+
+
+@needs_fmmax
+@pytest.mark.parametrize("readout", ["field", "field3d"])
+def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
+    """#313: with a period of exactly two wavelengths in air, the (+-2,0) and (0,+-2) orders have kz = 0 in the
+    air layer. T and R stay finite, but the interior amplitudes (and so the field in every layer above that
+    one) were NaN with nothing to signal it. It must raise and name the order; a period off the resonance
+    gives a finite field."""
+    from jno.rcwa import Rcwa
+
+    g = np.ones((16, 16))
+    g[4:12, 4:12] = 3.0
+
+    def solve(period):
+        stack = [(0.5, 2.13), (0.36, g), (0.5, 1.0)]
+        return Rcwa(stack, period=(period, period), orders=25, wavelength=WL, assume_periodic=True).solve()
+
+    # Where the solve's own T/R guard already trips (the efficiencies come out NaN on some backends, here a
+    # GPU), the same grazing message is raised one step earlier: either way it is loud, never a NaN field.
+    with pytest.raises(jno.RcwaError, match="grazing"):
+        getattr(solve(2.0), readout)(nx=16, density=20.0)
+    out = getattr(solve(2.1), readout)(nx=16, density=20.0)
+    assert np.isfinite(np.asarray(out[0])).all()
 
 
 @needs_fmmax

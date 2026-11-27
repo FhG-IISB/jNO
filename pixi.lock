@@ -5652,7 +5652,7 @@ packages:
   - mmgpy ; extra == 'mesh'
   - pypardiso>=0.4.4 ; platform_machine == 'x86_64' and extra == 'pardiso'
   - nvmath-python>=1.0 ; platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cudss'
-  - nvidia-cudss-cu12 ; platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cudss'
+  - nvidia-cudss-cu12>=0.8,<0.9 ; platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cudss'
   - cupy-cuda12x ; platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cudss'
   - pytest>=7.0 ; extra == 'dev'
   - black>=22.0 ; extra == 'dev'

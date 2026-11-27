@@ -3489,3 +3489,18 @@ def test_cg_on_a_nonsymmetric_grid_problem_raises():
     )
     with pytest.raises(ValueError, match="symmetric"):
         prob.solve(linear=jno.solve.cg(), precond=jno.precond.gmg())
+
+
+def test_a_parameters_initial_value_is_the_source_it_solves_with():
+    """`f.initialize(constant(1.0))` on a `jno.np.parameter` without an optimizer is lazy, so `jno.fdm` read the
+    zeros the parameter is born with and solved -Δu - f = 0 to u = 0, with no error. The initial value is used,
+    as in `jno.fem`: the answer equals the one with the literal f = 1."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = jno.np.parameter((1,), name="f").initialize(jax.nn.initializers.constant(1.0))
+    got = np.asarray(jno.fdm([-ui.laplacian(x, y) - f, u(xb, yb) - 0.0]).solve())
+    want = np.asarray(jno.fdm([-ui.laplacian(x, y) - 1.0, u(xb, yb) - 0.0]).solve())
+    assert np.abs(want).max() > 1e-2 and np.abs(got - want).max() < 1e-8

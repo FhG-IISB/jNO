@@ -109,13 +109,23 @@ def _nodes(node):
         yield from _nodes(c)
 
 
+def _region_tag(v):
+    """The boundary tag a coordinate Variable was bound to. A fem build rebinds a boundary Variable to its
+    quadrature pool in place (``right`` -> ``gauss_right``) and keeps the original in ``_jno_region_tag``;
+    a coupling built from the same expressions afterwards must still read ``right``."""
+    t = v.tag
+    if isinstance(t, str) and (t == "fem_gauss" or t.startswith("gauss_")):
+        return getattr(v, "_jno_region_tag", t)
+    return t
+
+
 def _spatial_tags(node):
     """The boundary tags of the spatial coordinate variables in ``node`` (normals excluded)."""
     from .._fvm.trace import _is_normal
     from .._strong_form import _iter_variables
 
     return {
-        v.tag
+        _region_tag(v)
         for v in _iter_variables(node)
         if getattr(v, "axis", "spatial") == "spatial" and not _is_normal(v) and v.tag is not None
     }
@@ -182,7 +192,7 @@ class Coupled:
                     getattr(v, "_domain", None) is dom for v in cv.values() if getattr(v, "axis", "spatial") == "spatial"
                 )
             ]
-            tags = {v.tag for cv in mine for v in cv.values() if getattr(v, "axis", "spatial") == "spatial"}
+            tags = {_region_tag(v) for cv in mine for v in cv.values() if getattr(v, "axis", "spatial") == "spatial"}
             if not tags:  # no binding survived (git-bug 3c78460): its own Variables in the tree say where it is
                 tags = self._tags_from_variables(expr, dom)
                 if len(tags) == 1:
@@ -212,7 +222,7 @@ class Coupled:
         for v in _iter_variables(expr):
             if getattr(v, "_domain", None) is not dom or getattr(v, "axis", "spatial") == "temporal":
                 continue
-            tag = str(v.tag)
+            tag = str(_region_tag(v))
             tags.add(tag[2:] if _is_normal(v) and tag.startswith("n_") else tag)
         return tags
 

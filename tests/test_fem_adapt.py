@@ -640,3 +640,19 @@ def test_adapt_vector_field_anisotropic_rejected():
     fem = jno.fem([weak, u(xb, yb) - 0.0])
     with pytest.raises(NotImplementedError, match="scalar-only"):
         fem.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=2, anisotropic=True))
+
+
+def test_remesh_of_a_p2_problem_returns_the_full_p2_field():
+    """After a remesh round a P2 problem returned its VERTEX values (one per mesh vertex) while
+    `fem.dofs` counted P2 DOFs, so `fem.eval` read a vertex-sized vector as a P2 field and the error grew."""
+    d = _l_shape_domain(0.2)
+    u, phi = d.fem_symbols(order=2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - _u_singular(xb, yb, J, _mod)])
+    sol = np.asarray(fem.solve(adapt=jno.solve.remesh(theta=0.5, max_iters=2, refine_factor=2.0)))
+    assert sol.size == fem.dofs > np.asarray(fem.domain.mesh.points).shape[0]
+    pts = np.asarray(fem.domain.mesh.points)
+    exact = _u_singular(pts[:, 0], pts[:, 1], np, lambda a, m: np.mod(a, m))
+    assert np.abs(sol[: pts.shape[0]] - exact).max() < 2e-2  # the vertex values of the P2 field

@@ -873,3 +873,53 @@ def test_couple_with_declared_interface_conditions():
     sol = np.asarray(jno.core([femL, fdmR, value_cond, flux_cond]).solve()).reshape(-1)
     rel = float(np.linalg.norm(sol - exact) / np.linalg.norm(exact))
     assert rel < 5e-2, f"declared-interface coupling must match the MMS solution, got {rel:.2e}"
+
+
+def _fem_fdm_overlap_coupling():
+    """`-div(k grad u) = f` on the unit square with a coefficient jump at x = 0.5: FEM on x <= 0.7, finite
+    differences on x >= 0.6, so the two methods differ in the overlap by their discretisation error."""
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    k_left, k_right = 1.0, 10.0
+    kfun = lambda x, m: m.where(x < 0.5, k_left, k_right)
+    phi = lambda x, m: (x - 0.5) / kfun(x, m) + m.cos(2 * np.pi * (x - 0.5))
+    exact = lambda x, y, m: m.sin(np.pi * y) * phi(x, m)
+    source = lambda x, y, m: (
+        -kfun(x, m) * (-4 * np.pi**2 * m.cos(2 * np.pi * (x - 0.5)) - np.pi**2 * phi(x, m)) * m.sin(np.pi * y)
+    )
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("soft", box(0.0, 0.0, 0.5, 1.0))
+    d.region("stiff", box(0.5, 0.0, 1.0, 1.0))
+    d.build_mesh(mesh_size=0.1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f, g = source(xi, yi, jnn), exact(xb, yb, jnn)
+    uf, vf = d.fem_symbols()
+    ui, vi = uf.bind(x=xi, y=yi), vf.bind(x=xi, y=yi)
+    fem = jno.fem([kfun(xi, jnn) * (ui.x * vi.x + ui.y * vi.y) - f * vi, uf(xb, yb) - g])
+    u = d.unknown()
+    us = u.bind(x=xi, y=yi)
+    fdm = jno.fdm([-k_right * (us.d2(xi) + us.d2(yi)) - f, u(xb, yb) - g])
+    left, right = jno.shape.rect(0.0, 0.0, 0.7, 1.0), jno.shape.rect(0.6, 0.0, 1.0, 1.0)
+    return couple([(fem, left), (fdm, right)])
+
+
+def test_overlap_schwarz_of_two_discretisations_stops_on_the_iterate_change():
+    """With FEM on one side and finite differences on the other, the overlap jump settles at their
+    discretisation gap (here ~2.6e-3, far above tol) at any number of sweeps; the plain loop stopped on it and
+    always ran to max_iter. It stops on the change of the iterate, like the differentiable path, and reports the
+    jump as information."""
+    cpl = _fem_fdm_overlap_coupling()
+    _, info = cpl.solve(tol=1e-9, max_iter=400, return_info=True)
+    assert info["iterations"] < 200, info
+    assert info["iterate_change"] < 1e-9
+    assert info["overlap_jump"] > 1e-4  # the discretisation gap: reported, not the stopping test
+
+
+def test_overlap_schwarz_warns_when_tol_is_not_met_by_max_iter():
+    cpl = _fem_fdm_overlap_coupling()
+    with pytest.warns(UserWarning, match="did not reach tol"):
+        _, info = cpl.solve(tol=1e-12, max_iter=2, return_info=True)
+    assert info["iterations"] == 2

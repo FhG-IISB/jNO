@@ -10,7 +10,9 @@ method-of-lines split. Nothing in this module discretises.
 from __future__ import annotations
 
 import contextlib
+import os
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -395,8 +397,34 @@ class StrongFormProblem:
         for lid, model in models.items():
             module = getattr(model, "module", None)
             if module is not None:
-                found[lid] = self._nodal_module(module)
+                found[lid] = self._nodal_module(self._with_initial_value(model, module))
         return found
+
+    @staticmethod
+    def _with_initial_value(model, module):
+        """A parameter's ``.initialize(...)`` is lazy (the training loop applies it), so a stored value still at
+        the zeros the parameter is born with read as 0 in an eager solve without an optimizer: ``-Δu - f`` with
+        ``f.initialize(constant(1.0))`` solved with f = 0 and no error. Resolve the initializer the way
+        ``jno.fem`` does; a value set by hand (not all zero) is kept."""
+        value = getattr(module, "value", None)
+        if (
+            value is None
+            or not getattr(model, "_is_parameter", False)
+            or isinstance(value, jax.core.Tracer)
+            or np.any(np.asarray(value))
+        ):
+            return module
+        from .geometry.parametric import model_initial_value
+
+        init = model_initial_value(model)
+        weight = getattr(model, "_weight_tree", None)
+        if init is None and weight is not None and not isinstance(weight, (str, os.PathLike)):
+            init = weight
+        if init is None:
+            return module
+        import equinox as eqx
+
+        return eqx.tree_at(lambda m: m.value, module, jnp.reshape(jnp.asarray(init, value.dtype), jnp.shape(value)))
 
     def _nodal_module(self, module):
         """``module``, with a value of one entry per node (``(N,)``) shaped ``(N, 1)``: a per-node scalar field,

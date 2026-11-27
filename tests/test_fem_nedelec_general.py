@@ -1085,3 +1085,18 @@ def test_hypre_ams_at_degree_k_is_flat_under_refinement():
 
     assert not PETSc.Options().hasName("pc_hypre_ams_cycle_type")
     assert _ams_iterations(0.35, 1, hyp)[0] == 11  # measured 11 (coordinates, default cycle) before any degree-k run
+
+
+def test_inner_of_two_scalar_curls_is_their_product():
+    """On a 2-D N1E field the curl is a scalar, so ``inner(curl u, curl v)`` is ``curl u * curl v`` (it used to sum
+    the last axis away and fail to build)."""
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E", order=1)
+    x, y = d.variable("interior", split=True)[:2]
+    mass = jno.np.inner(u.bind(x=x, y=y), v.bind(x=x, y=y))
+    cu, cv = u.vector.curl(x, y), v.vector.curl(x, y)
+    A_inner = jno.fem([mass + jno.np.inner(cu, cv)]).A
+    A_prod = jno.fem([mass + cu * cv]).A
+    A_inner, A_prod = (np.asarray(A) for A in (A_inner, A_prod))
+    np.testing.assert_allclose(A_inner, A_prod, rtol=1e-10, atol=1e-12)
+    assert np.abs(A_inner - np.asarray(jno.fem([mass]).A)).max() > 0.0  # the curl-curl part is there

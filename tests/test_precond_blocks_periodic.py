@@ -78,7 +78,7 @@ def _channel(periodic: bool, nonlinear: bool = False):
         xe, ye, _ = d.variable("ends", split=True)
         terms += [u(xe, ye)[0] - _poiseuille(ye), u(xe, ye)[1] - 0.0]
     fem = jno.fem(terms)
-    ref = np.asarray(fem.solve(linear=jno.solve.lu(backend="host")))
+    ref = _arr(fem.solve(linear=jno.solve.lu(backend="host")))  # a periodic nonlinear solve is a lazy node
     return fem, u, p, pb, qb, ref
 
 

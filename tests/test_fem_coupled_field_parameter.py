@@ -149,3 +149,29 @@ def test_field_parameter_spanning_different_order_fields_builds_and_warns():
     with pytest.warns(UserWarning, match="carry P1"):
         fem = jno.fem(cons)
     assert fem.is_transient
+
+
+def test_a_per_cell_parameter_against_a_higher_order_field_does_not_warn_about_the_vertex_mesh():
+    """A P0 parameter holds one value per cell and is not resolved on the vertex mesh, so the
+    "carry P1 (mesh-vertex) values" warning (right for a P1 parameter, test above) must not fire."""
+    import warnings
+
+    d = jno.shape.rect(0, 0, 1, 1, size=0.3).domain()
+    _, s = d.fem_symbols(space="P0", names=("r_nu", "s_nu"))
+    nu = jno.np.parameter(s, name="nu")
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    X = d.variable("interior", split=True)[:2]
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = jno.np.grad(u, X), jno.np.grad(v, X)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        jno.fem(
+            [
+                nu * jno.np.inner(gu, gv, n_contract=2) - p.bind(x=X[0], y=X[1]) * jno.np.trace(gv),
+                -q.bind(x=X[0], y=X[1]) * jno.np.trace(gu),
+                u(xb, yb)[0] - yb * (1 - yb),
+                u(xb, yb)[1] - 0.0,
+            ]
+        )
+    assert not [w for w in caught if "carry P1" in str(w.message)]

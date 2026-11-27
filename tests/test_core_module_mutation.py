@@ -119,8 +119,15 @@ def test_the_eager_solve_path_still_reads_the_module_live():
     g = jno.np.parameter((1,), name="g", key=jax.random.PRNGKey(0))
     form = [ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - g]
 
+    def solve_now():
+        # A parametric solve is a deferred node; the core that evaluates it reads the module when it is built,
+        # so a core built after the mutation sees it. (np.asarray of the node itself used to give a 0-d object
+        # array, and the comparison below then compared two nodes and passed whatever they held.)
+        node = jno.fem(form).solve()
+        return np.asarray(jno.core([node.mse], domain=d).eval([node])).reshape(-1)
+
     _set(g, 1.0)
-    lo = np.asarray(jno.fem(form).solve()).reshape(-1)
+    lo = solve_now()
     _set(g, 5.0)
-    hi = np.asarray(jno.fem(form).solve()).reshape(-1)
+    hi = solve_now()
     assert hi.mean() - lo.mean() > 3.0, f"the eager solve stopped reading the module: {lo.mean()} -> {hi.mean()}"

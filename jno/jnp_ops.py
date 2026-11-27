@@ -720,7 +720,16 @@ def concat(items, axis: int = -1) -> FunctionCall:
     """
     items = _align_temporal(items)
 
+    # Components of an FE symbol (trial or test function) are bare, (n_q, n_dof): the components of one vector
+    # go on a NEW last axis, (n_q, n_dof, n_comp) as the symbol itself is. Joined along the last axis they came
+    # out as (n_q, n_comp * n_dof), and every product with a per-point vector then failed to broadcast.
+    from .trace import _component_keeps_axis
+
+    fe_components = not all(_component_keeps_axis(_u(i)) for i in items)
+
     def _fn(*args):
+        if fe_components:
+            return jnp.stack(jnp.broadcast_arrays(*[jnp.asarray(a) for a in args]), axis=-1)
         expanded = []
         for a in args:
             a = jnp.asarray(a)
@@ -774,7 +783,7 @@ def concat(items, axis: int = -1) -> FunctionCall:
         broadcasted = [jnp.broadcast_to(a, target_prefix + (a.shape[-1],)) for a in aligned]
         return jnp.concatenate(broadcasted, axis=-1)
 
-    return FunctionCall(_fn, [_u(i) for i in items], name="concat")
+    return _attach_coords(FunctionCall(_fn, [_u(i) for i in items], name="concat"), list(items))
 
 
 # docstring-from: jno.jnp_ops.concat
@@ -806,7 +815,12 @@ def vector(*components):
     """
     from .trace.views import VectorView
 
-    return VectorView(concat(list(components)))
+    call = concat(list(components))
+    out = VectorView(call)
+    cv = getattr(call, "_coord_vars", None)
+    if cv:  # the components' region binding, so `vector(Et[0], Et[1])` is bound as `Et` is
+        object.__setattr__(out, "_coord_vars", dict(cv))
+    return out
 
 
 def stack(items, axis: int = 0) -> FunctionCall:
@@ -1738,6 +1752,22 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
     Returns:
         FunctionCall: the contraction.
     """
+
+    from .trace import _component_keeps_axis
+    from .trace.views import ScalarView
+
+    if (
+        n_contract == 1
+        and not keepdims
+        and isinstance(x, ScalarView)
+        and isinstance(y, ScalarView)
+        and not (_component_keeps_axis(_u(x)) and _component_keeps_axis(_u(y)))
+    ):
+        # Two scalar FE quantities, as the curl of a 2-D N1E field is: there is no value axis to contract, and
+        # the last axis of ``(n_q,)`` / ``(n_q, n_dof)`` would be summed away. Their inner product is the
+        # product, exactly as written ``cu * cv`` (a per-point scalar field, ``(N, 1)``, still contracts its
+        # one column below).
+        return _attach_coords(_u(x) * _u(y), [x, y])
 
     def _fn(a, b, _n=n_contract, _keep=keepdims):
         a = jnp.asarray(a)

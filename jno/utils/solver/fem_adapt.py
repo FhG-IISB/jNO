@@ -535,11 +535,17 @@ def _rebuilt_remeshed(domain: Any, vertex_size: np.ndarray) -> _Remeshed:
             "built from a jno.shape). Adapt a shape-built domain, or refine the file's mesh outside jNO."
         )
     if getattr(plan, "_structured", None) is not None:
+        if len(plan.leaves()) > 1:  # a rectilinear lattice of several boxes: n= is refused there, size= decides
+            resolution, knob = (
+                "a lattice of several boxes takes its spacing from the regions' size= (and grading=)",
+                "lower the regions' size= and rebuild the lattice yourself",
+            )
+        else:
+            resolution, knob = "a lattice's resolution is its cell COUNTS", "rebuild the lattice yourself at a larger n"
         raise NotImplementedError(
-            "h-adaptive remeshing cannot refine a shape.structured() plan: a lattice's resolution is its "
-            "cell COUNTS, so rebuilding it against a marked size field returns the same mesh -- a silent "
-            "no-op. Drop .structured() to let gmsh mesh (and recombine) the geometry at a graded size, "
-            "or rebuild the lattice yourself at a larger n."
+            f"h-adaptive remeshing cannot refine a shape.structured() plan: {resolution}, so rebuilding it "
+            "against a marked size field returns the same mesh -- a silent no-op. Drop .structured() to let gmsh "
+            f"mesh (and recombine) the geometry at a graded size, or {knob}."
         )
     dim = int(domain.dimension)
     pts = np.asarray(domain.mesh.points)[:, :dim]
@@ -3433,6 +3439,10 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     # rebind the caller's FEM to the final adapted state so fem.points / A / b match ``u``
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
+    # A higher-order Lagrange field has more DOFs than vertices: return the whole field (the vector
+    # `fem.dofs` counts and `fem.eval` reads), not the vertex view the estimator worked on.
+    if u is not None and _cover_block_stride(cur) == 1 and np.size(u) != _full.size:
+        return _full
     return u
 
 

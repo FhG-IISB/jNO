@@ -191,7 +191,7 @@ def test_a_position_dependent_initial_condition_follows_the_moving_mesh():
 
     y1 = _param("y1", 1.0)
     moved = np.sort(np.asarray(_value_of(march(y1), "y1", 1.5)))
-    rebuilt = np.sort(np.asarray(march(1.5)).reshape(-1))
+    rebuilt = np.sort(np.asarray(march(1.5).eval()).reshape(-1))  # a transient solve is a deferred node
     if moved.size == rebuilt.size:
         assert np.allclose(moved, rebuilt, rtol=0, atol=2e-2)
     # the strong statement that does not depend on matching meshes: the INITIAL maximum is the moved top
