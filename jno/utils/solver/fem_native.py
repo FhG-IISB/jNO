@@ -1446,7 +1446,21 @@ def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
         b = (b - lin(jnp.zeros(n, b.dtype).at[dofs].set(vals))).at[dofs].set(vals * s)
         diag = diag.at[dofs].set(s)
         diag_fn = lambda: diag  # noqa: E731
-    return _unstored_operator(lin, mask, pin, diag_fn, n), b
+    A = _unstored_operator(lin, mask, pin, diag_fn, n)
+    if getattr(jacobian, "sem_statics", None) is not None:
+        # the spectral-element preconditioners' data (sem_precond.py), at the one state a linear form has
+        _sem: list = []
+
+        def sem():
+            if not _sem:
+                from .sem_precond import sem_data
+
+                with jax.ensure_compile_time_eval():
+                    _sem.append(sem_data(jacobian, zeros, mask, pin))
+            return _sem[0]
+
+        A.sem_fn = sem
+    return A, b
 
 
 def diagonal_entries(apply, n, dtype):
@@ -3567,19 +3581,14 @@ def assemble_fem_native(
         except _NotSeedable:
             return None
 
-    def _vol_elem_diag(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
-        """The diagonal of one volume term's own-field element block on cell ``c``, ``(n_test,)``, by sum
-        factorisation; ``None`` where it does not apply (no tensor factors, a term that is not seeded).
-
-        A weak term is, per quadrature point, a bilinear form in the trial field's value and gradient there and the
-        test function's: ``I_q = X_q^T C_q Y_q`` (for a nonlinear term, its linearisation at the state). The
-        diagonal entry of node ``n`` is ``Σ_q w_q ψ_n(q)^T C_q ψ_n(q)`` with ``ψ_n = (φ_n, ∇φ_n)``. ``C_q`` is
-        read off the integrand itself, ``(1 + dim)·vec`` forward-over-reverse passes of the POINTWISE integrand with
-        the field's point data put in directly. In reference coordinates every product ``ψ_a ψ_b`` is a product of
-        1-D tables per axis (``B∘B``, ``B∘D``, ``D∘D``), so the sum over the points is one contraction per axis per
-        pair: ``O((1 + d)² k^(d+1))`` per cell, where differentiating the element residual for every local DOF
-        costs ``O(k^(2d+1))`` (measured at Q8, 2M DOFs: most of a matrix-free build). A term that reads the field
-        some other way (a second derivative) is caught by the caller, which checks this against that exact pass."""
+    def _vol_elem_C(
+        c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None, *, full=False
+    ):  # fmt: skip
+        """``(Cr, factors)``: one volume term's per-point bilinear coefficients on cell ``c`` in REFERENCE
+        coordinates, ``Cr[comp, q, a, b]`` (trial slot ``a`` against test slot ``b``, slot 0 the value, ``1 + i``
+        the derivative along ``ξ_i``; the quadrature weight and ``|det J|`` included), and the field's tensor
+        factors. ``full=True``: every component pair, ``Cr[trial comp, test comp, q, a, b]``. ``None`` where the
+        term is not read this way. See :func:`_vol_elem_diag`."""
         cell_sols = _split_cell_local(local_all)
         per, loc, w = _vol_loc(c, cell_sols, local_all.dtype, tfi, rnames, t, args, pts, cells, cells_f)
         base = per[tfi]
@@ -3631,15 +3640,67 @@ def assemble_fem_native(
             dV, dH = jax.vmap(column)((dU, dG))  # (T, n_q, vec), (T, n_q, vec, dim)
         except _NotSeedable:
             return None
-        # C[comp, q, a, b]: trial slot a (value, ∂/∂x_d) against test slot b, same component
+        # C[trial comp k, test comp l, q, a, b]: trial slot a (value, ∂/∂x_d) against test slot b
         Ct = jnp.concatenate([dV[..., None], dH], axis=-1).reshape(vec, 1 + dim, n_q, vec, 1 + dim)
-        C = jnp.stack([Ct[k, :, :, k, :] for k in range(vec)])  # (vec, 1+dim, n_q, 1+dim)
-        C = jnp.moveaxis(C, 2, 1)  # (vec, n_q, 1+dim trial, 1+dim test)
+        C = jnp.transpose(Ct, (0, 3, 2, 1, 4))  # (vec, vec, n_q, 1+dim trial, 1+dim test)
+        if not full:
+            C = jnp.stack([C[k, k] for k in range(vec)])  # (vec, n_q, 1+dim, 1+dim): same component only
         # to reference coordinates: the physical gradient is ∂u/∂ξ · K (K = J⁻¹ per point)
         K = jnp.broadcast_to(factors.per_point(Kq)[:, 0], (n_q,) + tuple(jnp.shape(factors.per_point(Kq))[-2:]))
         tdim = int(K.shape[-2])
         T = jnp.zeros((n_q, 1 + tdim, 1 + dim), dtype).at[:, 0, 0].set(1.0).at[:, 1:, 1:].set(K)
-        Cr = jnp.einsum("qae,kqef,qbf->kqab", T, C, T, precision=jax.lax.Precision.HIGHEST)
+        sub = "...qef" if full else "kqef"
+        out = "...qab" if full else "kqab"
+        return jnp.einsum(f"qae,{sub},qbf->{out}", T, C, T, precision=jax.lax.Precision.HIGHEST), factors
+
+    def _vol_cell_sem(
+        c, local_all, coeff, tfi, rnames, t, args, pts, cells, cells_f, mask_cell, phi_local
+    ):  # fmt: skip
+        """One volume term's contribution to the spectral-element preconditioners on cell ``c``, or ``None``:
+
+        - ``(vec, 1 + tdim)`` separable coefficients, ``Σ_q Cr[k, k, q, a, a]`` (the reference cell's volume is 1, so
+          this is the cell mean of the value and the axis-``a`` slot, ``|det J|`` and the metric included). An
+          axis-aligned affine cell with a constant coefficient is exactly ``Σ_a c_a (M⊗..K..⊗M) + c_0 M⊗..⊗M`` in
+          these numbers;
+        - ``(n_v·vec, n_v·vec)`` the cell's block of the Q1 Galerkin coarse operator ``P̂ᵀ A P̂``, ``P̂ = mask · P``:
+          the masked vertex functions (``phi_local`` ``(n_dof, n_v)`` at the element's nodes, ``mask_cell``
+          ``(n_dof, vec)``) evaluated at the quadrature points by the tensor factors, against ``Cr``. Exact for this
+          term (the coarse functions are in the fine space, and the rule is the fine one).
+
+        See ``jno/utils/solver/sem_precond.py``."""
+        got = _vol_elem_C(c, local_all, coeff, tfi, rnames, t, args, pts, cells, cells_f, full=True)
+        if got is None:
+            return None
+        Cr, factors = got  # (vec, vec, n_q, 1 + tdim, 1 + tdim)
+        vec, n_v = int(Cr.shape[0]), int(phi_local.shape[1])
+        coeffs = jnp.stack(
+            [jnp.stack([Cr[k, k, :, a, a].sum() for a in range(Cr.shape[-1])]) for k in range(vec)]
+        )  # fmt: skip
+        F = (phi_local[:, :, None] * mask_cell[:, None, :]).astype(Cr.dtype).reshape(phi_local.shape[0], n_v * vec)
+        psi = jnp.concatenate([factors.values(F)[..., None], factors.ref_grads(F)], axis=-1).reshape(
+            -1, n_v, vec, Cr.shape[-1]
+        )  # (n_q, n_v, comp, slot): function (j, comp) lives in comp only
+        Ce = jnp.einsum("klqab,qjka,qilb->iljk", Cr, psi, psi, precision=jax.lax.Precision.HIGHEST)
+        return coeffs, Ce.reshape(n_v * vec, n_v * vec)
+
+    def _vol_elem_diag(c, local_all, coeff, tfi, rnames, t=0.0, args=None, pts=None, cells=None, cells_f=None):
+        """The diagonal of one volume term's own-field element block on cell ``c``, ``(n_test,)``, by sum
+        factorisation; ``None`` where it does not apply (no tensor factors, a term that is not seeded).
+
+        A weak term is, per quadrature point, a bilinear form in the trial field's value and gradient there and the
+        test function's: ``I_q = X_q^T C_q Y_q`` (for a nonlinear term, its linearisation at the state). The
+        diagonal entry of node ``n`` is ``Σ_q w_q ψ_n(q)^T C_q ψ_n(q)`` with ``ψ_n = (φ_n, ∇φ_n)``. ``C_q`` is
+        read off the integrand itself, ``(1 + dim)·vec`` forward-over-reverse passes of the POINTWISE integrand with
+        the field's point data put in directly. In reference coordinates every product ``ψ_a ψ_b`` is a product of
+        1-D tables per axis (``B∘B``, ``B∘D``, ``D∘D``), so the sum over the points is one contraction per axis per
+        pair: ``O((1 + d)² k^(d+1))`` per cell, where differentiating the element residual for every local DOF
+        costs ``O(k^(2d+1))`` (measured at Q8, 2M DOFs: most of a matrix-free build). A term that reads the field
+        some other way (a second derivative) is caught by the caller, which checks this against that exact pass."""
+        got = _vol_elem_C(c, local_all, coeff, tfi, rnames, t, args, pts, cells, cells_f)
+        if got is None:
+            return None
+        Cr, factors = got
+        vec, tdim, dtype = int(Cr.shape[0]), int(Cr.shape[-1]) - 1, Cr.dtype
         B, D = factors.B, factors.D
 
         def table(slot_, axis):
@@ -4888,7 +4949,7 @@ def assemble_fem_native(
                 _inv_blocks_cache[key] = hit
             return hit[1]
 
-        def jacobian(u_flat, t=0.0, args=None, *, diag=False, elements=False, _verdicts_only=False):
+        def jacobian(u_flat, t=0.0, args=None, *, diag=False, elements=False, _verdicts_only=False, sem=None):
             """The assembled tangent (a BCOO); with ``diag=True`` only its DIAGONAL, a ``(total,)`` vector.
 
             With ``elements=True`` nothing is summed: it returns the raw triplets ``(rows, cols, data, cell)``,
@@ -4901,6 +4962,12 @@ def assemble_fem_native(
             row and column coincide, scattered straight into one vector: no matrix, no sparsity plan, and a
             batch of element blocks as the only scratch -- what a Jacobi preconditioner on the matrix-free
             Newton needs (as deal.II's ``MatrixFreeTools::compute_diagonal`` does)."""
+            # ``sem=(mask, phi_local)``: per test field, ``(coeffs (n_cells, vec, 1 + tdim), Ce (n_cells, n_v·vec,
+            # n_v·vec))`` at this state (``_vol_cell_sem``), for the spectral-element preconditioners
+            # (sem_precond.py). Runs the diagonal's loop over the volume terms and keeps these instead.
+            _cc: Dict[int, Any] = {}
+            cell_coeffs = sem is not None
+            diag = diag or cell_coeffs
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
@@ -5006,6 +5073,33 @@ def assemble_fem_native(
                         _ok = _hit[1]
                     if _verdicts_only:
                         continue
+                    if cell_coeffs:
+                        if not _ok:
+                            raise ValueError(
+                                "a spectral-element preconditioner reads each volume term's coefficients by sum "
+                                f"factorisation, and this term is not read that way (field {tfi}): "
+                                f"{str(coeff)[:120]}. Use jno.precond.jacobi() for this problem."
+                            )
+                        _per = None if _sf_residual_bytes is None else _sf_residual_bytes * vecs[tfi] * (1 + dim)
+                        _chunk_c = (
+                            None
+                            if _per is None or (_chunk_setting is None and _n_t * _per <= whole_pass_budget_bytes())
+                            else cell_chunk(_n_t, 1, 1, _chunk_setting, per_bytes=_per)
+                        )
+                        _smask, _sphi = jnp.asarray(sem[0]), jnp.asarray(sem[1])
+                        _vt = vecs[tfi]
+
+                        def _kc(c, la, _e=coeff, _t=tfi, _r=rnames, _p=pts_dyn, _rt=cd_d[tfi]):
+                            m_c = _smask[_rt[c]].reshape(-1, _vt)  # (n_dof, vec), node-major as the test DOFs
+                            return _vol_cell_sem(c, la, _e, _t, _r, t, args, _p, cl_d, clf_d, m_c, _sphi)
+
+                        part = _elem_map(_kc, (_cells_t, _la_t), _chunk_c)
+                        if _lc is not None:
+                            part = tuple(
+                                jnp.zeros((n_cells,) + x.shape[1:], x.dtype).at[jnp.asarray(_lc)].set(x) for x in part
+                            )
+                        _cc[tfi] = part if tfi not in _cc else tuple(x + y for x, y in zip(_cc[tfi], part))
+                        continue
                     if _ok:
                         _kd = _kf
                         _per = None if _sf_residual_bytes is None else _sf_residual_bytes * vecs[tfi] * (1 + dim)
@@ -5050,6 +5144,8 @@ def assemble_fem_native(
                 )
             if _verdicts_only:  # see `prime_diag_verdicts`
                 return None
+            if cell_coeffs:
+                return _cc
 
             normals_dyn = _surface_normals(pts_dyn)  # differentiable facet normals under coordinate motion
             # A region tagged `follow_normals=True` uses the DEFORMED surface's normal instead: the
@@ -5216,6 +5312,28 @@ def assemble_fem_native(
             return _pl[0] if _pl is not None else _is
 
         jacobian._jno_static_idx_for = _static_idx_for  # type: ignore[attr-defined]
+
+        _sem_cache: list = []
+
+        def _sem_statics():
+            """The spectral-element preconditioners' host structure of this problem's field (sem_precond.py)."""
+            if not _sem_cache:
+                from .sem_precond import sem_statics
+
+                if len(fields) != 1 or _sumfact[0] is None or dynamic_topology:
+                    raise ValueError(
+                        "jno.precond.fdm_schwarz() / pmg() precondition ONE Q_k field (k >= 3, quadrilaterals or "
+                        f"hexahedra, a fixed mesh); this problem has {len(fields)} field(s)"
+                        + ("" if len(fields) != 1 or _sumfact[0] is not None else " of a lower degree or other cell")
+                        + ". Use jno.precond.jacobi()."
+                    )
+                with jax.ensure_compile_time_eval():
+                    _sem_cache.append(
+                        sem_statics(_sumfact[0], np.asarray(cdofs[0]), vecs[0], _cell_type, int(fields[0]["order"]), total)
+                    )
+            return _sem_cache[0]
+
+        jacobian.sem_statics = _sem_statics  # type: ignore[attr-defined]
         from .fem_utils import _MATRIX_FREE
 
         # A matrix-free build never assembles, so it never plans the pattern either (see `jacobian`'s
@@ -6790,6 +6908,26 @@ def assemble_fem_native(
         _op_np.matrix_free = bool(_MATRIX_FREE[0])  # the default Newton: JVPs + this diagonal, no tangent assembled
         if _op_np.matrix_free:
             _prime_diag_verdicts(jacobian, zeros)
+            # the spectral-element preconditioners' data of the tangent ``M J(P u) M + (I - M)`` (sem_precond.py)
+            _sm = jnp.ones((total,), zeros.dtype)
+            _spin = jnp.zeros((total,), zeros.dtype)
+            _sproj = lambda u: u  # noqa: E731
+            if dirichlet_pairs:
+                _sd, _sv, _sproj = dirichlet_projection(dirichlet_pairs)
+                _sm, _spin = _sm.at[_sd].set(0.0), _spin.at[_sd].set(1.0)
+
+            def _jac_sem_np(u, args=None, _m=_sm, _p=_spin, _pr=_sproj):
+                from .sem_precond import sem_data
+
+                return sem_data(jacobian, _pr(jnp.asarray(u)), _m, _p, 0.0, args)
+
+            def _jac_sem_ref(_m=_sm, _p=_spin):
+                from .sem_precond import sem_data
+
+                with jax.ensure_compile_time_eval():
+                    return sem_data(jacobian, zeros, _m, _p)
+
+            _op_np.jacobian_sem, _op_np.jacobian_sem_ref = _jac_sem_np, _jac_sem_ref
         if dirichlet_pairs and any(float(v) != 0.0 for _dof, v in dirichlet_pairs):
             _ld, _lv, _lproj = dirichlet_projection(dirichlet_pairs)
             _op_np.lift_start = lambda u0, args=None: dirichlet_lift_start(

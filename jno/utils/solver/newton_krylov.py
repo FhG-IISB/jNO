@@ -638,8 +638,9 @@ class _DiagMatvec:
     on the matrix-free Newton: :func:`~jno.utils.solver.solver_api.compose_nonlinear_solve_fn` hands it to
     ``LinearOperator.from_matvec(..., diag_fn=)``, which is what ``jno.precond.jacobi()`` reads."""
 
-    def __init__(self, mv, diag_fn):
+    def __init__(self, mv, diag_fn, sem_fn=None):
         self._mv, self.diag_fn = mv, diag_fn
+        self.sem_fn = sem_fn  # the spectral-element preconditioners' data at this iterate (sem_precond.py)
 
     def __call__(self, v):
         return self._mv(v)
@@ -680,6 +681,7 @@ def newton_krylov(
     anderson=0,
     jacobian_diag=None,
     stall=None,
+    jacobian_sem=None,
 ):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract.
@@ -710,7 +712,10 @@ def newton_krylov(
     forcing term, as in :func:`newton_direct`, when the inner solve takes a per-call tolerance.
 
     ``stall=N`` stops the loop once N steps in a row have not brought the residual 1% below its best, and
-    raises saying it stalled (see :func:`jno.solve.newton`). Not with ``anderson``."""
+    raises saying it stalled (see :func:`jno.solve.newton`). Not with ``anderson``.
+
+    ``jacobian_sem`` (``u -> SemData``) hands a composed ``jno.precond.fdm_schwarz()`` / ``pmg()`` the
+    spectral-element data of the tangent at each iterate (``jno.fem(matrix_free=True)``, ``sem_precond.py``)."""
     stall = _stall_check(stall)
     if stall is not None and anderson:
         raise ValueError("newton_krylov(stall=..., anderson=...): the stall watch is not wired into the Anderson loop.")
@@ -755,7 +760,8 @@ def newton_krylov(
             return _jacobi_bicgstab(jvp, rhs, jacobian_diag(u), tol=tol, maxit=inner_maxit)
         dfn = None if jacobian_diag is None else (lambda: jacobian_diag(u))
         kw = {} if eta is None else {"rtol": eta}
-        lin = lambda mv, b: linear_solve(_DiagMatvec(mv, dfn), b, **kw)  # noqa: E731
+        sfn = None if jacobian_sem is None else (lambda: jacobian_sem(u))
+        lin = lambda mv, b: linear_solve(_DiagMatvec(mv, dfn, sfn), b, **kw)  # noqa: E731
         return jax.lax.custom_linear_solve(jvp, rhs, lin, transpose_solve=lin)
 
     def _update(f, u, eta=None):
@@ -821,7 +827,8 @@ def newton_krylov(
         # matvec, so a diagonal attached to `g` itself would not reach them
         _d0 = lambda: jacobian_diag(u0)  # noqa: E731
         _who = "the newton_krylov inner linear_solve slot"
-        _lin0 = lambda mv, b: linear_solve(_DiagMatvec(mv, _d0), b)  # noqa: E731
+        _s0 = None if jacobian_sem is None else (lambda: jacobian_sem(u0))
+        _lin0 = lambda mv, b: linear_solve(_DiagMatvec(mv, _d0, _s0), b)  # noqa: E731
         tangent_solve = lambda g, y: jax.lax.custom_linear_solve(  # noqa: E731
             g, y, _gated(_lin0, _who, "forward"), transpose_solve=_gated(_lin0, _who, "transpose")
         )
