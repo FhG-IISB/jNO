@@ -91,3 +91,38 @@ def test_vmapped_solve_warns_once_for_the_batch():
     with pytest.warns(RcwaWarning, match="energy not conserved"):
         jax.block_until_ready(T(grids))
 
+
+def _solved_square_post(period=2.1):
+    g = np.ones((16, 16))
+    g[4:12, 4:12] = 3.0
+    stack = [(0.5, 2.13), (0.36, g), (0.5, 1.0)]
+    return Rcwa(stack, period=(period, period), orders=25, wavelength=1.0, assume_periodic=True).solve()
+
+
+def test_a_nan_field_with_finite_efficiencies_raises(monkeypatch):
+    """#313's case: T and R finite but the reconstructed field NaN. The field readout raises instead of
+    returning the NaNs (forced here by a NaN intensity from the reconstruction)."""
+    from jno._rcwa import fields as fields_mod
+
+    sol = _solved_square_post()
+    real = fields_mod.volume_intensity
+
+    def nan_intensity(*a, **k):
+        inten, x, y = real(*a, **k)
+        return inten.at[0, 0, 0].set(jnp.nan), x, y
+
+    monkeypatch.setattr(fields_mod, "volume_intensity", nan_intensity)
+    for readout in ("field", "field3d"):
+        with pytest.raises(RcwaError, match="grazing"):
+            getattr(sol, readout)(nx=16, density=20.0)
+
+
+def test_the_grazing_message_names_the_order():
+    """The message names the order whose kz vanishes: with k_in = k0 - 2 pi / P along x, the (1, 0) order lands
+    exactly on the light cone of the air substrate (layer 2), kz = 0 there."""
+    sol = _solved_square_post()
+    eng = sol._eng
+    k0 = 2 * np.pi
+    eng._prepared_kin = jnp.asarray([k0 - 2 * np.pi / 2.1, 0.0])  # (1, 0): kx = k0 exactly in the air layer
+    msg = sol._nonfinite_field_message()
+    assert "order (1, 0) in layer 2" in msg, msg

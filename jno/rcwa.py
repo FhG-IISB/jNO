@@ -338,24 +338,35 @@ class _Sol:
         return jnp.array([[exx, exy], [eyx, eyy]])  # J[out q, in p]
 
     def _nonfinite_field_message(self):
-        """Why the interior amplitudes are NaN/inf: name the order(s) whose z-wavevector vanishes in a layer
-        (a grazing order, kz = 0, makes the interior propagation 1/kz blow up while T and R stay finite)."""
-        bc = np.asarray(self._ex.basis_coefficients)
+        """Why the reconstructed field is NaN/inf: name the order(s) whose z-wavevector vanishes in an ambient or a
+        uniform layer (a grazing order, kz = 0, makes the interior propagation 1/kz blow up). ``kz^2 = eps k0^2 -
+        |k_in + G|^2`` per order, with ``G = 2 pi (m/Px, n/Py)`` on the rectangular lattice of the stack."""
+        eng = self._eng
+        bc = np.asarray(self._ex.basis_coefficients, float)
+        k0 = 2 * np.pi / float(np.real(np.asarray(eng._prepared_wl)))
+        kin = np.real(np.asarray(eng._prepared_kin, float))
+        kx = kin[0] + 2 * np.pi * bc[:, 0] / float(self._period[0])
+        ky = kin[1] + 2 * np.pi * bc[:, 1] / float(self._period[1])
         grazing = []
-        for i, layer in enumerate(self._layers):
-            ev = np.abs(np.asarray(layer.eigenvalues))  # per order and polarization: ~ |kz|
-            near = np.where(ev < 1e-4 * max(float(ev.max()), 1e-300))[0]
-            grazing += [(i, tuple(int(c) for c in bc[j % self._nt])) for j in near]
+        for i, grid in enumerate(eng._prepared_grids):
+            if isinstance(grid, tuple):
+                continue  # anisotropic: no single kz per order
+            vals = np.asarray(grid)
+            if vals.size and not np.allclose(vals, vals.flat[0]):
+                continue  # patterned: its modes are not single orders
+            kz2 = complex(vals.flat[0]) * k0**2 - kx**2 - ky**2
+            near = np.where(np.abs(kz2) < 1e-6 * k0**2)[0]
+            grazing += [(i, tuple(int(c) for c in bc[j])) for j in near]
         what = (
             "; ".join(f"order {o} in layer {i}" for i, o in dict.fromkeys(grazing))
             if grazing
             else "no single grazing order was identified"
         )
         return (
-            "the interior field is non-finite (NaN/inf) although T and R are finite: an order sits at grazing "
-            f"incidence (kz = 0), the Rayleigh/Wood condition ({what}; period={self._period}, wl={self._wl}). "
-            "Shift the wavelength, the incidence angle or the period slightly (e.g. a period of 2.1 instead of "
-            "2.0 wavelengths), or lower orders= so the truncation drops that order."
+            "the interior field is non-finite (NaN/inf): an order sits at grazing incidence (kz = 0), the "
+            f"Rayleigh/Wood condition ({what}; period={self._period}, wl={self._wl}). Shift the wavelength, the "
+            "incidence angle or the period slightly (e.g. a period of 2.1 instead of 2.0 wavelengths), or lower "
+            "orders= so the truncation drops that order."
         )
 
     def _field_volume(self, nx=80, density=40.0):
@@ -412,6 +423,8 @@ class _Sol:
             sub,
         )
         inten, x, y = _fields_mod.volume_intensity(ex, ey, ez, eng._ex, eng._prepared_kin, self._period, nx)
+        if _concrete(inten) and not np.all(np.isfinite(np.asarray(inten))):  # never a silent NaN field (#313)
+            raise RcwaError(self._nonfinite_field_message())
         return inten, x, y, jnp.asarray(z)
 
     def field(self, y_frac=0.5, nx=80, density=40.0):

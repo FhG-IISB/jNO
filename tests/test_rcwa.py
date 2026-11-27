@@ -1017,7 +1017,6 @@ def test_field3d_absorbed_power_matches_one_minus_r_minus_t():
     assert absorbed == pytest.approx(balance, rel=1e-3)
 
 
-@pytest.mark.skip(reason="field/field3d are stage 2 (task T40) on the state-space backend")
 @pytest.mark.parametrize("readout", ["field", "field3d"])
 def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
     """#313: with a period of exactly two wavelengths in air, the (+-2,0) and (0,+-2) orders have kz = 0 in the
@@ -1033,8 +1032,9 @@ def test_interior_field_names_a_grazing_order_instead_of_returning_nan(readout):
         stack = [(0.5, 2.13), (0.36, g), (0.5, 1.0)]
         return Rcwa(stack, period=(period, period), orders=25, wavelength=WL, assume_periodic=True).solve()
 
-    # Where the solve's own T/R guard already trips (the efficiencies come out NaN on some backends, here a
-    # GPU), the same grazing message is raised one step earlier: either way it is loud, never a NaN field.
+    # The state-space backend's efficiencies are already NaN at this resonance, so the solve's own T/R guard
+    # raises the grazing message one step earlier; the field readout's guard covers a NaN field with finite
+    # T/R (the case #313 was about). Either way it is loud, never a NaN field.
     with pytest.raises(jno.RcwaError, match="grazing"):
         getattr(solve(2.0), readout)(nx=16, density=20.0)
     out = getattr(solve(2.1), readout)(nx=16, density=20.0)
