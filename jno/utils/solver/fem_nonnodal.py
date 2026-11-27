@@ -226,9 +226,9 @@ def assemble_fem_nonnodal(
         _nc = int(_f.get("vec", 1) or 1)
         if _nc > 1 and spaces[_i] in ("P0", "DG", "Hermite", "Argyris", "Morley"):
             raise NotImplementedError(
-                f"jno.fem (non-nodal): a {spaces[_i]} field with {_nc} components is not supported next to a "
-                f"non-nodal field; only Lagrange takes a vector value_shape here. Declare one scalar "
-                f"{spaces[_i]} unknown per component."
+                f"jno.fem (non-nodal): a {spaces[_i]} field with {_nc} components is not supported: "
+                f"{spaces[_i]} fields hold SCALAR DOFs here, and only Lagrange takes a vector value_shape. "
+                f"Declare one scalar {spaces[_i]} unknown per component."
             )
         _ncomp.append(_nc if spaces[_i] == "Lagrange" else 1)
     has_edge = any(s in _EDGE_FAMILIES for s in spaces)
