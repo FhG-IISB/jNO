@@ -1334,8 +1334,9 @@ def _unstored_operator(lin, mask, pin, diag_fn, n):
     diag: list = []
 
     def _state():
-        if not state:
-            state.append(to_solve_device((lin, mask, pin)))
+        if not state:  # cached, so moved on concrete values even when first applied inside a trace
+            with jax.ensure_compile_time_eval():
+                state.append(to_solve_device((lin, mask, pin)))
         return state[0]
 
     def mv(v):

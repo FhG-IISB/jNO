@@ -269,3 +269,19 @@ def test_a_diagonal_the_fast_route_cannot_read_keeps_the_exact_pass(monkeypatch)
     assert verdicts and not any(verdicts)
     exact = np.diag(np.asarray(_scalar_problem(2, 4, "gll").A))
     assert np.abs(d - exact).max() < 1e-11 * np.abs(exact).max()
+
+
+def test_a_matrix_free_operator_first_applied_inside_a_trace_still_applies(monkeypatch):
+    """Its coefficients are moved to the solving device on first use and kept: a first use inside ``jit`` or
+    ``make_jaxpr`` must not keep traced values (on the GPU the next eager apply then failed with "Execution
+    supplied 15 buffers but compiled program expected 23"). On a CPU the move is a no-op, so it is made a real
+    ``device_put`` here, as on a GPU."""
+    from jno.utils.solver import placement
+
+    monkeypatch.setattr(placement, "to_solve_device", lambda tree: jax.tree_util.tree_map(jax.device_put, tree))
+    A, b = _poisson(2, 4, matrix_free=True)[0].operator
+    v = jax.numpy.ones(b.shape[0])
+    jax.make_jaxpr(A.mv)(v)
+    traced = jax.jit(A.mv)(v)
+    assert np.allclose(np.asarray(A.mv(v)), np.asarray(traced))
+    assert np.isfinite(np.asarray(A.diag())).all()
