@@ -323,7 +323,7 @@ def test_the_unused_part_of_the_step_budget_costs_nothing(make):
     n_big, out_big = _count_solves(make(4000), fem)
     assert 0 < n_small
     assert n_big == n_small, (n_small, n_big)
-    np.testing.assert_array_equal(out_small, out_big)
+    np.testing.assert_allclose(out_small, out_big, rtol=1e-6, atol=1e-9 * np.max(np.abs(out_small)))  # GPU: not bitwise
 
 
 @pytest.mark.parametrize("make", [lambda ms: jno.solve.bdf().adaptive(rtol=1e-5, atol=1e-8, max_steps=ms),
