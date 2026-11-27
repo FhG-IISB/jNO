@@ -40,16 +40,41 @@ def _lagrange_basix(cell_type, degree: int):
     """basix Lagrange element of ``degree`` on ``cell_type``.
 
     Degree > 2 *requires* an explicit Lagrange variant (basix raises ``Lagrange elements of degree > 2
-    need to be given a variant`` otherwise); we use **equispaced** nodes so the interpolation points are
-    the natural ``1/k``-spaced lattice that :func:`fem_utils._promote_to_degree` places on the global
-    mesh. Degree <= 2 keeps the default (``unset``), so P1/P2 are byte-identical to before. The mesh
-    node generator and the basis tabulation BOTH go through this one builder, so their DOF order and
-    node positions always agree."""
+    need to be given a variant`` otherwise). On a **quadrilateral or hexahedron** it is the
+    Gauss-Lobatto-Legendre (GLL) node set, ``gll_warped`` (the tensor product of the 1-D GLL points): the
+    nodes of a spectral element, whose interpolation stays well conditioned as the degree grows (an
+    equispaced Q6 interpolant has a Lebesgue constant of ~30, the GLL one ~2.7) -- the F4 item of
+    plans/fem-basis-function-gaps.md. On a simplex it stays **equispaced**, the natural ``1/k``-spaced
+    lattice. Degree <= 2 keeps the default (``unset``), so P1/P2 and Q1/Q2 are byte-identical to before. The
+    mesh node generator (:func:`fem_utils._promote_to_degree`, through :func:`lagrange_interp_points`) and
+    the basis tabulation BOTH go through this one builder, so their DOF order and node positions always
+    agree."""
     import basix
-    from basix import ElementFamily, LagrangeVariant
+    from basix import CellType, ElementFamily, LagrangeVariant
 
-    variant = LagrangeVariant.equispaced if degree > 2 else LagrangeVariant.unset
+    if degree <= 2:
+        variant = LagrangeVariant.unset
+    elif cell_type in (CellType.quadrilateral, CellType.hexahedron):
+        variant = LagrangeVariant.gll_warped
+    else:
+        variant = LagrangeVariant.equispaced
     return basix.create_element(ElementFamily.P, cell_type, degree, variant)
+
+
+def edge_node_parameters(cell_type: str, degree: int) -> np.ndarray:
+    """Parameters in ``[0, 1]``, ascending, of a degree-``degree`` Lagrange element's nodes along one edge of a
+    ``"quad"`` / ``"hexahedron"`` cell (any other name: a simplex).
+
+    ``k / degree`` up to degree 2 and on a simplex; the Gauss-Lobatto-Legendre points on a quadrilateral or
+    hexahedron above. Read off the element :func:`_lagrange_basix` builds (its nodes on the reference edge
+    ``y = z = 0``), so whoever places or looks for DOFs along an edge -- the hanging-node constraints -- follows
+    the node set the basis really has."""
+    from basix import CellType
+
+    cell = {"quad": CellType.quadrilateral, "hexahedron": CellType.hexahedron}.get(cell_type, CellType.triangle)
+    pts = np.asarray(_lagrange_basix(cell, int(degree)).points, dtype=float)
+    on_edge = np.all(np.abs(pts[:, 1:]) < 1e-12, axis=1)
+    return np.sort(pts[on_edge, 0])
 
 
 def _ref_hessian_from_tab(tab: np.ndarray, dim: int) -> np.ndarray:
@@ -253,7 +278,18 @@ def lagrange_on(cell_type: str, degree: int, quad_degree: Optional[int] = None) 
     cell, tdim = basix_cell(cell_type)
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
     elem = _lagrange_basix(cell, degree)
-    qp, qw = basix.make_quadrature(cell, qd)
+    from .fem_utils import _QUAD_RULE
+
+    if _QUAD_RULE[0] == "gll" and cell in (basix.CellType.quadrilateral, basix.CellType.hexahedron):
+        # the GLL rule at the element's own nodes (degree >= 1: k + 1 points per axis, exact to 2k - 1): every
+        # basis function is cardinal at the quadrature points, so the mass matrix is diagonal
+        qp, qw = basix.make_quadrature(cell, max(2 * degree - 1, 1), rule=basix.QuadratureType.gll)
+        # basix lists the GLL points end points first; in lexicographic order (as its Gauss rule already is)
+        # the sum-factorised kernels need no permutation of the quadrature points, forward or transposed
+        lex = np.lexsort(tuple(np.round(qp[:, a], 12) for a in range(qp.shape[1] - 1, -1, -1)))
+        qp, qw = qp[lex], qw[lex]
+    else:
+        qp, qw = basix.make_quadrature(cell, qd)
     tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1): values, 1st and 2nd ref derivatives
     return ElementSpec(
         family=f"Lagrange-P{degree}-{basix.CellType(cell).name}",
@@ -434,3 +470,162 @@ def _is_zero_table(a) -> bool:
     if isinstance(a, jax.core.Tracer):
         return False
     return not np.any(np.asarray(a))
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Sum factorisation on tensor-product cells
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _lagrange_1d(nodes: np.ndarray, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Values and first derivatives ``(len(x), len(nodes))`` at ``x`` of the Lagrange basis on ``nodes``
+    (barycentric form; a point on a node gives the exact cardinal row)."""
+    from ..._spectral.bases import _barycentric_weights
+
+    nodes, x = np.asarray(nodes, float), np.asarray(x, float)
+    w = _barycentric_weights(nodes)
+    diff = x[:, None] - nodes[None, :]
+    hit = np.abs(diff) < 1e-13
+    c = w[None, :] / np.where(hit, 1.0, diff)
+    B = c / c.sum(axis=1, keepdims=True)
+    on = hit.any(axis=1)
+    B[on] = hit[on].astype(float)
+    dn = nodes[:, None] - nodes[None, :]
+    np.fill_diagonal(dn, 1.0)
+    Dn = (w[None, :] / w[:, None]) / dn
+    np.fill_diagonal(Dn, 0.0)
+    np.fill_diagonal(Dn, -Dn.sum(axis=1))  # the derivative of a constant is zero
+    return B, B @ Dn
+
+
+# The lowest degree evaluated by sum factorisation. Q1 and Q2 keep the dense tables (8 and 27 DOFs: the
+# tables are as cheap, and their programs stay as they were).
+SUMFACT_MIN_DEGREE = 3
+
+
+class TensorFactors:
+    """The 1-D factors of a Lagrange tabulation on a quadrilateral or hexahedron.
+
+    The basis of ``Q_k`` at a tensor quadrature rule is a product of 1-D tables,
+    ``φ_n(ξ_q) = Π_a B_a[q_a, n_a]`` and ``∂φ_n/∂ξ_a = D_a[q_a, n_a] Π_{b≠a} B_b[q_b, n_b]``. A field's values and
+    gradients at the quadrature points are then one small matrix applied along each axis of the cell's DOF
+    tensor: ``O(k^(d+1))`` work per cell where contracting the dense ``(n_quad, n_dof)`` tables costs
+    ``O(k^(2d))`` (Orszag 1980). With the quadrature at the element's own nodes (GLL) ``B_a`` is the identity
+    and is skipped.
+
+    Everything is a linear map of ``cell_sol`` written in JAX, so forward mode gives the element tangent and
+    reverse mode the transposed contractions that test a flux against the basis.
+
+    Attributes:
+        B, D: per axis, the ``(m_a, p_a)`` value and derivative tables.
+        dof: ``(n_dof,)`` element DOF index of each lexicographic tensor DOF.
+        quad: ``(n_quad,)`` lexicographic index of each quadrature point, ``None`` when already in that order.
+    """
+
+    __slots__ = ("B", "D", "dof", "quad", "p", "m", "_ident")
+
+    def __init__(self, B, D, dof, quad):
+        self.B, self.D = tuple(B), tuple(D)
+        self.dof, self.quad = np.asarray(dof), quad
+        self.p = tuple(int(b.shape[1]) for b in self.B)
+        self.m = tuple(int(b.shape[0]) for b in self.B)
+        self._ident = tuple(b.shape[0] == b.shape[1] and np.array_equal(b, np.eye(b.shape[0])) for b in self.B)
+
+    @staticmethod
+    def _along(M, T, axis):
+        # Full float32 precision, stated: on an Ampere-or-later GPU a float32 ``dot_general`` otherwise runs
+        # in TensorFloat-32 (a 10-bit mantissa). A stiffness apply differences neighbouring values, so that
+        # loss is amplified with the mesh: measured on an RTX 3070, ``A x`` in float32 was off by 5.5e-4 at
+        # 227k DOFs and 5.6e-2 at 2M (CG then stalled at a relative residual of 1.1), against 2.2e-6 here.
+        M = jnp.asarray(M, _real_of(T))
+        return jnp.moveaxis(jnp.tensordot(M, T, axes=(1, axis), precision=jax.lax.Precision.HIGHEST), 0, axis)
+
+    def _lex(self, cell_sol):
+        # a permutation: said so, its transpose is a plain scatter, not a scatter-add
+        lex = cell_sol.at[self.dof].get(unique_indices=True, mode="promise_in_bounds")
+        return lex.reshape(self.p + cell_sol.shape[1:])
+
+    def _flat(self, T):
+        out = T.reshape((-1,) + T.shape[len(self.m) :])
+        return out if self.quad is None else out[self.quad]
+
+    def values(self, cell_sol):
+        """``(n_quad, vec)``: the field at the quadrature points from its cell DOFs ``(n_dof, vec)``."""
+        T = self._lex(cell_sol)
+        for a, B in enumerate(self.B):
+            if not self._ident[a]:
+                T = self._along(B, T, a)
+        return self._flat(T)
+
+    def ref_grads(self, cell_sol):
+        """``(n_quad, vec, tdim)``: the reference gradient ``∂u_c/∂ξ_a`` at the quadrature points."""
+        T = self._lex(cell_sol)
+        out = []
+        for a in range(len(self.B)):
+            G = self._along(self.D[a], T, a)
+            for b, B in enumerate(self.B):
+                if b != a and not self._ident[b]:
+                    G = self._along(B, G, b)
+            out.append(self._flat(G))
+        return jnp.stack(out, axis=-1)
+
+    def grads(self, cell_sol, K):
+        """``(n_quad, vec, dim)``: the physical gradient, ``∂u/∂x = ∂u/∂ξ J⁻¹`` with ``K = J⁻¹`` per cell
+        ``(tdim, dim)`` or per quadrature point ``(n_quad, tdim, dim)``."""
+        g = self.ref_grads(cell_sol)
+        return jnp.sum(g[..., :, None] * self.per_point(K), axis=-2)
+
+    @staticmethod
+    def per_point(K):
+        """``K`` broadcast against ``(n_quad, vec, tdim, dim)``. A caller with several fields on one cell does
+        this once and hands the result to every :meth:`grads`: one array, kept once by a linearisation."""
+        return K if K.ndim == 4 else (K[:, None, :, :] if K.ndim == 3 else K[None, None, :, :])
+
+
+def _real_of(T):
+    dt = jnp.result_type(T, jnp.float32)
+    return jnp.finfo(dt).dtype
+
+
+def tensor_factors(cell_type: str, degree: int, quad_points, ref_values, ref_grads, *, tol: float = 1e-9):
+    """The :class:`TensorFactors` of a Lagrange ``Q_degree`` tabulation on ``cell_type``, or ``None``.
+
+    The factors are rebuilt from the element's node coordinates and the quadrature points, then checked against
+    the tabulation they stand in for (values and reference gradients, to ``tol``): a cell, node set or rule
+    that is not a full tensor product returns ``None`` and the dense tables stay in use.
+    """
+    cell, tdim = basix_cell(cell_type)
+    import basix
+
+    if cell not in (basix.CellType.quadrilateral, basix.CellType.hexahedron):
+        return None
+    X = np.asarray(_lagrange_basix(cell, int(degree)).points, float)
+    Q = np.asarray(quad_points, float)
+    V = np.asarray(ref_values, float)[..., 0]
+    dV = np.asarray(ref_grads, float)[..., 0, :]
+    if V.shape != (Q.shape[0], X.shape[0]):
+        return None
+    B, D, ni, qi = [], [], [], []
+    for a in range(tdim):
+        _xn, ia = np.unique(np.round(X[:, a], 11), return_inverse=True)
+        _xq, ja = np.unique(np.round(Q[:, a], 11), return_inverse=True)
+        xn = np.array([X[ia == j, a].mean() for j in range(_xn.size)])
+        xq = np.array([Q[ja == j, a].mean() for j in range(_xq.size)])
+        b, d = _lagrange_1d(xn, xq)
+        B.append(b), D.append(d), ni.append(ia), qi.append(ja)
+    p, m = tuple(b.shape[1] for b in B), tuple(b.shape[0] for b in B)
+    if int(np.prod(p)) != X.shape[0] or int(np.prod(m)) != Q.shape[0]:
+        return None
+    lex_n, lex_q = np.ravel_multi_index(ni, p), np.ravel_multi_index(qi, m)
+    if np.unique(lex_n).size != lex_n.size or np.unique(lex_q).size != lex_q.size:
+        return None
+    # the tabulation the factors must reproduce
+    parts = [B[a][qi[a]][:, ni[a]] for a in range(tdim)]  # (n_quad, n_dof) each
+    if np.abs(np.prod(parts, axis=0) - V).max() > tol:
+        return None
+    for a in range(tdim):
+        g = np.prod([D[b][qi[b]][:, ni[b]] if b == a else parts[b] for b in range(tdim)], axis=0)
+        if np.abs(g - dV[..., a]).max() > tol * max(1.0, np.abs(dV).max()):
+            return None
+    quad = None if np.array_equal(lex_q, np.arange(lex_q.size)) else lex_q
+    return TensorFactors(B, D, np.argsort(lex_n), quad)

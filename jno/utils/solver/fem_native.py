@@ -173,6 +173,9 @@ _VOLUME_BLOCKS = {1: ("line",), 2: ("triangle", "quad"), 3: ("tetra", "hexahedro
 
 #: The cells whose reference map is NOT affine, so the Jacobian must be formed per quadrature point.
 TENSOR_PRODUCT_CELLS = ("quad", "hexahedron")
+# Arrays of ``n_quad x components x dim`` numbers a sum-factorised residual keeps per cell (a bound for the
+# chunk size, see ``_residual_chunk``).
+_SUMFACT_RESIDUAL_ARRAYS = 32
 
 
 def mesh_cell_type(domain, dim: int) -> str:
@@ -1266,6 +1269,76 @@ def _with_interface_facets(domain, conn, cells_p1, cell_key, regions):
     return merged, interior
 
 
+def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
+    """``(A, b)`` of a steady linear form whose operator is applied, never stored (``jno.fem(matrix_free=True)``).
+
+    The residual is linearised ONCE (``jax.linearize``): its pass over the cells is partially evaluated, so the
+    geometry, the quadrature weights and the coefficients are computed here and kept, and ``A v`` is what is
+    left -- gather, the gradient contractions (sum-factorised on a Q_k quadrilateral / hexahedron), a scaling
+    per quadrature point, the transposed contractions, scatter-add. Differentiating at every apply instead
+    (``jax.jvp``) recomputes the whole primal pass beside the tangent: measured 6x the apply on Q5 hexahedra.
+    The memory is the kept coefficients, tens of numbers per quadrature point, where the assembled operator
+    holds ``O(k^d)`` entries per DOF (measured, Q5 hexahedra: 322).
+
+    Essential conditions are eliminated as :func:`fem_1d._apply_dirichlet_symmetric` does on a stored matrix:
+    known columns moved to the load, constrained rows and columns zeroed, the pinned row kept at the local
+    diagonal scale. The diagonal (for Jacobi) comes from the assembler's own matrix-free ``diag=True`` pass.
+    """
+    from .placement import to_solve_device
+    from .solver_api import LinearOperator
+
+    n = int(zeros.shape[0])
+
+    def free(u):
+        return jnp.asarray(residual(u)).reshape(-1)
+
+    r0, lin = jax.linearize(free, zeros)  # lin: a Partial whose leaves are the kept coefficients
+    b = -r0
+    diag = jnp.asarray(jacobian(zeros, 0.0, None, diag=True)).reshape(-1)
+    mask = jnp.ones(n, b.dtype)
+    pin = jnp.zeros(n, b.dtype)
+    if dirichlet_pairs:
+        dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
+        vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=b.dtype)
+        d0 = jnp.abs(diag[dofs])
+        s = jnp.where(d0 > 0.0, d0, jnp.mean(jnp.abs(diag))).astype(b.dtype)
+        mask = mask.at[dofs].set(0.0)
+        pin = pin.at[dofs].set(s)  # the pinned rows' diagonal, zero elsewhere
+        b = (b - lin(jnp.zeros(n, b.dtype).at[dofs].set(vals))).at[dofs].set(vals * s)
+        diag = diag.at[dofs].set(s)
+
+    # Multiplies only around the linear map, so the operator transposes like any other. The coefficients ride
+    # as ARGUMENTS of the compiled apply (not constants baked into it) and move to the solving device once.
+    @jax.jit
+    def _apply(lin_, mask_, pin_, v):
+        return mask_ * lin_(mask_ * v) + pin_ * v
+
+    @jax.jit
+    def _apply_t(lin_, mask_, pin_, v):
+        (out,) = jax.linear_transpose(lin_, v)(mask_ * v)
+        return mask_ * out + pin_ * v
+
+    state: list = []
+
+    def _state():
+        if not state:
+            state.append(to_solve_device((lin, mask, pin)))
+        return state[0]
+
+    def mv(v):
+        return _apply(*_state(), jnp.asarray(v))
+
+    def t_mv(v):
+        return _apply_t(*_state(), jnp.asarray(v))
+
+    # No ``dense_fn``: a direct solver or a matrix-based preconditioner then raises instead of quietly building
+    # the dense matrix this operator exists to avoid. ``fem.A`` (dense by contract) builds it when asked.
+    A = LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=lambda: diag, shape=(n, n))
+    A.matrix_free = True
+    A.coefficient_bytes = int(sum(getattr(leaf, "nbytes", 0) for leaf in jax.tree_util.tree_leaves(lin)))
+    return A, b
+
+
 def assemble_fem_native(
     domain,
     volume_terms: List[Any],
@@ -1540,6 +1613,17 @@ def assemble_fem_native(
 
     ref_vals_all = [jnp.asarray(s.ref_values) for s in specs]  # list of (n_quad, n_dof_i, 1)
     ref_grads_all = [jnp.asarray(s.ref_grads) for s in specs]  # list of (n_quad, n_dof_i, 1, dim)
+    # Sum factorisation (fem_lagrange.TensorFactors): a Q_k field on a quadrilateral / hexahedron is evaluated
+    # at the quadrature points by 1-D contractions along each axis instead of the dense (n_quad, n_dof) tables
+    # -- O(k^(d+1)) per cell, not O(k^(2d)). ``None`` where it does not apply; the tables then serve as before.
+    from .fem_lagrange import SUMFACT_MIN_DEGREE, TensorFactors, tensor_factors
+
+    _sumfact = [
+        tensor_factors(_cell_type, f["order"], s.quad_points, s.ref_values, s.ref_grads)
+        if _tensor_product and not c and cb <= 1 and int(f["order"]) >= SUMFACT_MIN_DEGREE
+        else None
+        for f, s, c, cb in zip(fields, specs, _const_f, _cblk)
+    ]
     # reference Hessians (for 4th-order / biharmonic weak forms); None if a spec doesn't tabulate them
     ref_hess_all = [None if s.ref_hess is None else jnp.asarray(s.ref_hess) for s in specs]
     cells_f_j = [jnp.asarray(cf, dtype=jnp.int32) for cf in cells_f_all]  # list of (n_cells, n_local_i)
@@ -2632,6 +2716,30 @@ def assemble_fem_native(
                 _geo_cache.append(jax.jit(build)(pts_j, cells_j))
         return _geo_cache[0]
 
+    # The same for a sum-factorised tensor-product mesh, per QUADRATURE POINT: a march would rebuild ``J``,
+    # its inverse and determinant on every pass -- three gradient-sized contractions of the geometry. Costs
+    # ``dim² + 1`` numbers per quadrature point. (A matrix-free linear operator keeps its own, see
+    # :func:`_matrix_free_system`.)
+    _geo_q_cache: list = []
+    _geo_q_on = _geo_cache_on and _nonaffine and _sumfact[_geom_field] is not None
+
+    def _static_geometry_q():
+        """``(J⁻¹, det J)`` at every quadrature point of every cell of the BAKED mesh, ``(n_cell, n_q, dim, dim)``
+        and ``(n_cell, n_q)``; built once, with the arithmetic of the per-call path."""
+        if not _geo_q_cache:
+            _sfg = _sumfact[_geom_field]
+
+            def one(gverts):
+                J = _sfg.ref_grads(gverts)
+                return small_inv(J), small_det(J)
+
+            def build(P, C):
+                return jax.lax.map(one, P[C], batch_size=min(int(C.shape[0]), 4096))
+
+            with jax.ensure_compile_time_eval():
+                _geo_q_cache.append(jax.jit(build)(pts_j, cells_f_j[_geom_field]))
+        return _geo_q_cache[0]
+
     def _cell_fields(c, cell_sols, pts=pts_j, cells=None, cells_f=None):
         """Per-field ``(phi, dphi_phys, cell_sol)`` and shared ``(xq, meas)`` for cell c.
 
@@ -2653,9 +2761,18 @@ def assemble_fem_native(
             # the general isoparametric map: it serves an order-2 curved simplex and a
             # bilinear/trilinear tensor-product cell without knowing which it has.
             gverts = pts[cells_f[_geom_field][c]]  # (n_geom, dim)
-            J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
-            detJ = small_det(J)  # (n_q,)
-            xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
+            _sfg = _sumfact[_geom_field]
+            if _sfg is not None:  # the same two sums, one axis at a time
+                J = _sfg.ref_grads(gverts)  # (n_q, dim, dim)
+                xq = _sfg.values(gverts)  # (n_q, dim)
+            else:
+                J = jnp.einsum("ad,qan->qdn", gverts, ref_grads_all[_geom_field][..., 0, :])  # (n_q, dim, dim)
+                xq = ref_vals_all[_geom_field][..., 0] @ gverts  # (n_q, dim)
+            if _geo_q_on and pts is pts_j and cells_f is cells_f_j:
+                K_all, det_all = _static_geometry_q()
+                K_cell, detJ = K_all[c], det_all[c]
+            else:
+                detJ = small_det(J)  # (n_q,)
         else:
             verts = pts[cells[c]]  # (dim+1, dim)
             J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
@@ -2670,6 +2787,11 @@ def assemble_fem_native(
         meas = jnp.abs(detJ)  # scalar (affine) or (n_quad,) (curved)
 
         per = []
+        _Kq = None
+        if any(sf is not None for sf in _sumfact):
+            if K_cell is None:
+                K_cell = small_inv(J)  # shared by the tables' push-forward and the factorised gradients
+            _Kq = TensorFactors.per_point(K_cell)  # one array for every field (and its seeded test function)
         for i in range(len(fields)):
             phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ, K_cell)
             if _cblk[i] > 1:
@@ -2679,8 +2801,13 @@ def assemble_fem_native(
                 # M(cell)-transform families do.
                 _cn = cells[c]
                 phi, dphi = expand_cover(phi, dphi, xq, pts[_cn], _cover_scale_j[_cn])
+            _fd = {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"}
+            if _sumfact[i] is not None:
+                # The trial rules of the evaluator read this in place of the tables above, which then drop
+                # out of the compiled program unless a term reads them (an unseeded test function, a Hessian).
+                _fd["sumfact"] = (_sumfact[i], _Kq)
             fd = _CellFieldData(
-                {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"},
+                _fd,
                 # Deferred: only a 4th-order weak form ever reads this. See _CellFieldData.
                 None if ref_hess_all[i] is None else (lambda _rh=ref_hess_all[i], _J=J: identity_pushforward_hess(_rh, _J)),
             )
@@ -3886,6 +4013,20 @@ def assemble_fem_native(
     def _cell_chunk(n_items: int, n_test: int, n_local: int):
         return cell_chunk(n_items, n_test, n_local, _chunk_setting)
 
+    # A residual whose fields are all sum-factorised holds no (n_quad, n_dof) table and no element block: per
+    # cell it keeps a few dozen arrays of ``n_quad x components x dim`` numbers (values, gradients, fluxes and
+    # their tangents). Its chunks are sized by that, not by the Jacobian's ``n_local**3``.
+    _sf_residual_bytes = (
+        _SUMFACT_RESIDUAL_ARRAYS * int(qw_shared.shape[0]) * sum(vecs) * dim * 8
+        if all(sf is not None for sf in _sumfact)
+        else None
+    )
+
+    def _residual_chunk(n_items: int, n_test: int, n_local: int):
+        if _sf_residual_bytes is None:
+            return _cell_chunk(n_items, n_test, n_local)
+        return cell_chunk(n_items, n_test, n_local, _chunk_setting, per_bytes=_sf_residual_bytes)
+
     _elem_map = elem_map
 
     if dynamic_topology and any(int(f["order"]) != 1 for f in fields):
@@ -4048,7 +4189,7 @@ def assemble_fem_native(
                     R = _elem_map(
                         kernel,
                         (cells_t, local_all if lc is None else local_all[lc]),
-                        _cell_chunk(int(cells_t.shape[0]), cd_d[tfi].shape[1], cad_d.shape[1]),
+                        _residual_chunk(int(cells_t.shape[0]), cd_d[tfi].shape[1], cad_d.shape[1]),
                         scatter=(R, rows_t),
                     )
                 else:
@@ -4057,7 +4198,9 @@ def assemble_fem_native(
                         rows_t,
                         # indices, not gathered values: each device gathers only its own cells' DOFs
                         lambda xs, _k=kernel, _t=tfi: _elem_map(
-                            _k, (xs[0], u_flat[xs[1]]), _cell_chunk(int(xs[0].shape[0]), cd_d[_t].shape[1], cad_d.shape[1])
+                            _k,
+                            (xs[0], u_flat[xs[1]]),
+                            _residual_chunk(int(xs[0].shape[0]), cd_d[_t].shape[1], cad_d.shape[1]),
                         ),
                         (cells_t, cad_d if lc is None else cad_d[lc]),
                         _emesh,
@@ -4481,7 +4624,10 @@ def assemble_fem_native(
             args = _derived_args(u_flat, args)  # jno.derived fields: nodal values from the frozen state
             # The pattern belongs to the PAIRING, not to the build: `fem.solve(contact=...)` re-pairs
             # between rounds and the contact block's indices move with it.
-            _idx_static, _plan, _blk_sizes = _pattern(args)
+            # The diagonal needs no pattern: building one here (the plan of every element block's entries,
+            # `n_local**2` per cell) was the whole host-memory peak of a matrix-free Q8 build -- 48 GB at
+            # 2M DOFs, for a result the next lines dropped.
+            _idx_static, _plan, _blk_sizes = (None, None, None) if diag else _pattern(args)
             _dacc = [None]
             cell_l = []
             if elements:  # raw, cell-tagged triplets: no plan, no compression
@@ -4761,7 +4907,11 @@ def assemble_fem_native(
             return _pl[0] if _pl is not None else _is
 
         jacobian._jno_static_idx_for = _static_idx_for  # type: ignore[attr-defined]
-        jacobian._jno_static_idx = _static_idx_for()  # type: ignore[attr-defined]  -- frozen pairing
+        from .fem_utils import _MATRIX_FREE
+
+        # A matrix-free build never assembles, so it never plans the pattern either (see `jacobian`'s
+        # ``diag`` branch); `_jno_static_idx_for` still builds it on demand.
+        jacobian._jno_static_idx = None if _MATRIX_FREE[0] else _static_idx_for()  # type: ignore[attr-defined]  -- frozen pairing
         return jacobian
 
     def _dirichlet_jac_rows(jac_fn, pairs):
@@ -6254,6 +6404,10 @@ def assemble_fem_native(
         return (_op_np, "nonlinear", offs)
 
     # linear (non-parametric)
+    from .fem_utils import _MATRIX_FREE
+
+    if _MATRIX_FREE[0]:
+        return _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs), "linear", offs
     A = jacobian(zeros)
     b = -residual(zeros)
     if dirichlet_pairs:

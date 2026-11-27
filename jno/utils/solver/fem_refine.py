@@ -183,8 +183,10 @@ def hanging_dofs(
     one of the cell's own is not free, and its value is the cell's own basis on that facet evaluated
     where it sits.
 
-    On an edge that means: the cell's own DOFs sit at parameters ``k/order``, a 2:1 neighbour's sit at
-    ``k/(2*order)``, and the ones in between are constrained by the Lagrange basis through the cell's.
+    On an edge that means: the cell's own DOFs sit at the element's edge parameters ``t_k`` (``k/order`` up
+    to order 2, the Gauss-Lobatto-Legendre points above: :func:`~.fem_lagrange.edge_node_parameters`), a 2:1
+    neighbour's sit at ``t_k/2`` and ``1/2 + t_k/2`` (``k/(2*order)`` when equispaced), and the ones in
+    between are constrained by the Lagrange basis through the cell's.
     At order 1 that is the familiar midpoint tied to the two ends at 1/2 each; at order 2 the ends and
     the cell's OWN midpoint carry the neighbour's quarter points at ``(0.375, -0.125, 0.75)`` and
     ``(-0.125, 0.375, 0.75)``. The negative weights are real -- a quadratic through three points is not
@@ -203,6 +205,10 @@ def hanging_dofs(
     edges, faces = _cell_tables(cell_type)
     order = int(order)
     lut, q = _node_lookup(dof_points)
+    from .fem_lagrange import edge_node_parameters
+
+    own_ts = [float(t) for t in edge_node_parameters(cell_type, order)]  # this cell's nodes along an edge
+    fine_ts = sorted({round(0.5 * (h + t), 14) for h in (0.0, 1.0) for t in own_ts} - {0.0, 1.0})  # each half's
 
     def _at(pos):
         return lut.get(tuple(np.round(pos / q).astype(np.int64)))
@@ -214,17 +220,16 @@ def hanging_dofs(
             A, B = mesh_points[cell[a_loc]], mesh_points[cell[b_loc]]
             ts: List[float] = []
             ids: List[int] = []
-            for k in range(order + 1):  # this cell's own DOFs along the edge
-                nid = _at(A + (k / order) * (B - A))
+            for tk in own_ts:  # this cell's own DOFs along the edge
+                nid = _at(A + tk * (B - A))
                 if nid is None or nid not in own:
                     ids = []
                     break
-                ts.append(k / order)
+                ts.append(tk)
                 ids.append(int(nid))
             if not ids:
                 continue
-            for k in range(1, 2 * order):  # a 2:1 neighbour's DOFs on the same edge
-                t = k / (2 * order)
+            for t in fine_ts:  # a 2:1 neighbour's DOFs on the same edge
                 if any(abs(t - tt) < 1e-12 for tt in ts):
                     continue  # a parameter this cell already owns: shared, hence free
                 nid = _at(A + t * (B - A))

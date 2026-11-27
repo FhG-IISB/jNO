@@ -77,6 +77,9 @@ def _default_newton(residual_fn, u0, *, jacobian=None):
 
 def _as_dense(x):
     """Densify a sparse/BCOO matrix to a plain JAX array (no-op if already dense)."""
+    if getattr(x, "matrix_free", False):
+        # jno.fem(matrix_free=True): asked for explicitly (``fem.A``), n matvecs -- small systems only
+        return jax.vmap(x.mv)(jnp.eye(x.shape[0], dtype=x.diag().dtype)).T
     return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
 
 
@@ -176,6 +179,27 @@ def _summarise_linear_iterations(records):
     if any(r.get("breakdown") for r in records):
         out["breakdown"] = True
     return out
+
+
+def _solve_matrix_free_operator(A, b, *, tol=1e-8, maxiter=20_000):
+    """The default solve of ``jno.fem(matrix_free=True)``: Jacobi-preconditioned BiCGStab on the matvec, the
+    same iteration as the assembled default (:func:`_bicgstab_jacobi`), compiled once per operator."""
+    from .utils.solver.krylov import bicgstab_counted
+    from .utils.solver.solver_api import record_iterations
+
+    run = getattr(A, "_default_solve", None)
+    if run is None:
+        d = A.diag()
+        inv = jnp.where(d != 0, 1.0 / jnp.where(d != 0, d, 1.0), 1.0)
+
+        @jax.jit
+        def run(rhs):
+            return bicgstab_counted(A.mv, rhs, tol=tol, atol=0.0, maxiter=maxiter, M=lambda r: inv * r)
+
+        A._default_solve = run
+    x, k, broke = run(b)
+    record_iterations(k, "Jacobi-preconditioned BiCGStab (matrix-free operator)", side="forward", broke=broke)
+    return _residual_check(A, b, x, "Jacobi-preconditioned BiCGStab (matrix-free operator)")
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000, shard=None):
@@ -4291,6 +4315,16 @@ class FEM:
             # blkdiag(P, P) and the result is recombined u = x[:n] + i·x[n:] on the way out.
             _per = self._periodic_2n if self._complex_n is not None else self._periodic
             _fin = _complex_recombine(self._complex_n) if self._complex_n is not None else (lambda x: x)
+            if getattr(A, "matrix_free", False):
+                # jno.fem(matrix_free=True): the operator is a matvec, there is no matrix to reduce or factor
+                if _per is not None or self._complex_n is not None:
+                    raise NotImplementedError(
+                        "jno.fem(matrix_free=True): a periodic tie or a complex problem reduces the ASSEMBLED "
+                        "operator. Drop matrix_free=True for this problem."
+                    )
+                if solve_fn is not None:
+                    return _fin(solve_fn(A, b))  # a Krylov slot (linear=jno.solve.cg(), ...) takes the matvec
+                return _fin(_solve_matrix_free_operator(A, b))
             if _per is not None:
                 # periodic tie: eliminate secondary DOFs via the prolongation P, solve the reduced
                 # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
@@ -8156,6 +8190,8 @@ def fem(
     *,
     quad_degree: int | None = None,
     chunk: Any = None,
+    quadrature: str | None = None,
+    matrix_free: bool = False,
     _dd_overlap: bool = False,
 ) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`: the finite-element front door.
@@ -8193,9 +8229,24 @@ def fem(
             here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
             non-nodal) is an error rather than a silent no-op.
 
+        quadrature: ``"gll"`` integrates every term of a quadrilateral or hexahedral Lagrange field of degree
+            ``k`` with the Gauss-Lobatto-Legendre rule at its own nodes (``k + 1`` points per axis, exact to
+            degree ``2k - 1``): the spectral-element rule, under which the mass matrix is diagonal (exact
+            lumping) and the stiffness of an affine cell stays exact. ``None`` (the default) is the Gauss rule
+            of ``quad_degree``. See docs/spectral.md.
+        matrix_free: ``True`` applies a steady linear operator through its element residual and never stores
+            it: ``fem.operator`` is ``(A, b)`` with ``A`` a matvec (``A @ v``, ``A.diag()``, ``A.T``), solved by
+            Jacobi-preconditioned BiCGStab or the Krylov slot you pass (``linear=jno.solve.cg()``). On a
+            quadrilateral or hexahedral field of degree ``k >= 3`` the apply is sum-factorised, ``O(k^(d+1))``
+            per cell, and the memory is the mesh: the stored matrix of a Q5 hexahedral Poisson holds 322
+            entries per DOF. A direct solver or a matrix-based preconditioner has nothing to factor and
+            raises. Steady linear, non-parametric, non-periodic real problems only.
+
     Returns:
         FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """
+    if quadrature not in (None, "gll"):
+        raise ValueError(f"jno.fem(quadrature={quadrature!r}): use None (Gauss) or 'gll' (Gauss-Lobatto-Legendre).")
     # This wrapper only scopes `chunk=` over the assembly: the element-chunk policy has to be in force while
     # the assembler builds its closures (it is captured there, not read when they later run), and threading a
     # parameter through every `assemble_fem_native` call site to say the same thing would be churn.
@@ -8203,6 +8254,9 @@ def fem(
 
     prev, prev_consumed = _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0]
     prev_quad, prev_reported = _fn._QUAD_EXPLICIT[0], set(_fn._QUAD_REPORTED)
+    prev_rule, prev_mf = _fn._QUAD_RULE[0], _fn._MATRIX_FREE[0]
+    _fn._QUAD_RULE[0] = quadrature
+    _fn._MATRIX_FREE[0] = bool(matrix_free)
     _fn._CHUNK_OVERRIDE[0] = _fn.normalize_chunk(chunk)
     from ._strong_form import _refuse_inside
 
@@ -8256,6 +8310,8 @@ def fem(
     finally:
         _fn._CHUNK_OVERRIDE[0], _fn._CHUNK_CONSUMED[0] = prev, prev_consumed
         _fn._QUAD_EXPLICIT[0] = prev_quad
+        _fn._QUAD_RULE[0] = prev_rule
+        _fn._MATRIX_FREE[0] = prev_mf
         _fn._QUAD_REPORTED.clear()
         _fn._QUAD_REPORTED.update(prev_reported)
         while _TIED_CONSTANT_DOMAINS:
