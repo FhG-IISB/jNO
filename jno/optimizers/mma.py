@@ -886,6 +886,28 @@ class MMACallback(_Callback):
             )
 
     def on_before_update(self, *, grads, trainable, context, rng, epoch, **kw):
+        """Take one MMA (or GCMMA) step in place of the optimizer's own.
+
+        Reads the design vector from ``trainable`` and the objective gradient from ``grads``, the constraint
+        values from ``individual_losses`` and their Jacobian from ``constraint_jacobian`` (else it computes
+        it), solves the convex subproblem inside the move limits and the box bounds, and returns the step
+        negated, so that the plain ``sgd(1.0)`` update ``x - returned`` lands on the new design.
+
+        Keyword Args:
+            grads: Gradient pytree ``{lid: model_params}`` of the objective, the loss actually descended.
+            trainable: Current parameter pytree; the design variables are its blocks named by the optimizer.
+            context: Domain context (current batch), passed on to the constraint Jacobian.
+            rng: Current JAX PRNG key.
+            epoch: Current outer epoch (unused: the step count is kept by the callback).
+            individual_losses: Per-entry values of every constraint, including the ``jno.le``/``jno.ge`` rows
+                this optimizer treats as inequality constraints.
+            constraint_jacobian: Optional precomputed Jacobian of those rows with respect to the design
+                vector, as ``(rows, n)``.
+
+        Returns:
+            ``grads`` with the design blocks replaced by the negated step, or ``None`` (leave the gradients
+            unchanged) when the callback has not been bound to a solve yet.
+        """
         import jax
         from jax.flatten_util import ravel_pytree
 
@@ -1050,9 +1072,11 @@ class MMACallback(_Callback):
             off += size
         return out
 
-    # docstring-from: jno.utils.adaptive.callbacks.Callback.on_training_end
     def on_training_end(self, **kw):
-        """Called once after the training loop ends (also after an early stop).
+        """Called once after the training loop ends (also after an early stop): report the run's summary.
+
+        Args:
+            **kw: Ignored; accepted so the hook takes whatever the training loop passes.
 
         Returns:
             None.

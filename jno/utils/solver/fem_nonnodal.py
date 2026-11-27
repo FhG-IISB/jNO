@@ -27,6 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..sets import unique_values
 from .fem_elements import ElementSpec, piola_contravariant, raviart_thomas_triangle
 from .fem_topology import EdgeTopology, build_edge_topology
 from .small_linalg import small_det, small_inv
@@ -3593,7 +3594,7 @@ def _region_field_pins(fields, spaces, cdofs, offs, domain):
                 f"jno.fem (non-nodal): a field is declared on region={region!r}, which no cell of the mesh is in."
             )
         free = np.zeros(int(offs[i + 1]) - int(offs[i]), dtype=bool)
-        free[np.unique(cd[m > 0]) - int(offs[i])] = True
+        free[unique_values(cd[m > 0]) - int(offs[i])] = True
         out.extend((int(offs[i]) + int(k), 0.0) for k in np.flatnonzero(~free))
     return out
 

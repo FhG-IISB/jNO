@@ -57,7 +57,7 @@ def test_missing_in_one_region_raises_and_names_it():
     """Hard error, not a silent default: a region that forgot a property must be reported."""
     d = _two_regions(a={"k": 1.0}, b={}).domain()
     with pytest.raises(AttributeError, match=r"region\(s\) \['b'\] never attached a 'k'"):
-        d.k
+        d.k + 1  # reading d.k does not raise (the refusal is deferred to its use); using it does
 
 
 def test_unattached_name_is_a_normal_attribute_error():
@@ -159,8 +159,8 @@ def test_attached_returns_the_raw_mapping_for_partial_consumers():
     takes a {tag: eps} dict."""
     d = _two_regions(a={"eps": 0.8}, b={"k": 1.0}).domain()
     assert d.attached("eps") == {"a": 0.8}
-    with pytest.raises(AttributeError):
-        d.eps  # 'b' never declared one, so the COEFFICIENT is still an error
+    with pytest.raises(AttributeError, match=r"never attached a .eps."):
+        d.eps * 2  # 'b' never declared one: USING the coefficient is still an error
 
 
 def test_attached_rejects_an_undeclared_property():
@@ -370,7 +370,7 @@ def test_missing_region_without_a_default_still_refuses():
     d, *_ = _pair()
     d.attach("L", Q=2.0)
     with pytest.raises(AttributeError, match=r"never attached a 'Q'"):
-        d.Q
+        d.Q + 1  # the refusal fires where the property is used, not where it is read
 
 
 def test_a_default_on_a_boundary_tag_is_refused():

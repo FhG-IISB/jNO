@@ -5001,7 +5001,7 @@ def assemble_fem_native(
                     f"Dirichlet on {region!r}: the faces of body {_body!r} inside the mesh could not be "
                     "resolved on this field's cells. Pin a whole interface tag (domain.interface_tags()) instead."
                 )
-            _surf = np.intersect1d(np.unique(_cf[_in]), np.unique(_cf[~_in]))
+            _surf = np.intersect1d(unique_values(_cf[_in]), unique_values(_cf[~_in]))
             _keep = np.asarray(_pred(*(pts_all[_surf, i] for i in range(dim))), dtype=bool).reshape(-1)
             bnodes = np.union1d(np.asarray(bnodes, dtype=np.int64), _surf[_keep])
         # `d.tag(..., region=...)`: keep only the nodes belonging to that body. Two coincident faces of

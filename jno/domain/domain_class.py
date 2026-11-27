@@ -3341,16 +3341,15 @@ class domain(MeshIOMixin):
         if not inspect.isroutine(value):
             return True  # a callable object: a datasheet table, a fitted law
         try:
-            params = [
-                p
-                for p in inspect.signature(value).parameters.values()
-                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
-            ]
+            all_params = list(inspect.signature(value).parameters.values())
         except (TypeError, ValueError):
             return False
+        params = [p for p in all_params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty]
         fields = self.__dict__.get("_field_names") or set()
         if any(p.name in fields for p in params):
             return True
+        if any(p.kind is p.VAR_POSITIONAL for p in all_params):
+            return False  # `lambda *c`: takes however many coordinates it is given, a function of position
         return len(params) != int(self.dimension)
 
     def _evaluate_attached(self, value, args, name, target):
