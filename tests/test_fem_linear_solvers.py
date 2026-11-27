@@ -454,8 +454,9 @@ def test_lu_host_reuse_false_does_not_retain_a_factorization():
     b = jnp.asarray(np.ones(n))
 
     _FACTOR_CACHE.clear()
-    x_cached = np.asarray(host_lu_solve(A, b))
-    assert len(_FACTOR_CACHE) == 1, "the default should retain the factorization it just built"
+    for _ in range(3):  # a factorization is kept once its operator recurs
+        x_cached = np.asarray(host_lu_solve(A, b))
+    assert len(_FACTOR_CACHE) == 1, "the default should retain the factorization of a repeated operator"
 
     _FACTOR_CACHE.clear()
     x_free = np.asarray(host_lu_solve(A, b, reuse=False))
