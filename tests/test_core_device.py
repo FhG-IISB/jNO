@@ -113,12 +113,12 @@ class TestSetupParallelism:
 
 
 class TestDomainDataCPUPinning:
-    """prepare_domain_data() must pin context arrays to CPU, not default device.
+    """prepare_domain_data() keeps context arrays on the host, never on the default device.
 
-    The fix: replacing jnp.asarray() with jax.device_put(arr, _cpu_device())
-    in prepare_domain_data() ensures domain data never hits GPU at compile()
-    time. GPU placement only happens inside solve() (via _shard_data for
-    offload_data=False, or stays as numpy for offload_data=True).
+    A numpy entry stays numpy (pinning it would copy it, #397); any other array is placed with
+    jax.device_put(arr, _cpu_device()). So domain data never hits the GPU at compile() time. GPU
+    placement only happens inside solve() (via _shard_data for offload_data=False, or one batch at
+    a time through _host_batch for offload_data=True).
     """
 
     def _build_solver(self):
@@ -149,22 +149,51 @@ class TestDomainDataCPUPinning:
                 "jax.device_put(arr, _cpu_device()) instead."
             )
 
-    def test_context_arrays_are_jax_arrays_not_numpy(self):
-        """Context values must be JAX arrays (CPU-pinned), not plain numpy.
+    def test_context_arrays_are_host_arrays(self):
+        """Context values stay on the host: numpy as given, anything else as a CPU-pinned JAX array.
 
-        Plain numpy would break JAX tracer indexing inside jit'd functions
-        (TracerArrayConversionError). CPU-pinned JAX arrays satisfy both
-        constraints: no GPU allocation at compile time, and compatible with
-        JAX tracing.
+        A numpy entry (``__time__``, sampled coordinates) is not copied into a JAX array at
+        compile() time (#397). It reaches jit'd code as an argument of the compiled step, so it is
+        traced like any other input; the test below checks that a loss reading it trains.
         """
+        cpu_devices = set(jax.devices("cpu"))
         s = self._build_solver()
         for key_name, v in s.domain_data.context.items():
-            if isinstance(v, dict) or isinstance(v, str):
+            if isinstance(v, (dict, str)):
                 continue
-            assert isinstance(v, jax.Array), (
-                f"domain_data.context['{key_name}'] is {type(v).__name__}, expected jax.Array. "
-                "CPU-pinned JAX arrays are required so downstream JIT'd code can index them."
+            assert isinstance(v, (np.ndarray, jax.Array)), (
+                f"domain_data.context['{key_name}'] is {type(v).__name__}, expected numpy or a CPU-pinned jax.Array."
             )
+            if isinstance(v, jax.Array):
+                assert v.devices().issubset(cpu_devices), f"domain_data.context['{key_name}'] is on {v.devices()}"
+
+    @pytest.mark.parametrize("offload_data", [False, True])
+    def test_a_loss_that_reads_numpy_time_context_trains_under_jit(self, offload_data):
+        """A time-dependent loss trains with ``__time__`` kept as numpy, on device and streamed.
+
+        Indexing a closed-over numpy array with a tracer raises TracerArrayConversionError; the old
+        contract (every context entry a JAX array) guarded against that. With numpy entries the
+        compiled step must still take them as traced inputs, both when the whole dataset goes to the
+        device and when ``offload_data=True`` streams host batches.
+        """
+        import optax
+
+        dom = 8 * jno.domain(constructor=jno.domain.line(mesh_size=0.2, time=(0.0, 1.0, 4)))
+        x, t = dom.variable("interior")
+        u_net = jnn.nn.wrap(foundax.mlp(2, output_dim=1, hidden_dims=8, num_layers=1, key=jax.random.PRNGKey(3)))
+        u_net.optimizer(optax.adam(1e-3))
+        u = u_net(jno.np.concat([t, x], axis=-1))
+        s = jno.core([(u.d(t) - x).mse])
+        assert isinstance(s.domain_data.context["__time__"], np.ndarray)
+
+        before = [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(s.models) if isinstance(leaf, jax.Array)]
+        kwargs = {"offload_data": True, "batchsize": 2} if offload_data else {}
+        s.solve(3, **kwargs)
+        after = [np.asarray(leaf) for leaf in jax.tree_util.tree_leaves(s.models) if isinstance(leaf, jax.Array)]
+
+        assert before and len(before) == len(after)
+        assert all(np.isfinite(a).all() for a in after)
+        assert any(not np.array_equal(b, a) for b, a in zip(before, after)), "the parameters did not move"
 
 
 # ---------------------------------------------------------------------------
@@ -464,26 +493,19 @@ class TestGPUPlacement:
 
     @requires_gpu
     def test_offload_data_full_dataset_stays_on_host(self, monkeypatch):
-        """With offload_data=True, solve() converts CPU-pinned JAX arrays to numpy.
+        """With offload_data=True the full dataset stays in host numpy; only each batch reaches the GPU.
 
-        prepare_domain_data() pins context to CPU (not GPU). When offload_data=True,
-        solve() calls np.asarray() on those CPU-pinned JAX arrays to obtain plain
-        numpy for per-batch streaming. We spy on np.asarray to verify:
-          - it is called (the offload path is entered), and
-          - input arrays are CPU-pinned JAX arrays (not GPU).
+        prepare_domain_data() keeps numpy entries as numpy and pins any other array to the CPU (#397),
+        so nothing is on the GPU before solve(). The offload path hands ``_host_batch`` a host context
+        of plain numpy and moves one batch per step to the device. We spy on ``_host_batch`` to check
+        both: its input is host numpy, its output is on the GPU.
 
         ``20 * domain`` sets ``total_samples=20``; ``batchsize=int(jax.device_count())``
         is less than 20 so the offload path is not suppressed.
         """
-        import sys
-
         import optax
 
         from jno import LearningRateSchedule as lrs
-
-        # jno/__init__.py re-exports the class as jno.core, so grab the
-        # underlying module (jno/core.py) via sys.modules.
-        core_mod = sys.modules["jno.core"]
 
         dom = 20 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
@@ -494,31 +516,24 @@ class TestGPUPlacement:
         s = jno.core([pde.mse])
         u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
-        converted_types = {}
-        original_np_asarray = core_mod.np.asarray
+        calls = []
+        original_host_batch = s._host_batch
 
-        def spy_asarray(v, *args, **kwargs):
-            result = original_np_asarray(v, *args, **kwargs)
-            if isinstance(v, jax.Array) and v.ndim > 0 and isinstance(result, np.ndarray):
-                converted_types[id(v)] = {
-                    "input_platform": [d.platform for d in v.devices()],
-                    "output_type": type(result).__name__,
-                }
-            return result
+        def spy_host_batch(host_context, indices):
+            out = original_host_batch(host_context, indices)
+            calls.append((host_context, out))
+            return out
 
-        monkeypatch.setattr(core_mod.np, "asarray", spy_asarray)
+        monkeypatch.setattr(s, "_host_batch", spy_host_batch)
         s.solve(3, offload_data=True, batchsize=int(jax.device_count()))
 
-        assert len(converted_types) > 0, (
-            "np.asarray was never called with a jax.Array during offload_data solve; "
-            "the host-offload path may not have been reached"
-        )
-        for arr_id, info in converted_types.items():
-            assert "cpu" in info["input_platform"], (
-                f"Expected input to np.asarray to be a CPU-pinned JAX array, got {info['input_platform']}. "
-                "prepare_domain_data() must not place domain data on GPU before solve()."
-            )
-            assert info["output_type"] == "ndarray", f"Expected np.asarray to return ndarray, got {info['output_type']}"
+        assert calls, "_host_batch was never called; the host-offload path was not reached"
+        host_context, batch = calls[0]
+        for key_name, v in host_context.items():
+            assert isinstance(v, np.ndarray), f"host context '{key_name}' is {type(v).__name__}, expected numpy"
+        for key_name, v in batch.items():
+            if isinstance(v, jax.Array) and v.ndim > 0:
+                assert all(d.platform == "gpu" for d in v.devices()), f"batch '{key_name}' is on {v.devices()}"
 
     @requires_gpu
     def test_offload_batch_transferred_to_gpu_each_step(self, monkeypatch):
