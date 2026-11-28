@@ -80,6 +80,7 @@ from jno._rcwa import (
     generate_expansion,
 )
 from jno._rcwa.stack import _Result  # the backend's request/result container for the seam readouts
+from jno._rcwa.stack import highest_precision as _highest_precision  # no TF32 in the solver (GPU complex64)
 from jno.litho import Threshold  # default resist for the .develop() / .printed() lithography readout
 from jno.utils.profiling import annotate as _annot  # stage annotator for rc.solve(profile=True)
 
@@ -1272,7 +1273,7 @@ class Rcwa:
                 films, sup, sub = self._backend_materials(grids)
                 return stack._solve_core(films, wl, kin, pol, sup, sub, self._film_thick(thick))
 
-            fn = self._core_jit = jax.jit(core)
+            fn = self._core_jit = jax.jit(_highest_precision(core))
         return _Result.from_tuple(
             fn(tuple(grids), tuple(thick), jnp.asarray(wl), jnp.asarray(kin), tuple(jnp.asarray(p) for p in pol))
         )

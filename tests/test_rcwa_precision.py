@@ -84,3 +84,19 @@ def test_a_complex64_gradient_is_finite_and_close_to_complex128(x64):
     g64, g128 = dT("complex64"), dT("complex128")
     assert np.isfinite(g64)
     assert g64 == pytest.approx(g128, rel=1e-3)
+
+
+def test_every_matmul_of_the_solve_is_traced_at_the_highest_precision(x64):
+    """No TF32: the compiled solve asks for the highest precision in every dot, whatever the caller's default
+    (TF32 on a GPU put complex64 T off by up to 2.7e-2; see stack.highest_precision)."""
+    rc = _rc("complex64")
+    grid = jnp.asarray(DISK)
+    with jax.default_matmul_precision("bfloat16"):  # the loosest global setting a caller could have
+        text = (
+            jax.jit(lambda g: rc.solve(layers=[(np.inf, 1.0), (0.4, g), (np.inf, 2.25)]).efficiency("T"))
+            .lower(grid)
+            .as_text()
+        )
+    dots = [line for line in text.splitlines() if "dot_general" in line]
+    assert dots, "the lowered solve should contain matmuls"
+    assert all("HIGHEST" in line for line in dots), next(line for line in dots if "HIGHEST" not in line)

@@ -312,4 +312,6 @@ def _make_emission_core(stack, si, kind):
 
         return up, down
 
-    return jax.jit(core)
+    from .stack import highest_precision
+
+    return jax.jit(highest_precision(core))

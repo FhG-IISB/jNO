@@ -57,6 +57,21 @@ def _concrete(x) -> bool:
     return not isinstance(x, jax.core.Tracer)
 
 
+def highest_precision(fn):
+    """Trace ``fn`` with ``jax.default_matmul_precision("highest")``. On GPUs with tensor cores a float32 /
+    complex64 matmul defaults to TF32 (10-bit mantissa): measured on an RTX 3070, that put T off by 8e-4 to 2.7e-2
+    in complex64, against 8e-6 to 1.7e-4 at the highest precision (and no change on the CPU, where it is the
+    default). Every solver core is wrapped, so the choice is ours, not the caller's global setting."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        with jax.default_matmul_precision("highest"):
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
 def _load_guard(res):
     """Never-silent check that the solve stayed inside the static budget fixed at build (eager only).
 
@@ -306,7 +321,7 @@ class StateStack:
         # Cache the jitted core ONCE: `jax.jit(bound_method)` misses JAX's function cache when the
         # Jit is rebuilt per call, so a warm `solve()` used to re-trace/recompile (~4x wall time, the
         # stage-0 bench's 4505ms-vs-1142ms at 2n=2402). Same caching as the jNO seam's `_core_jit`.
-        self._solve_core_jit = jax.jit(self._solve_core)
+        self._solve_core_jit = jax.jit(highest_precision(self._solve_core))
 
         # Per-layer STATIC decisions from the concrete prototype grids.
         self._thick = []
@@ -750,7 +765,7 @@ class StateStack:
         """
         fn = self.__dict__.get("_field_core_jit")
         if fn is None:
-            fn = self._field_core_jit = jax.jit(self._field_core, static_argnums=(6, 7))
+            fn = self._field_core_jit = jax.jit(highest_precision(self._field_core), static_argnums=(6, 7))
         thick = self._thick if thick is None else thick
         return fn(
             tuple(grids),
