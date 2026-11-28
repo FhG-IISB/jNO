@@ -35,13 +35,6 @@ from jno.rcwa import Rcwa, RcwaError
 WL = 1.0
 K0 = 2.0 * math.pi / WL
 
-try:  # fmmax is a test-only oracle for field-parity checks
-    import fmmax  # noqa: F401
-
-    needs_fmmax = lambda fn: fn  # noqa: E731
-except Exception:  # pragma: no cover
-    needs_fmmax = pytest.mark.skipif(True, reason="fmmax oracle not installed")
-
 
 def _disk_grid(period, ng, radius, eps_in, eps_out=1.0, center_frac=0.5):
     """A (ng, ng) permittivity grid with a centred circular inclusion."""
@@ -179,69 +172,6 @@ def test_field3d_uniform_anisotropic_layer_keeps_energy_balance():
     # the loss profile is the diagonal-value loss, Im eps ~ 0.3 in-plane
     absorbed = float(_absorbed_fraction(sol, 0.3, nx=16, density=200.0))
     assert absorbed == pytest.approx(balance, rel=3e-3)
-
-
-@needs_fmmax
-def test_field3d_anisotropic_matches_fmmax_oracle():
-    """The patterned-general-anisotropic reconstruction is parity-exact against fmmax:
-    the |E|^2 volume agrees to ~1e-5 even though the layer is solved by the export's
-    own anisotropic eigensolve (fmmax fields are the reference for the same stack)."""
-    import fmmax
-
-    from jno._rcwa import LatticeVectors, generate_expansion
-    from jno.rcwa import Rcwa
-
-    period = (0.6, 0.6)
-    xs = (np.arange(24) + 0.5) / 24 * period[0]
-    X, Y = np.meshgrid(xs, xs, indexing="ij")
-    ripple = 2.0 + 0.6 * np.cos(2 * np.pi * X / period[0])
-    five = (ripple + 0.4j, np.zeros_like(ripple), np.zeros_like(ripple), ripple + 0.4j, np.full_like(ripple, 2.4))
-    layers = [(0.5, 1.0), (0.3, five), (0.5, 2.25)]
-    orders, nx = 15, 12
-    sol = Rcwa(layers, period=period, orders=orders, wavelength=WL, assume_periodic=True).solve()
-    inten = sol.field3d(nx=nx, density=120.0)[0]
-
-    lv = LatticeVectors(u=jnp.asarray([period[0], 0.0]), v=jnp.asarray([0.0, period[1]]))
-    ex = generate_expansion(lv, approximate_num_terms=orders)
-    thick = [0.5, 0.3, 0.5]
-    lsrs = [
-        fmmax.fmm.eigensolve_isotropic_media(
-            jnp.asarray(WL),
-            jnp.asarray((0.0, 0.0)),
-            lv,
-            jnp.full((1, 1), 1.0, jnp.complex64),
-            ex,
-            formulation=fmmax.Formulation.JONES_DIRECT_FOURIER,
-        ),
-        fmmax.fmm.eigensolve_anisotropic_media(
-            jnp.asarray(WL),
-            jnp.asarray((0.0, 0.0)),
-            lv,
-            *(jnp.asarray(c) for c in five),
-            ex,
-            formulation=fmmax.Formulation.JONES_DIRECT_FOURIER,
-        ),
-        fmmax.fmm.eigensolve_isotropic_media(
-            jnp.asarray(WL),
-            jnp.asarray((0.0, 0.0)),
-            lv,
-            jnp.full((1, 1), 2.25, jnp.complex64),
-            ex,
-            formulation=fmmax.Formulation.JONES_DIRECT_FOURIER,
-        ),
-    ]
-    gs = fmmax.basis.min_array_shape_for_expansion(ex)
-    ones = jnp.ones((*gs, 1), complex)
-    zeros = jnp.zeros((*gs, 1), complex)
-    fwd = jnp.reshape(fmmax.sources.amplitudes_for_fields(ones, zeros, zeros, ones, lsrs[0])[0], (-1, 1))
-    smi = fmmax.scattering.stack_s_matrices_interior(lsrs, thick)
-    amps = fmmax._fields.stack_amplitudes_interior(smi, fwd, jnp.zeros_like(fwd))
-    znum = [max(4, int(round(t * 120.0))) for t in thick]
-    (ef, _h, (x, y, z)) = fmmax._fields.stack_fields_3d(amps, lsrs, thick, znum, grid_shape=(nx, nx))
-    oracle = jnp.sum(jnp.abs(ef) ** 2, axis=0)[..., 0]
-    a, b = np.asarray(oracle), np.asarray(inten)
-    assert a.shape == b.shape
-    assert float(np.abs(a - b).max() / np.abs(a).max()) < 1e-4
 
 
 # ------------------------------------------------------------------------------------

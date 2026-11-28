@@ -8,7 +8,6 @@ plane). Readouts: power radiated up / down and the extraction fraction — the L
 observables. Differentiable in the source amplitude and the design permittivity.
 """
 
-import importlib.util
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # the dense RCWA solve OOMs on a small GPU at these orders
@@ -38,8 +37,6 @@ from jno.trace import FunctionCall  # noqa: E402
 from jno.trace_evaluator import TraceEvaluator  # noqa: E402
 from jno.utils.solver.fem_adapt import _domain_from_arrays  # noqa: E402
 
-HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
-needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax oracle not installed")
 pytest.importorskip("pygmsh", reason="pygmsh required for box meshing")
 
 K0 = 2 * jnp.pi
@@ -309,88 +306,6 @@ def test_emitter_wavelength_is_the_vacuum_one_whichever_ambient_is_dielectric(di
     assert abs(eps[0] - (n**2 if dielectric_top else 1.0)) < 1e-2, eps
     assert abs(eps[-1] - (1.0 if dielectric_top else n**2)) < 1e-2, eps
     assert abs(eps[1] - 6.0) < 1e-2, eps
-
-
-# ----------------------------- fmmax oracle (test-only) -----------------------------
-@needs_fmmax
-def test_engine_delta_source_matches_fmmax_oracle():
-    """The backend's jump-condition emission solve reproduces fmmax's
-    ``amplitudes_for_source`` powers (up/down) in the engine geometry -- the
-    audio chain, not self-consistency. Anchored at orders=60 in complex128."""
-    import fmmax
-    from fmmax import basis as fmmax_basis
-    from fmmax import fields as fmmax_fields
-    from fmmax import fmm, scattering, sources
-
-    def fmmax_powers(eps_sub, orient, amp, kind, fwhm):
-        lv = fmmax_basis.LatticeVectors(u=jnp.array([1.0, 0.0]), v=jnp.array([0.0, 1.0]))
-        ex = fmmax_basis.generate_expansion(lv, approximate_num_terms=60)
-        kin = jnp.asarray((1e-3, 1e-3))
-        layers = [1.0, 1.0, eps_sub]
-
-        def ls(eps):
-            return fmm.eigensolve_isotropic_media(
-                wavelength=jnp.asarray(1.0),
-                in_plane_wavevector=kin,
-                primitive_lattice_vectors=lv,
-                permittivity=jnp.asarray([[eps]]),
-                expansion=ex,
-                formulation=fmmax.Formulation.FFT,
-            )
-
-        lsr = [ls(e) for e in layers]
-        before = lsr[:2]
-        before_t = [1.0, 0.5]
-        after = lsr[1:]
-        after_t = [0.5, 1.0]
-        s_before = scattering.stack_s_matrix(before, before_t)
-        s_after = scattering.stack_s_matrix(after, after_t)
-        loc = jnp.asarray([[0.5, 0.5]])
-        if kind == "gaussian":
-            base = sources.gaussian_source(jnp.asarray(fwhm), loc, kin, lv, ex)
-        else:
-            base = sources.dirac_delta_source(loc, kin, lv, ex)
-        ox, oy, oz = orient
-        ampv = jnp.asarray(amp) + 0j
-        jx, jy, jz = ampv * ox * base, ampv * oy * base, ampv * oz * base
-        bwd0, _, _, _, _, fN = sources.amplitudes_for_source(jx, jy, jz, s_before, s_after)
-        _, ub = fmmax_fields.directional_poynting_flux(jnp.zeros_like(bwd0), bwd0, lsr[0])
-        df, _ = fmmax_fields.directional_poynting_flux(fN, jnp.zeros_like(fN), lsr[-1])
-        return float(jnp.abs(jnp.sum(jnp.real(ub)))), float(jnp.abs(jnp.sum(jnp.real(df))))
-
-    from jno._rcwa import sources as jno_sources
-    from jno._rcwa.stack import StateStack
-
-    def ours(eps_sub, orient, amp, kind, fwhm):
-        st = StateStack(
-            wavelength=1.0,
-            period=(1.0, 1.0),
-            amb_sup=1.0,
-            amb_sub=eps_sub,
-            layers=[(1.0, 1.0)],
-            orders=60,
-            k_in=(1e-3, 1e-3),
-            dtype=jnp.complex128,
-        )
-        src = dict(
-            layer=0,
-            t_upper=0.5,
-            t_lower=0.5,
-            kind=kind,
-            loc=np.array([[0.5, 0.5]]),
-            orient=np.asarray(orient, float),
-            amp=amp,
-            fwhm=fwhm,
-        )
-        up, down = jno_sources.emission_solve(st, src)
-        return float(up), float(down)
-
-    for orient, kind in [((1, 0, 0), "delta"), ((0, 0, 1), "delta"), ((1, 0, 0), "gaussian")]:
-        for eps_sub in (1.0, 9.0):
-            up_o, down_o = fmmax_powers(eps_sub, orient, 1.0, kind, 0.2)
-            up, down = ours(eps_sub, orient, 1.0, kind, 0.2)
-            assert up == pytest.approx(up_o, rel=2e-4), (orient, kind, eps_sub, "up")
-            assert down == pytest.approx(down_o, rel=2e-4), (orient, kind, eps_sub, "down")
 
 
 # ----------------------------- energy + gradient anchors -----------------------------

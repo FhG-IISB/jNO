@@ -4,15 +4,8 @@ plane-wave solve, plus readouts.
 Anchors (always run): analytic Fresnel/Airy slabs (normal + oblique TE/TM),
 energy conservation, chunk-invariance, uniform-collapse exactness, jit reuse,
 native-JVP gradients vs finite differences, re-solve across wavelength, order
-indexing and the loud interior-fields failure. Oracle tests (skip without
-fmmax): the crossed-grating disk and the uniform slab against fmmax 1.7.1.
-
-The disk numbers below are directly measured against fmmax in this file: the
-FFT formulation agrees to rel ~1e-5 (complex64) and ~1e-14 (complex128); the
-JONES_DIRECT_FOURIER formulation (the jNO default) agrees to rel ~1e-6 at both
-precisions, at orders=160. The recursion is found stable at complex64 for this
-problem (the stack executes ~30 chunk steps of an O(1)-conditioned impedance
-recursion; see the energy and chunk-invariance anchors).
+indexing and the loud interior-fields failure. Independent libraries enter only
+through tests/test_rcwa_reference.py (stored torcwa/fmmax numbers).
 """
 
 import jax
@@ -496,236 +489,8 @@ def test_bad_formulation_name_raises_loud():
 
 
 # -----------------------------------------------------------------------------
-# fmmax oracles (skip when fmmax is absent).
-# -----------------------------------------------------------------------------
-
-
-def _fmmax():
-    return pytest.importorskip("fmmax", reason="fmmax oracle not installed")
-
-
-def _fmmax_disk_reference(fmmax, dg, h=0.35, orders=160, formulation="fft", period=(0.6, 0.6)):
-    """fmmax x64 T/R for the crossed-grating disk (prototype oracle builder)."""
-    from fmmax import fields as ff
-    from fmmax import fmm, scattering, sources
-
-    jax.config.update("jax_enable_x64", True)
-    lv = fmmax.basis.LatticeVectors(jnp.array([period[0], 0.0]), jnp.array([0.0, period[1]]))
-    ex = fmmax.basis.generate_expansion(lv, orders)
-    kin = jnp.asarray([0.0, 0.0])
-    form = fmm.Formulation.FFT if formulation == "fft" else fmm.Formulation.JONES_DIRECT_FOURIER
-    layers = [
-        fmm.eigensolve_isotropic_media(jnp.asarray(1.0), kin, lv, jnp.asarray([[1.0]]), ex, formulation=form),
-        fmm.eigensolve_isotropic_media(jnp.asarray(1.0), kin, lv, jnp.asarray(dg), ex, formulation=form),
-        fmm.eigensolve_isotropic_media(jnp.asarray(1.0), kin, lv, jnp.asarray([[1.0]]), ex, formulation=form),
-    ]
-    s = scattering.stack_s_matrix(layers, [1.0, h, 1.0])
-    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
-    fwd = sources.amplitudes_for_fields(
-        jnp.ones((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        layers[0],
-    )[0]
-    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
-    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
-    fbw = ff.directional_poynting_flux(jnp.zeros_like(fwd), s.s21 @ fwd, layers[0])[1]
-    t = float(jnp.sum(jnp.real(ft))) / pin
-    r = -float(jnp.sum(jnp.real(fbw))) / pin
-    jax.config.update("jax_enable_x64", False)
-    return t, r
-
-
-def test_disk_matches_fmmax_fft():
-    """Crossed-grating disk, FFT formulation: rel ~1e-5 (c64), ~1e-14 (c128)."""
-    fmmax = _fmmax()
-    dg = _disk_grid(64)
-    t_ref, r_ref = _fmmax_disk_reference(fmmax, dg, h=0.35, orders=160, formulation="fft")
-
-    st = StateStack(
-        1.0,
-        (0.6, 0.6),
-        1.0,
-        1.0,
-        [(0.35, jnp.asarray(dg))],
-        orders=160,
-        formulation="FFT",
-    )
-    res = st.solve(validate=False)
-    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
-    assert abs(float(res.R) - r_ref) / r_ref < 5e-4
-
-    jax.config.update("jax_enable_x64", True)
-    st128 = StateStack(
-        1.0,
-        (0.6, 0.6),
-        1.0,
-        1.0,
-        [(0.35, jnp.asarray(dg))],
-        orders=160,
-        formulation="FFT",
-        dtype=jnp.complex128,
-    )
-    res128 = st128.solve(validate=False)
-    jax.config.update("jax_enable_x64", False)
-    assert abs(float(res128.T) - t_ref) / t_ref < 1e-9
-    assert abs(float(res128.R) - r_ref) / r_ref < 1e-9
-
-
-def test_disk_matches_fmmax_jones():
-    """Crossed-grating disk, JONES_DIRECT_FOURIER (jNO default): rel ~1e-6."""
-    fmmax = _fmmax()
-    dg = _disk_grid(64)
-    t_ref, r_ref = _fmmax_disk_reference(fmmax, dg, h=0.35, orders=160, formulation="jones")
-
-    st = StateStack(
-        1.0,
-        (0.6, 0.6),
-        1.0,
-        1.0,
-        [(0.35, jnp.asarray(dg))],
-        orders=160,
-        formulation="JONES_DIRECT_FOURIER",
-    )
-    res = st.solve(validate=False)
-    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
-    assert abs(float(res.R) - r_ref) / r_ref < 5e-4
-
-    jax.config.update("jax_enable_x64", True)
-    st128 = StateStack(
-        1.0,
-        (0.6, 0.6),
-        1.0,
-        1.0,
-        [(0.35, jnp.asarray(dg))],
-        orders=160,
-        formulation="JONES_DIRECT_FOURIER",
-        dtype=jnp.complex128,
-    )
-    res128 = st128.solve(validate=False)
-    jax.config.update("jax_enable_x64", False)
-    assert abs(float(res128.T) - t_ref) / t_ref < 5e-6
-    assert abs(float(res128.R) - r_ref) / r_ref < 5e-6
-
-
-def test_slab_matches_fmmax():
-    """Uniform slab order-0 transmission vs fmmax x64 (rel ~1e-5 at c64)."""
-    fmmax = _fmmax()
-    jax.config.update("jax_enable_x64", True)
-    lv = fmmax.basis.LatticeVectors(jnp.array([PERIOD[0], 0.0]), jnp.array([0.0, PERIOD[1]]))
-    ex = fmmax.basis.generate_expansion(lv, 60)
-    from fmmax import fields as ff
-    from fmmax import fmm, scattering, sources
-
-    layers = [
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0),
-            jnp.asarray([0.0, 0.0]),
-            lv,
-            jnp.asarray([[1.0]]),
-            ex,
-            formulation=fmm.Formulation.FFT,
-        ),
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0),
-            jnp.asarray([0.0, 0.0]),
-            lv,
-            jnp.asarray([[4.0]]),
-            ex,
-            formulation=fmm.Formulation.FFT,
-        ),
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0),
-            jnp.asarray([0.0, 0.0]),
-            lv,
-            jnp.asarray([[1.0]]),
-            ex,
-            formulation=fmm.Formulation.FFT,
-        ),
-    ]
-    s = scattering.stack_s_matrix(layers, [1.0, 0.4, 1.0])
-    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
-    fwd = sources.amplitudes_for_fields(
-        jnp.ones((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        layers[0],
-    )[0]
-    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
-    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
-    t_ref = float(jnp.sum(jnp.real(ft))) / pin
-    jax.config.update("jax_enable_x64", False)
-
-    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.4, jnp.asarray([[4.0]]))], orders=60)
-    res = st.solve(validate=False)
-    assert abs(float(res.T) - t_ref) / t_ref < 1e-3
-
-
-# -----------------------------------------------------------------------------
 # Stage 2a: anisotropic (5-/10-component) layers and the uniform fast path.
 # -----------------------------------------------------------------------------
-
-
-def _fmmax_aniso_slab(T_COMPONENTS, thickness=0.3, orders=41, formulation="FFT"):
-    """fmmax x64 T/R for a uniform general-anisotropic slab in vacuum."""
-    fmmax = _fmmax()
-    from fmmax import fields as ff
-    from fmmax import fmm, scattering, sources
-
-    jax.config.update("jax_enable_x64", True)
-    lv = fmmax.basis.LatticeVectors(jnp.array([PERIOD[0], 0.0]), jnp.array([0.0, PERIOD[1]]))
-    ex = fmmax.basis.generate_expansion(lv, orders)
-    form = fmm.Formulation.FFT if formulation == "FFT" else fmm.Formulation.JONES_DIRECT_FOURIER
-    comps10 = T_COMPONENTS if len(T_COMPONENTS) == 10 else tuple(T_COMPONENTS) + (1.0, 0.0, 0.0, 1.0, 1.0)
-    layers = [
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=form
-        ),
-        fmm.eigensolve_general_anisotropic_media(
-            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, *[jnp.asarray([[v]]) for v in comps10], ex, formulation=form
-        ),
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=form
-        ),
-    ]
-    s = scattering.stack_s_matrix(layers, [1.0, thickness, 1.0])
-    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
-    fwd = sources.amplitudes_for_fields(
-        jnp.ones((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        layers[0],
-    )[0]
-    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
-    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
-    fbw = ff.directional_poynting_flux(jnp.zeros_like(fwd), s.s21 @ fwd, layers[0])[1]
-    t_ref = float(jnp.sum(jnp.real(ft))) / pin
-    r_ref = -float(jnp.sum(jnp.real(fbw))) / pin
-    jax.config.update("jax_enable_x64", False)
-    return t_ref, r_ref
-
-
-def test_uniform_aniso_matches_fmmax_fft():
-    """Uniform 5-comp biaxial slab vs fmmax general-aniso eigensolve (rel ~1e-5 c64)."""
-    comps = (8.0, 0.0, 0.0, 4.0, 6.0)
-    t_ref, r_ref = _fmmax_aniso_slab(comps)
-    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps)], orders=41, formulation="FFT")
-    res = st.solve(validate=False)
-    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
-    assert abs(float(res.R) - r_ref) / max(abs(r_ref), 1e-12) < 5e-4
-
-
-def test_uniform_aniso_mu_matches_fmmax():
-    """Uniform 10-comp magnetic slab (mu != I) vs fmmax (the mu genuinely enters)."""
-    comps = (6.0, 0.0, 0.0, 4.0, 5.0, 1.0, 0.0, 0.0, 2.0, 1.5)
-    t_ref, r_ref = _fmmax_aniso_slab(comps)
-    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps)], orders=41, formulation="FFT")
-    res = st.solve(validate=False)
-    assert abs(float(res.T) - t_ref) / t_ref < 5e-4
-    assert abs(float(res.R) - r_ref) / max(abs(r_ref), 1e-12) < 5e-4
 
 
 def test_uniform_aniso_fast_path_is_not_a_patterned_solve():
@@ -875,84 +640,29 @@ def test_iso_film_above_aniso_films_solves_and_conserves():
     assert abs(float(res4.T) - float(res3.T)) < 1e-5
 
 
-def test_patterned_aniso_precision_guard_is_an_instructive_valueerror():
-    """A precision-class mismatch on a patterned anisotropic layer (complex128
-    component grids under a complex64 stack, jax_enable_x64 on) raises an
-    INSTRUCTIVE ValueError naming the two precision classes -- never the old
-    bare empty AssertionError (which ``python -O`` would strip entirely,
-    violating never-silent). Regression for iss_mwwg9iz893b1iw."""
+def test_a_complex64_stack_under_x64_keeps_its_precision():
+    """complex128 component grids in a complex64 stack with jax_enable_x64 on: the grids are cast to the stack's
+    dtype and everything downstream, the tangent field included, stays complex64 (the old tangent field was
+    promoted to complex128 by the float64 lattice vectors, which a precision guard then had to reject). The
+    result agrees with the complex128 stack to the complex64 floor."""
+    from jno._rcwa import basis, matrices
+
     _x64_prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
         rng = np.random.default_rng(0)
         n = 8
         comps = tuple((1.0 + rng.uniform(0, 0.5, (n, n))).astype(np.complex128) for _ in range(5))
-        with pytest.raises(ValueError, match="precision"):
-            StateStack(
-                1.0,
-                PERIOD,
-                1.0,
-                1.0,
-                [(0.4, comps)],
-                orders=41,
-                formulation="JONES_DIRECT_FOURIER",
-                dtype=jnp.complex64,
-            )
+        lv = basis.LatticeVectors(u=jnp.asarray([PERIOD[0], 0.0]), v=jnp.asarray([0.0, PERIOD[1]]))
+        ex = basis.generate_expansion(lv, 9)
+        tx, ty = matrices.tangent_field_for(
+            matrices.Formulation.JONES_DIRECT_FOURIER, jnp.asarray(comps[0], jnp.complex64), ex, lv
+        )
+        assert tx.dtype == ty.dtype == jnp.complex64
+        t = {}
+        for dt in (jnp.complex64, jnp.complex128):
+            st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, comps)], orders=9, formulation="JONES_DIRECT_FOURIER", dtype=dt)
+            t[dt] = float(st.solve(validate=False).T)
+        assert abs(t[jnp.complex64] - t[jnp.complex128]) < 1e-5
     finally:
         jax.config.update("jax_enable_x64", _x64_prev)
-
-
-def test_patterned_aniso_matches_fmmax_fft():
-    """A PATTERNED anisotropic layer (in-plane varying tensor, FFT formulation)
-    vs fmmax -- exercises the general-aniso M_L assembly end to end."""
-    n = 16
-
-    def grid(base_lo, base_hi):
-        x = (np.arange(n) + 0.5) / n
-        xx, yy = np.meshgrid(x, x, indexing="ij")
-        inside = (xx - 0.5) ** 2 + (yy - 0.5) ** 2 < 0.3**2
-        return np.where(inside, base_hi, base_lo).astype(np.float32)
-
-    eps5 = tuple(grid(1.0, v) for v in (9.0, 0.4, -0.2, 6.0, 7.0))
-    mu10 = (np.ones((n, n)), np.zeros((n, n)), np.zeros((n, n)), np.ones((n, n)), np.ones((n, n)))
-    st = StateStack(1.0, PERIOD, 1.0, 1.0, [(0.3, tuple(eps5) + tuple(mu10))], orders=41, formulation="FFT")
-    res = st.solve(validate=False)
-
-    # fmmax oracle for the same grids (x64 for the reference, ours c64)
-    fmmax = _fmmax()
-    from fmmax import fields as ff
-    from fmmax import fmm, scattering, sources
-
-    lv = fmmax.basis.LatticeVectors(jnp.array([PERIOD[0], 0.0]), jnp.array([0.0, PERIOD[1]]))
-    ex = fmmax.basis.generate_expansion(lv, 41)
-    jax.config.update("jax_enable_x64", True)
-    layers = [
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=fmm.Formulation.FFT
-        ),
-        fmm.eigensolve_general_anisotropic_media(
-            jnp.asarray(1.0),
-            jnp.asarray([0.0, 0.0]),
-            lv,
-            *[jnp.asarray(g) for g in eps5 + mu10],
-            ex,
-            formulation=fmm.Formulation.FFT,
-        ),
-        fmm.eigensolve_isotropic_media(
-            jnp.asarray(1.0), jnp.asarray([0.0, 0.0]), lv, jnp.asarray([[1.0]]), ex, formulation=fmm.Formulation.FFT
-        ),
-    ]
-    s = scattering.stack_s_matrix(layers, [1.0, 0.3, 1.0])
-    g = 2 * int(np.amax(np.abs(ex.basis_coefficients))) + 1
-    fwd = sources.amplitudes_for_fields(
-        jnp.ones((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        jnp.zeros((g, g, 1), jnp.complex128),
-        layers[0],
-    )[0]
-    pin = float(jnp.sum(jnp.real(ff.directional_poynting_flux(fwd, jnp.zeros_like(fwd), layers[0])[0])))
-    ft = ff.directional_poynting_flux(s.s11 @ fwd, jnp.zeros_like(fwd), layers[-1])[0]
-    t_ref = float(jnp.sum(jnp.real(ft))) / pin
-    jax.config.update("jax_enable_x64", False)
-    assert abs(float(res.T) - t_ref) / t_ref < 5e-3

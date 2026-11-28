@@ -2,36 +2,43 @@
   "aniso5": {
     "description": "uniform biaxial 5-component anisotropic slab diag(8,4,6)",
     "dtype": "complex128",
-    "sha256": "27e99e683dd0b58ce9b47d5f57959868b4e40b9e0442ab8354ed0b1b659b5100"
+    "made_at_commit": "1467c010",
+    "sha256": "89dc1370c68a026f84d4dae435cff8a836c16cd5c8ae5a12505f71f1aa17d95a"
   },
   "asi_disk": {
     "description": "a-Si pillar slab (high-contrast eps) \u2014 convergence stress",
     "dtype": "complex128",
-    "sha256": "11b2d1629f71053177fe951541e1bc735fd609630cf9e25c430ec014f746cad1"
+    "made_at_commit": "1467c010",
+    "sha256": "f1904013fd9d6c9f1e6e1fa20db652283cd99a37c605318aa98c5f61d8273507"
   },
   "disk_160": {
     "description": "crossed-grating disk, orders 160 (high-order stress)",
     "dtype": "complex128",
-    "sha256": "fbcc42949213c622c91faeb8095e7c2941363b49ecb17899ab997e43c7cd896b"
+    "made_at_commit": "1467c010",
+    "sha256": "70b3fd50cac037082e361e47b683d94f2ab9303e8285c2120c435095b030cda6"
   },
   "disk_40": {
     "description": "crossed-grating disk, orders 40",
     "dtype": "complex128",
-    "sha256": "92acdb41c57fef2f17ab1150c0d59893665fc656de41852bc216b597d77a70e2"
+    "made_at_commit": "1467c010",
+    "sha256": "29e07e11dd766ca55116dc3a74d7c4053e38f8a76b61637c75469416ddf96675"
   },
   "emitter": {
     "description": "internal delta x-dipole in a vacuum film over a higher-index substrate",
     "dtype": "complex128",
-    "sha256": "1312b40e456f930b48cb0d6f9b070cb25567405069fef4ab2d3af7fe1b8cb027"
+    "made_at_commit": "1467c010",
+    "sha256": "26d447b540249cf8fec38f01390286aa6b4751dfd8f3faa4165e81cc074e88e9"
   },
   "pml10": {
     "description": "uniform uniaxial 10-component frame (diagonal eps & mu), the PML material",
     "dtype": "complex128",
-    "sha256": "5d61504d1d2ac9229a39c6f60026c3d051dc63922e6ebf5170ccc7b4a22fb0fc"
+    "made_at_commit": "1467c010",
+    "sha256": "5d6edc0fe2d2b3daa38d66527db2bd17cffc8ca2330a4c7f3cfe1d624ba07c97"
   },
   "slab_airy": {
     "description": "uniform n=2 slab in vacuum \u2014 order-0 Fresnel/Airy T/R",
     "dtype": "complex128",
-    "sha256": "3cd4a20ed097b9cf2e572b47f08a62bc462a238a6b1e76868a87cc426079f5f2"
+    "made_at_commit": "1467c010",
+    "sha256": "0abde0853b9cc3e8e3276f407112cb9326de0106bbd5d6f7e3db6207b7075074"
   }
 }
