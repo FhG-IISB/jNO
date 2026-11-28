@@ -26,7 +26,7 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-def _scalar(order=4, n=3, *, coef="variable", sigma=0.5, rough=True, matrix_free=True, nonlinear=False):
+def _scalar(order=4, n=3, *, coef="variable", sigma=0.5, rough=True, matrix_free=True, nonlinear=False, load=30.0):
     d = jno.shape.rect(0, 0, 1, 1).structured(n=n).quad().domain(compute_mesh_connectivity=False)
     u, v = d.fem_symbols(order=order)
     x, y, _ = d.variable("interior", split=True)
@@ -36,7 +36,7 @@ def _scalar(order=4, n=3, *, coef="variable", sigma=0.5, rough=True, matrix_free
     if nonlinear:
         kappa = kappa * (1.0 + ui * ui)
     f = 1.0 + (sin(23.0 * x + 7.0 * y) * cos(19.0 * y) if rough else 0.0)
-    form = kappa * (ui.x * vi.x + ui.y * vi.y) + sigma * ui * vi - 30.0 * f * vi
+    form = kappa * (ui.x * vi.x + ui.y * vi.y) + sigma * ui * vi - load * f * vi
     return jno.fem([form, u(xb, yb) - 0.0], quadrature="gll", matrix_free=matrix_free)
 
 
@@ -170,3 +170,38 @@ def test_an_operator_that_is_not_matrix_free_spectral_elements_is_refused():
         _scalar(order=2, n=2).solve(linear=jno.solve.cg(), precond=jno.precond.pmg())
     with pytest.raises(ValueError, match="smoother"):
         jno.precond.pmg(smoother="gauss-seidel")
+
+
+def test_the_amg_coarse_cycle_contracts_at_a_state_far_from_the_one_it_was_built_at(monkeypatch):
+    """The AMG hierarchy is built once, from the coarse operator at the zero state (coefficient 1 + u² = 1); a Newton
+    iterate's is several times stiffer. With the finest level's smoothing window frozen at the reference state the
+    polynomial amplified there (a GPU Newton solve, Q3 at 551k DOFs, diverged to NaN). The window is measured on each
+    build's own coarse operator: the cycle's error propagator ``I - M A_c`` contracts."""
+    from jno.utils.solver import sem_precond
+    from jno.utils.solver.sem_precond import coarse_levels, coarse_solver
+
+    monkeypatch.setattr(sem_precond, "DENSE_COARSE_MAX", 10)
+    fem = _scalar(order=4, n=14, nonlinear=True)
+    op = fem._op
+    n = int(op.size)
+    levels = coarse_levels(op.jacobian_sem_ref())
+    assert levels is not None and "Ainv" not in levels[0]  # a real hierarchy (225 vertices)
+    stiff = op.jacobian_sem(jnp.full((n,), 3.0))  # 1 + u² = 10 in the interior
+    Ac = np.asarray(stiff.coarse_dense())
+    cycle = coarse_solver(stiff, levels)
+    M = np.asarray(jax.vmap(cycle)(jnp.eye(Ac.shape[0])).T)
+    rho = np.abs(np.linalg.eigvals(np.eye(Ac.shape[0]) - M @ Ac)).max()
+    assert rho < 1.0, rho
+
+
+def test_the_amg_hierarchy_is_built_once_per_problem(monkeypatch):
+    from jno.utils.solver import sem_precond
+
+    monkeypatch.setattr(sem_precond, "DENSE_COARSE_MAX", 10)
+    builds = []
+    real = sem_precond.coarse_levels
+    monkeypatch.setattr(sem_precond, "coarse_levels", lambda d: builds.append(1) or real(d))
+    fem = _scalar(order=4, n=6)
+    for _ in range(3):  # a new spec each call, as `fem.solve(precond=jno.precond.pmg())` makes one
+        fem.solve(linear=jno.solve.cg(tol=1e-10), precond=jno.precond.pmg())
+    assert len(builds) == 1

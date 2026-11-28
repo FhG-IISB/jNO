@@ -474,31 +474,35 @@ def _sem_levels(spec, ctx, data):
 
     if data.st.n_coarse <= DENSE_COARSE_MAX:
         return None
-    hit = spec._levels.get(id(data.st))
-    if hit is None or hit[0] is not data.st:
+    # Kept on the problem's own structure, not on the spec: `fem.solve(precond=jno.precond.pmg())` builds a new spec
+    # per call, and rebuilding the hierarchy each time cost 1.2 s of a 1.7 s solve (Q3, 551k DOFs, 21952 vertices).
+    levels = data.st.cache.get("amg_levels")
+    if levels is None:
         if isinstance(data.coarse_data, jax.core.Tracer):
             raise TypeError(
                 f"{spec!r}: the coarse operator ({data.st.n_coarse} unknowns) needs an AMG hierarchy built from a "
                 "concrete state, and this solve is traced without one. Solve through fem.solve(precond=...), which "
                 "builds it first."
             )
-        hit = spec._levels[id(data.st)] = (data.st, coarse_levels(data))
-    return hit[1]
+        levels = data.st.cache["amg_levels"] = coarse_levels(data)
+    return levels
 
 
 def _sem_prepare(spec, fem):
-    """Before a solve is traced: the AMG hierarchy of a large coarse operator, from the problem's reference state."""
+    """Before a solve is traced: the AMG hierarchy of a large coarse operator, from the problem's reference state,
+    once per problem (kept on its structure, see :func:`_sem_levels`)."""
     from .utils.solver.sem_precond import DENSE_COARSE_MAX, coarse_levels
 
     op = getattr(fem, "_op", None)
-    ref = getattr(op, "jacobian_sem_ref", None)
-    if ref is None and isinstance(op, tuple) and op:
-        ref = getattr(op[0], "sem_fn", None)
-    if ref is None:
+    holder = op[0] if isinstance(op, tuple) and op else op
+    statics = getattr(holder, "sem_statics", None)
+    ref = getattr(holder, "jacobian_sem_ref", None) or getattr(holder, "sem_fn", None)
+    if statics is None or ref is None:
         return
-    data = ref()
-    if data.st.n_coarse > DENSE_COARSE_MAX and id(data.st) not in spec._levels:
-        spec._levels[id(data.st)] = (data.st, coarse_levels(data))
+    st = statics()
+    if st.n_coarse <= DENSE_COARSE_MAX or st.cache.get("amg_levels") is not None:
+        return
+    st.cache["amg_levels"] = coarse_levels(ref())
 
 
 class _FDMSchwarz(_Spec):
@@ -511,7 +515,6 @@ class _FDMSchwarz(_Spec):
 
     def __init__(self, coarse):
         self.coarse = bool(coarse)
-        self._levels = {}
         self.key = ("fdm_schwarz", self.coarse)
 
     def prepare(self, fem):
@@ -543,7 +546,6 @@ class _PMG(_Spec):
             raise ValueError(f"jno.precond.pmg(degree={degree!r}): the smoothing polynomial needs degree >= 1.")
         self.smoother, self.degree = smoother, int(degree)
         self.lmin_ratio, self.bound_iters, self.safety = float(lmin_ratio), int(bound_iters), float(safety)
-        self._levels = {}
         self.key = ("pmg", self.smoother, self.degree, self.lmin_ratio, self.bound_iters, self.safety)
 
     def prepare(self, fem):

@@ -21,7 +21,7 @@ built once on the host (pyamg) and whose finest level takes the current ``A_c``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import jax
@@ -73,6 +73,8 @@ class SemStatics:
     coarse_rows: Any  # (nnz,) coarse pattern
     coarse_cols: Any
     coarse_inv: Any  # (n_cells * (n_v vec)^2,) -> pattern slot
+    # per problem, kept across solves and specs: the frozen AMG hierarchy of the coarse operator (see `coarse_levels`)
+    cache: dict = field(default_factory=dict)
 
 
 def sem_statics(factors, cdofs, vec: int, cell_type: str, order: int, n: int) -> SemStatics:
@@ -193,30 +195,39 @@ class SemData:
         )
 
 
+#: The coarse AMG solve: Chebyshev of this degree on the current coarse operator, preconditioned by the frozen
+#: hierarchy, over the window ``[top / COARSE_WINDOW, 1.1 top]`` of the preconditioned operator.
+COARSE_CHEBYSHEV_DEGREE = 4
+COARSE_WINDOW = 10.0
+
+
 def coarse_solver(data: SemData, levels=None):
-    """``rc -> A_c⁻¹ rc``: an LU of the dense ``A_c`` (small), or an AMG V-cycle whose finest level is the current
-    ``A_c`` and whose coarser levels are the frozen ``levels`` (:func:`amg.build_hierarchy` of an earlier ``A_c``)."""
+    """``rc -> ≈ A_c⁻¹ rc``: an LU of the dense ``A_c`` (small), or, with an AMG ``levels`` hierarchy
+    (:func:`amg.build_hierarchy` of the coarse operator at the reference state, frozen), Chebyshev iteration on the
+    CURRENT ``A_c`` preconditioned by one frozen V-cycle, its window from power iterations on this build's own
+    preconditioned operator.
+
+    The frozen hierarchy alone is the inverse of another operator: a Newton iterate's coarse operator was ten
+    times stiffer than the reference one, and the V-cycle's error propagator ``I - M A_c`` had spectral radius
+    3.1e7 there (with only the finest level's window re-measured, 6.1). Chebyshev on ``M A_c`` is a fixed linear
+    map, symmetric where they are, and contracts while the two operators are spectrally equivalent."""
     if levels is None:
         lu = jax.scipy.linalg.lu_factor(data.coarse_dense())
         return lambda rc: jax.scipy.linalg.lu_solve(lu, rc)
     from .amg import vcycle_apply
-    from .krylov import chebyshev_apply
+    from .krylov import chebyshev_apply, power_iteration_bound
 
     A0 = data.coarse_matrix()
-    lv = levels[0]
-    if "Ainv" in lv:  # pyamg stopped at one level: the frozen dense inverse is the whole hierarchy
-        return lambda rc: lv["Ainv"] @ rc
 
     def mv(v):
         return A0 @ v
 
-    def cycle(r):
-        smooth = lambda rhs: chebyshev_apply(mv, rhs, lmin=lv["lmin"], lmax=lv["lmax"], degree=lv["degree"])  # noqa: E731
-        x = smooth(r)
-        x = x + lv["P"] @ vcycle_apply(levels[1:], lv["R"] @ (r - mv(x)))
-        return x + smooth(r - mv(x))
+    def M(r):
+        return vcycle_apply(levels, r)
 
-    return cycle
+    hi = 1.1 * power_iteration_bound(mv, data.st.n_coarse, dtype=data.coarse_data.dtype, iters=15, M=M)
+    lo = hi / COARSE_WINDOW
+    return lambda rc: chebyshev_apply(mv, rc, lmin=lo, lmax=hi, degree=COARSE_CHEBYSHEV_DEGREE, M=M)
 
 
 def coarse_levels(data: SemData):

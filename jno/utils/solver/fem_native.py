@@ -1460,6 +1460,7 @@ def _matrix_free_system(residual, jacobian, zeros, dirichlet_pairs):
             return _sem[0]
 
         A.sem_fn = sem
+        A.sem_statics = jacobian.sem_statics
     return A, b
 
 
@@ -6929,6 +6930,7 @@ def assemble_fem_native(
                     return sem_data(jacobian, zeros, _m, _p)
 
             _op_np.jacobian_sem, _op_np.jacobian_sem_ref = _jac_sem_np, _jac_sem_ref
+            _op_np.sem_statics = jacobian.sem_statics
         if dirichlet_pairs and any(float(v) != 0.0 for _dof, v in dirichlet_pairs):
             _ld, _lv, _lproj = dirichlet_projection(dirichlet_pairs)
             _op_np.lift_start = lambda u0, args=None: dirichlet_lift_start(
