@@ -8470,6 +8470,24 @@ def _fem_impl(
             here, before any solve. Setting it on a problem whose assembler has no element loop (1-D,
             non-nodal) is an error rather than a silent no-op.
 
+        quadrature: ``"gll"`` integrates every term of a quadrilateral or hexahedral Lagrange field of degree
+            ``k`` with the Gauss-Lobatto-Legendre rule at its own nodes (``k + 1`` points per axis, exact to
+            degree ``2k - 1``): the spectral-element rule, under which the mass matrix is diagonal (exact
+            lumping) and the stiffness of an affine cell stays exact. ``None`` (the default) is the Gauss rule
+            of ``quad_degree``. See docs/spectral.md.
+        matrix_free: ``True`` applies a steady linear operator through its element residual and never stores
+            it: ``fem.operator`` is ``(A, b)`` with ``A`` a matvec (``A @ v``, ``A.diag()``, ``A.T``), solved by
+            Jacobi-preconditioned BiCGStab or the Krylov slot you pass (``linear=jno.solve.cg()``). On a
+            quadrilateral or hexahedral field of degree ``k >= 3`` the apply is sum-factorised, ``O(k^(d+1))``
+            per cell, and the memory is the mesh: the stored matrix of a Q5 hexahedral Poisson holds 322
+            entries per DOF. A direct solver or a matrix-based preconditioner has nothing to factor and
+            raises. A nonlinear form is solved by Newton-Krylov: each step applies the tangent as a JVP of the
+            residual and preconditions it with the tangent's diagonal (sum-factorised too), so no tangent is
+            ever assembled; ``jno.solve.newton(direct=True)`` assembles it anyway on a steady form. A transient
+            form with constant boundary values marches on every time scheme with the mass stored as its
+            diagonal (GLL) or applied, a nonlinear one by a Newton-Krylov solve per implicit step. Not for
+            periodic ties or complex fields.
+
     Returns:
         FEM: the assembled problem; call :meth:`FEM.solve`, :meth:`FEM.eigs` or read ``fem.operator``.
     """

@@ -14,6 +14,7 @@ import math
 import jax.numpy as jnp
 import numpy as np
 
+from ..utils.sets import unique_values
 from .bases import HIGHEST, Axis, Fourier, apply_axis
 
 __all__ = ["Grid"]
@@ -106,7 +107,7 @@ class Grid:
             for s in (0, 1)
             if np.isclose(a.nodes[0 if s == 0 else -1], a.a if s == 0 else a.b)
         ]
-        return np.unique(np.concatenate(faces)) if faces else np.empty(0, dtype=int)
+        return unique_values(np.concatenate(faces)) if faces else np.empty(0, dtype=int)
 
     # layout -----------------------------------------------------------------------------------------------
     def as_grid(self, values):

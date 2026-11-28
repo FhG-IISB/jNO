@@ -57,7 +57,22 @@ def fdm_1d(p: int):
 
 @dataclass
 class SemStatics:
-    """Host-built structure of one Q_k field (one field per problem), shared by every build of a preconditioner."""
+    """Host-built structure of one Q_k field (one field per problem), shared by every build of a preconditioner.
+
+    Attributes:
+        n: the system size.
+        vec: components per node.
+        tdim: the cell's dimension.
+        p: nodes per axis, ``k + 1``.
+        lex_dofs: ``(n_cells, p^tdim, vec)`` global DOFs in lexicographic node order.
+        S, lam: the 1-D fast-diagonalisation eigenvectors ``(p, p)`` and eigenvalues ``(p,)`` (:func:`fdm_1d`).
+        phi_local: ``(n_dof, n_v)`` the vertex functions at the element's nodes, local order.
+        P, Pt: the vertex prolongation ``(n, n_coarse)`` and its transpose, BCOO.
+        n_coarse: the coarse space's size (vertices x components).
+        coarse_rows, coarse_cols: the coarse operator's fixed pattern, ``(nnz,)`` each.
+        coarse_inv: ``(n_cells * (n_v vec)^2,)``, each cell block entry's slot in that pattern.
+        cache: per problem, kept across solves and specs: the frozen AMG hierarchy (``"amg_levels"``).
+    """
 
     n: int  # system size
     vec: int
@@ -135,7 +150,11 @@ def sem_statics(factors, cdofs, vec: int, cell_type: str, order: int, n: int) ->
 
 class SemData:
     """One build of the preconditioners' data at one state: the separable coefficients, the coarse operator and
-    the Dirichlet structure (``mask`` 1 on free rows, ``pin`` the constrained rows' diagonal)."""
+    the Dirichlet structure (``mask`` 1 on free rows, ``pin`` the constrained rows' diagonal).
+
+    ``st`` is the problem's :class:`SemStatics`, ``coeffs`` ``(n_cells, vec, 1 + tdim)`` the cells' separable
+    coefficients and ``Ce`` ``(n_cells, n_v vec, n_v vec)`` their blocks of the coarse operator, both from
+    ``fem_native._vol_cell_sem``."""
 
     def __init__(self, st: SemStatics, coeffs, Ce, mask, pin):
         self.st, self.mask, self.pin = st, jnp.asarray(mask), jnp.asarray(pin)
@@ -180,6 +199,7 @@ class SemData:
 
     # ---- the Q1 coarse correction ------------------------------------------------------------------------------
     def coarse_matrix(self):
+        """The coarse operator ``A_c = P̂ᵀ A P̂`` as a BCOO on its fixed pattern."""
         import jax.experimental.sparse as jsp
 
         st = self.st
@@ -187,6 +207,7 @@ class SemData:
         return jsp.BCOO((self.coarse_data, idx), shape=(st.n_coarse, st.n_coarse))
 
     def coarse_dense(self):
+        """The coarse operator as a dense ``(n_coarse, n_coarse)`` array (for the LU of a small one)."""
         st = self.st
         return (
             jnp.zeros((st.n_coarse, st.n_coarse), self.coarse_data.dtype)

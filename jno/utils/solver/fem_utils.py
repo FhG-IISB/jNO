@@ -5430,6 +5430,10 @@ def _leaf_content_token(leaf, seen):
     if isinstance(leaf, _Ph):
         d = _expr_digest(leaf)
         return None if d is None else ("expr", d)
+    if isinstance(leaf, type):
+        # a class held in a closure cell (one imported inside the assembler: `TensorFactors`), keyed by name as
+        # a class read from the globals is (`_fn_content_key`); bailing here made every Q_k rebuild recompile
+        return ("type", leaf.__module__, leaf.__qualname__)
     tname = type(leaf).__name__
     # MRO walk, not a name match on the leaf class: ``PolygonDomain(domain)`` and any other subclass
     # must token the same way -- matching only the base name made every shapely-built domain bail,

@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 from .._strong_form import _iter, _map_children, _unwrap
+from ..utils.sets import unique_values
 from .transfer import Interface
 
 
@@ -861,8 +862,8 @@ class FEMHighOrderParticipant(FEMParticipant):
             raise ValueError(f"interface: the domain has no boundary facets tagged {tag!r}.")
         mesh_pts = np.asarray(self.domain.mesh_connectivity["points"], dtype=float)[:, : self.dim]
         tree = cKDTree(self.points)
-        dist, vnode = tree.query(mesh_pts[np.unique(np.asarray(facets))])
-        vmap = dict(zip(np.unique(np.asarray(facets)).tolist(), vnode.tolist()))
+        dist, vnode = tree.query(mesh_pts[unique_values(facets)])
+        vmap = dict(zip(unique_values(facets).tolist(), vnode.tolist()))
         wanted = {frozenset((vmap[int(a)], vmap[int(b)])) for a, b in np.asarray(facets)}
         found = {}
         for loc, s_ref in self._reference_edges():
@@ -876,7 +877,7 @@ class FEMHighOrderParticipant(FEMParticipant):
                 f"coupling: {len(wanted) - len(found)} of the {len(wanted)} edges tagged {tag!r} are not edges of the "
                 "high-order field's cells (a hanging node?)."
             )
-        nodes = np.unique(np.concatenate([g for g, _ in found.values()]))
+        nodes = unique_values(np.concatenate([g for g, _ in found.values()]))
         pos = {int(n): i for i, n in enumerate(nodes)}
         edges = [np.array([pos[int(n)] for n in g]) for g, _ in found.values()]
         s = [sr for _, sr in found.values()]

@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..sets import unique_values
 from .fem_elements import ElementSpec
 
 # ``BASIX_TET_EDGES`` (defined in fem_topology) is the basix tetrahedron edge order, which is also
@@ -550,7 +551,7 @@ class TensorFactors:
         return out if self.quad is None else out[self.quad]
 
     def values(self, cell_sol):
-        """``(n_quad, vec)``: the field at the quadrature points from its cell DOFs ``(n_dof, vec)``."""
+        """``(n_quad, vec)``: the field at the quadrature points from its cell DOFs ``cell_sol`` ``(n_dof, vec)``."""
         T = self._lex(cell_sol)
         for a, B in enumerate(self.B):
             if not self._ident[a]:
@@ -558,7 +559,8 @@ class TensorFactors:
         return self._flat(T)
 
     def ref_grads(self, cell_sol):
-        """``(n_quad, vec, tdim)``: the reference gradient ``∂u_c/∂ξ_a`` at the quadrature points."""
+        """``(n_quad, vec, tdim)``: the reference gradient ``∂u_c/∂ξ_a`` at the quadrature points, from the cell DOFs
+        ``cell_sol`` ``(n_dof, vec)``."""
         T = self._lex(cell_sol)
         out = []
         for a in range(len(self.B)):
@@ -570,7 +572,7 @@ class TensorFactors:
         return jnp.stack(out, axis=-1)
 
     def grads(self, cell_sol, K):
-        """``(n_quad, vec, dim)``: the physical gradient, ``∂u/∂x = ∂u/∂ξ J⁻¹`` with ``K = J⁻¹`` per cell
+        """``(n_quad, vec, dim)``: the physical gradient of the cell DOFs ``cell_sol``, ``∂u/∂x = ∂u/∂ξ J⁻¹`` with ``K = J⁻¹`` per cell
         ``(tdim, dim)`` or per quadrature point ``(n_quad, tdim, dim)``."""
         g = self.ref_grads(cell_sol)
         return jnp.sum(g[..., :, None] * self.per_point(K), axis=-2)
@@ -617,7 +619,7 @@ def tensor_factors(cell_type: str, degree: int, quad_points, ref_values, ref_gra
     if int(np.prod(p)) != X.shape[0] or int(np.prod(m)) != Q.shape[0]:
         return None
     lex_n, lex_q = np.ravel_multi_index(ni, p), np.ravel_multi_index(qi, m)
-    if np.unique(lex_n).size != lex_n.size or np.unique(lex_q).size != lex_q.size:
+    if unique_values(lex_n).size != lex_n.size or unique_values(lex_q).size != lex_q.size:
         return None
     # the tabulation the factors must reproduce
     parts = [B[a][qi[a]][:, ni[a]] for a in range(tdim)]  # (n_quad, n_dof) each

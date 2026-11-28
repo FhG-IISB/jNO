@@ -1195,6 +1195,7 @@ def jacobi(*, float32: bool = False) -> _Jacobi:
     return _precision(_Jacobi(), float32)
 
 
+@_reusable
 def fdm_schwarz(*, coarse: bool = True) -> _FDMSchwarz:
     """Element **fast-diagonalisation Schwarz** for ``jno.fem(..., matrix_free=True)`` on a Q_k field (k >= 3,
     quadrilaterals or hexahedra): each cell's problem, extended by one node into its neighbours, is replaced by
@@ -1206,6 +1207,7 @@ def fdm_schwarz(*, coarse: bool = True) -> _FDMSchwarz:
     return _FDMSchwarz(coarse)
 
 
+@_reusable
 def pmg(
     *, smoother: str = "schwarz", degree: int = 2, lmin_ratio: float = 0.1, bound_iters: int = 12, safety: float = 1.1
 ) -> _PMG:
@@ -4313,6 +4315,7 @@ def chebyshev(
     return _precision(_Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters), float32)
 
 
+@_reusable
 def spectral(*, max_block: int = 4096, rcond: float = 1e-12):
     """The **Fourier-mode block** preconditioner of a ``jno.spectral`` problem: the operator's dense block per Fourier
     mode (over the polynomial nodes of every unknown), read by probing and inverted mode by mode. Exact for an
