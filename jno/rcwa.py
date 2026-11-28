@@ -763,6 +763,26 @@ class _EmitterSol:
         raise RcwaError(f"extraction(kind): kind must be 'up' | 'down', got {kind!r}")
 
 
+def _resolve_dtype(dtype):
+    """The solve's complex dtype from the user's ``dtype=`` (``None``: complex128 under ``jax_enable_x64``,
+    complex64 otherwise)."""
+    if dtype is None:
+        return jnp.dtype(jnp.complex128) if jax.config.jax_enable_x64 else jnp.dtype(jnp.complex64)
+    names = {"complex64": jnp.complex64, "complex128": jnp.complex128, "c64": jnp.complex64, "c128": jnp.complex128}
+    try:
+        dt = jnp.dtype(names.get(dtype, dtype)) if isinstance(dtype, str) else jnp.dtype(dtype)
+    except TypeError:
+        dt = None
+    if dt not in (jnp.dtype(jnp.complex64), jnp.dtype(jnp.complex128)):
+        raise RcwaError(f"dtype must be 'complex64' or 'complex128' (or None to follow jax_enable_x64), got {dtype!r}.")
+    if dt == jnp.dtype(jnp.complex128) and not jax.config.jax_enable_x64:
+        raise RcwaError(
+            "dtype='complex128' needs 64-bit JAX: set jax.config.update('jax_enable_x64', True) before building the "
+            "problem, or use dtype='complex64'."
+        )
+    return dt
+
+
 class Rcwa:
     """A periodic layered RCWA problem with an **explicit** layer stack (the backend engine).
 
@@ -783,6 +803,9 @@ class Rcwa:
             tangent-field hook.
         assume_periodic: skip the check that each layer's grid is periodic.
         polarization: ``"x"``, ``"y"``, or a Jones vector ``(p_x, p_y)``.
+        dtype: the complex precision of the solve, ``"complex64"`` or ``"complex128"``; ``None`` (default)
+            follows ``jax_enable_x64``. complex128 needs ``jax_enable_x64``. complex64 is the fast GPU
+            path (the RTX-class GPUs run float64 at 1/32-1/64 rate) and is accurate to about 1e-5.
     """
 
     def __init__(
@@ -796,8 +819,10 @@ class Rcwa:
         formulation="JONES_DIRECT_FOURIER",
         assume_periodic=False,
         polarization="x",
+        dtype=None,
     ):
         self.polarization = _as_jones(polarization)
+        self._dtype = _resolve_dtype(dtype)
         if period is None or len(period) != 2 or period[0] <= 0 or period[1] <= 0:
             raise RcwaError(f"period must be (Px,Py) > 0, got {period!r}.")
         if not assume_periodic:
@@ -1024,7 +1049,7 @@ class Rcwa:
         if fold_bot:
             films.append((1.0, self.layers_spec[-1][1]))
         self._fold_amb = (fold_top, fold_bot)
-        dtype = jnp.dtype(jnp.complex128) if jax.config.jax_enable_x64 else jnp.dtype(jnp.complex64)
+        dtype = self._dtype if self._dtype is not None else _resolve_dtype(None)
         try:
             self._stack = StateStack(
                 wavelength=float(wavelength),
@@ -2308,10 +2333,11 @@ class _RcwaProblem:
     """An RCWA problem inferred from a jNO constraint list / FEM problem. Holds the inferred
     :class:`RcwaSpec` and builds the state-space engine on :meth:`solve`."""
 
-    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None, rpe=None):
+    def __init__(self, spec, orders, formulation="JONES_DIRECT_FOURIER", resample=None, rpe=None, dtype=None):
         self.spec = spec
         self.orders = orders
         self.formulation = formulation
+        self.dtype = dtype
         self._resample = resample  # params -> ([(thickness, eps_grid), ...], wavelength)  (jax)
         self._rpe = rpe or {}  # {name: parameter-expr} for the trainable parameters in the graph
 
@@ -2328,6 +2354,7 @@ class _RcwaProblem:
             formulation=self.formulation,
             assume_periodic=True,
             polarization=self.spec.polarization,
+            dtype=self.dtype,
         )
 
     def _engine(self):
@@ -2607,6 +2634,7 @@ def rcwa(
     formulation="JONES_DIRECT_FOURIER",
     smoothing=1,
     polarization=None,
+    dtype=None,
 ):
     """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
 
@@ -2659,6 +2687,8 @@ def rcwa(
             grating: E parallel to its lines; TE) -- so ``jno.rcwa`` and ``jno.fem`` answer the same
             equation. A stack patterned along both axes has no such polarization; it is solved
             x-polarized, and the log says so.
+        dtype: The complex precision, ``"complex64"`` or ``"complex128"``; ``None`` (default) follows
+            ``jax_enable_x64``. complex128 needs ``jax_enable_x64``.
 
     Returns:
         _RcwaProblem: Holds the inferred :class:`RcwaSpec` (``.spec``) and a
@@ -2712,7 +2742,7 @@ def rcwa(
     # ---- internal source (dipole / Gaussian emitter): a `- f·v` / `- inner(J, v)` volume forcing ----
     vsrc = _extract_volume_source(_volume_constraint(femobj))
     if vsrc is not None:
-        return _build_emitter_problem(
+        problem = _build_emitter_problem(
             femobj,
             domain,
             period,
@@ -2734,6 +2764,8 @@ def rcwa(
             is_pml,
             sub,
         )
+        problem.dtype = dtype
+        return problem
 
     face_z, k_in = _source_kin(femobj, domain, cparams)
     source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
@@ -2883,4 +2915,4 @@ def rcwa(
         polarization=pol,
         polarization_from=pol_from,
     )
-    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe)
+    return _RcwaProblem(spec, orders=orders, formulation=formulation, resample=resample, rpe=rpe, dtype=dtype)

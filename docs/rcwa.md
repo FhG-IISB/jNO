@@ -339,6 +339,14 @@ supported, anisotropic 5/10-component layers (including the uniaxial PML materia
 per-order fast path, and internal sources are handled by Maxwell jump conditions. How correctness is
 checked is described at the top of this page.
 
+## Precision — `dtype=`
+
+`jno.rcwa(..., dtype=...)` and `jno.Rcwa(..., dtype=...)` choose the complex precision of the solve:
+`"complex128"` (needs `jax.config.update("jax_enable_x64", True)`) or `"complex64"`. The default `None` follows
+the x64 flag. complex64 is the fast path on consumer GPUs, which run float64 at a small fraction of their float32
+rate; it is accurate to about 1e-5 in T and R (the error grows slowly with the number of doublings of thick
+layers). Gradients are available in both.
+
 ## Layer detection
 
 `jno.rcwa.detect_layers(E, z)` groups a z-sampled permittivity `E` of shape `(Nz, Ng, Ng)` into RCWA
