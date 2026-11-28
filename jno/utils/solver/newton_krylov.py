@@ -24,6 +24,7 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
 
 from .. import beacon
 from .krylov import gmres as _scaled_gmres
@@ -1094,6 +1095,14 @@ def newton_direct(
     f_root = lambda u: f_c(u, *f_consts0)  # noqa: E731
     J_root = lambda u: J_c(u, *J_consts0)  # noqa: E731
 
+    def _plain(J):
+        """A BCOO tangent with its ordering flags cleared, so a carried tangent and a freshly assembled one
+        always share a pytree structure (the flags are static metadata; lax.cond and while_loop
+        refuse two structures). Clearing them only drops hints, never changes the matrix."""
+        if isinstance(J, jsparse.BCOO) and (J.indices_sorted or J.unique_indices):
+            return jsparse.BCOO((J.data, J.indices), shape=J.shape, indices_sorted=False, unique_indices=False)
+        return J
+
     def _backtrack(u, delta, rn):  # residual-norm Armijo -- the same retreat newton_krylov uses
         return _retreat(_armijo(f_fwd, u, delta, rn, ls_c=ls_c), hi=damping, lo=0.0, max_halvings=ls_max, dtype=u.dtype)
 
@@ -1201,7 +1210,7 @@ def newton_direct(
             refresh = stale & jnp.logical_not(theta < 0.5)
             u_new = jnp.where(reject, u, u_try)
             r_new = jnp.where(reject, r, r_try)
-            J_new = jax.lax.cond(refresh, lambda: J_fwd(u_new), lambda: J)
+            J_new = jax.lax.cond(refresh, lambda: _plain(J_fwd(u_new)), lambda: J)
             if beacon.active():  # nothing is traced unless the solve has log=
                 rn_new, target = jnp.linalg.norm(r_new), atol + rtol * r0n
                 last = (rn_new <= target) | (k + 1 >= max_steps)
@@ -1217,14 +1226,14 @@ def newton_direct(
             )
 
         if tangent0 is None:
-            J0, fresh0 = J_fwd(x0), jnp.asarray(True)
+            J0, fresh0 = _plain(J_fwd(x0)), jnp.asarray(True)
         else:
             # A tangent the caller carried (the last time step's): taken as a REUSED one, so the first
             # step on it is judged by the contraction rule; an invalid one (the march's first step) is
             # replaced by a fresh assembly, here, in one place.
             J_carried, valid = tangent0
             valid = jnp.asarray(valid)
-            J0 = jax.lax.cond(valid, lambda: J_carried, lambda: J_fwd(x0))
+            J0 = jax.lax.cond(valid, lambda: _plain(J_carried), lambda: _plain(J_fwd(x0)))
             fresh0 = jnp.logical_not(valid)
         state0 = (x0, r_start, 0, J0, fresh0, fresh0.astype(jnp.int32), r0n, jnp.asarray(0, jnp.int32))
         u, r, k, J_last, _f, nfact, *_ = jax.lax.while_loop(cond, body_reuse, state0)

@@ -850,7 +850,9 @@ class domain(MeshIOMixin):
         observations or any custom set of collocation points.
 
         Args:
-            tags: Mapping of tag name to ``(N, D)`` numpy array of coordinates.
+            tags: Mapping of tag name to ``(N, D)`` numpy array of coordinates, ``D <= 3``
+                (more columns raise: rows of high-dimensional samples go in as a tensor,
+                ``dom.variable('rows', a[None, None])``).
             compute_mesh_connectivity: Whether to build mesh connectivity data.
 
         Returns:
@@ -1300,6 +1302,13 @@ class domain(MeshIOMixin):
                 arr = np.zeros((0, inferred_dim), dtype=np.float64)
             elif arr.shape[1] < 1:
                 raise ValueError(f"NPZ tag '{tag}' must have at least one coordinate column, got {arr.shape}")
+            elif arr.shape[1] > 3:
+                raise ValueError(
+                    f"NPZ tag '{tag}' has {arr.shape[1]} columns, but a point-cloud domain holds at most 3 coordinate "
+                    "columns (x, y, z); the others would be dropped silently. For rows of high-dimensional samples "
+                    "(a discretised field per row) attach the array as a tensor and slice it: "
+                    "`dom.variable('rows', a[None, None])` instead of `jno.domain.from_array({'rows': a})`."
+                )
 
             if inferred_dim is None and arr.shape[0] > 0:
                 inferred_dim = int(arr.shape[1])
@@ -3347,16 +3356,15 @@ class domain(MeshIOMixin):
         if not inspect.isroutine(value):
             return True  # a callable object: a datasheet table, a fitted law
         try:
-            params = [
-                p
-                for p in inspect.signature(value).parameters.values()
-                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty
-            ]
+            all_params = list(inspect.signature(value).parameters.values())
         except (TypeError, ValueError):
             return False
+        params = [p for p in all_params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty]
         fields = self.__dict__.get("_field_names") or set()
         if any(p.name in fields for p in params):
             return True
+        if any(p.kind is p.VAR_POSITIONAL for p in all_params):
+            return False  # `lambda *c`: takes however many coordinates it is given, a function of position
         return len(params) != int(self.dimension)
 
     def _evaluate_attached(self, value, args, name, target):

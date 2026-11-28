@@ -52,7 +52,11 @@ def initial_value(mc):
     ``module.value`` before training gives zeros. A reference geometry, like a reference
     conductivity, has to be the point the optimisation starts from, so the initializer is applied here.
     """
-    m = getattr(mc, "model", None)
+    return model_initial_value(getattr(mc, "model", None))
+
+
+def model_initial_value(m):
+    """:func:`initial_value` of a parameter's model rather than its call node."""
     # a `domain.rebuild` moved the reference to the design it rebuilt at
     ref = getattr(m, "_rebuild_reference", None)
     if ref is not None:

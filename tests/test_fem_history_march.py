@@ -1102,3 +1102,32 @@ def test_adapt_on_a_march_fails_loud():
     for kw in ({}, {"tau": jno.solve.adaptive(limit=0.5)}):
         with pytest.raises(NotImplementedError, match="LOAD-PATH march"):
             fem.solve(adapt=jno.solve.remesh(max_iters=1), **kw)
+
+
+def test_runtime_parameter_only_in_an_evolves_formula_reaches_the_state_readout():
+    """`a` appears only in the `.evolves` update, not in any weak-form term. The readout must see the
+    runtime parameters the residual sees: it used to fail at the first march step with "Runtime
+    parameter 'a' not supplied to the kernel"."""
+    sym, grad, trace, inner, sqrt, maximum, identity = _aliases()
+    N = 4
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.5).domain(tau=(0.0, 1.0, N))
+    d.tag("bdry", lambda x, y: (x < 1e-9) | (x > 1 - 1e-9) | (y < 1e-9) | (y > 1 - 1e-9))
+    co, cb = d.variable("interior", split=True), d.variable("bdry", split=True)
+    X, tau = [co[0], co[1]], co[-1]
+    u, phi = d.fem_symbols()
+    Hs, _ = d.fem_symbols(value_shape=())
+    a = jno.np.parameter((1,), name="a")
+    weak = inner(grad(u, X), grad(phi, X), 1) + 0.1 * u * u * phi - (1.0 + tau) * phi
+    fem = jno.fem([weak, Hs.evolves(maximum(Hs.i(-1), a * u)), u(*cb) - 0.0])
+
+    traj = np.asarray(fem.solve(a=np.array([2.0])))
+    assert traj.shape[0] == N
+
+    def readout(av):
+        buf = {k: jnp.zeros(v["shape"]) for k, v in fem._op.history_specs.items()}
+        out = fem._op.state_readout(jnp.asarray(traj[-1]), 1.0, {"__history__": buf, "a": jnp.asarray([av])})
+        return np.asarray(next(iter(out.values())))
+
+    r1, r2 = readout(1.0), readout(2.0)
+    assert np.abs(r1).max() > 0.0
+    np.testing.assert_allclose(r2, 2.0 * r1, rtol=1e-10)  # the update is linear in a

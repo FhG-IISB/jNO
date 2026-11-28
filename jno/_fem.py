@@ -571,6 +571,10 @@ def _spatial_coord_vars(constraint: Any) -> List[Variable]:
                 if isinstance(v, Variable) and getattr(v, "axis", None) != "temporal":
                     out[id(v)] = v
 
+    # `_coord_sets` keeps every binding a view's arithmetic combined (a boundary operand's coordinates
+    # that the sum's own `_coord_vars` cannot hold), so a mixed-region residual is seen as mixed.
+    for _cs in getattr(constraint, "_coord_sets", None) or ():
+        _add_coords(_cs)
     _add_coords(getattr(constraint, "_coord_vars", None))
     for n in _walk(_bare(constraint)):
         _add_coords(getattr(n, "_coord_vars", None))
@@ -895,7 +899,7 @@ def _lower_gauge_pin(pin: GaugePin, ties: Any = ()) -> Any:
         if m.shape[0] != cells.shape[0] or not m.any():
             raise ValueError(f"jno.fem: p.pin() on a field of region={region!r} found no cell of that region.")
         outside = _np.ones(len(pts), dtype=bool)
-        outside[_np.unique(cells[m > 0])] = False
+        outside[unique_values(cells[m > 0])] = False
         d2 = _np.where(outside, _np.inf, d2)
     nid = int(d2.argmin())
     if ties:
@@ -1168,7 +1172,7 @@ def _field_keys(constraints: List[Any]) -> List[Any]:
 
 @jax.tree_util.register_pytree_node_class
 class Solution:
-    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name.
+    """What ``fem.solve()`` returns: the flat vector of every DOF that also reads its fields by name::
 
         u = fem.solve()
         u.T, u.A, u.I          # nodal T, complex nodal A (from its two real halves), a constant unknown's value
@@ -1180,6 +1184,13 @@ class Solution:
     the same name: ``u.T`` is the field ``T``, not the transpose (``u.flat.T`` is). The fields are slices of
     the vector, so they are differentiable. It is a pytree of the one vector, so it passes through ``jit``,
     ``grad`` and ``vmap``.
+
+    Args:
+        flat: The solved DOF vector, ``(n_dofs,)``, or ``(n_steps, n_dofs)`` for a trajectory.
+        layout: Where each field sits in ``flat``: a tuple of ``(name, parts, shape)``, with ``parts`` the
+            ``(start, stop)`` slice of the last axis (two slices for a complex field, its real and imaginary
+            halves) and ``shape`` the per-node shape (``()`` for a constant unknown, otherwise ``(-1, ...)``).
+            ``FEM`` builds it from the problem; it is the static part of the pytree.
     """
 
     __slots__ = ("flat", "_layout", "__weakref__")
@@ -1191,10 +1202,12 @@ class Solution:
 
     # -- pytree
     def tree_flatten(self):
+        """Pytree flattening: the DOF vector is the one child, the field layout the static auxiliary data."""
         return (self.flat,), self._layout
 
     @classmethod
     def tree_unflatten(cls, layout, children):
+        """Rebuild a ``Solution`` from the field ``layout`` (auxiliary data) and ``children == (flat,)``."""
         return cls(children[0], layout)
 
     # -- fields
@@ -1535,7 +1548,9 @@ def _region_and_support(constraint: Any, domain: Any, *, integrand: bool = False
 
     if len(boundary_tags) > 1 or (boundary_tags and interiorish):
         raise ValueError(
-            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
+            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region. "
+            "Write the volume term and each boundary term as separate entries of the list, "
+            "e.g. jno.fem([volume_term, boundary_term, u(x, y) - g])."
         )
     if boundary_tags:
         # A gmsh physical VOLUME also registers a node set, so it can land in `_boundary_regions` and
@@ -2192,7 +2207,9 @@ def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
                 )
             return comp, value_node
     if isinstance(bare, TrialFunction):
-        return None, 0.0
+        from .trace import Literal
+
+        return None, Literal(0.0)  # `u(region)` alone is `u(region) - 0.0`: a node, as every other value is
     raise ValueError(
         "jno.fem: could not read an essential condition from the residual. "
         "Write it as `u(region) - value` (e.g. `u(xl, yl) - 0.0`) or `u(xl, yl)[i] - value`."
@@ -3579,6 +3596,10 @@ class FEM:
         Profile a *concrete* forward solve; a parametric solve returns a deferred trace node with no numeric
         work to time.
 
+        ``log=True`` prints each Newton step and each time step while the solve runs (``log=N``: every N-th
+        step of each loop, and its last), from inside the compiled program without stopping it. A deferred
+        solve reports when it is evaluated. Off by default, and then nothing is added to the program.
+
         A problem whose source is a ``jno.peec`` network's ``em.loss`` is solved TOGETHER with that network
         (see :mod:`jno.utils.solver.electrothermal`): the result is the converged field, the same state
         ``em.solve()`` then reads the network at, and only ``tol=`` / ``max_iter=`` (the fixed point) are
@@ -3626,6 +3647,16 @@ class FEM:
             linear = _default_direct(self)
         if linear is None and precond is None and solve_fn is None:
             linear = _default_saddle_step_solve(self)
+        if (
+            linear is None
+            and getattr(nonlinear, "name", None) == "staggered"
+            and getattr(nonlinear, "direct", None) is True
+        ):
+            # staggered(direct=True) factorizes each field's block: with no linear slot that is what lu() resolves to
+            # (cuDSS where it runs, else JAX's spsolve), not an unconditional spsolve -- on a GPU, cuSolver's sparse QR.
+            from .solve import lu
+
+            linear = lu()
         linear = at_solve_spec(linear)  # the log, a shared factorisation and the composed solve see the same one
         get_logger().info(_route_line(self, linear=linear, precond=precond, nonlinear=nonlinear, time=time))
 
@@ -3940,6 +3971,12 @@ class FEM:
             # nonlinear one splits its cells only when it is a plain march (`_element_split_devices`)
             self._op.metadata["shard"] = shard
             self._op.metadata["split_cells"] = adapt is None and not getattr(self, "_geometry", None)
+        if self._mode == "transient":
+            # The CSR-or-COO choice is measured (two timed programs, each synced), so it is decided HERE, on the
+            # built operators, and not when the march is evaluated: a deferred march must stay asynchronous.
+            from .utils.solver.matvec_format import prime
+
+            prime(getattr(self._op, "M", None), getattr(self._op, "A", None))
         if contact is None and not getattr(self, "_in_contact_loop", False):
             # ... and NOT when the contact driver is re-entering this method for one of its own rounds:
             # it dispatches with `contact=None` by design, so an unguarded check would refuse the very
@@ -4604,11 +4641,21 @@ class FEM:
         if per is None:
             res_at = lambda uu: op.residual(uu, vals)  # noqa: E731
         else:
-            from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
+            from .utils.solver.fem_utils import (
+                prolong_periodic,
+                reduce_vector_periodic,
+                restrict_state_periodic,
+                wrap_reduced_dirichlet,
+            )
 
-            def res_at(ur, _p=per, _o=op, _v=vals):
+            def _free(ur, _p=per, _o=op, _v=vals):
                 full = _o.residual(prolong_periodic(_p, ur), _v)
                 return reduce_vector_periodic(_p, jnp.asarray(full).reshape(-1))
+
+            # The residual the solve worked on, so with the prescribed rows `Pᵀ` polluted re-imposed (a
+            # prescribed DOF that is a tie target): the bare `Pᵀ r(P u)` keeps the eliminated DOFs'
+            # reaction in those rows, which no iterate removes, and a converged Newton was refused.
+            res_at = wrap_reduced_dirichlet(per, _free)[0]
 
             u = restrict_state_periodic(per, u)
             if u0.shape[0] != u.shape[0]:
@@ -5592,7 +5639,7 @@ class FEM:
         """``((name, ((start, stop), ...), shape), ...)``: each field's slice(s) of the DOF vector (two for a complex
         field's real halves) and its shape per node (``()`` for a constant unknown's value)."""
         offs = list(self.offsets) if self.offsets is not None else None
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         if offs is None or not keys:
             return None
         names = _field_names(self._constraints or [])
@@ -5636,7 +5683,7 @@ class FEM:
         if not trials:
             return None
         offs = list(self.offsets) if self.offsets is not None else None
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         if offs is None or len(keys) < len(offs) - 1:
             raise ValueError(
                 "u.initialize: this problem's DOF layout per field is not known; pass the start to the solver."
@@ -5745,7 +5792,7 @@ class FEM:
         names = _field_names(self._constraints or [])
         # the assembler's field order -- what `offsets` indexes. `_trial_field_keys` is trace-walk
         # order and does not always agree (see `_finalize`).
-        keys = list(getattr(self, "_block_field_keys", None) or self._trial_field_keys or [])
+        keys = list(getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None) or [])
         dim = int(self.domain.dimension)
         root, ext = os.path.splitext(save_path)
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
@@ -6311,6 +6358,30 @@ def _edges_on_tag(edge_vertices: np.ndarray, tag_vertex_ids: np.ndarray) -> np.n
     return np.flatnonzero(on_tag[ev[:, 0]] & on_tag[ev[:, 1]]).astype(int)
 
 
+def _tie_face_nodes(domain: Any, vpts: Any, tag: str) -> Optional[np.ndarray]:
+    """Vertex ids of a periodic tie's face: :func:`_face_nodes`, and when the exclusive partition left the tag
+    empty, the tag's predicate evaluated INCLUSIVELY over the vertices.
+
+    ``domain.tag`` hands each boundary node to one tag only. A new name whose predicate selects the nodes of a
+    built-in face (``d.tag("xr", lambda x, y, z: x > P - e)`` over a box's ``right``) therefore owns none of
+    them, although the predicate says exactly where the face is."""
+    f = _face_nodes(domain, vpts, None, tag)
+    if f is not None and np.asarray(f).size:
+        return f
+    m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+    if m is None:
+        return f
+    return np.flatnonzero(np.asarray(m, dtype=bool).reshape(-1)[: np.asarray(vpts).shape[0]])
+
+
+def _no_vertices_error(domain: Any, tag: str, where: str) -> ValueError:
+    """The error for a periodic tie face that selects no vertex, naming the tag that holds its nodes if any."""
+    msg = f"jno.fem periodic ({where}): boundary tag {tag!r} has no mesh vertices."
+    if tag not in (getattr(domain, "tag_indices", {}) or {}):
+        msg += f" {tag!r} is not a tag of this domain (known: {sorted(getattr(domain, 'tag_indices', {}) or {})})."
+    return ValueError(msg)
+
+
 def _face_nodes(
     domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str, cells: Any = None
 ) -> Optional[np.ndarray]:
@@ -6496,9 +6567,9 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
     phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]  # Bloch phase (e^{iφ}) per tie
     etags: dict = {}
     for tag in {t for tie in ties for t in tie[:2]}:
-        f = _face_nodes(domain, vpts, None, tag)
+        f = _tie_face_nodes(domain, vpts, tag)
         if f is None or np.asarray(f).size == 0:
-            raise ValueError(f"jno.fem periodic (N1E): boundary tag {tag!r} has no mesh vertices.")
+            raise _no_vertices_error(domain, tag, "N1E")
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
         etags[tag] = _edges_on_tag(ev, np.asarray(f, dtype=int).reshape(-1))
 
@@ -6607,9 +6678,9 @@ def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: An
     vtags: dict = {}
     etags: dict = {}
     for tag in {t for (m, s, *_rest) in ties for t in (m, s)}:
-        f = _face_nodes(domain, vpts, None, tag)
+        f = _tie_face_nodes(domain, vpts, tag)
         if f is None or np.asarray(f).size == 0:
-            raise ValueError(f"jno.fem periodic (non-nodal C¹): boundary tag {tag!r} has no mesh vertices.")
+            raise _no_vertices_error(domain, tag, "non-nodal C¹")
         vids = np.asarray(f, dtype=int).reshape(-1)
         vtags[tag] = vids
         # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
@@ -7776,7 +7847,7 @@ def _coupling_support(couplings, slices):
         if sup is None:
             return None
         parts.append(lo + np.asarray(sup, dtype=np.int64).reshape(-1))
-    return np.unique(np.concatenate(parts)) if parts else None
+    return unique_values(np.concatenate(parts)) if parts else None
 
 
 def _analytic_blocks(couplings, slices, pick=lambda args: args):
@@ -9077,8 +9148,12 @@ def _fem_impl(
             # keyed in `_source_regions`) — pinning that region's whole node set, a volumetric hard
             # constraint used by subdomain / domain-decomposition solves. The default whole-domain
             # `volume` is still rejected (that signals a forgotten test function).
+            # A `domain.tag` point set that is not a boundary region (a corner node, a band of interior
+            # nodes) classifies as a volume term on that tag too; it pins its node set the same way.
             is_subregion_pin = support == "volume" and (
-                region in (getattr(domain, "_source_regions", {}) or {}) or _is_volume_region(domain, region)
+                region in (getattr(domain, "_source_regions", {}) or {})
+                or region in (getattr(domain, "_tag_predicates", {}) or {})
+                or _is_volume_region(domain, region)
             )
             if support != "boundary" and not is_subregion_pin:
                 raise ValueError(

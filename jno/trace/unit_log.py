@@ -321,6 +321,13 @@ def check(nodes, log: Optional[str] = None) -> UnitLogger:
         if id(node) in visited:
             return
         visited.add(id(node))
+        # A typed view (``u.bind(...)``, ``u.t - a * u.xx``) is its expression: seen through, so the root and
+        # every operand that is a view carry the unit of the node under it, not "undeclared".
+        inner = _unwrap_view(node)
+        if inner is not node:
+            visit(inner)
+            umap[id(node)] = umap.get(id(inner))
+            return
         for child in _children(node):
             visit(child)
         unit, warnings = _infer_unit(node, umap)

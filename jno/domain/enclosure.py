@@ -1146,7 +1146,12 @@ def radiosity_resolvent(F, eps):
 
 class EnclosureSet:
     """The radiating faces of every connected transparent medium of a domain (what ``d.irradiation`` integrates
-    over), one :class:`Enclosure` per medium: each is its own radiosity system, no exchange between media."""
+    over), one :class:`Enclosure` per medium: each is its own radiosity system, no exchange between media.
+
+    Args:
+        parts: The :class:`Enclosure` of each medium, in the order of ``media``.
+        media: For each medium, the names of the transparent regions that form it.
+    """
 
     def __init__(self, parts, media):
         self.parts = list(parts)
@@ -1154,10 +1159,12 @@ class EnclosureSet:
 
     @property
     def size(self) -> int:
+        """The number of radiating faces, summed over every medium."""
         return int(sum(p.size for p in self.parts))
 
     @property
     def element_tags(self) -> np.ndarray:
+        """The mesh element tag of each radiating face: the media's tags concatenated in the order of ``parts``."""
         return np.concatenate([p.element_tags for p in self.parts])
 
     def __repr__(self):
@@ -1236,7 +1243,7 @@ def enclosures_of_medium(domain, medium_regions, *, cache=True, **options):
     if unknown:
         raise ValueError(f"d.irradiation: {unknown} are not volume regions of this mesh; known: {sorted(regions)}.")
     cells2, _cell_type = _area_cells(mesh)
-    nodes = {m: set(np.unique(cells2[regions[m]]).tolist()) for m in medium_regions}
+    nodes = {m: set(unique_values(cells2[regions[m]]).tolist()) for m in medium_regions}
 
     # connected media: regions sharing a node belong to one medium
     parent = {m: m for m in medium_regions}

@@ -465,3 +465,22 @@ class TestFunctionalSolver:
         xi, yi, _ = d.variable("interior", split=True)
         with pytest.raises(TypeError, match="only to a FEM functional"):
             (xi * yi).integrate(solver=jno.solve.lu(backend="host"))
+
+
+def test_integrating_a_bound_field_over_a_fem_matches_eval():
+    """`ui.integrate(fem)` and `(1.0 * ui).integrate(fem)` on a BOUND scalar field raised
+    "ScalarView.integrate() takes 1 positional argument but 2 were given": the view forwards `fem` to the
+    placeholder's integral and the two routes agree."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.25).domain()
+    u, v = d.fem_symbols()
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    ref = float(np.asarray(fem.eval(ui, fem.solve())))
+    assert ref > 0.0
+    for expr in (ui, 1.0 * ui):
+        node = expr.integrate(fem)
+        crux = jno.core([node], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+        got = float(np.asarray(crux.eval([node])).reshape(-1)[0])
+        assert abs(got - ref) < 1e-6 * ref  # the traced route uses the default Krylov solve

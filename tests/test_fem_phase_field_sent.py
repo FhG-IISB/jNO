@@ -141,6 +141,46 @@ def test_sent_2d_initiates_localizes_and_softens():
     assert inband.mean() > 0.8, f"damage must localize on the crack plane ({100 * inband.mean():.0f}% in band)"
 
 
+def _face_gap(pts, values):
+    """Largest difference between a slab's two faces (z = min and z = max), compared BY POSITION.
+
+    An unstructured tet mesh does not put the same nodes on both faces (491 vs 492 here), so each face's
+    values are interpolated linearly over the other face's triangulation, at that face's (x, y) points
+    (nearest neighbour where a point falls outside the triangulation's hull), and the larger of the two
+    directions is returned. A through-thickness uniform field gives ~0 whatever the node layout."""
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+    z = pts[:, 2]
+    faces = [(z < z.min() + 1e-9), (z > z.max() - 1e-9)]
+
+    def one_way(src, dst):
+        xy_s, xy_d = pts[src][:, :2], pts[dst][:, :2]
+        lin = LinearNDInterpolator(xy_s, values[src])(xy_d)
+        near = NearestNDInterpolator(xy_s, values[src])(xy_d)
+        return np.abs(np.where(np.isnan(lin), near, lin) - values[dst]).max()
+
+    return max(one_way(faces[0], faces[1]), one_way(faces[1], faces[0]))
+
+
+def test_face_gap_compares_by_position_and_resolves_a_5_percent_variation():
+    """The face comparison must not need matching node layouts, and must still tell a through-thickness
+    uniform field from one that varies by more than the 5 % tolerance."""
+    rng = np.random.default_rng(0)
+
+    def face_nodes(n_inner, n_edge):  # the outline is meshed (as in a real mesh), the interior is scattered
+        t = np.sort(rng.uniform(0, 1, n_edge))
+        edge = np.vstack([np.c_[t, 0 * t], np.c_[t, 0 * t + 1], np.c_[0 * t, t], np.c_[0 * t + 1, t]])
+        corners = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        return np.vstack([corners, edge, rng.uniform(0, 1, (n_inner, 2))])  # different counts and places per face
+
+    xy_lo, xy_hi = face_nodes(1500, 50), face_nodes(1501, 51)
+    pts = np.vstack([np.c_[xy_lo, np.zeros(len(xy_lo))], np.c_[xy_hi, np.full(len(xy_hi), 0.06)]])
+    field = np.exp(-(((pts[:, 1] - 0.5) / 0.3) ** 2))  # a smooth band of peak 1, z-independent
+    assert _face_gap(pts, field) < 0.03  # uniform: only the interpolation error remains
+    bumped = field + 0.08 * (pts[:, 2] > 0.03) * np.exp(-(((pts[:, 0] - 0.5) / 0.2) ** 2))  # +8 % on one face
+    assert _face_gap(pts, bumped) / field.max() > 0.05
+
+
 @pytest.mark.slow
 def test_sent_3d_reproduces_the_plane_strain_answer():
     """A through-thickness notch in a thin slab IS the plane-strain problem, so the 3-D mid-plane damage
@@ -153,13 +193,9 @@ def test_sent_3d_reproduces_the_plane_strain_answer():
     dmg2 = traj2[:, fem2.blocks[fem2.block_index(dm2)]]
     # Compare the through-thickness variation: a plane-strain field is z-independent, so the damage at
     # the two faces must agree with the mid-plane to a few percent of the peak.
-    z = pts3[:, 2]
-    lo, hi = z < z.min() + 1e-9, z > z.max() - 1e-9
     peak3 = dmg3[-1].max()
     assert peak3 > 0.3
-    order = np.lexsort((np.round(pts3[lo, 1], 6), np.round(pts3[lo, 0], 6)))
-    order_h = np.lexsort((np.round(pts3[hi, 1], 6), np.round(pts3[hi, 0], 6)))
-    face_gap = np.abs(dmg3[-1][lo][order] - dmg3[-1][hi][order_h]).max() / peak3
+    face_gap = _face_gap(pts3, dmg3[-1]) / peak3
     assert face_gap < 0.05, f"the 3-D field is not through-thickness uniform ({100 * face_gap:.1f}%)"
     # ...and the two dimensions agree on how much damage there is at the end of the same load path.
     assert abs(peak3 - dmg2[-1].max()) / max(peak3, dmg2[-1].max()) < 0.15, (

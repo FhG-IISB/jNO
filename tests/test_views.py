@@ -1542,3 +1542,57 @@ class TestRebind:
         u = (x * y).scalar.bind(x=x)
         with pytest.raises(TypeError, match="requires at least one argument"):
             u.bind()
+
+
+class TestDerivativeKeepsBinding:
+    """A derivative of a bound view, and its components, carry the binding (``_coord_vars``, ``_bind_scheme``)."""
+
+    @staticmethod
+    def _bound_vector():
+        d, x, y = _domain_xy()
+        u = jno.trace.TrialFunction("u", value_shape=(2,))
+        return u.vector.bind(x=x, y=y, scheme=jno.fd(order=4)), x, y
+
+    @staticmethod
+    def _cv(v):
+        return getattr(v, "_coord_vars", None)
+
+    def test_component_of_derivative_matches_derivative_of_component(self):
+        ua, x, y = self._bound_vector()
+        for comp in (ua.x[0], ua.y[1], ua[0].x, ua[1].y):
+            assert self._cv(comp) == {"x": x, "y": y}
+            assert getattr(comp, "_bind_scheme", None) is getattr(ua, "_bind_scheme")
+
+    def test_second_derivative_and_fd_namespace_keep_binding(self):
+        ua, x, y = self._bound_vector()
+        for v in (ua.xy, ua.xy[0], ua.fd.x, ua.fd.x[1], ua[0].xx):
+            assert self._cv(v) == {"x": x, "y": y}
+
+    def test_derivative_stays_the_plain_view(self):
+        ua, x, y = self._bound_vector()
+        assert type(ua.x) is type(ua).__mro__[1]
+
+
+def test_integer_index_of_a_per_point_vector_variable_is_a_component():
+    """``w[1]`` of a Variable spanning several columns is component 1 (as ``w[..., 1]``), not point 1; a one-column
+    Variable and a slice keep the array meaning."""
+    d, x, y = _domain_xy()
+    w = Variable("xy", [0, 2], domain=d)
+    pts = jnp.array([[0.5, 0.7], [1.5, 1.7], [2.5, 2.7]])
+    ctx = {"xy": pts}
+    np.testing.assert_allclose(np.asarray(_eval(w[1], ctx)).reshape(-1), [0.7, 1.7, 2.7])
+    np.testing.assert_allclose(np.asarray(_eval(w[-2], ctx)).reshape(-1), [0.5, 1.5, 2.5])
+    np.testing.assert_allclose(np.asarray(_eval(w[1], ctx)), np.asarray(_eval(w[..., 1], ctx)))
+    np.testing.assert_allclose(np.asarray(_eval(w[1:], ctx)), np.asarray(pts[1:]))  # a slice still slices the points
+    assert np.asarray(_eval(w[(1,)], ctx)).shape != ()  # a tuple key is the array's own, not a component
+
+
+def test_numpy_conversion_of_a_traced_node_raises_and_arithmetic_defers():
+    """``np.asarray(node)`` used to give a 0-d object array (and arithmetic on it built more nodes); it raises and
+    names ``.eval()``. NumPy scalars and arrays on either side of an operator still build a node."""
+    d, x, y = _domain_xy()
+    node = x * 2.0
+    with pytest.raises(TypeError, match=r"\.eval\(\)"):
+        np.asarray(node)
+    for built in (np.float64(2.0) * node, node * np.float64(2.0), np.ones(1) * node, node + np.ones(1)):
+        assert isinstance(built, Placeholder)

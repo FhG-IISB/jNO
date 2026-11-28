@@ -3815,6 +3815,31 @@ def _nearest_in_interface(s_loc, m_loc):
     return idx, dist
 
 
+def _refuse_uncovered_secondary(m_facets, loc, s_loc, main_tag, secondary_tag):
+    """Refuse a non-matching tie whose secondary face reaches well past the main face.
+
+    Collocation clamps a secondary node outside the main face onto the nearest main facet, which is right for a
+    face tagged from geometry that drops its corners (the two faces then differ by about one facet at each
+    end). Where the faces differ by more than the longest main facet, they are not translations of each other
+    -- the left and right faces of an L-shaped plan, which does not fill its bounding box -- and clamping would
+    tie nodes that have no partner onto the end of the main face, silently."""
+    m_facets = np.asarray(m_facets, dtype=int)
+    m_facets = m_facets[:, : 2 if loc.shape[1] == 1 else 3]
+    corners = loc[m_facets]  # (n_facets, vertices, dim-1)
+    h = float((corners.max(axis=1) - corners.min(axis=1)).max())
+    flat = corners.reshape(-1, loc.shape[1])
+    lo, hi = flat.min(axis=0) - h * (1.0 + 1.0e-9), flat.max(axis=0) + h * (1.0 + 1.0e-9)
+    away = np.any((s_loc < lo) | (s_loc > hi), axis=1)
+    if away.any():
+        raise ValueError(
+            f"periodic tie ({main_tag!r}, {secondary_tag!r}): the faces do not cover the same extent. "
+            f"{int(away.sum())} of {len(s_loc)} nodes of {secondary_tag!r} lie more than one facet ({h:.3g}) beyond "
+            f"{main_tag!r}, so they have no partner to tie to. The faces of a periodic pair must be translations "
+            "of each other: a plan that does not fill its bounding box (an L-shape) has none. Tie only the parts "
+            "that match (a tag for each, e.g. with domain.tag(name, where=...)), or use a plan that fills its box."
+        )
+
+
 def build_periodic_prolongation(
     points: np.ndarray,
     pairs: Sequence[Tuple[str, str]],
@@ -4064,6 +4089,9 @@ def build_periodic_prolongation(
         # leaves some without one, and filling those from collocation is the mixing this removes.
         _mortar_ok = bool(mortar) and all(int(sid) in mortar for sid in s_ids if int(sid) not in _rim)
         _mode = "conforming" if _exact_ok else ("mortar" if _mortar_ok else "collocated")
+
+        if _mode == "collocated" and m_fc is not None:
+            _refuse_uncovered_secondary(m_fc, loc, s_loc, main_tag, secondary_tag)
 
         for k, sid in enumerate(s_ids):
             if _mode == "mortar" and int(sid) in _rim:

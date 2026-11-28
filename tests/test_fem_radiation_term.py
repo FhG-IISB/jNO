@@ -15,7 +15,18 @@ import jno
 from jno.domain.radiation import STEFAN_BOLTZMANN as SIGMA
 from jno.domain.radiation import lower_radiation_terms
 
-config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = config.jax_enable_x64
+    config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        config.update("jax_enable_x64", prev)
+
+
 R1, R2, R3 = 0.3, 0.6, 0.8
 
 

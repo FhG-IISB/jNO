@@ -171,11 +171,23 @@ def test_transient_record_is_deferred_until_evaluated(nonlinear):
 
 
 def test_evaluating_a_linear_transient_stays_asynchronous(monkeypatch):
-    """Recording must never add a device sync: `.fn()` returns before the march has finished."""
+    """Recording must never add a device sync: `.fn()` returns before the march has finished.
+
+    The CSR-or-COO timing syncs, so `fem.solve()` decides it when it builds, not during the evaluation. The one
+    sync allowed is the placement of the program's host constants on a GPU (`placement.shard_const_args`: one
+    synced upload each, to hold a single staging buffer at a time), which is not the recording's."""
+    import sys
+
     fem = _heat(False, nt=11)
     node = fem.solve()
     calls = []
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: calls.append(1) or x)
+
+    def sync(x):
+        if not sys._getframe(1).f_code.co_filename.endswith("placement.py"):
+            calls.append(sys._getframe(1).f_code.co_filename)
+        return x
+
+    monkeypatch.setattr(jax, "block_until_ready", sync)
     node.fn()
     assert calls == []
 
@@ -208,7 +220,7 @@ def test_the_post_solve_line_does_no_matvec():
     """A residual matvec in the log line was 10 % of every GPU solve (6.7 of 63 ms at 73k dofs), and
     redundant with the solve's own residual gate. The line must work with no operator products."""
     fem = _poisson()
-    out = fem.solve()
+    out = np.asarray(fem.solve())  # fem.solve() is a deferred node; the range is read from the evaluated array
 
     class NoMatvec:
         def __matmul__(self, other):

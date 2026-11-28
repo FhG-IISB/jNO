@@ -70,7 +70,8 @@ class Unit:
         """Parse a unit string such as ``'m'``, ``'m/s'``, ``'kg/m^3'``, ``'Pa'``.
 
         Grammar (informal): a ``numerator`` optionally followed by ``/`` and a
-        ``denominator``; each is a juxtaposition of ``base[^power]`` factors
+        ``denominator``, and any further ``/ factor`` is divided out too (``W/m/K`` is
+        ``W/(m*K)``); each is a juxtaposition of ``base[^power]`` factors
         separated by spaces, ``*``, or ``·``.  Powers may be negative or
         fractional (``m^1/2``).  Recognises the 7 SI bases plus the aliases in
         :data:`_ALIASES` (``T``→K, ``Pa``, ``N``, ``J``, ``W``, ``Hz``, …).
@@ -92,10 +93,14 @@ class Unit:
         if text in ("", "1", "-", "dimensionless"):
             return DIMENSIONLESS
 
-        # Split a single top-level '/' into numerator / denominator.
+        # '/' divides left to right: the first part is the numerator and every further part is divided out, so
+        # ``W/m/K`` is ``W/(m*K)``. A part may be parenthesised, ``W/(m*K)``.
         if "/" in text:
-            num, _, den = text.partition("/")
-            return cls._parse_product(num) / cls._parse_product(den)
+            num, *dens = text.split("/")
+            result = cls._parse_product(num)
+            for den in dens:
+                result = result / cls._parse_product(den)
+            return result
         return cls._parse_product(text)
 
     @classmethod

@@ -202,7 +202,7 @@ def test_a_window_of_one_sweep_runs_as_one_compiled_program(implicit):
     # Python glue between their compiled pieces dominated a long march (the nozzle start-up: 80 windows, 5.4 min).
     # Oracle: the same coupling with compile=False, window by window as before.
 
-    def coupled(compile):  # fresh problems for each run (git-bug 44958ea: a fem build re-tags shared Variables)
+    def coupled(compile):  # fresh problems for each run (a second coupling of the SAME ones: see the test below)
         pa, ua, fa, _ = _fem_cold(0.04)
         pb, ub, fb, _ = _fvm_hot(0.03)
         if implicit:  # cooling of the cold side by the hot one's surface temperature: data flow one way only
@@ -219,3 +219,16 @@ def test_a_window_of_one_sweep_runs_as_one_compiled_program(implicit):
     np.testing.assert_allclose(ta, ra, atol=1e-12)
     np.testing.assert_allclose(tb, rb, atol=1e-12)
     assert np.abs(ta[-1] - ta[0]).max() > 0.01  # the cold side did warm
+
+
+def test_the_same_problems_and_expressions_couple_twice():
+    # A fem build points its boundary Variables at the quadrature pool (`right` -> `gauss_right`); a second
+    # coupling built from the same expressions must still find the interface tag `right`.
+    pa, ua, fa, _ = _fem_cold(0.04)
+    pb, ub, fb, _ = _fvm_hot(0.03)
+    conds = [K1 * fa + 5.0 * (ua - ub)]  # a boundary term on the fem side
+    spec = CouplingSpec(implicit=True, compile=False, tol=1e-8, max_iter=40)
+    ta, tb = couple([pa, pb], conds, spec).solve()
+    ta2, tb2 = couple([pa, pb], conds, spec).solve()
+    np.testing.assert_allclose(ta2, ta, atol=1e-12)
+    np.testing.assert_allclose(tb2, tb, atol=1e-12)

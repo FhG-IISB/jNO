@@ -143,6 +143,12 @@ def lu(*, backend: str | None = None, host: bool | None = None, reuse: bool | No
             *GPUs lose*: see ``"cudss"``. Its factorization is cached on the operator's CONTENT, so a
             constant-operator march factorizes once for the trajectory (measured 2.9x at 23,934 DOFs
             over 51 steps) and the adjoint reuses it; a Newton loop's steps are not kept (see ``reuse``).
+            It is the CPU fallback for 3-D problems of moderate size, not the backend meant for them: its
+            factors are the largest of the four (P2 elasticity, 36,648 unknowns: 48 M entries and 6 s), so on a
+            3-D problem past a few 10k unknowns take ``"pardiso"`` (CPU) or ``"cudss"`` (GPU). SuperLU's
+            symmetric ordering (``MMD_AT_PLUS_A``) stores 1.4-1.7x fewer entries on these operators but is
+            slower overall (its ordering costs more than it saves; 15 s against 6 s there), so the default
+            ordering stays.
 
             ``"cudss"`` -- NVIDIA cuDSS on the GPU. **The fastest of the three wherever it runs**, and
             on a COMPLEX form whose operator is complex symmetric (eddy currents: ``nu curl curl + j w

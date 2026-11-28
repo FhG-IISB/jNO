@@ -18,7 +18,17 @@ import jno
 from jno._fem import Coupling
 from jno.domain.enclosure import build_enclosure
 
-jax.config.update("jax_enable_x64", True)
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """These tests run in float64; the session default is x64-off (tests/conftest.py), so opt in per test."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 SIGMA = 5.670374419e-8
 
@@ -167,3 +177,40 @@ def test_direct_newton_gradient_is_exact_when_the_iterative_tangent_solve_misses
     g = np.asarray(jax.grad(lambda bb: jnp.sum(solve(bb)))(b))
     J = np.asarray(A) + np.diag(3.0 * np.asarray(u) ** 2)
     np.testing.assert_allclose(g, np.linalg.solve(J.T, np.ones(n)), rtol=1e-10)
+
+
+def _tangent_flag_problem():
+    import jax.experimental.sparse as jsparse
+
+    n = 5
+    A = np.diag(np.full(n, 4.0)) + np.diag(np.full(n - 1, -1.0), 1) + np.diag(np.full(n - 1, -1.0), -1)
+    A = jnp.asarray(A)
+    b = jnp.arange(1.0, n + 1)
+
+    def jac(w):  # a callback whose BCOO carries NO ordering flags
+        J = jsparse.BCOO.fromdense(A + jnp.diag(3.0 * w**2), nse=n * n)
+        return jsparse.BCOO((J.data, J.indices), shape=J.shape, indices_sorted=False, unique_indices=False)
+
+    J = jac(jnp.zeros(n))  # the same matrix with the flags a sorted assembler sets
+    carried = jsparse.BCOO((J.data, J.indices), shape=J.shape, indices_sorted=True, unique_indices=True)
+    return A, b, jac, carried
+
+
+def test_newton_direct_reuse_accepts_a_carried_tangent_whose_bcoo_flags_differ():
+    """``lax.cond`` between the carried tangent and a fresh one needs one pytree structure; two BCOO that differ
+    only in indices_sorted / unique_indices used to fail with 'cond branch outputs must have the same pytree
+    structure'."""
+    from jno.utils.solver.linear import sparse_lu_solve
+    from jno.utils.solver.newton_krylov import newton_direct
+
+    A, b, jac, J_carried = _tangent_flag_problem()
+    assert J_carried.indices_sorted and not jac(jnp.zeros(5)).indices_sorted
+    for valid in (True, False):  # the carried tangent used / replaced by a fresh assembly
+        info = {}
+        u = newton_direct(lambda w: A @ w + w**3 - b, jac, jnp.zeros(5), linear_solve=sparse_lu_solve, reuse=True,
+                          tangent0=(J_carried, jnp.asarray(valid)), rtol=0.0, atol=1e-12, max_steps=50, info=info)  # fmt: skip
+        np.testing.assert_allclose(np.asarray(A @ u + u**3 - b), 0.0, atol=1e-10)
+        # the tangent handed back can be carried into the next call whatever flags it started with
+        u2 = newton_direct(lambda w: A @ w + w**3 - b, jac, u, linear_solve=sparse_lu_solve, reuse=True,
+                           tangent0=(info["tangent"], jnp.asarray(True)), rtol=0.0, atol=1e-12, max_steps=50)  # fmt: skip
+        np.testing.assert_allclose(np.asarray(u2), np.asarray(u), atol=1e-10)

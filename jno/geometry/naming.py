@@ -22,6 +22,9 @@ from typing import Dict, Tuple
 _CAP_BACK = -1
 _CAP_FRONT = -2
 
+# The names of an axis-aligned box's (or rectangle's) faces and of an extrusion's caps: the same on every box.
+_FACE_NAMES = frozenset({"left", "right", "front", "back", "bottom", "top"})
+
 
 def _sample_point(bdim: int, tag: int):
     """A point in the interior of boundary entity ``(bdim, tag)`` (param-space midpoint)."""
@@ -120,7 +123,15 @@ def _classify(node, x: float, y: float, z: float, tol: float = 1e-6):
         name = node[1].classify(x, y, z)
         return (node[2], name) if name is not None else None
     if kind in ("cut", "fuse", "inter"):
-        return _classify(node[1]._node, x, y, z, tol) or _classify(node[2]._node, x, y, z, tol)
+        first = _classify(node[1]._node, x, y, z, tol)
+        if first is not None or kind != "cut":
+            return first or _classify(node[2]._node, x, y, z, tol)
+        # A face of the cut's own (the wall of the hole) comes from the cutter. Its box-face names (left, bottom,
+        # ...) would also name the outer faces of the cut shape, so a condition on `left` would pin the hole too:
+        # such a face keeps no name (it stays in `boundary`; select it with `where=`). A name that cannot clash
+        # (a drilled cylinder's `side`, a disk's `arc`) is kept.
+        label = _classify(node[2]._node, x, y, z, tol)
+        return None if label is not None and label[1] in _FACE_NAMES else label
     if kind == "regions":
         for _name, sub in node[1]:
             label = _classify(sub._node, x, y, z, tol)

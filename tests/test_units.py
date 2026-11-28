@@ -27,6 +27,12 @@ class TestUnitAlgebra:
         # '^', '**', and bare-digit spellings are equivalent.
         assert Unit.parse("m^2") == Unit.parse("m**2") == Unit({"m": 2})
 
+    def test_repeated_slash_divides_each_further_factor(self):
+        # W/m/K is W/(m*K), read left to right.
+        assert Unit.parse("W/m/K") == Unit.parse("W/(m*K)") == Unit.parse("W m^-1 K^-1")
+        assert Unit.parse("kg/m/s^2") == Unit.parse("Pa")
+        assert Unit.parse("J / kg / K") == Unit.parse("J/(kg K)")
+
     def test_dimensionless_spellings(self):
         for spec in ("", "1", "-", "rad"):
             assert Unit.parse(spec).is_dimensionless()
@@ -190,3 +196,24 @@ class TestLogFile:
         text = path.read_text()
         assert "K·m⁻¹" in text or "K/m" in text
         assert logger.entries  # at least the leaves + the Jacobian
+
+
+class TestBoundViews:
+    """A bound view is seen through: the unit of an expression built from ``u.bind(...)`` is that of the node under it."""
+
+    def test_infer_of_a_bound_derivative_and_residual(self):
+        x = make_var("x").unit("m")
+        t = make_var("t").unit("s")
+        u = make_var("u").unit("K").scalar.bind(x=x, t=t)
+        alpha = make_var("alpha").unit("m^2/s")
+        assert jno.units.infer(u.x) == Unit.parse("K/m")
+        assert jno.units.infer(u.t) == Unit.parse("K/s")
+        residual = u.t - alpha * u.xx
+        assert jno.units.infer(residual) == Unit.parse("K/s")
+        assert not jno.units.check(residual).warnings
+
+    def test_a_mismatch_under_a_bound_view_is_still_reported(self):
+        x = make_var("x").unit("m")
+        t = make_var("t").unit("s")
+        u = make_var("u").unit("K").scalar.bind(x=x, t=t)
+        assert jno.units.check(u.t - u.xx).warnings

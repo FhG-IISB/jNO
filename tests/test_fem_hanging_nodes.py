@@ -264,7 +264,9 @@ def test_a_named_boundary_region_survives_the_split(x64):
         xl, yl, _ = dom.variable("left", split=True)
         xr, yr, _ = dom.variable("right", split=True)
         ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
-        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * v.bind(x=xr, y=yr), u(xl, yl) - 0.0])
+        # the flux on `right` is its own entry: summed into the volume residual it would be integrated over the
+        # volume (now refused, #361)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y, -1.0 * v.bind(x=xr, y=yr), u(xl, yl) - 0.0])
         return np.asarray(fem.solve(linear=jno.solve.lu(backend="host"))).ravel()
 
     base = solve_flux(_grid(4))

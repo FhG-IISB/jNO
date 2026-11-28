@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import warnings
 from collections import OrderedDict
 from typing import Any
@@ -299,12 +300,60 @@ def sparse_lu_solve(A, b):
     return _sparse_lu_solve(A, b)
 
 
+_CUDSS_PIN = "nvidia-cudss-cu12>=0.8,<0.9"  # what nvmath-python 1.0.x asks for (`nvidia-cudss-cu12==0.8.*`)
+
+
+@functools.lru_cache(maxsize=1)
+def _cudss_version_problem() -> str | None:
+    """Why the installed cuDSS cannot be used by the installed nvmath-python, or ``None`` if it can.
+
+    nvmath-python binds ONE cuDSS minor version and refuses any other at its first solve ("nvmath-python requires
+    cuDSS version 0.8, while you have cuDSS version 1.0"), whereas a fresh install of the unpinned ``nvidia-cudss-cu12``
+    resolves to the newest. nvmath's own check is run here, at selection, so the mismatch is found before a solve and
+    named with the versions and the pin that works. A nvmath-python without that private hook is taken as compatible
+    (its own error then stays the one at the first solve)."""
+    try:
+        import importlib
+        from importlib.metadata import PackageNotFoundError, version
+
+        # by module path: `nvmath.sparse.advanced.direct_solver` as an attribute is the function of that name
+        direct_solver = importlib.import_module("nvmath.sparse.advanced.direct_solver")
+    except Exception:
+        return None
+    check = getattr(direct_solver, "_check_cudss_version", None)
+    if check is None:
+        return None
+    try:
+        check()
+    except RuntimeError as err:  # "nvmath-python requires cuDSS version 0.8, while you have cuDSS version 1.0."
+        found = {}
+        for dist in ("nvidia-cudss-cu12", "nvidia-cudss-cu13", "nvmath-python"):
+            try:
+                found[dist] = version(dist)
+            except PackageNotFoundError:
+                pass
+        installed = ", ".join(f"{k} {v}" for k, v in found.items()) or "versions not found"
+        return (
+            f"{err} Installed: {installed}. jNO's cuDSS backend goes through nvmath-python, so the two must agree: "
+            f"install `{_CUDSS_PIN}` (nvmath-python's own requirement), or use backend='pardiso' / 'host'."
+        )
+    except Exception:  # the check could not run (library not loadable): leave it to the solve's own error
+        return None
+    return None
+
+
 def _cudss_available() -> bool:
-    """True when the optional cuDSS stack (nvmath-python + cuDSS + a GPU array library) imports."""
+    """True when the optional cuDSS stack (nvmath-python + cuDSS + a GPU array library) imports AND its versions
+    agree (see :func:`_cudss_version_problem`). A version mismatch is warned about, by name, and reads as
+    unavailable: the default backend then falls back to ``device`` instead of failing at its first solve."""
     try:
         import cupy  # noqa: F401
         import nvmath.sparse.advanced  # noqa: F401
     except Exception:
+        return False
+    problem = _cudss_version_problem()
+    if problem is not None:
+        warnings.warn(f"cuDSS is installed but unusable, so it is not selected: {problem}", RuntimeWarning, stacklevel=2)
         return False
     return True
 
@@ -744,6 +793,8 @@ def cudss_lu_solve(A, b):
     import jax.experimental.sparse as jsp
 
     if not _cudss_available():
+        if (problem := _cudss_version_problem()) is not None:
+            raise ImportError(f"jno.solve.lu(backend='cudss'): {problem}")
         raise ImportError(
             "jno.solve.lu(backend='cudss') needs the optional cuDSS stack. Install it with "
             "`pip install nvmath-python[cu12] cupy-cuda12x` (NVIDIA ships cuDSS as a wheel; no source "
@@ -1028,6 +1079,13 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     data = _np.ascontiguousarray(data)
     idx = _np.ascontiguousarray(_np.asarray(indices))
     rhs2 = _np.asarray(rhs).reshape(rhs.shape[0], -1)
+    out_dtype = rhs2.dtype  # the solution goes back in the right-hand side's precision
+    # PyPardiso factorises float64 / complex128 only and raises a TypeError on anything else. A run without
+    # jax_enable_x64 hands it float32, so the system is factored in double precision and the answer cast back
+    # (the cache key below sees the widened dtype, so a float32 and a float64 operator never share a factor).
+    cplx = _np.iscomplexobj(data)
+    data = data.astype(_np.complex128 if cplx else _np.float64, copy=False)
+    rhs2 = rhs2.astype(_np.complex128 if cplx or _np.iscomplexobj(rhs2) else _np.float64, copy=False)
     rows, cols = idx[:, 0], idx[:, 1]
     # BCOO marks padding with an out-of-bounds index; JAX's own CSR conversion sorts it past the last row
     # and never reads it, but scipy refuses it, so it is dropped here
@@ -1071,7 +1129,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
         A.sum_duplicates()
         return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
 
-    b = _np.asfortranarray(rhs2.astype(data.dtype if _np.iscomplexobj(data) else rhs2.dtype))
+    b = _np.asfortranarray(rhs2)
 
     if entry is None:
         order, orderT, pat = _cudss_sym_perms(rows, cols)
@@ -1120,7 +1178,7 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             x = solver._call_pardiso(A, b)
         finally:
             solver.set_iparm(12, 0)
-    return _np.asarray(x.reshape(rhs.shape), dtype=rhs.dtype)
+    return _np.asarray(x.reshape(rhs.shape), dtype=out_dtype)
 
 
 def _pardiso_set_pivoting(solver):
