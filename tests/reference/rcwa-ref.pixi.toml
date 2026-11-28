@@ -1,0 +1,17 @@
+# Reference RCWA libraries for jNO (test and benchmark data only, never a dependency of jno).
+# Generates the cross-check data under tests/reference/ in the jNO repo; see the README there.
+[workspace]
+name = "rcwa-ref"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+numpy = ">=1.26"
+scipy = "*"
+
+[pypi-dependencies]
+fmmax = "==1.7.1"
+meent = "*"
+torcwa = "*"
+torch = { version = ">=2.4", index = "https://download.pytorch.org/whl/cpu" }

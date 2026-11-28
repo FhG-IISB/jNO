@@ -244,6 +244,8 @@ class StateStack:
         doublings_override: Optional fixed series doubling count for all
             patterned layers (tests / stress).
         dtype: The complex dtype of the solve (``complex64`` default).
+        truncation: The order set (``basis.Truncation``): circular (default) or
+            parallelogramic, ``|m|, |n| <= M`` (for comparisons with other codes).
     """
 
     def __init__(
@@ -260,6 +262,7 @@ class StateStack:
         chunk_override: Optional[Sequence[Optional[int]]] = None,
         doublings_override: Optional[int] = None,
         dtype=None,
+        truncation=basis_mod.Truncation.CIRCULAR,
     ):
         if dtype is None:
             dtype = jnp.complex64
@@ -288,7 +291,7 @@ class StateStack:
             u=jnp.asarray([self.period[0], 0.0]),
             v=jnp.asarray([0.0, self.period[1]]),
         )
-        expansion = basis_mod.generate_expansion(lv, approximate_num_terms=orders)
+        expansion = basis_mod.generate_expansion(lv, approximate_num_terms=orders, truncation=truncation)
         self._lv = lv
         self.expansion = expansion
         self._n = expansion.num_terms
