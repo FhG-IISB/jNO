@@ -255,10 +255,12 @@ def test_pml_raises_on_offdiagonal_stretch():
 def test_zero_sigma_structured_cell_conserves_energy_and_matches_the_scalar_route(grid, orders):
     """Issue #409: with sigma = 0 the PML tensor is eps * I, a lossless structured cell. Its tensor vector rule
     lost 1.2 % of the power (T + R = 0.988 at grid 64) because the frame of the raw least-squares tangent field is
-    not unitary, so [[R]] F [[R^-1]] was not Hermitian. With the unit frame it conserves energy to roundoff, and T
-    approaches the scalar route's (the two factorizations differ by truncation: 4e-3 at 80 orders, 1.3e-3 at 200;
-    it was 1.5e-2 at 80)."""
+    not unitary, so [[R]] F [[R^-1]] was not Hermitian. With the unit frame it conserves energy to roundoff at
+    every grid. At grid 64 its T is within 8e-4 of the scalar route's (the two factorizations differ by
+    truncation; it was 1.5e-2); at grid 32 the pillar spans 8 pixels and both routes move by several 1e-3 with
+    the sampling, so T is compared on the finer grid only."""
     T, R = _TR(_constraints(1.4, 0.0, _scatterer), orders=orders, grid=grid)
     assert T + R == pytest.approx(1.0, abs=1e-9)
-    Ts, _ = _TR(_scalar_slab(1.4, _scatterer), orders=orders, grid=grid)
-    assert T == pytest.approx(Ts, abs=6e-3)
+    if grid >= 64:
+        Ts, _ = _TR(_scalar_slab(1.4, _scatterer), orders=orders, grid=grid)
+        assert T == pytest.approx(Ts, abs=2e-3)
