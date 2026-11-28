@@ -123,3 +123,68 @@ def test_total_internal_reflection_reflects_everything(pol):
     r, t = _slab(eps, d, 0.5, kx, pol)
     assert r == pytest.approx(1.0, abs=1e-11)
     assert t == pytest.approx(0.0, abs=1e-11)
+
+
+def _film_airy(eps_top, eps_bottom, kz_film, q_film, d, kx, pol):
+    """Airy R, T of a film whose wavenumber ``kz_film`` and admittance ``q_film`` are given (an anisotropic film),
+    between isotropic half-spaces, for the out-of-plane field of ``pol``."""
+    kz = [np.sqrt(complex(e) * K0**2 - kx**2 + 0j) for e in (eps_top, eps_bottom)]
+    kz = [k if k.imag >= 0 else -k for k in kz]
+    q0, q2 = [k if pol == "s" else k / complex(e) for k, e in zip(kz, (eps_top, eps_bottom))]
+    q1 = q_film
+    r01, r12 = (q0 - q1) / (q0 + q1), (q1 - q2) / (q1 + q2)
+    t01, t12 = 2 * q0 / (q0 + q1), 2 * q1 / (q1 + q2)
+    ph = np.exp(1j * kz_film * d)
+    den = 1 + r01 * r12 * ph**2
+    r, t = (r01 + r12 * ph**2) / den, t01 * t12 * ph / den
+    return abs(r) ** 2, abs(t) ** 2 * q2.real / q0.real
+
+
+def _tensor_slab(tensor, d, kx, pol, eps_bottom=1.2**2, period=0.45, orders=9):
+    rc = Rcwa(
+        [(np.inf, 1.0), (d, tensor), (np.inf, eps_bottom)],
+        period=(period, period),
+        orders=orders,
+        wavelength=WL,
+        k_in=(kx, 0.0),
+        assume_periodic=True,
+        polarization={"s": "y", "p": "x"}[pol],
+    )
+    sol = rc.solve()
+    return float(sol.efficiency("R")), float(sol.efficiency("T"))
+
+
+@pytest.mark.parametrize("pol", ["s", "p"])
+@pytest.mark.parametrize("theta_deg", [0.0, 25.0, 60.0])
+def test_biaxial_slab_at_oblique_incidence_matches_airy(theta_deg, pol):
+    """A biaxial film ``diag(eps_xx, eps_yy, eps_zz)`` in the x-z plane of incidence: the s wave (E_y) sees only
+    ``eps_yy``, ``kz^2 = eps_yy k0^2 - kx^2``; the p wave (H_y) sees ``kz^2 = eps_xx (k0^2 - kx^2 / eps_zz)`` with
+    the admittance ``kz / eps_xx`` (Berreman's 4 x 4 problem decouples for a diagonal tensor)."""
+    exx, eyy, ezz = 2.6, 3.4, 1.9 + 0.05j
+    kx = K0 * np.sin(np.deg2rad(theta_deg))
+    if pol == "s":
+        kz = np.sqrt(eyy * K0**2 - kx**2 + 0j)
+        q = kz
+    else:
+        kz = np.sqrt(exx * (K0**2 - kx**2 / ezz) + 0j)
+        q = kz / exx
+    r_ref, t_ref = _film_airy(1.0, 1.2**2, kz, q, 0.41, kx, pol)
+    r, t = _tensor_slab((exx, 0.0, 0.0, eyy, ezz), 0.41, kx, pol)
+    assert r == pytest.approx(r_ref, abs=1e-12)
+    assert t == pytest.approx(t_ref, abs=1e-12)
+
+
+@pytest.mark.parametrize("angle_deg", [0.0, 30.0, 72.0])
+def test_rotated_in_plane_tensor_splits_into_its_eigenpolarizations(angle_deg):
+    """At normal incidence a film whose in-plane tensor has eigenvalues ``a``, ``b`` along axes rotated by
+    ``angle`` carries the two eigenpolarizations independently: for x-polarized light
+    ``T = cos^2 T_a + sin^2 T_b`` and the same for R (the two outputs are orthogonal, so their powers add)."""
+    a, b, c = 2.2, 4.1, 3.0
+    th = np.deg2rad(angle_deg)
+    cs, sn = np.cos(th), np.sin(th)
+    tensor = (a * cs**2 + b * sn**2, (a - b) * cs * sn, (a - b) * cs * sn, a * sn**2 + b * cs**2, c)
+    ra, ta = airy_slab((1.0, a, 1.2**2), 0.33, 0.0, "s")
+    rb, tb = airy_slab((1.0, b, 1.2**2), 0.33, 0.0, "s")
+    r, t = _tensor_slab(tensor, 0.33, 0.0, "p")
+    assert t == pytest.approx(cs**2 * ta + sn**2 * tb, abs=1e-12)
+    assert r == pytest.approx(cs**2 * ra + sn**2 * rb, abs=1e-12)
