@@ -4819,7 +4819,9 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     # refused it as a whole-domain volume. The transient driver already does this; this path did not.
     dom.__dict__.pop("_gauge_pin_coords", None)
     cur = jno.fem(fem._constraints, **fem._fem_kwargs)
-    u_final = np.asarray(cur.solve(solve_fn, **kwargs)).reshape(-1)
+    out = cur.solve(solve_fn, **kwargs)
+    # a transient solve is deferred (a trace node): evaluate it, as the caller holds the array
+    u_final = np.asarray(out.fn() if hasattr(out, "fn") else out).reshape(-1)
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u_final

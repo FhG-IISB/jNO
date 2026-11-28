@@ -1465,8 +1465,10 @@ class core:
                     context[tag] = arr
                     continue
 
-                if not isinstance(arr, np.ndarray):  # a host array is already on the host: pinning it would copy it
-                    arr = jax.device_put(arr, _cpu_device())
+                # A host (NumPy) array is pinned too, at the cost of one host copy per preparation: left as NumPy,
+                # an entry indexed by a tracer inside jitted code raises TracerArrayConversionError
+                # (tests/test_core_device.py::TestDomainDataCPUPinning).
+                arr = jax.device_put(arr, _cpu_device())
 
                 if tag in metadata_tags:
                     context[tag] = arr
