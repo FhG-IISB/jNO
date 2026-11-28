@@ -139,8 +139,8 @@ def test_zero_sigma_pml_reduces_to_scalar():
     assert Rp == pytest.approx(Rs, abs=1e-5)
 
 
-def _scalar_slab(Lx):
-    """The scalar no-PML reference: same box + slab, plain Laplacian stiffness."""
+def _scalar_slab(Lx, eps_fn=None):
+    """The scalar no-PML reference: same box + slab (or ``eps_fn``), plain Laplacian stiffness."""
     d = _structured_box(Lx)
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
@@ -156,7 +156,7 @@ def _scalar_slab(Lx):
     ur, _ = face("right")
     uf, _ = face("front")
     ub, _ = face("back")
-    eps = jno.fn(_uniform, [xi, yi, zi])
+    eps = jno.fn(_uniform if eps_fn is None else eps_fn, [xi, yi, zi])
     vol = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi)
     return [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt - 2j * K0) * vbt, ul - ur, uf - ub]
 
@@ -249,3 +249,16 @@ def test_pml_raises_on_offdiagonal_stretch():
     cons = [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt - 2j * K0) * vbt, ul - ur, uf - ub]
     with pytest.raises(RcwaError, match="off-diagonal"):
         jno.rcwa(cons, orders=20, grid=16)
+
+
+@pytest.mark.parametrize("grid,orders", [(32, 80), (64, 80)])
+def test_zero_sigma_structured_cell_conserves_energy_and_matches_the_scalar_route(grid, orders):
+    """Issue #409: with sigma = 0 the PML tensor is eps * I, a lossless structured cell. Its tensor vector rule
+    lost 1.2 % of the power (T + R = 0.988 at grid 64) because the frame of the raw least-squares tangent field is
+    not unitary, so [[R]] F [[R^-1]] was not Hermitian. With the unit frame it conserves energy to roundoff, and T
+    approaches the scalar route's (the two factorizations differ by truncation: 4e-3 at 80 orders, 1.3e-3 at 200;
+    it was 1.5e-2 at 80)."""
+    T, R = _TR(_constraints(1.4, 0.0, _scatterer), orders=orders, grid=grid)
+    assert T + R == pytest.approx(1.0, abs=1e-9)
+    Ts, _ = _TR(_scalar_slab(1.4, _scatterer), orders=orders, grid=grid)
+    assert T == pytest.approx(Ts, abs=6e-3)

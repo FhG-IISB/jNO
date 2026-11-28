@@ -22,7 +22,8 @@ onto the normal direction,
 ``P = [[|t_x|^2, t_x* t_y], [t_x t_y*, |t_y|^2]] / |t|^2`` (the rotation by 90 degrees that maps the field to ``u``
 turns the normal projector in ``(x, y)`` into this matrix). It is invariant to the scale of ``t``. A tensor layer is
 rotated into the frame of ``t`` and the normal, gets Laurent's rule on the three blocks that do not divide by the
-normal component and the inverse rule on the one that does, and is rotated back.
+normal component and the inverse rule on the one that does, and is rotated back, with the pointwise-unit frame
+of ``t`` (a unitary rotation, so that the rule keeps a lossless tensor Hermitian).
 """
 
 from __future__ import annotations
@@ -162,6 +163,19 @@ def _rotation_matrices(t00, t01, t10, t11, expansion):
     )
 
 
+def _unit_field(tx, ty):
+    """``t / |t|`` pointwise (``(1, 0)`` where ``t = 0``, where no interface constrains the frame).
+
+    The tensor rule needs a *unitary* frame: then ``R^-1 = R^H`` pointwise, so ``[[R^-1]] = [[R]]^H`` exactly and
+    ``[[R]] F [[R]]^H`` is Hermitian whenever the tensor is, i.e. a lossless tensor layer conserves energy. With
+    the raw least-squares field (``|t|`` varies) the product lost up to 1.2 % of the power on a lossless cell
+    (issue #409)."""
+    m = jnp.sqrt(_abs2(tx) + _abs2(ty))
+    zero = jnp.isclose(m, 0)
+    m = jnp.where(zero, 1.0, m)
+    return jnp.where(zero, 1.0, tx / m), jnp.where(zero, 0.0, ty / m)
+
+
 def _rotated_rule(tensor, rotation, expansion) -> jnp.ndarray:
     """``[[R]] F [[R^-1]]`` where ``F`` applies Laurent's rule to ``R^-1 tensor R`` except for its ``(1, 1)`` (normal)
     block, which takes the inverse rule."""
@@ -181,6 +195,7 @@ def transverse_permittivity_vector_anisotropic(eps_xx, eps_xy, eps_yx, eps_yy, t
     """Vector-rule ``E_t`` of a tensor. The frame ``R = [[t_y, t_x*], [-t_x, t_y*]]`` maps (tangential, normal)
     components to the ``u`` ordering; the normal one is the second."""
     tensor = _pointwise2(eps_yy, -eps_yx, -eps_xy, eps_xx)
+    tx, ty = _unit_field(tx, ty)
     return _rotated_rule(tensor, _rotation_matrices(ty, tx.conj(), -tx, ty.conj(), expansion), expansion)
 
 
@@ -188,6 +203,7 @@ def transverse_permeability_vector_anisotropic(mu_xx, mu_xy, mu_yx, mu_yy, tx, t
     """Vector-rule ``M_t`` of a tensor, in the ``v = (H_x, H_y)`` ordering, where the frame is
     ``R = [[t_x, -t_y*], [t_y, t_x*]]`` (tangential, normal)."""
     tensor = _pointwise2(mu_xx, mu_xy, mu_yx, mu_yy)
+    tx, ty = _unit_field(tx, ty)
     return _rotated_rule(tensor, _rotation_matrices(tx, -ty.conj(), ty, tx.conj(), expansion), expansion)
 
 
