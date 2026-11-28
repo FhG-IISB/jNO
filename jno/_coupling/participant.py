@@ -192,17 +192,22 @@ class Participant:
 
         return not any(walk(c) for c in self.constraints())
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
-        """``(end, frames)``: the state after the window ``[t0, t0 + window]`` from ``state``, the data held over it,
-        and the states at the problem's own steps from the window's start, ``(n_steps + 1, n)`` (a flux it sends is
-        their mean over the window), or ``None`` when it sends its end state's flux. ``params``
-        (``{layer_id: value}``) gives trainable parameters their (possibly traced) values, as in :meth:`solve`."""
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
+        """``(end, frames)``, or ``(end, frames, means)`` when ``flux`` is given and taken: the state after the window ``[t0, t0 + window]`` from ``state``, the data held
+        over it, the states at the problem's own steps from the window's start, ``(n_steps + 1, n)`` (a flux it
+        sends is, failing ``means``, their mean over the window), or ``None`` when it sends its end state's flux.
+        ``flux`` (a list of ``(expr, tag, interface)``) asks an explicit or IMEX march for the window mean of each
+        flux as its own scheme integrates it, over its stages; ``means`` is the list of them (nodal values like
+        :meth:`sample`'s). ``params`` (``{layer_id: value}``) gives
+        trainable parameters their (possibly traced) values, as in :meth:`solve`."""
         raise NotImplementedError
 
+    stage_flux = False  # does march(flux=) return the stage quadrature of the flux?
+
     @staticmethod
-    def _frames(traj):
-        """``(end, frames)`` of a window's trajectory ``(n_steps + 1, n)``."""
-        return traj[-1].reshape(-1), traj
+    def _frames(traj, means=None):
+        """``(end, frames)`` of a window's trajectory ``(n_steps + 1, n)``, and ``means`` when given."""
+        return (traj[-1].reshape(-1), traj) if means is None else (traj[-1].reshape(-1), traj, means)
 
     def initial(self, problem):
         """The state its initial condition gives."""
@@ -315,7 +320,7 @@ class FDMParticipant(_StrongForm):
 
     kind = "fdm"
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window, with the data held over it (read through ``_override``, as jno.fvm's march reads them). Its
         steps are direct solves, as :meth:`solve` is: exact to round-off, so the coupling and its gradient are not
         limited by a Krylov tolerance."""
@@ -389,53 +394,81 @@ class FVMParticipant(_StrongForm):
 
         return jno.fvm(self.constraints() + list(extra), centering=self.problem.graph.centering)
 
-    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
-        """Evaluated on the tag's boundary faces with the problem's own boundary rule (face values and normal
-        derivatives as its fluxes see them), then lumped to the nodes: ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with
-        ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly. Compiled once per expression."""
+    def _flux_rows(self, problem, expr, tag, iface):
+        """``rows(state, data, params)``: ``expr`` on the tag's boundary faces with the problem's own boundary rule
+        (face values and normal derivatives as its fluxes see them), then lumped to the nodes:
+        ``q_i = Σ_f a_fi F_f / Σ_f a_fi`` with ``a_fi = ∫_f φ_i dμ``, so ``Σ_i w_i q_i = Σ_f ∫_f F dμ`` exactly."""
         import jax.numpy as jnp
 
-        data, params = data or {}, params or {}
-        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         faces = np.asarray(problem._region_faces(tag))
         A = jnp.asarray(self._attachment(problem, faces, iface))
         # how its boundary rule treats each condition is decided on concrete values, once; a problem sampled
         # before it was ever solved (a coupling's probe reads its initial state) has not decided it yet
         problem._decide_condition_affinity(problem._concrete_scope())
+
+        def rows(state, data, params):
+            return (A @ self._face_values(problem, state, expr, faces, data, params)) / A.sum(axis=1)
+
+        return rows
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        """:meth:`_flux_rows` at ``state``, compiled once per expression."""
+        import jax.numpy as jnp
+
+        data, params = data or {}, params or {}
+        keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
+        rows = self._flux_rows(problem, expr, tag, iface)
         cache = problem.__dict__.setdefault("_cpl_sample", {})
 
         def run(state, values, pvalues):
-            F = self._face_values(problem, state, expr, faces, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
-            return (A @ F) / A.sum(axis=1)
+            return rows(state, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
 
         args = (jnp.asarray(state), [data[k] for k in keys], [params[k] for k in pkeys])
         return _compiled(cache, (id(expr), tag, keys, pkeys), run, *args)
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    stage_flux = True
+
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window, compiled once per window length for an autonomous problem: the data are traced inputs
         (the march reads them through ``_override``). An explicit or IMEX scheme with ``cfl=`` decides its
-        substeps inside the program, from the state at the window's start, so every window runs the same one."""
+        substeps inside the program, from the state at the window's start, so every window runs the same one.
+        ``flux`` (a list of ``(expr, tag, interface)``): the march also takes the window mean of each flux as its
+        scheme integrates it over its stages (see :meth:`Participant.march`)."""
         import jax.numpy as jnp
 
         params = params or {}
         keys, pkeys = tuple(sorted(data)), tuple(sorted(params))
         span = self._span(t0, window)
         state = jnp.asarray(state).reshape(-1)
+        flux = list(flux or [])
+        rows = [self._flux_rows(problem, e, tag, iface) for e, tag, iface in flux]
+        sizes = [int(iface.weights.size) for _, _, iface in flux]
 
         def run(values, pvalues, x0):
-            problem._override = self._scope(problem, dict(zip(keys, values)), dict(zip(pkeys, pvalues)))
+            d, p = dict(zip(keys, values)), dict(zip(pkeys, pvalues))
+            problem._override = self._scope(problem, d, p)
             try:
-                traj = problem._march(time=time, x0=x0, span=span)
+                if not rows:
+                    traj = jnp.asarray(problem._march(time=time, x0=x0, span=span))
+                    return traj.reshape(traj.shape[0], -1)
+                f = lambda U, t: jnp.concatenate([r(U, d, p) for r in rows])  # noqa: E731
+                traj, acc = problem._march(time=time, x0=x0, span=span, flux=f)
             finally:
                 problem._override = None
             traj = jnp.asarray(traj)
-            return traj.reshape(traj.shape[0], -1)
+            return traj.reshape(traj.shape[0], -1), acc / float(window)
 
         args = ([data[k] for k in keys], [params[k] for k in pkeys], state)
+        fkey = tuple((id(e), tag) for e, tag, _ in flux)
         if not self.autonomous():  # its own times: compiled per window
-            return self._frames(_compiled({}, None, run, *args))
-        cache = problem.__dict__.setdefault("_cpl_march", {})
-        return self._frames(_compiled(cache, (keys, pkeys, span, repr(time)), run, *args))
+            out = _compiled({}, None, run, *args)
+        else:
+            cache = problem.__dict__.setdefault("_cpl_march", {})
+            out = _compiled(cache, (keys, pkeys, span, repr(time), fkey), run, *args)
+        if not rows:
+            return self._frames(out)
+        traj, mean = out
+        return self._frames(traj, list(jnp.split(mean, np.cumsum(sizes)[:-1])))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -596,7 +629,7 @@ class FEMParticipant(Participant):
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
-    def march(self, problem, state, t0, window, data, time=None, params=None):
+    def march(self, problem, state, t0, window, data, time=None, params=None, flux=None):
         """One window of the FEM's own time block: its step solvers (a direct step, composed once per scheme), a
         window copy of the block from ``state``, and the data as the runtime arguments. Going through
         ``fem.solve`` composed new step solvers on every call, a new compiled-march key each time (0.5 s a window,
@@ -620,7 +653,8 @@ class FEMParticipant(Participant):
             ys = time.integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
         else:
             ys = _default_transient_integrate(win, args, grid, linear_solve=lin_s, nonlinear_solve=nonlin_s)
-        return jnp.asarray(ys)[-1].reshape(-1), None  # its flux is read from the end state
+        ys = jnp.asarray(ys)
+        return self._frames(ys.reshape(ys.shape[0], -1))
 
     def initial(self, problem):
         import jax.numpy as jnp
@@ -651,12 +685,55 @@ class FEMParticipant(Participant):
 
         return [c for c in self.constraints() if has_test(c)]
 
-    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+    def split_terms(self, problem):
+        """``(stiffness, mass)``: the weak terms without their ``u.t`` parts, and those parts with ``u.t`` read as
+        ``u``. The free residual of the first at ``u`` is ``K u``, of the second at ``w`` the mass action ``M w`` (``M``
+        before any essential row is eliminated, which the block's own is not). ``fem.eval`` on the weak terms as
+        they are does not read ``u.t`` as zero but as a small spurious value, so a transient flux needs the split."""
+        from ..utils.solver.time_route import _strip_temporal_trial_derivative
+        from ..utils.solver.weak_form import _apply_sign, _contains_temporal_derivative, _split_additive_terms
+
+        stiff, mass = [], []
+        for c in self.weak_terms(problem):
+            for sign, sub in _split_additive_terms(problem.domain, getattr(c, "expr", c)):
+                term = _apply_sign(problem.domain, sign, sub)
+                if _contains_temporal_derivative(sub):
+                    mass.append(_strip_temporal_trial_derivative(term))
+                else:
+                    stiff.append(term)
+        return stiff, mass
+
+    def check_step_flux(self, problem, time):
+        """Raise unless a flux read from this problem's steps is exact: backward Euler (the default step, or
+        ``jno.solve.theta(1)``) on a mass that does not depend on the state."""
+        from ..utils.solver.timeschemes import _ThetaScheme
+
+        block = problem._op
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+        if time is not None:
+            theta = time.theta if isinstance(time, _ThetaScheme) else None
+        if theta != 1.0 or getattr(block, "mass_residual", None) is not None or getattr(block, "time_order", 1) == 2:
+            raise NotImplementedError(
+                "coupling: a transient jno.fem problem sends a flux read from its backward Euler steps "
+                "(M (u_n - u_{n-1})/dt + K u_n at the interface rows); this one steps with "
+                f"{time if time is not None else 'its assembled scheme'} or has a state-dependent mass. Use "
+                "backward Euler (jno.solve.theta(1.0)) and a mass without the unknown, or give the flux side "
+                "to the other problem (dirichlet=...)."
+            )
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None, prev=None):
+        """As :meth:`Participant.sample`. A flux of a transient problem is the reaction of its backward Euler step
+        and needs the state ``prev = (u_{n-1}, dt)`` that step started from: it is ``M (u_n - u_{n-1})/dt + K u_n``
+        (the mass action is the ``u.t`` part of the residual). Without ``prev`` only the ``K u_n`` part is read
+        (the flux at a start state, whose time derivative is not known)."""
         import jax.numpy as jnp
+
+        from ..utils.solver.backend_blocks import _algebraic_rows
 
         if has_derivative(expr, self.owns):
             # the natural flux, read as the consistent reaction ∫ N φ_i over the interface, per unit weight
-            terms = self.weak_terms(problem)
+            transient = self.transient(problem)
+            terms, mass = self.split_terms(problem) if transient else (self.weak_terms(problem), [])
             total = terms[0]
             for c in terms[1:]:
                 total = total + c
@@ -664,6 +741,18 @@ class FEMParticipant(Participant):
             # only the parameters are arguments (read as 0 when missing: a trainable conductivity's reaction was 0)
             args = self._args(problem, {}, params, with_data=False)
             r = jnp.asarray(problem.eval(total, jnp.asarray(state), args=args or None))
+            if prev is not None and transient and mass:
+                before, dt = prev
+                rate = (jnp.asarray(state).reshape(-1) - jnp.asarray(before).reshape(-1)) / dt
+                r = r + jnp.asarray(problem.eval(mass, rate, args=args or None))
+                # The step's own equations drop the mass rows and columns of the essential nodes (they carry no
+                # time derivative): the free rows beside such a node never see its change. The heat that goes
+                # into them is the node's, so it is counted with the reaction: the total over the interface is
+                # then exactly the heat the problem took in, and a receiver that gives it back conserves it.
+                block = problem._op
+                M = block.M if block.M is not None else block.mass(block.t0, args or {})
+                free = jnp.where(_algebraic_rows(M, M.shape[0], r.dtype), 0.0, 1.0)
+                r = r + jnp.asarray(problem.eval(mass, free, args=args or None)) * rate * (1.0 - free)
             field = self._flux_field(expr)
             sl = problem.blocks[problem.block_index(field)]
             # loads ∫ N φ_i -> the density whose loads they are (the interface mass, not the lumped weights,

@@ -85,9 +85,10 @@ With transient problems in the list, the coupling advances **window by window**:
 - The interface data start where the problems do: each at what its sender gives from its initial state or `x0=`,
   or, when the sender has neither, at the value that holds the condition at its receiver's start (a gas starting
   at rest reads its wall at its own temperature, not at 0).
-- A flux sent by a problem that took several steps in the window is its **mean over them** (the trapezoid rule
-  for an explicit or IMEX march, the step ends for backward Euler), so what the receiver takes in over the window
-  is what the sender gave out. Give a fast-changing sender a step finer than the window.
+- A flux sent by a problem that took several steps in the window is its **mean over them**: an explicit or IMEX
+  `jno.fvm` sender hands over the mean its own scheme integrated over its stages (the weights `b_i` of the
+  tableau, over every substep), a backward Euler sender the step ends, so what the receiver takes in over the
+  window is exactly what the sender gave out.
 - `implicit=True` (the default) iterates each window until the data stop changing. `implicit=False` takes one
   sweep per window, which is cheaper and first order in the window.
 
@@ -153,13 +154,13 @@ resistance of two slabs (dT/dk to 1e-8) and against a central difference of a tr
 
 - A differentiated or compiled coupling relaxes with Aitken or a fixed factor; `accel="iqn-ils"` runs step by step
   only.
-- A `u.tt` problem cannot take part in a transient coupling, and a transient `jno.fem` side cannot send a flux (it
-  takes the flux side of a pair).
+- A `u.tt` problem cannot take part in a transient coupling.
+- A transient `jno.fem` side sends the flux of its backward Euler steps (`M (u_n - u_{n-1})/dt + K u_n` at the
+  interface rows, plus the mass of the free nodes beside the interface, which a step leaves out of its own equations
+  when the interface value changes); a Crank-Nicolson or other scheme, and a mass that depends on the state, raise.
 - A vector load on a `jno.fem` side must be a coefficient times the boundary normal (`p * n`).
 - A vertex-centred fvm side sends a Dirichlet interface's flux from its least-squares gradient (exact for linear
   fields, not conservative).
-- The window mean of an explicit sender's flux is the trapezoid rule over its steps, not its own stage
-  quadrature: right after a jump (two bodies brought into contact) its first step is off.
 - A gas wall moved by its wall (two-way fluid–structure interaction), turbulence models and grain burnback are
   outside it.
 

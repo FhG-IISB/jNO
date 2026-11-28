@@ -298,13 +298,20 @@ def test_adaptivity_beats_uniform_refinement_at_matched_dofs():
     sol = np.asarray(f0.solve(adapt=jno.solve.remesh(theta=0.6, max_iters=4, refine_factor=1.6))).reshape(-1)
     err_adaptive = _ritz_energy(f0.domain, sol) - e_ref
 
-    best = None
-    for size in np.linspace(0.045, 0.10, 12):
+    # Uniform comparison mesh at the adaptive vertex count: the count scales as 1/h^2, so the size is
+    # rescaled by sqrt(n / target) until it lands near the target (a fixed sweep went stale as soon as the
+    # adaptive loop produced more vertices than the sweep's finest mesh).
+    size, best = 0.07, None
+    for _ in range(6):
         du, fu = _l_shape("tensor", size=size)
         n = len(du.mesh.points)
         if best is None or abs(n - len(sol)) < abs(best[0] - len(sol)):
-            best = (n, _ritz_energy(du, np.asarray(fu.solve()).reshape(-1)) - e_ref)
-    n_uniform, err_uniform = best
+            best = (n, du, fu)
+        if abs(n - len(sol)) < 0.05 * len(sol):
+            break
+        size *= (n / len(sol)) ** 0.5
+    n_uniform, du, fu = best
+    err_uniform = _ritz_energy(du, np.asarray(fu.solve()).reshape(-1)) - e_ref
 
     assert abs(n_uniform - len(sol)) < 0.15 * len(sol), "the uniform comparison is not at matched DOFs"
     assert err_adaptive > 0 and err_uniform > 0, "the Ritz energy must exceed the reference from above"

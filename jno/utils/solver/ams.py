@@ -185,3 +185,72 @@ def high_order_transfer(topology: Mapping, *, chunk: int = 20000):
     if isinstance(topology, dict):
         topology["_ams_cache"] = out
     return out
+
+
+def _to_scipy(M):
+    """BCOO / dense -> scipy CSR through the COO triplets (O(nnz); duplicates sum)."""
+    import scipy.sparse as sp
+
+    if hasattr(M, "indices") and hasattr(M, "data"):
+        idx = np.asarray(M.indices)
+        return sp.csr_matrix((np.asarray(M.data), (idx[:, 0], idx[:, 1])), shape=tuple(M.shape))
+    return sp.csr_matrix(np.asarray(M))
+
+
+def _to_bcoo(M):
+    M = M.tocoo()
+    return jsparse.BCOO((jnp.asarray(M.data), jnp.asarray(np.stack([M.row, M.col], axis=1))), shape=M.shape)
+
+
+def reduce_transfers(topology: Mapping, reduction: Mapping, G, Pis):
+    """Carry the AMS transfers ``G`` and ``Π_α`` onto the space of a TIE-REDUCED system.
+
+    A periodic / Floquet-Bloch tie makes the solve run on ``P_eᴴ A P_e`` (``u = P_e ũ``), so the auxiliary
+    spaces must be reduced the same way: with ``P_n`` the prolongation of the H¹ space ``G`` maps from
+    (built from the SAME tie masks and phases, :func:`fem_dofmap.periodic_prolongation`) and ``S_e`` the
+    selection of the kept edge DOFs, ``G_r = S_e G P_n`` and ``Π_r = S_e Π P_n``. The tie is consistent
+    exactly when ``P_e G_r = G P_n`` (a tied nodal gradient is a tied edge field); that is checked, and a
+    mismatch raises. With a Bloch phase ``G_r`` is complex, so the auxiliary operators are the Hermitian
+    ``G_rᴴ A_r G_r`` (``A_r`` is already ``P_eᴴ A P_e``).
+
+    Returns ``(G, Pis)`` unchanged when the reduction does not touch the edge field."""
+    from .fem_dofmap import build_dofmap, periodic_prolongation
+    from .fem_utils import _periodic_blocks
+
+    n_e = int(G.shape[0])
+    blocks, _off_f, _off_r = _periodic_blocks(reduction)
+    cand = [b for b in blocks if int(b["P"].shape[0]) == n_e]
+    if not cand:
+        return G, Pis
+    spec = reduction.get("tie_spec")
+    if spec is None:
+        raise NotImplementedError(
+            "jno.precond.ams: this system is reduced by a constraint other than a periodic / Bloch tie "
+            "(slip elimination or hanging nodes), whose nodal counterpart AMS cannot build, so its "
+            "discrete gradient cannot be reduced to match. Solve it with another preconditioner "
+            "(jno.precond.jacobi(), a form(...) of the same operator) or without the constraint."
+        )
+    P_e = _to_scipy(cand[0]["P"])
+    kept = np.asarray(cand[0]["kept"], dtype=np.int64)
+    pts = np.asarray(topology["vertex_points"], dtype=float)
+    cells = np.asarray(topology["cells"], dtype=np.int64)
+    m = 1
+    dmN = topology.get("dofmap")
+    if not topology.get("lowest_order_n1e", True) and dmN is not None:
+        m = _lagrange_degree_for(dmN.family, dmN.degree)
+    dmL = build_dofmap(cells, "Lagrange", m, n_verts=pts.shape[0])
+    P_n, _kept_n, _bloch = periodic_prolongation(dmL, pts, cells, spec)
+    P_n = _to_scipy(P_n)
+    G_full = _to_scipy(G)
+    G_r = G_full[kept] @ P_n
+    gap = P_e @ G_r - G_full @ P_n
+    scale = max(abs(G_full @ P_n).max() if (G_full @ P_n).nnz else 0.0, 1.0)
+    if gap.nnz and abs(gap).max() > 1e-8 * scale:
+        raise ValueError(
+            "jno.precond.ams: the periodic tie of the edge (H(curl)) field and the tie of its nodal "
+            f"auxiliary space disagree (|P_e G_r - G P_n| = {abs(gap).max():.2e}), so the reduced discrete "
+            "gradient would not span the gradients of the reduced system. Check that the tied faces are "
+            "translates of each other on a conforming periodic mesh."
+        )
+    Pis_r = tuple(_to_bcoo(_to_scipy(Pa)[kept] @ P_n) for Pa in Pis)
+    return _to_bcoo(G_r), Pis_r

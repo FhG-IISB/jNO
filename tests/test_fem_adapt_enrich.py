@@ -161,7 +161,19 @@ def test_a_gradient_criterion_finds_the_reentrant_corner():
     grad, inner = jno.np.grad, jno.np.inner
     s = jno.shape.rect(0.0, 0.0, 1.0, 1.0, size=0.14) - jno.shape.rect(0.5, 0.5, 1.0, 1.0, size=0.14)
     d = s.domain()
-    d.tag("walls", lambda x, y: np.ones_like(x, dtype=bool))
+
+    def _on_l_boundary(x, y, e=1e-9):
+        # the six edges of the L; a tag that holds everywhere would pin the interior too (#393)
+        return (
+            (np.abs(x) < e)
+            | (np.abs(y) < e)
+            | ((np.abs(x - 1.0) < e) & (y <= 0.5 + e))
+            | ((np.abs(y - 1.0) < e) & (x <= 0.5 + e))
+            | ((np.abs(x - 0.5) < e) & (y >= 0.5 - e))
+            | ((np.abs(y - 0.5) < e) & (x >= 0.5 - e))
+        )
+
+    d.tag("walls", _on_l_boundary)
     co, cw = d.variable("interior", split=True), d.variable("walls", split=True)
     X = [co[0], co[1]]
     u, phi = d.fem_symbols(space="cover")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
+import warnings
 
 import jax
 import jax.experimental.sparse as jsparse
@@ -103,3 +104,66 @@ def test_the_guard_message_counts_the_non_finite_entries():
     idx = np.array([[0, 0], [1, 1], [2, 2], [3, 3]])
     with pytest.raises(FloatingPointError, match=r"2 of 4 matrix value"):
         _pardiso_host_solve(data, idx, np.ones(4), (4, 4), False)
+
+
+def _exact_2x2(A, b):
+    """The exact solution of a 2x2 system in rational arithmetic: a pivot of 1e-13 makes the system far too
+    ill-conditioned for a dense double-precision solve to serve as the oracle."""
+    from fractions import Fraction as F
+
+    (a, c), (d, e) = [[F(float(v)) for v in row] for row in A]
+    r0, r1 = F(float(b[0])), F(float(b[1]))
+    det = a * e - c * d
+    return np.array([float((r0 * e - c * r1) / det), float((a * r1 - d * r0) / det)])
+
+
+def _perturbed_pivot_system(transpose=False, pivot=9e-14, size=1e7):
+    """Nonsingular, but its second pivot (``pivot``) is below the 1e-13 PARDISO replaces: the factorization is of
+    a perturbed matrix, and the raw solution has a residual of 1e-7 (under the singularity gate) and no digits."""
+    A = np.array([[1.0, 1.0], [1.5, 1.5 + pivot]])
+    # the right-hand side puts a solution entry of ``size`` on the pivot's row, for A x = b or for A^T x = b
+    return A, np.array([1.0, (1.0 if transpose else 1.5) + size * pivot])
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_a_perturbed_pivot_of_a_nonsingular_operator_is_refined_and_reported(transpose):
+    """PARDISO perturbed the pivot, the residual (8e-8) is far under the singularity gate, and the raw vector
+    was 16 % off (cond 1e13) with nothing said. Now the solve is refined against the true operator and the
+    perturbed pivots and the residual before and after are reported."""
+    _skip_unless_available()
+    import scipy.sparse as sp
+
+    from jno.utils.solver import linear as lin
+
+    A, b = _perturbed_pivot_system(transpose)
+    M = sp.coo_matrix(A)
+    idx = np.stack([M.row, M.col], axis=1)
+    oracle = _exact_2x2(A.T if transpose else A, b)
+    lin._PARDISO_CACHE.clear()
+    lin._warned_pardiso_perturbed = False
+    with pytest.warns(
+        RuntimeWarning, match=r"perturbed 1 pivot\(s\).*raw solution had relative residual .*brought it to"
+    ) as w:
+        x = lin._pardiso_host_solve(M.data, idx, b, (2, 2), transpose)
+    assert "refined" in str(w[0].message)
+    assert next(iter(lin._PARDISO_CACHE.values()))["perturbed"] == 1
+    op = A.T if transpose else A
+    assert np.linalg.norm(op @ x - b) / np.linalg.norm(b) < 1e-9  # the raw solve is at 8e-8
+    assert np.linalg.norm(x - oracle) / np.linalg.norm(oracle) < 1e-2  # the raw solve is 16 % off
+    # a second solve against the same factorization is refined too, and says nothing more
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        x2 = lin._pardiso_host_solve(M.data, idx, b, (2, 2), transpose)
+    np.testing.assert_allclose(x2, x)
+
+
+def test_a_perturbed_pivot_of_a_singular_operator_still_raises():
+    _skip_unless_available()
+    import scipy.sparse as sp
+
+    from jno.utils.solver import linear as lin
+
+    M = sp.coo_matrix(np.array([[1.0, 1.0], [1.0, 1.0 + 1e-14]]))
+    lin._PARDISO_CACHE.clear()
+    with pytest.raises(RuntimeError, match=r"SINGULAR.*perturbed 1 pivot.*before refinement"):
+        lin._pardiso_host_solve(M.data, np.stack([M.row, M.col], axis=1), np.array([1.0, 2.0]), (2, 2), False)

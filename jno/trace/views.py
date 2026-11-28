@@ -22,8 +22,9 @@ from typing import TYPE_CHECKING, Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from ..jnp_ops import concat
+from ..jnp_ops import _small_det, _small_inv, concat
 from . import FunctionCall, Placeholder, _matmul
 
 # ---------------------------------------------------------------------------
@@ -1745,6 +1746,11 @@ def _as_pair(o):
         return ComplexPair(o.real if o.real != 0 else None, o.imag if o.imag != 0 else None)
     if isinstance(o, (int, float)):
         return ComplexPair(o, None)
+    if isinstance(o, (np.ndarray, np.generic, jax.Array)):
+        # a constant array (or numpy scalar of any width): real stays a real constant, complex splits into parts
+        if jnp.iscomplexobj(o):
+            return ComplexPair(jnp.real(o), jnp.imag(o))
+        return ComplexPair(o, None)
     if isinstance(o, (Placeholder, ScalarView, VectorView)):
         split = _split_complex(o)
         return ComplexPair(o, None) if split is None else ComplexPair(*split)
@@ -1853,6 +1859,7 @@ class ComplexPair:
     # distributes over (re, im). Without this, `parameter * pair` died in jnp.asarray(ComplexPair)
     # INSIDE Placeholder.__mul__, so Python never consulted the pair at all.
     _is_complex_pair = True
+    __array_ufunc__ = None  # ndarray + pair defers to the pair reflected op, not an object array of pairs
 
     def __init__(self, re, im=None):
         self._re = re
@@ -2192,7 +2199,7 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def det(self) -> "ScalarView":
         """Determinant → ScalarView."""
-        return ScalarView(FunctionCall(jnp.linalg.det, [self._expr], "det", True))
+        return ScalarView(FunctionCall(_small_det, [self._expr], "det", True))
 
     def diag(self) -> "VectorView":
         """Diagonal elements → VectorView, shape ``[..., n]``."""
@@ -2200,7 +2207,7 @@ class MatrixView(_DelegatesToPlaceholder):
 
     def inv(self) -> "MatrixView":
         """Matrix inverse → MatrixView."""
-        return MatrixView(FunctionCall(jnp.linalg.inv, [self._expr], "inv"))
+        return MatrixView(FunctionCall(_small_inv, [self._expr], "inv"))
 
     def eigvals(self) -> "VectorView":
         """Eigenvalues via ``jnp.linalg.eigh`` (symmetric input, ascending) → VectorView."""
@@ -2792,7 +2799,7 @@ class VoigtView(_DelegatesToPlaceholder):
                 - v[..., 4] ** 2
                 - v[..., 5] ** 2
             )
-            I3 = jnp.linalg.det(A)
+            I3 = _small_det(A)
             return jnp.stack([I1, I2, I3], axis=-1)
 
         return VectorView(FunctionCall(_fn, [self._expr, self.to_full()._expr], "invariants"))

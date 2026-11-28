@@ -16,6 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .small_linalg import small_inv, small_matmul
+
 # basix's reference vertices: the local order `cells_f` is written in
 _REF = {
     "interval": np.array([[0.0], [1.0]]),
@@ -108,7 +110,7 @@ class PointShape:
         if self.cell_type in _SIMPLEX:
             # affine: x = X0 + (X_i - X0) xi, one linear solve
             T = jnp.swapaxes(X[:, 1:, :] - X[:, :1, :], 1, 2)  # (n, dim, dim)
-            xi = jnp.linalg.solve(T, (pos - X[:, 0, :])[..., None])[..., 0]
+            xi = small_matmul(small_inv(T), (pos - X[:, 0, :])[..., None])[..., 0]
         else:
             # bi/trilinear: Newton from the centre; exact in one step on an axis-aligned box
             xi = jnp.full((n, self.dim), 0.5, dtype=pos.dtype)
@@ -116,6 +118,6 @@ class PointShape:
                 N, dN = _shape(self.cell_type, xi)
                 x = jnp.einsum("nv,nvd->nd", N, X)
                 J = jnp.einsum("nva,nvd->nda", dN, X)  # dx_d / dxi_a
-                xi = xi - jnp.linalg.solve(J, (x - pos)[..., None])[..., 0]
+                xi = xi - small_matmul(small_inv(J), (x - pos)[..., None])[..., 0]
         N, _ = _shape(self.cell_type, xi)
         return cell, N

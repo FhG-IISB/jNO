@@ -95,6 +95,13 @@ The second form selects **boundary facets** by position, orientation, and existi
 and exclusion in one predicate. `n` is the outward normal (boundary only), `name` each facet's
 current region.
 
+**A Dirichlet pin `u(tag) - g` on a coordinate-predicate tag reaches every mesh node the predicate selects**,
+interior nodes included (a surface term on the tag integrates over its boundary facets only). A tag meant for
+the boundary alone is therefore written with a predicate that holds on the boundary alone: `x < 1e-6`, not
+`x < 0.1`, and for a wall around a body a thin shell around its surface rather than a thick band, which would also
+pin the fluid inside the band. Fields that pin boundary nodes only (1-D, the non-nodal element families, finite
+differences) refuse a tag that also holds at interior nodes, by name, instead of pinning fewer nodes.
+
 A coordinate predicate works in **1-D too**, where a boundary facet is a single vertex: `d.tag("right_end",
 lambda x: x > 1 - 1e-9)` names an endpoint, carries its outward normal (`-1` at the left end, `+1` at the
 right), and a `u(right_end) - g` term is an ordinary Dirichlet condition.

@@ -2052,10 +2052,9 @@ def assemble_fem_native(
             raise NotImplementedError(
                 f"jno.fem: the runtime parameter {_pname!r} was declared with {_psize} components and is "
                 "used whole in a scalar form. Index it, k[i] for component i (e.g. "
-                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component. A coefficient "
-                "that varies over the mesh is a FIELD parameter, declared on a space so that every value has "
-                "its place: `jno.np.parameter(v)` with `v` a P1 symbol (one value per vertex) or a P0 one "
-                "(one per cell)."
+                "`k[0] * ui.x * vi.x + k[1] * ui.y * vi.y`), or declare it with one component. For one value "
+                "per cell or node, declare it on an FE space instead, a FIELD parameter: "
+                "`jno.np.parameter(s0)` with `_, s0 = d.fem_symbols(space='P0')` (P1 for nodes)."
             )
     vector_parameter_tags: Tuple[str, ...] = tuple(sorted(_vector_param_sizes))
     # A nodal field parameter on a VECTOR / tensor symbol holds `value_shape` values per vertex, rows by vertex. Its
@@ -5609,6 +5608,24 @@ def assemble_fem_native(
                     f"tag({region!r}, region={_owner!r}) selected no nodes: the predicate and the body "
                     "do not overlap. Check the predicate reaches that body's surface."
                 )
+        # A `domain.tag` POINT SET (not a body's faces, not an interface) is the set of mesh nodes its
+        # predicate selects, boundary and interior alike: a pin on it reaches every one of them. (A tag that
+        # should pin a boundary only is written as a predicate that holds on the boundary only.) The boundary
+        # walk above only ever finds the boundary part of it, so the set is taken over ALL the field's nodes.
+        _pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
+        if (
+            _pred is not None
+            and region != "boundary"
+            and _owner is None
+            and region not in (getattr(domain, "_interior_face_tags", ()) or ())
+        ):
+            _sel = np.flatnonzero(np.asarray(_pred(*(pts_all[:, i] for i in range(dim))), dtype=bool).reshape(-1))
+            if _sel.size == 0:
+                raise ValueError(
+                    f"jno.fem: the Dirichlet pin on tag {region!r} selects no node of the mesh: its predicate "
+                    "holds at none of the mesh nodes. Widen the predicate or refine the mesh."
+                )
+            return [int(n) for n in _sel]
         if bnodes.size == 0:  # interior pin (no boundary facet matched) -> predicate over all nodes
             return list(_region_node_ids_from_pts(domain, region, pts_all))
         return [int(n) for n in bnodes]

@@ -239,11 +239,12 @@ def _optimizer_states_match(a, b) -> bool:
 def _cpu_device():
     """Return a CPU JAX device.
 
-    Raises RuntimeError if no CPU backend is available — jNO requires
-    JAX_PLATFORMS=cuda,cpu (or cpu) so that pure_callback and host-side
-    data staging always have a CPU device.
+    Raises RuntimeError if no CPU backend is available (``JAX_PLATFORMS=cuda`` alone): host-side data staging
+    needs a CPU device, so the message names ``JAX_PLATFORMS=cuda,cpu``.
     """
-    cpu_devs = jax.devices("cpu")
+    from .utils.solver.placement import _host_devices
+
+    cpu_devs = _host_devices()
     if not cpu_devs:
         raise RuntimeError(
             "No CPU JAX device found. Set JAX_PLATFORMS=cuda,cpu (or cpu) "
@@ -1465,10 +1466,8 @@ class core:
                     context[tag] = arr
                     continue
 
-                # A host (NumPy) array is pinned too, at the cost of one host copy per preparation: left as NumPy,
-                # an entry indexed by a tracer inside jitted code raises TracerArrayConversionError
-                # (tests/test_core_device.py::TestDomainDataCPUPinning).
-                arr = jax.device_put(arr, _cpu_device())
+                if not isinstance(arr, np.ndarray):  # a host array is already on the host: pinning it would copy it
+                    arr = jax.device_put(arr, _cpu_device())
 
                 if tag in metadata_tags:
                     context[tag] = arr
@@ -3720,8 +3719,8 @@ class core:
         full_context = self.domain_data.context
 
         if offload_data:
-            # full_context holds CPU-pinned JAX arrays (prepare_domain_data never goes to GPU).
-            # Convert to numpy so the host_context is plain numpy for per-batch streaming.
+            # full_context holds host arrays: numpy as given, anything else CPU-pinned (prepare_domain_data
+            # never goes to the GPU). Convert to numpy so the host_context is plain numpy for per-batch streaming.
             # Lazy handles stay handles -- np.asarray would read the whole dataset, which is the
             # one thing attaching one is meant to avoid. `_host_batch` slices them per step.
             host_context = {k: (v if _is_lazy_source(v) else np.asarray(v)) for k, v in full_context.items()}

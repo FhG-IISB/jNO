@@ -1051,6 +1051,130 @@ def _pardiso_upper_with_diag(A, sp, np):
     return sp.coo_matrix((vals, (rows, cols)), shape=A.shape).tocsr()
 
 
+def _pardiso_matrix(values, rows, cols, shape, mtype):
+    """The CSR matrix PARDISO is handed for ``mtype``: the full matrix, or its upper triangle for a symmetric type."""
+    import numpy as _np
+    import scipy.sparse as _sp
+
+    A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
+    A.sum_duplicates()
+    return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
+
+
+def _pardiso_new_entry(data, rows, cols, shape, b, dhash):
+    """Detect the matrix type, analyse (phase 11) and factor (phase 22) once: ``(kind, data, entry)``, where
+    ``entry`` is what :func:`_pardiso_host_solve` caches and :class:`FactorOnce` keeps."""
+    import numpy as _np
+    from pypardiso import PyPardisoSolver
+
+    order, orderT, pat = _cudss_sym_perms(rows, cols)
+    kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
+    mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
+    A = _pardiso_matrix(data, rows, cols, shape, mtype)
+    solver = PyPardisoSolver(mtype=mtype)
+    _pardiso_set_pivoting(solver)
+    _pardiso_check_A(solver, A, _np)
+    threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
+    solver.set_phase(11)  # symbolic analysis: the half that survives a value change
+    solver._call_pardiso(A, b)
+    solver.set_phase(22)
+    solver._call_pardiso(A, b)
+    entry = {
+        "solver": solver,
+        "A": A,
+        "dhash": dhash,
+        "order": order,
+        "orderT": orderT,
+        "pat": pat,
+        "kind": kind,
+        "mtype": mtype,
+        "threads": threads,
+    }
+    return kind, data, entry
+
+
+class FactorOnce:
+    """A sparse matrix factored ONCE on the host and applied to many right-hand sides: what a
+    preconditioner's direct inner solve is. MKL PARDISO where it is installed (real or complex, the
+    symmetric type when the matrix is one), else SuperLU; both keep a COMPLEX matrix as itself.
+
+    ``solve(b)`` solves ``A x = b`` and ``solve_t(b)`` the plain transpose ``A^T x = b`` from the same
+    factors. Not a differentiable solve: a preconditioner is never differentiated through."""
+
+    def __init__(self, A):
+        import threading
+        import weakref
+
+        import numpy as np
+        import scipy.sparse as sp
+
+        A = sp.csr_matrix(A)
+        A.sum_duplicates()
+        self.shape = tuple(A.shape)
+        self.dtype = np.complex128 if np.iscomplexobj(A.data) else np.float64
+        self._lock = threading.Lock()  # one factorization, called from whichever pool thread applies it
+        self._entry = None
+        self._lu = None
+        A = A.astype(self.dtype)
+        if _pardiso_available():
+            C = A.tocoo()
+            if not (np.isfinite(C.data).all()):
+                raise FloatingPointError("FactorOnce: the matrix has non-finite entries.")
+            b0 = np.zeros((self.shape[0], 1), dtype=self.dtype, order="F")
+            _kind, _data, self._entry = _pardiso_new_entry(C.data, C.row, C.col, self.shape, b0, None)
+            weakref.finalize(self, _pardiso_release, self._entry)
+        else:
+            import scipy.sparse.linalg as spla
+
+            self._lu = spla.splu(A.tocsc())
+
+    def _apply(self, b, transpose):
+        import numpy as np
+
+        b = np.asarray(b)
+        if np.iscomplexobj(b) and self.dtype == np.float64:  # a real matrix, a complex vector: two real solves
+            return self._apply(b.real, transpose) + 1j * self._apply(b.imag, transpose)
+        out_dtype = np.result_type(b.dtype, self.dtype)
+        with self._lock:
+            if self._lu is not None:
+                x = self._lu.solve(np.asarray(b, dtype=self.dtype), trans="T" if transpose else "N")
+                return np.asarray(x, dtype=out_dtype)
+            e = self._entry
+            solver = e["solver"]
+            rhs = np.asfortranarray(b.reshape(b.shape[0], -1).astype(self.dtype, copy=False))
+            with _pardiso_thread_count(solver, e["threads"]):
+                if e.get("perturbed") is None:  # once per factorization, as lu(backend="pardiso"): a singular
+                    # operator raises, a perturbed pivot on a nonsingular one is reported and every solve refined
+                    e["perturbed"] = _pardiso_check_factorization(solver, e["A"], rhs, np, self.shape, transpose)
+                solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
+                solver.set_phase(33)
+                try:
+                    x = solver._call_pardiso(e["A"], rhs)
+                    if e["perturbed"]:  # the factors are of a perturbed matrix: refine against the true one
+                        x = _pardiso_refine(solver, e["A"], rhs, x, np, transpose)[0]
+                finally:
+                    solver.set_iparm(12, 0)
+            return np.asarray(np.asarray(x).reshape(b.shape), dtype=out_dtype)
+
+    def solve(self, b):
+        """Solve ``A x = b`` with the kept factorization; ``b`` is one right-hand side or a block of them
+        (columns), and ``x`` comes back in ``b``'s shape."""
+        return self._apply(b, False)
+
+    def solve_t(self, b):
+        """Solve ``A^T x = b`` with the same factorization (no second one is built); ``b`` as in :meth:`solve`."""
+        return self._apply(b, True)
+
+
+def _pardiso_release(entry):
+    """Hand a factorization's MKL-owned memory back (a finalizer: never raises)."""
+    try:
+        with _pardiso_thread_count(entry["solver"], entry["threads"]):
+            entry["solver"].free_memory()
+    except Exception:  # noqa: BLE001 -- interpreter shutdown, MKL already gone
+        pass
+
+
 def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     """One MKL PARDISO solve, with the phase-separated cache described on :data:`_PARDISO_CACHE`.
 
@@ -1065,8 +1189,6 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     import hashlib
 
     import numpy as _np
-    import scipy.sparse as _sp
-    from pypardiso import PyPardisoSolver
 
     def _h(*arrs):
         d = hashlib.blake2b(digest_size=16)
@@ -1125,36 +1247,13 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
     entry, data = _typed_lookup(_PARDISO_CACHE, _PARDISO_LAST_KIND, skey, dhash, data)
 
     def _build(values, mtype):
-        A = _sp.coo_matrix((values, (rows, cols)), shape=shape).tocsr()
-        A.sum_duplicates()
-        return _pardiso_upper_with_diag(A, _sp, _np) if mtype in _PARDISO_TRIANGLE_MTYPES else A
+        return _pardiso_matrix(values, rows, cols, shape, mtype)
 
     b = _np.asfortranarray(rhs2)
 
     if entry is None:
-        order, orderT, pat = _cudss_sym_perms(rows, cols)
-        kind, data = _symmetrized_kind_and_values(data, order, orderT, pat)
-        mtype = _PARDISO_MTYPE[(bool(_np.iscomplexobj(data)), kind)]
-        A = _build(data, mtype)
-        solver = PyPardisoSolver(mtype=mtype)
-        _pardiso_set_pivoting(solver)
-        _pardiso_check_A(solver, A, _np)
-        threads = _pardiso_mkl(solver).MKL_Get_Max_Threads()  # of THIS thread: what the analysis plans for
-        solver.set_phase(11)  # symbolic analysis: the half that survives a value change
-        solver._call_pardiso(A, b)
-        solver.set_phase(22)
-        solver._call_pardiso(A, b)
-        _PARDISO_CACHE[(skey, kind)] = entry = {
-            "solver": solver,
-            "A": A,
-            "dhash": dhash,
-            "order": order,
-            "orderT": orderT,
-            "pat": pat,
-            "kind": kind,
-            "mtype": mtype,
-            "threads": threads,
-        }
+        kind, data, entry = _pardiso_new_entry(data, rows, cols, shape, b, dhash)
+        _PARDISO_CACHE[(skey, kind)] = entry
         while len(_PARDISO_CACHE) > _PARDISO_CACHE_MAX:
             _, old = _PARDISO_CACHE.popitem(last=False)
             with _pardiso_thread_count(old["solver"], old["threads"]):
@@ -1170,12 +1269,16 @@ def _pardiso_host_solve(data, indices, rhs, shape, transpose):
             solver.set_phase(22)
             solver._call_pardiso(entry["A"], b)
             entry["dhash"] = dhash
+            entry["perturbed"] = None  # a new factorization: checked again below
         A = entry["A"]
-        _pardiso_check_factorization(solver, A, b, _np, shape)
+        if entry.get("perturbed") is None:  # once per factorization; a raise leaves it unset, so it raises again
+            entry["perturbed"] = _pardiso_check_factorization(solver, A, b, _np, shape, transpose)
         solver.set_iparm(12, 2 if transpose else 0)  # A^T x = b from the SAME factorization
         solver.set_phase(33)
         try:
             x = solver._call_pardiso(A, b)
+            if entry["perturbed"]:  # the factorization is of a perturbed matrix: refine against the true one
+                x = _pardiso_refine(solver, A, b, x, _np, transpose)[0]
         finally:
             solver.set_iparm(12, 0)
     return _np.asarray(x.reshape(rhs.shape), dtype=out_dtype)
@@ -1285,8 +1388,53 @@ def _pardiso_apply(A, x, mtype):
     return A @ x + lower - (diagonal[:, None] * x if x.ndim == 2 else diagonal * x)
 
 
-def _pardiso_check_factorization(solver, A, b, np, shape):
-    """Raise if PARDISO silently factored a singular operator.
+def _pardiso_residual(solver, A, x, b, np, transpose=False):
+    """Relative residual ``||M x - b|| / ||b||`` of the operator ``M`` PARDISO factored (``M^T`` for the
+    transposed direction, which is what ``iparm(12) = 2`` solves), and the residual vector."""
+    if transpose:
+        # M^T x: M is symmetric (A^T = A) except the Hermitian types, where M^T = conj(M)
+        if solver.mtype in (-4, 4):
+            mx = np.conj(_pardiso_apply(A, np.conj(x), solver.mtype))
+        elif solver.mtype in _PARDISO_TRIANGLE_MTYPES:
+            mx = _pardiso_apply(A, x, solver.mtype)
+        else:
+            mx = A.T @ x
+    else:
+        mx = _pardiso_apply(A, x, solver.mtype)
+    r = b - mx
+    denom = float(np.linalg.norm(b))
+    return float(np.linalg.norm(r)) / (denom if denom > 0 else 1.0), r
+
+
+def _pardiso_refine(solver, A, b, x, np, transpose=False, max_steps=None):
+    """Iterative refinement of ``x`` against the TRUE operator, reusing PARDISO's factorization of the perturbed one.
+
+    ``x += M_perturbed^-1 (b - M x)`` contracts by about ``||M - M_perturbed|| / ||M||`` per step when the
+    perturbation is small, which is the recoverable case (:func:`_cudss_refine` is the same loop for cuDSS).
+    It stops at :data:`_REFINE_TARGET`, or as soon as a step fails to reduce the residual (the factorization is
+    then no usable preconditioner: a null space), keeping the best ``x``. Returns ``(x, rel, stalled)`` with
+    ``rel`` the relative residual of the returned ``x``. The solver's phase and ``iparm(12)`` must already be
+    set for the direction asked.
+    """
+    rel, r = _pardiso_residual(solver, A, x, b, np, transpose)
+    stalled = False
+    for _ in range(_REFINE_MAX if max_steps is None else max_steps):
+        if rel <= _REFINE_TARGET:
+            break
+        trial = x + solver._call_pardiso(A, np.asfortranarray(r))
+        new, r_new = _pardiso_residual(solver, A, trial, b, np, transpose)
+        if not new < rel:
+            stalled = True  # not contracting: the correction lives in a null space
+            break
+        x, rel, r = trial, new, r_new
+    return x, rel, stalled
+
+
+_warned_pardiso_perturbed = False
+
+
+def _pardiso_check_factorization(solver, A, b, np, shape, transpose=False):
+    """Raise if PARDISO silently factored a singular operator; report a perturbed one it recovered.
 
     PARDISO behaves exactly like cuDSS here and exactly unlike ``spsolve``: measured on a rank-3
     4x4 matrix it returned ``[-1e13, 5e12, 0.2, 0.4]`` -- finite, plausible, residual 0.5, no
@@ -1294,26 +1442,52 @@ def _pardiso_check_factorization(solver, A, b, np, shape):
     ``npivots``; it read 1 on that matrix. As there, the residual is only computed once the pivot
     count fires, so a healthy factorization pays a single integer read.
 
+    A perturbed pivot on a NONSINGULAR operator returns a less accurate vector with nothing said (a residual
+    of 1e-7 is under the singularity gate), so, as for cuDSS, the answer is refined against the true operator
+    (:func:`_pardiso_refine`) and the refinement decides: a residual that stays in the singular regime raises,
+    one that recovers is reported once (the pivots, the residual before and after) and accepted.
+
+    Returns the number of perturbed pivots: nonzero means every solve against this factorization must be
+    refined too, because each raw solve carries the perturbation's error.
+
     pypardiso separately rejects a STRUCTURALLY singular matrix (an empty row or column) up front in
     ``_check_A`` with its own clear message; this covers the numerically singular case it cannot see.
     """
+    global _warned_pardiso_perturbed
     try:
         perturbed = int(solver.get_iparm(14))
     except Exception:  # a pypardiso that does not expose it -- do not fail a working solve over this
-        return
+        return 0
     if perturbed == 0:
-        return
+        return 0
+    solver.set_iparm(12, 2 if transpose else 0)  # the direction the caller's right-hand side belongs to
     solver.set_phase(33)
-    x = solver._call_pardiso(A, b)
-    denom = np.linalg.norm(b)
-    rel = float(np.linalg.norm(_pardiso_apply(A, x, solver.mtype) - b) / (denom if denom > 0 else 1.0))
+    try:
+        x = solver._call_pardiso(A, b)
+        raw = _pardiso_residual(solver, A, x, b, np, transpose)[0]
+        x, rel, stalled = _pardiso_refine(solver, A, b, x, np, transpose)
+    finally:
+        solver.set_iparm(12, 0)
     if rel > _SINGULAR_REL:  # the same singularity test as cuDSS; see _SINGULAR_REL
         raise RuntimeError(
             f"MKL PARDISO factorized a SINGULAR operator ({shape[0]}x{shape[1]}): it perturbed "
-            f"{perturbed} pivot(s) and the solution has relative residual {rel:.2e}. PARDISO reports "
-            f"this through neither an exception nor a NaN, so jNO checks it -- the returned vector "
-            f"would have been finite and wrong. {SINGULAR_HINTS}"
+            f"{perturbed} pivot(s) and iterative refinement "
+            f"{'stalled' if stalled else f'could not get there in {_REFINE_MAX} steps'}, leaving relative residual "
+            f"{rel:.2e} (before refinement {raw:.2e}). PARDISO reports this through neither an exception nor a "
+            f"NaN, so jNO checks it -- the returned vector would have been finite and wrong. {SINGULAR_HINTS}"
         )
+    if raw > _CLEAN_REL and not _warned_pardiso_perturbed:
+        _warned_pardiso_perturbed = True
+        warnings.warn(
+            f"MKL PARDISO perturbed {perturbed} pivot(s) on a {shape[0]}x{shape[1]} operator: the raw solution had "
+            f"relative residual {raw:.2e}, iterative refinement against the true operator brought it to {rel:.2e}"
+            f"{'' if rel <= _CLEAN_REL else f', still short of {_CLEAN_REL:.0e}'}. The operator is badly scaled "
+            f"rather than singular, so every solve against this factorization is refined. Rescaling the "
+            f"worst-conditioned block (a stiff penalty term is the usual source) removes the perturbation.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return perturbed
 
 
 def pardiso_lu_solve(A, b):

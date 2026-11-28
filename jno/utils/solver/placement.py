@@ -9,6 +9,8 @@ were that host->device copy of arrays that had not changed since the previous ca
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,6 +24,29 @@ def solve_device():
     if isinstance(d, str):  # a platform name
         d = jax.devices(d)[0]
     return d if d is not None else jax.devices()[0]
+
+
+def _host_devices() -> list:
+    """The host (CPU) devices, or ``[]`` when the CPU platform is not enabled (``JAX_PLATFORMS=cuda``):
+    ``jax.devices("cpu")`` raises there instead of returning an empty list."""
+    try:
+        return list(jax.devices("cpu"))
+    except RuntimeError:
+        return []
+
+
+def require_host_backend(what: str) -> None:
+    """Raise one clear error when the CPU platform is not enabled (``JAX_PLATFORMS=cuda``).
+
+    The solvers' convergence gate, iteration counts and warnings reach the host through ``jax.debug.callback`` /
+    ``pure_callback``, which place their inputs on a CPU device; without one JAX fails deep inside the compiled
+    program with an error that names neither jNO nor the remedy."""
+    if not _host_devices():
+        raise RuntimeError(
+            f"{what} needs a CPU device and JAX has none: the CPU platform is not enabled "
+            f"(JAX_PLATFORMS={os.environ.get('JAX_PLATFORMS', '')!r}). Run with JAX_PLATFORMS=cuda,cpu "
+            "(the GPU stays the default device; the CPU only stages data and runs the solvers' host callbacks)."
+        )
 
 
 def _movable(x, target) -> bool:

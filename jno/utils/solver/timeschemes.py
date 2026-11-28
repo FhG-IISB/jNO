@@ -40,6 +40,25 @@ def _cfl_substeps(dt, limit):
         return jnp.maximum(1, jnp.ceil(dt / limit - 1e-12)).astype(jnp.int32)
 
 
+def _flux_run(step, flux, dt, s0, t0):
+    """``run(u, t_start, sub) -> (u, acc)`` of a flux-accumulating ``step`` (see ``stepper(flux=)``): ``sub`` substeps
+    of ``dt``, the scheme's quadrature of ``flux`` summed over them, from a zero of the flux's shape."""
+    shape = jax.eval_shape(flux, s0, t0)
+    zero = jnp.zeros(shape.shape, shape.dtype)
+
+    def run(u, t_start, sub):
+        h = dt / sub
+
+        def body(i, carry):
+            w, acc = carry
+            w, part = step(w, t_start + i * h, h)
+            return w, acc + part
+
+        return jax.lax.fori_loop(0, sub, body, (u, zero))
+
+    return run
+
+
 class _TimeScheme:
     """Base for the ``fem.solve(time=…)`` schemes.
 
@@ -108,11 +127,11 @@ class _ExponentialScheme(_TimeScheme):
     """Matrix-exponential scheme (see :func:`jno.solve.exponential`) — linear, time-independent ``M``/``A``
     (a time-varying source is handled by ETD2).
 
-    NOTE ``order`` here is the **Krylov subspace size**, not the method's order in ``dt`` — do not feed it
-    to the adaptive controller."""
+    NOTE ``order`` here is the **cap of the Krylov subspace size** (the fixed size for ``symmetric=False``),
+    not the method's order in ``dt`` — do not feed it to the adaptive controller."""
 
-    def __init__(self, order: int, mass: str, symmetric: bool):
-        self.order = int(order)
+    def __init__(self, order, mass: str, symmetric: bool):
+        self.order = None if order is None else int(order)
         self.mass = mass
         self.symmetric = bool(symmetric)
 
@@ -1495,6 +1514,18 @@ def _refuse_nonpositive_lumping(d, mask):
         )
 
 
+#: ``jno.solve.exponential(order=None)``: the cap of the adaptive Lanczos (symmetric), and the fixed size of the
+#: non-symmetric Arnoldi (which has no error estimate yet).
+_DEFAULT_LANCZOS_CAP = 200
+_DEFAULT_ARNOLDI_ORDER = 40
+
+
+def _krylov_tolerance(dtype):
+    """Relative tolerance of the Krylov error estimate: 1e-10, or 100 machine epsilons when the dtype cannot
+    reach that (float32)."""
+    return max(1e-10, 100.0 * float(np.finfo(dtype).eps))
+
+
 def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, check_only=False):
     """Advance ``M u̇ + A u = f(t)`` per step via ``exp(-dt·M⁻¹A)``: exact for the homogeneous decay, with a
     ``φ₁`` weight for a constant source and a ``φ₂`` ramp weight (ETD2) for a time-varying one.
@@ -1578,6 +1609,18 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, chec
         z = -dt * lam
         return jnp.where(jnp.abs(z) < 1e-5, 0.5 + z / 6.0, (jnp.expm1(z) - z) / (z * z))
 
+    def _phi3(lam):  # φ₃(z) = (eᶻ − 1 − z − z²/2)/z³ (series below |z| = 0.1, where the difference cancels)
+        z = -dt * lam
+        series = 1.0 / 6.0 + z / 24.0 + z * z / 120.0 + z**3 / 720.0
+        zs = jnp.where(jnp.abs(z) < 0.1, 1.0, z)
+        return jnp.where(jnp.abs(z) < 0.1, series, (jnp.expm1(zs) - zs - 0.5 * zs * zs) / zs**3)
+
+    # (fun, error function) per Krylov evaluation: the a-posteriori estimate of f = φ_k reads dt·φ_{k+1}
+    # (Saad 1992, Sec. 5.2; see `m_inner_funm`).
+    _EXP = (_exp, lambda lam: dt * _phi1(lam))
+    _PHI1 = (_phi1, lambda lam: dt * _phi2(lam))
+    _PHI2 = (_phi2, lambda lam: dt * _phi3(lam))
+
     d = lumped_diagonal(Mop)
     # Dirichlet DOFs carry NO mass: their whole row of M is empty -- algebraic (u=0), not ODEs. Read off the
     # ABSOLUTE row sum, never the row sum ``d``: the row sum of a higher-order or derivative basis vanishes
@@ -1592,7 +1635,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, chec
     # A Krylov space cannot outgrow the problem: cap the size at the number of unknowns (the free ones, when
     # the mask is concrete). Past it the Arnoldi of `expmv` raised outright ("num_matvecs=40 exceeds ... 31").
     n_free = int(np.sum(np.asarray(mask))) if not isinstance(mask, jax.core.Tracer) else n
+    if order is None:  # the cap of the adaptive Lanczos; the non-symmetric Arnoldi has a fixed size
+        order = _DEFAULT_LANCZOS_CAP if symmetric else _DEFAULT_ARNOLDI_ORDER
     order = max(1, min(int(order), n_free))
+    krylov_tol = _krylov_tolerance(dtype)
     _refuse_what_the_mask_would_zero(
         A_check, mask, s0, [c_aff] + ([_f_of(grid[0]), _f_of(grid[-1])] if _time_varying else [])
     )
@@ -1664,7 +1710,10 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, chec
                 # inner product). A pinned DOF adds an eigenvalue 0 to L̃ and a symmetric mesh repeats
                 # eigenvalues, so the subspace can run out before `order` steps; the unrecovered Lanczos of
                 # `applyfun` then broke down to NaN (a 3-D P1 heat block), where this one carries on.
-                return m_inner_funm(Ctil_mv, lambda a, b: a @ b, e0, vec, fun, order)
+                return m_inner_funm(
+                    Ctil_mv, lambda a, b: a @ b, e0, vec, fun[0], order,
+                    err_fun=fun[1], tol=krylov_tol, m_mv=lambda b: b,
+                )  # fmt: skip
 
             w0, solve_c = s * s0, lambda x: s_inv * x  # forcing in the scaled system: D^{-1/2}·rhs
             to_field = lambda w: s_inv * w  # u = D^{-1/2} w (boundary → 0)
@@ -1673,20 +1722,22 @@ def _exponential_integrate(block, args, save_ts, *, order, mass, symmetric, chec
             L_mv = lambda x: m_solve(Aop @ x)  # M⁻¹A x (interior)
             m_inner = lambda a, b: a @ (Mop @ b)  # ⟨a,b⟩_M — M already zeros the boundary
             e0 = mask / jnp.sqrt(jnp.maximum(m_inner(mask, mask), 1e-300))  # a fixed M-unit interior vector (0 if none)
-            apply_f = lambda vec, fun: m_inner_funm(L_mv, m_inner, e0, vec, fun, order)
+            apply_f = lambda vec, fun: m_inner_funm(
+                L_mv, m_inner, e0, vec, fun[0], order, err_fun=fun[1], tol=krylov_tol, m_mv=lambda b: Mop @ b
+            )
             w0, solve_c = mask * s0, m_solve  # integrate u directly (homogeneous boundary); forcing M⁻¹·rhs
             to_field = lambda u: u
         if not _time_varying:
             g = solve_c(c_aff)  # constant forcing (fast φ₁ path)
 
         def step(w, t_target):
-            wn = apply_f(w, _exp)
+            wn = apply_f(w, _EXP)
             if has_forcing:
                 if _time_varying:  # ETD2: constant part rides φ₁, the step's source ramp rides φ₂
                     f0, f1 = _f_of(t_target - dt), _f_of(t_target)
-                    wn = wn + dt * apply_f(solve_c(f0), _phi1) + dt * apply_f(solve_c(f1 - f0), _phi2)
+                    wn = wn + dt * apply_f(solve_c(f0), _PHI1) + dt * apply_f(solve_c(f1 - f0), _PHI2)
                 else:
-                    wn = wn + dt * apply_f(g, _phi1)
+                    wn = wn + dt * apply_f(g, _PHI1)
             return wn, wn
 
     from .backend_blocks import _march_eagerly, _march_to_host
@@ -1837,7 +1888,10 @@ class _ERKScheme(_TimeScheme):
 
         return jax.lax.fori_loop(0, 8, body, U)
 
-    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None):
+    def stepper(self, block, args, *, linear_solve=None, nonlinear_solve=None, flux=None):
+        """``step(u, t, dt) -> u_next``: one explicit step. With ``flux=f`` (``f(U, t)`` an array: the interface
+        flux of a stage state, say) the step returns ``(u_next, acc)`` with ``acc = dt sum_i b_i f(U_i, t_i)``,
+        the scheme's own quadrature of ``f`` over the step: what the step took out of the interface."""
         mass, residual = _block_mass_and_residual(block, args)
         A, b, c = self.A, self.b, self.c
         n = int(jnp.asarray(block.state0).size)
@@ -1873,7 +1927,7 @@ class _ERKScheme(_TimeScheme):
             return -_apply_mass_inverse(mass(t), structure, algebraic, residual(U, t))
 
         def step_fn(u, t, dt, guess=None):
-            ks = []
+            ks, acc = [], None
             for i in range(b.size):
                 U = u
                 for j in range(i):
@@ -1882,11 +1936,15 @@ class _ERKScheme(_TimeScheme):
                 if has_alg:
                     U = project(U, t + c[i] * dt)
                 ks.append(rate(U, t + c[i] * dt))
+                if flux is not None and b[i] != 0:
+                    part = (dt * b[i]) * flux(U, t + c[i] * dt)
+                    acc = part if acc is None else acc + part
             out = u
             for i in range(b.size):
                 if b[i] != 0:
                     out = out + (dt * b[i]) * ks[i]
-            return project(out, t + dt) if has_alg else out
+            out = project(out, t + dt) if has_alg else out
+            return out if flux is None else (out, acc)
 
         return step_fn
 
@@ -1909,17 +1967,26 @@ class _ERKScheme(_TimeScheme):
         )
         # The compiled pieces are kept on the block, keyed by the tableau, so a repeated solve of a problem that
         # keeps its block (jno.fvm does) neither traces nor compiles again; a traced march is built afresh.
-        cache = {} if traced else block.__dict__.setdefault("_erk_compiled", {})
+        # a flux functional in the block's metadata (a coupling's interface flux): the march also returns the
+        # scheme's own quadrature of it over the window, ``(states, acc)``; its closure holds the window's data, so
+        # nothing compiled for it is kept on the block
+        flux = (block.metadata or {}).get("flux_functional")
+        cache = {} if traced or flux is not None else block.__dict__.setdefault("_erk_compiled", {})
         # keyed on everything a compiled piece bakes in: the tableau, the step and the number of steps (the grid
         # itself is an argument), so the windows of a coupled march (`window_block`) share them
         ident = (self.name, self.A.tobytes(), self.b.tobytes(), self.c.tobytes(), int(grid.shape[0]), dt)
         step = cache.get(("step", ident))
         if step is None:
-            step = cache[("step", ident)] = self.stepper(block, args)
+            step = cache[("step", ident)] = self.stepper(block, args, flux=flux)
 
-        def run(u, t_start, sub):
-            h = dt / sub
-            return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+        if flux is None:
+
+            def run(u, t_start, sub):
+                h = dt / sub
+                return jax.lax.fori_loop(0, sub, lambda i, w: step(w, t_start + i * h, h), u)
+
+        else:
+            run = _flux_run(step, flux, dt, s0, grid[0])
 
         from .backend_blocks import _march_eagerly, _march_to_host
 
@@ -1944,15 +2011,18 @@ class _ERKScheme(_TimeScheme):
         if self.cfl is not None and not traced:
             # Evaluated eagerly: the substeps of every interval come from the CFL limit of the state at its start,
             # so a wave that speeds up during the march is followed.
-            states, u = [s0], s0
+            states, u, acc = [s0], s0, 0.0
             for k in range(1, grid.shape[0]):
                 sub = max(1, int(np.ceil(dt / float(cfl_dt(u, self.cfl)) - 1e-12)))
                 if ("run", ident, sub) not in cache:
                     cache[("run", ident, sub)] = jax.jit(partial(run, sub=sub))
                 u = cache[("run", ident, sub)](u, grid[k - 1])
+                if flux is not None:
+                    u, part = u
+                    acc = acc + part
                 states.append(u)
-            traj = jnp.stack(states)
-            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+            traj = _resample_trajectory(jnp.stack(states), grid, save_ts, s0.dtype, self._order)
+            return traj if flux is None else (traj, acc)
         # Traced (a gradient through the march, a coupling's window): one number of substeps, from the initial
         # state -- a traced count when that state is traced too
         sub = 1 if self.cfl is None else _cfl_substeps(dt, cfl_dt(jax.lax.stop_gradient(s0), self.cfl))
@@ -1961,16 +2031,20 @@ class _ERKScheme(_TimeScheme):
 
             def advance(u, t_next):
                 u = run(u, t_next - dt, sub)
-                return u, u
+                return (u, u) if flux is None else (u[0], u)
 
             def march(s0, grid):
                 ys = jax.lax.scan(jax.checkpoint(advance), s0, grid[1:])[1]
-                return jnp.concatenate([s0[None, :], ys], axis=0)
+                if flux is None:
+                    return jnp.concatenate([s0[None, :], ys], axis=0)
+                return jnp.concatenate([s0[None, :], ys[0]], axis=0), ys[1].sum(axis=0)
 
             if not traced and isinstance(sub, int):
                 march = cache[("march", ident, sub)] = jax.jit(march)
         traj = march(s0, grid)
-        return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        if flux is None:
+            return _resample_trajectory(traj, grid, save_ts, s0.dtype, self._order)
+        return _resample_trajectory(traj[0], grid, save_ts, s0.dtype, self._order), traj[1]
 
     def __repr__(self):
         cfl = "" if self.cfl is None else f", cfl={self.cfl}"

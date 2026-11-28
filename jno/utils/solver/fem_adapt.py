@@ -37,6 +37,7 @@ import numpy as np
 
 from ...trace import Constraint
 from ..sets import unique_values
+from .small_linalg import small_det, small_inv, small_matmul
 
 
 def _boundary_edges_from_triangles(tris: np.ndarray) -> np.ndarray:
@@ -884,10 +885,10 @@ def _locate_in_one_ring_jax(src_pts, cells, cand, mask, qpts, *, tol: float = 1e
     v0 = V[:, :, 0, :]
     T = jnp.swapaxes(V[:, :, 1:, :] - v0[:, :, None, :], 2, 3)  # columns v_i - v0
     rhs = qpts[:, None, :] - v0
-    det = jnp.linalg.det(T)
+    det = small_det(T)
     safe = jnp.abs(det) > 1e-300
     Tsafe = jnp.where(safe[..., None, None], T, jnp.eye(dim, dtype=T.dtype))
-    lam_rest = jnp.linalg.solve(Tsafe, rhs[..., None])[..., 0]
+    lam_rest = small_matmul(small_inv(Tsafe), rhs[..., None])[..., 0]
     lam = jnp.concatenate([(1.0 - lam_rest.sum(axis=-1))[..., None], lam_rest], axis=-1)  # (Q, R, D+1)
 
     valid = jnp.asarray(mask) & safe
@@ -1037,7 +1038,7 @@ def _lagrange_cell_mass(X, cells, dim: int, order: int):
     X, cells = jnp.asarray(X), jnp.asarray(cells)
     v = X[cells]
     J = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=2)
-    detJ = jnp.abs(jnp.linalg.det(J))
+    detJ = jnp.abs(small_det(J))
     phi_q = jnp.asarray(_tabulate_lagrange_at(dim, int(order), np.asarray(qp, dtype=np.float64)), dtype=X.dtype)
     return jnp.einsum("q,c,qi,qj->cij", jnp.asarray(qw, dtype=X.dtype), detJ, phi_q, phi_q)
 
@@ -1155,7 +1156,7 @@ def _l2_transfer_jax(
     # every field, and only the basis tabulated on it changes.
     v_new = X_new[cells_j]  # (n_cells, n_loc, dim)
     J_new = jnp.stack([v_new[:, i + 1] - v_new[:, 0] for i in range(dim)], axis=2)  # columns are edges
-    detJ = jnp.abs(jnp.linalg.det(J_new))  # (n_cells,)
+    detJ = jnp.abs(small_det(J_new))  # (n_cells,)
     # x(q) = v0 + sum_d xi_d * edge_d. `J_new[c, :, d]` IS edge d (columns are edges), so the contraction
     # runs over J's LAST axis -- the batched form of the assembler's `verts[0] + qp @ J.T`.
     xq = v_new[:, 0][:, None, :] + jnp.einsum("qd,ced->cqe", qp_j, J_new)  # (n_cells, nq, dim)
@@ -2640,7 +2641,7 @@ def _signed_simplex_measures_jax(points, cells, dim: int):
     import jax.numpy as jnp
 
     v = points[jnp.asarray(cells)]
-    return jnp.linalg.det(v[:, 1:, :] - v[:, :1, :]) / _simplex_measure_divisor(dim)
+    return small_det(v[:, 1:, :] - v[:, :1, :]) / _simplex_measure_divisor(dim)
 
 
 def _mesh_boundary_facets(domain: Any) -> tuple[np.ndarray, np.ndarray, int]:
@@ -2678,8 +2679,8 @@ def _p1_stiffness_jax(pts, cells, dim):
     cells_j = jnp.asarray(cells)
     v = pts[cells_j]
     e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim)
-    measure = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
-    g = jnp.swapaxes(jnp.linalg.inv(e), 1, 2)  # ∇φ of vertices 1..d
+    measure = jnp.abs(small_det(e)) / (2.0 if dim == 2 else 6.0)
+    g = jnp.swapaxes(small_inv(e), 1, 2)  # ∇φ of vertices 1..d
     sg = jnp.concatenate([-g.sum(axis=1, keepdims=True), g], axis=1)  # φ₀ closes the partition of unity
     loc = jnp.einsum("cid,cjd->cij", sg, sg) * measure[:, None, None]
 
@@ -3441,7 +3442,14 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.adapt_history = history
     # A higher-order Lagrange field has more DOFs than vertices: return the whole field (the vector
     # `fem.dofs` counts and `fem.eval` reads), not the vertex view the estimator worked on.
-    if u is not None and _cover_block_stride(cur) == 1 and np.size(u) != _full.size:
+    if u is None:
+        # A criterion run kept the vertex view lazy inside the loop. The caller still gets the solution on
+        # the final mesh: its vertex view, or the whole vector where the view is refused (multifield).
+        try:
+            u = _vertex_view(_full, cur, allow_vector=True)
+        except NotImplementedError:
+            return _full
+    if _cover_block_stride(cur) == 1 and np.size(u) != _full.size:
         return _full
     return u
 
@@ -3681,8 +3689,8 @@ def _dirichlet_energy_jax(pts, u_nodal, cells, dim):
     s = u_nodal[cells]  # (n_cell, dim+1, n_comp)
     e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, dim): rows = edge vectors
     du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)  # (n_cell, dim, n_comp): du along each edge
-    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp): ∇u, since du = E·∇u with E the edge matrix
-    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    grad = small_matmul(small_inv(e), du)  # (n_cell, dim, n_comp): ∇u, since du = E·∇u with E the edge matrix
+    vol = jnp.abs(small_det(e)) / (2.0 if dim == 2 else 6.0)
     return jnp.sum(jnp.sum(grad**2, axis=(1, 2)) * vol)
 
 
@@ -3730,8 +3738,8 @@ def _equidistribution_jax(pts, u_nodal, cells, dim):
     s = u_nodal[cells]
     e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)
     du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
-    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
-    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)
+    grad = small_matmul(small_inv(e), du)  # (n_cell, dim, n_comp)
+    vol = jnp.abs(small_det(e)) / (2.0 if dim == 2 else 6.0)
 
     g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element, summed over components/blocks
     scale = jnp.mean(g2) + 1e-30  # normalise so the monitor (and the step size) is problem-independent
@@ -3789,17 +3797,17 @@ def _huang_ea_jax(pts, pts0, u_nodal, cells, dim, *, theta=1.0 / 3.0, p=1.5):
     e = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=1)  # Eᵀ, physical
     e0 = jnp.stack([v0[:, i + 1] - v0[:, 0] for i in range(dim)], axis=1)  # Êᵀ, computational
     du = jnp.stack([s[:, i + 1] - s[:, 0] for i in range(dim)], axis=1)
-    grad = jnp.linalg.solve(e, du)  # (n_cell, dim, n_comp)
+    grad = small_matmul(small_inv(e), du)  # (n_cell, dim, n_comp)
 
     g2 = jnp.sum(grad**2, axis=(1, 2))  # |∇u|² per element
     rho = jnp.sqrt(1.0 + g2 / (jnp.mean(g2) + 1e-30))  # arclength density, as in _equidistribution_jax
 
     # J = Ê E⁻¹, so Jᵀ = (E⁻¹)ᵀ Êᵀ = solve(Eᵀ, Êᵀ) = solve(e, e0). Frobenius norm and det are
     # transpose-invariant, so the transpose never has to be formed.
-    a = jnp.linalg.solve(e, e0)  # = Jᵀ
+    a = small_matmul(small_inv(e), e0)  # = Jᵀ
     fro2 = jnp.sum(a**2, axis=(1, 2))  # tr(J Jᵀ)
-    det_j = jnp.linalg.det(a)
-    vol = jnp.abs(jnp.linalg.det(e)) / (2.0 if dim == 2 else 6.0)  # |K|, PHYSICAL
+    det_j = small_det(a)
+    vol = jnp.abs(small_det(e)) / (2.0 if dim == 2 else 6.0)  # |K|, PHYSICAL
 
     m_inv = rho ** (-2.0 / dim)  # M = ρ^(2/d)·I  ⇒  M⁻¹ = ρ^(-2/d)·I
     align = rho * (m_inv * fro2) ** (dim * p / 2.0)
@@ -4194,7 +4202,7 @@ def _monge_ampere_displacement(monitor, ops, cells, dim, *, n_relax=60, dt=0.1):
         g = nodal_grad(phi)
         sigma = jnp.stack([nodal_grad(g[:, j]) for j in range(dim)], axis=1)  # (n_vert, dim, dim)
         sigma = 0.5 * (sigma + jnp.swapaxes(sigma, 1, 2))  # H(φ) is symmetric; recovery need not be
-        f = monitor * jnp.linalg.det(eye + sigma)  # m·det(I + σ)
+        f = monitor * small_det(eye + sigma)  # m·det(I + σ)
         theta = jnp.sum(meas_j * f[cells_j].mean(axis=1)) / total  # eq. (3.6)
         rhs = jnp.asarray(k_shift) @ phi + dt * mass_apply(f - theta)  # eq. (3.7)
         return jax.scipy.linalg.lu_solve(lu, rhs), None
@@ -4819,9 +4827,10 @@ def _finish_relocate(fem, dom, coord_specs, arrs, pts0, n_verts, dim, cells, his
     # refused it as a whole-domain volume. The transient driver already does this; this path did not.
     dom.__dict__.pop("_gauge_pin_coords", None)
     cur = jno.fem(fem._constraints, **fem._fem_kwargs)
-    out = cur.solve(solve_fn, **kwargs)
-    # a transient solve is deferred (a trace node): evaluate it, as the caller holds the array
-    u_final = np.asarray(out.fn() if hasattr(out, "fn") else out).reshape(-1)
+    _sol = cur.solve(solve_fn, **kwargs)
+    if hasattr(_sol, "eval"):
+        _sol = _sol.eval()  # a transient (or otherwise deferred) solve is a trace node: evaluate it for its values
+    u_final = np.asarray(_sol).reshape(-1)
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u_final

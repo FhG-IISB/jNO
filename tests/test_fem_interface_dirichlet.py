@@ -66,7 +66,10 @@ def test_an_interface_dirichlet_reaches_every_interface_node():
     """The defect, as a count. The interface is internal, so the boundary-facet path saw almost none of it."""
     d = _two_region()
     v, psi = d.fem_symbols(value_shape=(2,), names=("v", "psi"), order=2)
-    d.tag("noslip", lambda x, y: (y > H - 1e-9) | (abs(y) < 1e-9))
+    # the outer walls only: the fluid's top and the bottom of the fluid on either side of the solid (the two
+    # interface endpoints included). A pin reaches every node its predicate selects, so `abs(y) < 1e-9` over the
+    # whole line would pin the interface too.
+    d.tag("noslip", lambda x, y: (y > H - 1e-9) | ((abs(y) < 1e-9) & ((x < X0 + 1e-9) | (x > X1 - 1e-9))))
     ci, iv = d.variable("interior", split=True), d.variable("fluid|solid", split=True)
     xw, yw, _ = d.variable("noslip", split=True)
     base = _pinned_nodes(d, [_lap(v, psi, ci), v(xw, yw) - 0.0])

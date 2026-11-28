@@ -31,8 +31,13 @@ class ENGDOptimizer(ResidualOptimizer):
             ``jno.callbacks.engd(gram_terms=...)`` — for custom weighting or
             a subset of terms.
         gram_interval: Recompute G every *n* outer steps (default 1).
-        rcond: Condition-number cutoff for ``jnp.linalg.lstsq``.
-            ``None`` → machine epsilon (best for float64).
+        rcond: Cutoff on the eigenvalues of the Gram matrix, relative to the largest, for the
+            pseudo-inverse. ``None`` → machine epsilon times the parameter count (best for float64).
+            That cut sits at the rounding level of the Gram matrix, so a direction just above it is
+            amplified ~1e15-fold and the trajectory depends on the order of the floating-point sums,
+            which changes with the number of CPU threads: the same run ends at 1e-7 on one machine
+            and at 2e-3 on another (reported). A larger ``rcond`` (``1e-8`` gave a bitwise-identical result on
+            1 to 12 threads, at the cost of a floor on the reachable accuracy) makes it reproducible.
         line_search: If ``True`` (default), perform a 31-point grid line
             search α ∈ {0.5⁰, …, 0.5³⁰} each step.  Strongly recommended;
             the Gram is ill-conditioned near initialisation and the line search
@@ -165,8 +170,13 @@ def engd(
             ``jno.callbacks.engd(gram_terms=...)`` — for custom weighting or
             a subset of terms.
         gram_interval: Recompute G every *n* outer steps (default 1).
-        rcond: Condition-number cutoff for ``jnp.linalg.lstsq``.
-            ``None`` → machine epsilon (best for float64).
+        rcond: Cutoff on the eigenvalues of the Gram matrix, relative to the largest, for the
+            pseudo-inverse. ``None`` → machine epsilon times the parameter count (best for float64).
+            That cut sits at the rounding level of the Gram matrix, so a direction just above it is
+            amplified ~1e15-fold and the trajectory depends on the order of the floating-point sums,
+            which changes with the number of CPU threads: the same run ends at 1e-7 on one machine
+            and at 2e-3 on another (reported). A larger ``rcond`` (``1e-8`` gave a bitwise-identical result on
+            1 to 12 threads, at the cost of a floor on the reachable accuracy) makes it reproducible.
         line_search: If ``True`` (default), perform a 31-point grid line
             search α ∈ {0.5⁰, …, 0.5³⁰} each step.  Strongly recommended;
             the Gram is ill-conditioned near initialisation and the line search

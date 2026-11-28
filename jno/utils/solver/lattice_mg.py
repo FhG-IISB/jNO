@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .lattice import apply_stencil, offsets, probe, probe_reduced, shift
+from .small_linalg import small_inv
 
 #: Strength below which an axis is left uncoarsened (semi-coarsening): an axis whose couplings are weaker
 #: than this fraction of the strongest axis' does not carry the error a coarse grid must represent. The
@@ -272,7 +273,7 @@ def _smoother_inverse(d, block):
     D = D + jnp.moveaxis(off, 0, -1)[..., None] * jnp.eye(nf, dtype=d.dtype)
     live = jnp.moveaxis(d, 0, -1).sum(axis=-1) > 0
     D = jnp.where(live[..., None, None], D, jnp.eye(nf, dtype=d.dtype))
-    return jnp.where(live[..., None, None], jnp.linalg.inv(D), 0.0)
+    return jnp.where(live[..., None, None], small_inv(D), 0.0)
 
 
 def _dense_from_stencil(S, window, shape, nf, periodic):

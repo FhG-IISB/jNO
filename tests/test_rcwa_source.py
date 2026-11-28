@@ -113,9 +113,9 @@ def _sbox(Lx, dx=0.12, dz=0.2):
     return d
 
 
-def _emitter_cons(d, Lx, eps_sub=1.0, amp=None):
+def _emitter_cons(d, Lx, eps_sub=1.0, amp=None, eps_top=1.0):
     """Scalar Helmholtz on the supercell with an internal Gaussian emitter in the eps=6 slab (z∈[1,2]);
-    substrate eps_sub below, vacuum above. ``amp`` (an optional parameter) scales the source amplitude."""
+    substrate eps_sub below, eps_top (vacuum by default) above. ``amp`` (an optional parameter) scales the source amplitude."""
     u, phi = d.fem_symbols()
     xi, yi, zi, _ = d.variable("interior", split=True)
     ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
@@ -130,7 +130,7 @@ def _emitter_cons(d, Lx, eps_sub=1.0, amp=None):
     ur, _ = face("right")
     uf, _ = face("front")
     ub, _ = face("back")
-    eps = jno.fn(lambda x, y, z: jnp.where((z >= 1.0) & (z < 2.0), 6.0, jnp.where(z < 1.0, eps_sub, 1.0)), [xi, yi, zi])
+    eps = jno.fn(lambda x, y, z: jnp.where((z >= 1.0) & (z < 2.0), 6.0, jnp.where(z < 1.0, eps_sub, eps_top)), [xi, yi, zi])
     A = 1.0 if amp is None else amp
     profile = jno.np.exp(-(((xi - Lx / 2) ** 2 + (yi - Lx / 2) ** 2 + (zi - 1.5) ** 2) / (2 * 0.12**2)))
     vol = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi) - A * profile * vi
@@ -250,3 +250,18 @@ def test_source_outside_finite_layer_raises():
     cons = [vol, -(1j * K0 * utp) * vtp, -(1j * K0 * ubt) * vbt, ul - ur, uf - ub]
     with pytest.raises(RcwaError, match="not inside a finite"):
         jno.rcwa(cons, orders=40, grid=28)
+
+
+@needs_fmmax
+@pytest.mark.parametrize("dielectric_top", [True, False])
+def test_emitter_wavelength_is_the_vacuum_one_whichever_ambient_is_dielectric(dielectric_top):
+    """#386: k0 is read from the vacuum-side ambient, so a dielectric top (or bottom) ambient must not make the
+    reported wavelength lambda/n nor divide the layer permittivities by n^2."""
+    Lx, n = 1.4, 1.56
+    kw = dict(eps_top=n**2) if dielectric_top else dict(eps_sub=n**2)
+    s = jno.rcwa(_emitter_cons(_sbox(Lx), Lx, **kw), orders=20, grid=16).spec
+    assert abs(s.wavelength - 1.0) < 1e-3, s.wavelength
+    eps = [float(np.real(e).mean()) for _, e in s.layers]  # top-first: top ambient, slab, bottom ambient
+    assert abs(eps[0] - (n**2 if dielectric_top else 1.0)) < 1e-2, eps
+    assert abs(eps[-1] - (1.0 if dielectric_top else n**2)) < 1e-2, eps
+    assert abs(eps[1] - 6.0) < 1e-2, eps

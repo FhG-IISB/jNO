@@ -125,7 +125,9 @@ def test_sphere_in_an_unbounded_medium_reaches_the_far_value():
         .domain()
     )
     d.tag("hot", lambda x, y: np.abs(np.hypot(x, y) - a) < h / 4)
-    d.tag("far", lambda x, y: np.abs(np.hypot(x, y) - 2 * R) < h / 4)
+    # a pin reaches every node its predicate selects, and the shell is graded to 0.25 h at the far edge, so the
+    # shell around the edge is thinner than the node rows there: only the edge itself
+    d.tag("far", lambda x, y: np.abs(np.hypot(x, y) - 2 * R) < h / 50)
     T, v = d.fem_symbols(names=("T", "v"))
     r, z, _ = d.variable("interior", split=True)
     fem = jno.fem(

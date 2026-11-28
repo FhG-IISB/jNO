@@ -101,6 +101,7 @@ from ._strong_form import (  # noqa: F401  (re-exported: tests and fvm import th
 from .differential_operators import DifferentialOperators as _D
 from .trace_evaluator import fd_grid
 from .utils.sets import unique_values
+from .utils.solver.fem_1d import _refuse_pin_off_the_boundary
 
 __all__ = ["fdm", "laplacian", "gradient"]
 
@@ -816,6 +817,7 @@ class _TraceFDM(StrongFormProblem):
         mask = np.zeros(self._Ntot, dtype=bool)  # over the blocked DOF vector (field k at k·N …)
         vals = jnp.zeros(self._Ntot)
         for c in self._dirichlet:
+            _refuse_pin_off_the_boundary(self.domain, _region_tag(c), "finite-difference")
             nodes = np.asarray(self._region_nodes(_region_tag(c)), dtype=int)
             k = self._field_index(c)
             for b in self._blocks_of(k):
@@ -878,7 +880,9 @@ class _TraceFDM(StrongFormProblem):
         pts, cells = _mesh(self.domain)
         dim = pts.shape[1]
         e = pts[cells[:, 1:]] - pts[cells[:, :1]]  # (C, dim, dim) edge vectors from vertex 0
-        size = (jnp.abs(jnp.linalg.det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
+        from .utils.solver.small_linalg import small_det
+
+        size = (jnp.abs(small_det(e))) ** (1.0 / dim)  # (d!·|K|)^(1/d), since |det| = d!·|K|
         total = jnp.zeros(self._N).at[cells.reshape(-1)].add(jnp.repeat(size, cells.shape[1]))
         count = jnp.zeros(self._N).at[cells.reshape(-1)].add(1.0)
         return total / jnp.maximum(count, 1.0)
@@ -1032,6 +1036,7 @@ class _TraceFDM(StrongFormProblem):
         """Boolean mask of the Dirichlet DOFs (host-side indices, so it also works inside a trace)."""
         is_d = np.zeros(self._Ntot, dtype=bool)
         for c in self._dirichlet:
+            _refuse_pin_off_the_boundary(self.domain, _region_tag(c), "finite-difference")
             nodes = np.asarray(self._region_nodes(_region_tag(c)))
             for b in self._blocks_of(self._field_index(c)):
                 is_d[b * self._N + nodes] = True

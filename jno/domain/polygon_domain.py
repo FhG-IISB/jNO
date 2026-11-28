@@ -2191,12 +2191,13 @@ class PolygonDomain(domain):
 
             import gmsh  # local: the block above only imports it on the region-sizing branch
 
-            from ..geometry.emit import MESH_ALGORITHM_2D, MESH_THREADS
+            from ..geometry.emit import MESH_ALGORITHM_2D, MESH_THREADS, _keep_openmp_threads
 
             algo = effective_algorithm = MESH_ALGORITHM_2D if algorithm is None else int(algorithm)
             self._effective_mesh_algorithm = effective_algorithm
-            gmsh.option.setNumber("General.NumThreads", MESH_THREADS if threads is None else int(threads))
-            mesh = geo.generate_mesh(dim=2, algorithm=algo, verbose=False)
+            with _keep_openmp_threads():  # gmsh's thread option must not leak into the caller's thread
+                gmsh.option.setNumber("General.NumThreads", MESH_THREADS if threads is None else int(threads))
+                mesh = geo.generate_mesh(dim=2, algorithm=algo, verbose=False)
 
         # When CSG merges several source regions into a single mesh surface,
         # gmsh's representative-point dispatch cannot split per-region tags.

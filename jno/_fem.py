@@ -3356,7 +3356,9 @@ class FEM:
         from .utils import beacon
         from .utils.logger import get_logger
         from .utils.solver import newton_krylov as _nk
+        from .utils.solver.placement import require_host_backend
 
+        require_host_backend("jno.fem(...).solve()")
         # log=True / N: each Newton and time step (every N-th and the last) as it happens -- see jno.utils.beacon
         log = kwargs.pop("log", False)
         _t0 = _time.perf_counter()
@@ -3649,11 +3651,20 @@ class FEM:
             linear = _default_saddle_step_solve(self)
         if (
             linear is None
-            and getattr(nonlinear, "name", None) == "staggered"
             and getattr(nonlinear, "direct", None) is True
+            and (
+                getattr(nonlinear, "name", None) == "staggered"
+                # newton(direct=True) factorizes the ASSEMBLED tangent; a materialised dense one keeps its dense LU
+                or (
+                    getattr(nonlinear, "name", None) == "newton"
+                    and precond is None
+                    and getattr(getattr(self, "_op", None), "jacobian", None) is not None
+                )
+            )
         ):
-            # staggered(direct=True) factorizes each field's block: with no linear slot that is what lu() resolves to
-            # (cuDSS where it runs, else JAX's spsolve), not an unconditional spsolve -- on a GPU, cuSolver's sparse QR.
+            # staggered(direct=True) factorizes each field's block, newton(direct=True) the assembled tangent: with no
+            # linear slot that is what lu() resolves to (cuDSS where it runs, else JAX's spsolve), not an unconditional
+            # spsolve -- on a GPU, cuSolver's sparse QR.
             from .solve import lu
 
             linear = lu()
@@ -4195,15 +4206,24 @@ class FEM:
                 return run_adaptive_relocate(self, adapt, solve_fn=solve_fn, **kwargs)
             # x0= (warm start) and time= do not compose with a remesh — the DOF layout changes across it,
             # staling a warm start and any cached step operator. The nonlinear=/linear=/precond= slots DO
-            # compose: they configure the per-step (Newton / theta) solve, which is layout-independent —
-            # but only on the transient adaptive driver, which owns the march.
-            _adapt_step_slots = (nonlinear is not None) or (linear is not None) or (precond is not None)
-            if (x0 is not None) or (time is not None) or (_adapt_step_slots and self._mode != "transient"):
+            # compose: they configure the per-step (Newton / theta) solve or the steady solve, which is
+            # layout-independent. The transient driver takes them as arguments; the steady loop forwards
+            # them to the solve it repeats on every remeshed problem.
+            if (x0 is not None) or (time is not None):
                 raise NotImplementedError(
-                    "fem.solve: adapt= composes with the nonlinear=/linear=/precond= slots only on a "
-                    "transient problem; x0= (warm start) and time= do not compose with remeshing (the DOF "
-                    "layout changes across a remesh). Drop them, or pass solve_fn= for a custom loop."
+                    "fem.solve: adapt= does not take x0= (warm start) or time=: the DOF layout changes "
+                    "across a remesh, which stales both. Drop them, or pass solve_fn= for a custom loop. "
+                    "The nonlinear=/linear=/precond= slots are accepted."
                 )
+            if self._mode != "transient":
+                kwargs = {
+                    **kwargs,
+                    **{
+                        k: v
+                        for k, v in (("nonlinear", nonlinear), ("linear", linear), ("precond", precond))
+                        if v is not None
+                    },
+                }
             from .utils.solver.fem_adapt import run_adaptive_solve, run_adaptive_transient
 
             if getattr(adapt, "split", False) and self._mode == "transient":
@@ -6580,7 +6600,9 @@ def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) ->
         blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
         off_full.append(off_full[-1] + red["n_full"])
         off_red.append(off_red[-1] + red["n_red"])
-    return _multifield_reduction(blocks, off_full, off_red, is_bloch=red["is_bloch"])
+    return _multifield_reduction(
+        blocks, off_full, off_red, is_bloch=red["is_bloch"], tie_spec=_tie_vertex_spec(domain, ties, vpts)
+    )
 
 
 def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -6597,22 +6619,7 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
     cells = np.asarray(topo["cells"])
     n_verts = int(vpts.shape[0])
     field_maps = topo.get("field_dofmaps") or []
-    masks = {}
-    for tag in {t for tie in ties for t in tie[:2]}:
-        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
-        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
-        # ties along periodic edges would then miss their partners).
-        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
-        if m is None:
-            f = _face_nodes(domain, vpts, None, tag)
-            m = np.zeros(n_verts, dtype=bool)
-            if f is not None:
-                m[np.asarray(f, dtype=int).reshape(-1)] = True
-        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
-        if not m.any():
-            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
-        masks[tag] = m
-    spec = [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
+    spec = _tie_vertex_spec(domain, ties, vpts)
     n_fields = len(offsets) - 1
     blocks, off_full, off_red = [], [0], [0]
     is_bloch = False
@@ -6635,7 +6642,30 @@ def _build_periodic_reduction_entities(domain: Any, ties: List[Any], offsets: An
         blocks.append({"P": P, "kept": kept, "vec": 1, "is_selection": False})
         off_full.append(off_full[-1] + n_i)
         off_red.append(off_red[-1] + int(P.shape[1]))
-    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch)
+    return _multifield_reduction(blocks, off_full, off_red, is_bloch=is_bloch, tie_spec=spec)
+
+
+def _tie_vertex_spec(domain: Any, ties: List[Any], vpts: Any) -> list:
+    """``[(main_vertex_mask, secondary_vertex_mask, phase)]`` for the periodic / Bloch ties: the vertex
+    form :func:`fem_dofmap.periodic_prolongation` takes. Kept on the reduction (``tie_spec``) so a
+    consumer on the same mesh (the AMS transfers) can tie ANOTHER space with the very same masks and phases."""
+    n_verts = int(np.asarray(vpts).shape[0])
+    masks = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        # INCLUSIVE membership from the tag's predicate: a corner/edge vertex belongs to every face it
+        # lies on (the exclusive `tag_indices` partition would drop it from all but one, and the chained
+        # ties along periodic edges would then miss their partners).
+        m = domain.tag_node_mask(tag, np.asarray(domain.mesh.points))
+        if m is None:
+            f = _face_nodes(domain, vpts, None, tag)
+            m = np.zeros(n_verts, dtype=bool)
+            if f is not None:
+                m[np.asarray(f, dtype=int).reshape(-1)] = True
+        m = np.asarray(m, dtype=bool).reshape(-1)[:n_verts]
+        if not m.any():
+            raise ValueError(f"jno.fem periodic: boundary tag {tag!r} has no mesh vertices.")
+        masks[tag] = m
+    return [(masks[t[0]], masks[t[1]], (t[4] if len(t) > 4 and t[4] is not None else 1.0)) for t in ties]
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
@@ -8224,7 +8254,9 @@ def _host_assembly_scope():
         return contextlib.nullcontext()  # the caller expressed a preference; it wins
     if jax.default_backend() == "cpu":
         return contextlib.nullcontext()  # nothing to move away from
-    hosts = jax.devices("cpu")
+    from .utils.solver.placement import _host_devices
+
+    hosts = _host_devices()  # empty under JAX_PLATFORMS=cuda: assemble on the device then
     return jax.default_device(hosts[0]) if hosts else contextlib.nullcontext()
 
 

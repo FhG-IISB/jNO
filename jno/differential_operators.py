@@ -948,13 +948,15 @@ class DifferentialOperators:
         p0 = pts[i0]
         # Jacobian with columns e1, e2, e3 = p1-p0, p2-p0, p3-p0
         jac = jnp.stack([pts[i1] - p0, pts[i2] - p0, pts[i3] - p0], axis=2)  # (M, 3, 3)
-        det = jnp.linalg.det(jac)
+        from .utils.solver.small_linalg import small_det, small_inv  # lazy: jno.utils.solver imports this module
+
+        det = small_det(jac)
         # guard degenerate tets against a singular inverse -- relative to the tet's own size and the dtype, not
         # an absolute 1e-14 (a millimetre-scale mesh has volumes ~1e-9 and a micrometre one ~1e-18)
         edge3 = jnp.sum(jac**2, axis=(1, 2)) ** 1.5
         good = jnp.abs(det) > 64 * jnp.finfo(det.dtype).eps * edge3
         vol = jnp.where(good, jnp.abs(det) / 6.0, 0.0)
-        jinv = jnp.linalg.inv(jnp.where(good[:, None, None], jac, jnp.eye(3, dtype=jac.dtype)))
+        jinv = small_inv(jnp.where(good[:, None, None], jac, jnp.eye(3, dtype=jac.dtype)))
         g1, g2, g3 = jinv[:, 0, :], jinv[:, 1, :], jinv[:, 2, :]  # ∇λ_1, ∇λ_2, ∇λ_3 (rows of J⁻¹)
         g0 = -(g1 + g2 + g3)  # ∇λ_0 = -(∇λ_1 + ∇λ_2 + ∇λ_3)  (partition of unity)
         u0, u1, u2, u3 = u_values[i0], u_values[i1], u_values[i2], u_values[i3]

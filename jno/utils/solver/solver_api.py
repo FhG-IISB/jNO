@@ -1105,7 +1105,12 @@ class PrecondContext:
                 # loop body): the form and P are both concrete, and a host-side consumer -- the default
                 # factor-once LU, an AMG setup -- needs the reduced matrix as data, not as a tracer.
                 with jax.ensure_compile_time_eval():
-                    mat = reduce_matrix_periodic(target, op.bcoo if op.bcoo is not None else op.dense())
+                    # A complex operator is reduced by the Hermitian P^H op P (P itself is complex under a Bloch tie).
+                    mat = reduce_matrix_periodic(
+                        target,
+                        op.bcoo if op.bcoo is not None else op.dense(),
+                        conj=self._is_complex() or _is_complex_op(op),
+                    )
                 return LinearOperator(mat)
         if self._field is not None:
             raise ValueError(
@@ -1115,6 +1120,9 @@ class PrecondContext:
                 "one field's symbols inside block_diag/triangular, over every field for the whole system."
             )
         return op
+
+    def _is_complex(self) -> bool:
+        return _is_complex_op(self.A)
 
     def diag(self):
         """The diagonal of ``ctx.A``."""
@@ -1210,6 +1218,11 @@ class PrecondContext:
         Returns:
             LinearOperator: the assembled (and, on a reduced system, reduced) operator.
         """
+        return self._to_space(self._assemble_form(terms, quad_degree)[0])
+
+    def _assemble_form(self, terms, quad_degree: int | None = None):
+        """``(operator, is_complex)``: the auxiliary form assembled on the FULL finite-element space, not yet
+        reduced. A complex form's operator is the fused real-equivalent ``2n`` block ``[[Re,-Im],[Im,Re]]``."""
         import jax.experimental.sparse as jsp
 
         from ... import fem as _fem_entry
@@ -1245,7 +1258,7 @@ class PrecondContext:
         # on the same space (a form of any other size -- one field's, inside a user's own block scheme --
         # is returned as assembled).
         if aux.is_complex:
-            return self._to_space(LinearOperator(_bcoo(aux.A)))  # the fused 2n block IS `.A`
+            return LinearOperator(_bcoo(aux.A)), True  # the fused 2n block IS `.A`
         # `.A` is DOCUMENTED dense ("use fem.operator for the raw sparse form on large problems"), so
         # reaching for it here cost n^2 on every auxiliary -- 1.74 GB for a velocity-space mass at
         # 14,739 dofs, which is a preconditioner running out of memory doing the one thing it exists
@@ -1254,8 +1267,19 @@ class PrecondContext:
         if raw is not None:
             A_raw = raw.evaluate(None)[0] if hasattr(raw, "evaluate") else (raw[0] if isinstance(raw, tuple) else raw)
             if hasattr(A_raw, "indices"):  # already a BCOO -- keep it sparse end to end
-                return self._to_space(LinearOperator(A_raw))
-        return self._to_space(LinearOperator(_bcoo(aux.A)))
+                return LinearOperator(A_raw), False
+        return LinearOperator(_bcoo(aux.A)), False
+
+
+def _is_complex_op(op) -> bool:
+    """Does the (assembled) operator carry complex values? ``False`` for a matrix-free one with no dtype."""
+    if op is None:
+        return False
+    bcoo = getattr(op, "bcoo", None)
+    if bcoo is not None:
+        return bool(jnp.iscomplexobj(bcoo.data))
+    dt = getattr(op, "dtype", None)
+    return dt is not None and bool(jnp.issubdtype(dt, jnp.complexfloating))
 
 
 def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:

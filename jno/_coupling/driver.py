@@ -421,10 +421,14 @@ class Coupled:
                     extra.update(d.setter(part.nodal(face, lv), prob))
             if windowed:
                 window, t0, _ = self._window
-                state, _ = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i), params=mine)
+                state, fr = part.march(prob, part.initial(prob), t0, window, extra, time=self._time_of(i), params=mine)
+                if part.kind == "fem" and fr is not None:  # its flux is the reaction of its last step
+                    kw = self._step(i, prob, fr, fr.shape[0] - 1)
+                else:
+                    kw = {}
             else:
-                state = part.solve(prob, extra, x0=self._guess.get(i), params=mine)
-            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra, params=mine)))
+                state, kw = part.solve(prob, extra, x0=self._guess.get(i), params=mine), {}
+            out.append(np.asarray(part.sample(prob, state, flux, cf.tags[i], iface, extra, params=mine, **kw)))
         self.stiffness[key] = abs(float(iface.weights @ (out[1] - out[0]))) / (step * iface.total)
         return self.stiffness[key]
 
@@ -742,12 +746,13 @@ class Coupled:
     # -- iteration ---------------------------------------------------------------------------------------
     def _produce(self, d, states, values, frames=None, params=None):
         """Data ``d`` from its sender's current state, carried to the receiver's interface nodes; ``values`` the data
-        the sender read (its boundary conditions, which its own samples read too), ``frames`` the window's frames of
-        the participants that marched one (:meth:`Participant.march`). Traceable.
+        the sender read (its boundary conditions, which its own samples read too), ``frames`` the window's
+        ``(frames, flux means)`` of the participants that marched one (:meth:`Participant.march`). Traceable.
 
-        A flux from a sender that just marched a window is its mean over the window, from the sender's own
-        steps: what the receiver takes in over the window is then what the sender gave out. Its end value is
-        not, when the sender takes several steps (an explicit march, a finer step) while the flux changes."""
+        A flux from a sender that just marched a window is its mean over the window: what the receiver takes in
+        over the window is then what the sender gave out. Its end value is not, when the sender takes several
+        steps (an explicit march, a finer step) while the flux changes. An explicit or IMEX sender hands over the
+        mean its scheme integrated over its stages; a sender that cannot is averaged over its frames."""
         import jax.numpy as jnp
 
         s, r = self.parts[d.sender], self.parts[d.receiver]
@@ -755,22 +760,53 @@ class Coupled:
         dst = r.interface(d.receiver_tag, self.spec.measure)
         prob, data = self.problems[d.sender], self._extra(d.sender, values)
         mine = self._params_of(d.sender, params)
-        fr = (frames or {}).get(d.sender) if d.flux else None
-        if fr is None or fr.shape[0] < 2:
+        fr, means = (frames or {}).get(d.sender, (None, None)) if d.flux else (None, None)
+        if means is not None:
+            vals = means[next(k for k, o in enumerate(self._flux_data(d.sender)) if o is d)]
+        elif fr is None or fr.shape[0] < 2:
             vals = jnp.asarray(s.sample(prob, states[d.sender], d.expr, d.sender_tag, src, data, params=mine))
         else:
             w = self._window_weights(d.sender, fr.shape[0] - 1)
             vals = sum(
-                wk * jnp.asarray(s.sample(prob, fr[k], d.expr, d.sender_tag, src, data, params=mine))
+                wk
+                * jnp.asarray(
+                    s.sample(prob, fr[k], d.expr, d.sender_tag, src, data, params=mine, **self._step(d.sender, prob, fr, k))
+                )
                 for k, wk in enumerate(w)
                 if wk != 0.0
             )
         return self._map_jnp(d, dst, src) @ vals
 
+    def _flux_data(self, i):
+        """The flux data participant ``i`` sends."""
+        return [d for d in self.data if d.flux and d.sender == i]
+
+    def _stage_flux(self, i):
+        """What participant ``i``'s march is asked to integrate over its own stages: its fluxes as
+        ``(expr, tag, interface)``, or ``None`` when its scheme is not an explicit or IMEX one on a participant that
+        takes them (the window mean is then taken over its frames, :meth:`_window_weights`)."""
+        from ..utils.solver.imex import IMEXScheme
+        from ..utils.solver.timeschemes import _ERKScheme
+
+        if not self.parts[i].stage_flux or not isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)):
+            return None
+        out = [(d.expr, d.sender_tag, self.parts[i].interface(d.sender_tag, self.spec.measure)) for d in self._flux_data(i)]
+        return out or None
+
+    def _step(self, i, prob, fr, k):
+        """``sample`` keywords of frame ``k`` of a window's march: a transient ``jno.fem`` reads a flux from the step
+        that ended there, so it needs the frame before it and its step."""
+        part = self.parts[i]
+        if part.kind != "fem" or not part.transient(prob) or k < 1:
+            return {}
+        part.check_step_flux(prob, self._time_of(i))
+        return {"prev": (fr[k - 1], float(prob._op.dt))}
+
     def _window_weights(self, i, m):
-        """Weights of a window's ``m + 1`` frames in its mean: the trapezoid rule for an explicit (or IMEX) march,
-        whose flux is continuous across its steps, the step ends for an implicit Euler step, whose step takes the
-        flux at its end -- exactly what it gave out."""
+        """Weights of a window's ``m + 1`` frames in its mean: the trapezoid rule for an explicit (or IMEX) march
+        that cannot hand over its stage quadrature (:meth:`_stage_flux`), whose flux is continuous across its
+        steps, the step ends for an implicit Euler step, whose step takes the flux at its end -- exactly what it
+        gave out."""
         from ..utils.solver.imex import IMEXScheme
         from ..utils.solver.timeschemes import _ERKScheme
 
@@ -821,12 +857,13 @@ class Coupled:
     def _advance(self, i, start, states, values, t, window, params=None):
         """Participant ``i`` with the data ``values``: a window's march from ``start`` for a transient problem, a
         (warm-started) solve otherwise -- a steady problem in a transient coupling is quasi-steady. Returns its
-        state and the window's frames (``None`` for a solve)."""
+        state, the window's frames and the stage means of its fluxes (``None`` for a solve)."""
         part, prob = self.parts[i], self.problems[i]
         extra, mine = self._extra(i, values), self._params_of(i, params)
         if window is not None and part.transient(prob):
-            return part.march(prob, start[i], t, window, extra, time=self._time_of(i), params=mine)
-        return part.solve(prob, extra, x0=states[i], params=mine), None
+            out = part.march(prob, start[i], t, window, extra, time=self._time_of(i), params=mine, flux=self._stage_flux(i))
+            return out if len(out) == 3 else (*out, None)
+        return part.solve(prob, extra, x0=states[i], params=mine), None, None
 
     def _time_of(self, i):
         tm = self.spec.time
@@ -852,8 +889,8 @@ class Coupled:
         states, frames = list(states), {}
         if self.spec.scheme == "jacobi":
             advanced = [self._advance(i, start, states, values, t, window, params) for i in range(n)]
-            for i, (state, fr) in enumerate(advanced):
-                states[i], frames[i] = state, fr
+            for i, (state, fr, means) in enumerate(advanced):
+                states[i], frames[i] = state, (fr, means)
         else:
             for i in self.order:
                 fresh = {  # forward data: fresh from senders already run in this sweep
@@ -862,7 +899,8 @@ class Coupled:
                     if d.receiver == i and k not in back
                 }
                 values = tuple(fresh.get(k, v) for k, v in enumerate(values))
-                states[i], frames[i] = self._advance(i, start, states, values, t, window, params)
+                states[i], fr, means = self._advance(i, start, states, values, t, window, params)
+                frames[i] = fr, means
         produced = [self._produce(self.data[k], states, values, frames, params) for k in back]
         return states, values, jnp.concatenate(produced) if back else jnp.zeros(0)
 

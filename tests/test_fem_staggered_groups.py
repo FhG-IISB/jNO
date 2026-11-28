@@ -170,3 +170,27 @@ def test_staggered_direct_without_a_linear_slot_factorizes_with_lu_s_preferred_b
     np.testing.assert_allclose(out, ref, atol=1e-7)
     log = capfd.readouterr().out
     assert "bicgstab" not in log.split("staggered")[-1].splitlines()[0]
+
+
+def test_newton_direct_without_a_linear_slot_factorizes_with_lu_s_preferred_backend(monkeypatch, capfd):
+    """``newton(direct=True)`` with no ``linear=`` factorizes the assembled tangent with what ``jno.solve.lu()`` resolves
+    to (cuDSS on a GPU that has it), not an unconditional ``spsolve``, and the log line names that backend."""
+    import jno.solve as solve_mod
+    from jno.utils.solver import linear as lin
+
+    calls = []
+    real = lin.host_lu_solve
+
+    def counting(A, b):
+        calls.append(1)
+        return real(A, b)
+
+    monkeypatch.setattr(solve_mod, "_preferred_direct_backend", lambda: "host")  # stands in for "cudss" off a GPU
+    monkeypatch.setattr(lin, "host_lu_solve", counting)
+    fem, v, p, T = _stokes_thermal()
+    out = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-11, atol=1e-13)))
+    assert calls, "the tangent was not factorized by lu()'s preferred backend"
+    ref = np.asarray(fem.solve(nonlinear=jno.solve.newton(direct=True, rtol=1e-11, atol=1e-13), linear=_lu()))
+    np.testing.assert_allclose(out, ref, atol=1e-7)
+    line = [ln for ln in capfd.readouterr().out.splitlines() if "solve: nonlinear" in ln][0]
+    assert "lu" in line and "assembled tangent)" not in line.split("inner")[-1], line
