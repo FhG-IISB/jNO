@@ -218,7 +218,6 @@ def test_a_polarization_that_is_not_one_raises():
             _as_jones(bad)
 
 
-@needs_fmmax
 def test_an_edge_on_a_grid_sample_converges_at_second_order():
     """#207: a ridge edge written ``x < 0.5 * period`` used to land on a sample, so rounding put it half a cell
     off and the reflectance converged at first order (error 1.4e-3 at grid 256 for a thick ridge). Samples sit
