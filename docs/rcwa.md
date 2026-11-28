@@ -402,6 +402,20 @@ committed golden references in the tests.
   J. Opt. Soc. Am. **71**, 811 (1981).
 - M. G. Moharam, D. A. Pommet, E. B. Grann & T. K. Gaylord, *Stable implementation of the enhanced
   transmittance matrix approach*, J. Opt. Soc. Am. A **12**, 1077 (1995).
+- L. Li, *Use of Fourier series in the analysis of discontinuous periodic structures*, J. Opt. Soc. Am. A
+  **13**, 1870 (1996) — the factorization rules (Laurent's and the inverse rule).
+- V. Liu & S. Fan, *S4: A free electromagnetic solver for layered periodic structures*, Comput. Phys.
+  Commun. **183**, 2233 (2012) — the state ordering and the vector formulations.
+- M. F. Schubert & A. M. Hammond, *Fourier modal method for inverse design of metasurface-enhanced
+  micro-LEDs*, arXiv:2308.08573 (2023) — the least-squares tangent field of the vector formulations.
+- R. Redheffer, *On the relation of transmission-line theory to scattering and transfer*, J. Math. Phys.
+  **41**, 1 (1962) — the star product of S-matrices.
+- R. C. Rumpf, *Improved formulation of scattering matrices for semi-analytical methods that is consistent
+  with convention*, Prog. Electromagn. Res. B **35**, 241 (2011) — S-matrices in a fixed gap medium.
+- N. J. Higham & M. I. Smith, *Computing the matrix cosine*, Numer. Algorithms **34**, 13 (2003) — the
+  double-angle steps of the layer transfer.
+- M. S. Paterson & L. J. Stockmeyer, *On the number of nonscalar multiplications necessary to evaluate
+  polynomials*, SIAM J. Comput. **2**, 60 (1973) — the series evaluation.
 - W. C. Chew & W. H. Weedon, *A 3D perfectly matched medium from modified Maxwell's equations with
   stretched coordinates*, Microw. Opt. Technol. Lett. **7**, 599 (1994) — the complex coordinate stretch.
 - Z. S. Sacks, D. M. Kingsland, R. Lee & J.-F. Lee, *A perfectly matched anisotropic absorber for use as
