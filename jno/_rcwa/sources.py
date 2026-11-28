@@ -29,11 +29,9 @@ in state space, with no eigendecomposition anywhere:
   solve; the emitted powers are the fluxes of the amplitudes carried to the two
   ambients.
 
-The model is anchored against fmmax's ``amplitudes_for_source`` in the engine
-(test) geometry to ~1e-14 (complex128), including off-center sources, z-dipoles,
-patterned source layers, gaussian sources and the ``1/omega`` prefactor. The
-Fourier-space current generators (``dirac_delta_source``, ``gaussian_source``)
-are the same math as ``fmmax.sources``, ported without importing fmmax.
+The emitted powers agreed with fmmax's ``amplitudes_for_source`` to ~1e-14
+(complex128) on off-centre sources, z-dipoles, patterned source layers, Gaussian
+sources and the ``1/omega`` prefactor, when that library was the test oracle.
 
 Everything here is jit- and grad-clean: only JAX ops, no data-dependent control
 flow (chunk counts and half-stack layouts are static at build; the static inputs
@@ -49,128 +47,68 @@ import jax.numpy as jnp
 from . import basis as basis_mod
 
 
-def dirac_delta_source(
-    location: jnp.ndarray,
-    in_plane_wavevector: jnp.ndarray,
-    primitive_lattice_vectors: basis_mod.LatticeVectors,
-    expansion: basis_mod.Expansion,
-) -> jnp.ndarray:
-    """Fourier coefficients of a point (delta) source at ``location``.
-
-    ``exp(-i (kx x0 + ky y0))`` per order -- identical math to fmmax's
-    ``dirac_delta_source``. ``location`` has shape ``(num_sources, 2)`` (the
-    trailing axis is x, y); returns shape ``(num_terms, num_sources)``.
-
-    Args:
-        location: ``(num_sources, 2)`` x/y coordinates in the unit cell.
-        in_plane_wavevector: ``(..., 2)`` k_in (batch-broadcastable).
-        primitive_lattice_vectors, expansion: the lattice and truncation.
-
-    Returns:
-        Coefficients, ``(..., num_terms, num_sources)``.
-    """
+def _phases(location, in_plane_wavevector, primitive_lattice_vectors, expansion):
+    """``exp(-i k_mn . r_0)`` per order and source, ``(..., num_terms, num_sources)``, and the ``|k_mn|^2``."""
     if location.ndim != 2 or location.shape[-1] != 2:
         raise ValueError(f"`location` must be rank-2 with a trailing axis of 2, got shape {location.shape}")
     if in_plane_wavevector.shape[-1] != 2:
         raise ValueError(f"`in_plane_wavevector` must have a trailing axis of 2, got {in_plane_wavevector.shape}")
-    twv = basis_mod.transverse_wavevectors(
-        in_plane_wavevector=in_plane_wavevector,
-        primitive_lattice_vectors=primitive_lattice_vectors,
-        expansion=expansion,
-    )
-    kx = twv[..., 0][..., jnp.newaxis]
-    ky = twv[..., 1][..., jnp.newaxis]
-    x = location[:, 0]
-    y = location[:, 1]
-    return jnp.exp(-1j * (kx * x + ky * y))
+    k = basis_mod.transverse_wavevectors(in_plane_wavevector, primitive_lattice_vectors, expansion)
+    kx, ky = k[..., 0, None], k[..., 1, None]
+    return jnp.exp(-1j * (kx * location[:, 0] + ky * location[:, 1])), kx**2 + ky**2
 
 
-def gaussian_source(
-    fwhm: jnp.ndarray,
-    location: jnp.ndarray,
-    in_plane_wavevector: jnp.ndarray,
-    primitive_lattice_vectors: basis_mod.LatticeVectors,
-    expansion: basis_mod.Expansion,
-) -> jnp.ndarray:
-    """Fourier coefficients of a Gaussian source of ``fwhm`` at ``location``.
+def dirac_delta_source(location, in_plane_wavevector, primitive_lattice_vectors, expansion) -> jnp.ndarray:
+    """Floquet-Bloch coefficients of a point source ``delta(r - r_0)`` in the cell: ``exp(-i k_mn . r_0)``.
 
-    ``exp(-i k·x0) * exp(-sigma^2 |k|^2 / 2)`` with
-    ``sigma = fwhm / (2 sqrt(2 ln 2))`` -- identical math to fmmax's
-    ``gaussian_source`` (the Gibbs-free soft source used by the front door for a
-    Gaussian emitter).
+    (The periodised delta ``sum_R delta(r - r_0 - R) e^{i k_in . R}`` expands as ``(1/A) sum_mn exp(i k_mn . (r -
+    r_0))``; the cell area ``A`` is a common factor of every emitted power and is left out, as in the readouts.)
 
     Args:
-        fwhm: Full-width at half-maximum (scalar array).
-        location: ``(num_sources, 2)`` x/y coordinates.
-        in_plane_wavevector, primitive_lattice_vectors, expansion: as
-            :func:`dirac_delta_source`.
+        location: ``(num_sources, 2)`` positions ``(x_0, y_0)`` in the cell.
+        in_plane_wavevector: ``(..., 2)`` ``k_in``.
+        primitive_lattice_vectors, expansion: The lattice and the truncation.
 
     Returns:
-        Coefficients, ``(..., num_terms, num_sources)``.
+        ``(..., num_terms, num_sources)``.
     """
-    if location.ndim != 2 or location.shape[-1] != 2:
-        raise ValueError(f"`location` must be rank-2 with a trailing axis of 2, got shape {location.shape}")
-    if in_plane_wavevector.shape[-1] != 2:
-        raise ValueError(f"`in_plane_wavevector` must have a trailing axis of 2, got {in_plane_wavevector.shape}")
-    twv = basis_mod.transverse_wavevectors(
-        in_plane_wavevector=in_plane_wavevector,
-        primitive_lattice_vectors=primitive_lattice_vectors,
-        expansion=expansion,
-    )
-    kx = twv[..., 0][..., jnp.newaxis]
-    ky = twv[..., 1][..., jnp.newaxis]
-    x = location[:, 0]
-    y = location[:, 1]
-    coeffs = jnp.exp(-1j * (kx * x + ky * y))
+    return _phases(location, in_plane_wavevector, primitive_lattice_vectors, expansion)[0]
+
+
+def gaussian_source(fwhm, location, in_plane_wavevector, primitive_lattice_vectors, expansion) -> jnp.ndarray:
+    """Coefficients of a Gaussian spot of full width at half maximum ``fwhm`` at ``r_0``: the point-source phases
+    times the Gaussian's spectrum ``exp(-sigma^2 |k|^2 / 2)``, ``sigma = fwhm / (2 sqrt(2 ln 2))`` (a soft source,
+    free of the Gibbs ringing of a truncated delta). Shapes as :func:`dirac_delta_source`."""
+    phases, k2 = _phases(location, in_plane_wavevector, primitive_lattice_vectors, expansion)
     sigma = fwhm / (2 * jnp.sqrt(2 * jnp.log(2)))
-    return coeffs * jnp.exp(-(sigma**2) * (kx**2 + ky**2) / 2)
+    return phases * jnp.exp(-(sigma**2) * k2 / 2)
 
 
-def polarization_terms(
-    jx: jnp.ndarray,
-    jy: jnp.ndarray,
-    jz: jnp.ndarray,
-    inverse_z_permittivity: jnp.ndarray,
-    transverse_wavevectors: jnp.ndarray,
-    omega,
-) -> jnp.ndarray:
-    """The source-side jump vector ``(s_u, s_v)`` across the source plane.
+def polarization_terms(jx, jy, jz, inverse_z_permittivity, transverse_wavevectors, omega) -> jnp.ndarray:
+    """The jump ``(s_u, s_v)`` of the state ``(u, v)`` across a current sheet ``j delta(z - z_0)``.
 
-    Derivation (Maxwell jump conditions, state-space closure): the tangential
-    current ``(jx, jy)`` jumps the tangential magnetic field, and the z-current
-    ``jz`` enters through the ``E_z`` elimination (Ampere's law in the source
-    layer), producing a source in the ``u`` channel proportional to the
-    transverse wavevector times the inverse-rule z-permittivity; the ``1/omega``
-    prefactor follows from time-harmonic Maxwell in the ``e^{-iwt}`` phasor
-    convention used by the backend (anchored to fmmax at wl 1.0, 0.7, 1.55 to
-    ~1e-14). This is the eig-free substitute for the Whittaker-§7 modal emission
-    vector.
+    With ``e^{-i omega t}`` and ``c = eps_0 = mu_0 = 1``, Ampere's law is ``curl H = -i omega eps E + J``:
+
+    * its transverse part across the sheet: the tangential ``H`` jumps by the tangential current, ``H_x`` by ``j_y``
+      and ``H_y`` by ``-j_x``, so ``s_v = (j_y, -j_x)``;
+    * its z part gives ``E_z = (i k_x H_y - i k_y H_x - J_z) / (-i omega eps)``, whose ``delta`` term
+      ``eta j_z / (i omega)`` (``eta`` the inverse-rule ``[[eps_zz]]^-1`` of the source layer, or ``1/eps`` when it
+      is uniform) enters Faraday's law ``curl E = i omega mu H`` as ``d/dy`` and ``d/dx`` of a delta: ``E_y`` jumps
+      by ``k_y eta j_z / omega`` and ``E_x`` by ``-k_x eta j_z / omega``. In ``u = (-E_y, E_x)``,
+      ``s_u = (1/omega) (-k_y eta j_z, k_x eta j_z)``.
 
     Args:
-        jx, jy, jz: Fourier coefficients of the x/y/z current, ``(num_terms,)``
-            each (``amp * orient * source_coeffs``).
-        inverse_z_permittivity: The ``(num_terms, num_terms)`` inverse-rule
-            z-permittivity matrix of the source layer (as returned by the
-            backend's Toeplitz builder), or a scalar ``1/eps`` for a uniform
-            layer.
-        transverse_wavevectors: Per-order ``(num_terms, 2)`` wavevectors.
-        omega: Angular frequency ``2 pi / wavelength``.
+        jx, jy, jz: Current coefficients per order, ``(num_terms,)``.
+        inverse_z_permittivity: ``(num_terms, num_terms)`` matrix or a scalar.
+        transverse_wavevectors: ``(num_terms, 2)``.
+        omega: ``2 pi / wavelength``.
 
     Returns:
-        The ``(4 * num_terms,)`` jump vector ``(s_u, s_v)``, top half the u
-        (E_t) channel jump, bottom half the v (H_t) channel jump.
+        ``(s_u, s_v)`` concatenated, ``(4 num_terms,)``.
     """
-    kx = transverse_wavevectors[:, 0]
-    ky = transverse_wavevectors[:, 1]
-    if jnp.ndim(inverse_z_permittivity) == 0:
-        eta_jz = inverse_z_permittivity * jz
-    else:
-        eta_jz = inverse_z_permittivity @ jz
-    s_u = (1.0 / omega) * jnp.concatenate([-ky * eta_jz, kx * eta_jz])
-
-    # s_v: the tangential-current H jump (v = (Hx, Hy)): Hx jumps by jy, Hy by -jx.
-    s_v = jnp.concatenate([jy, -jx])
-    return jnp.concatenate([s_u, s_v])
+    kx, ky = transverse_wavevectors[:, 0], transverse_wavevectors[:, 1]
+    eta_jz = inverse_z_permittivity * jz if jnp.ndim(inverse_z_permittivity) == 0 else inverse_z_permittivity @ jz
+    return jnp.concatenate([(1.0 / omega) * jnp.concatenate([-ky * eta_jz, kx * eta_jz]), jy, -jx])
 
 
 # -----------------------------------------------------------------------------
@@ -307,7 +245,7 @@ def _make_emission_core(stack, si, kind):
             expansion=expansion,
         ).astype(cdt)
 
-        # source coefficients (same math as fmmax sources.py)
+        # Floquet-Bloch coefficients of the point or Gaussian source
         loc = jnp.asarray(loc).reshape(1, 2)
         kin_arr = jnp.asarray(kin)
         if kind == "gaussian":
