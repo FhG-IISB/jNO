@@ -199,6 +199,7 @@ def test_gradient_through_the_march_matches_finite_differences():
     save = jnp.linspace(blk.t0, blk.t1, 3)
     for sch in (jno.solve.bdf2(), jno.solve.sdirk(3)):
 
+        @jax.jit  # one compile per direction: the two finite-difference evaluations share the forward one
         def loss(kv, sch=sch):
             return jnp.sum(sch.integrate(blk, {"k": jnp.reshape(kv, (1,))}, save) ** 2)
 

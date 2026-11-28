@@ -454,8 +454,9 @@ def test_lu_host_reuse_false_does_not_retain_a_factorization():
     b = jnp.asarray(np.ones(n))
 
     _FACTOR_CACHE.clear()
-    x_cached = np.asarray(host_lu_solve(A, b))
-    assert len(_FACTOR_CACHE) == 1, "the default should retain the factorization it just built"
+    for _ in range(3):  # a factorization is kept once its operator recurs
+        x_cached = np.asarray(host_lu_solve(A, b))
+    assert len(_FACTOR_CACHE) == 1, "the default should retain the factorization of a repeated operator"
 
     _FACTOR_CACHE.clear()
     x_free = np.asarray(host_lu_solve(A, b, reuse=False))
@@ -517,3 +518,57 @@ def test_the_sparse_direct_solve_differentiates_an_entry_stored_as_zero():
     want = (solve(1e-6) - solve(-1e-6)) / 2e-6  # A = [[2, s], [s, 2]]: dx/ds = -A^-1 [[0, 1], [1, 0]] x
     assert np.abs(np.asarray(want)).max() > 0.1
     np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-8)
+
+
+def _stiff_block(n=24, stiffness=1e-7):
+    """A nonsingular block like the damage-march displacement block: unit Dirichlet rows at the ends beside interior
+    stiffness entries ``stiffness`` times smaller, so after dividing by the largest entry the interior pivots are
+    ~1e-7 -- under cuSolver's default absolute ``tol=1e-6``, far above any real singularity."""
+    A = np.zeros((n, n))
+    for i in range(1, n - 1):
+        A[i, i - 1], A[i, i], A[i, i + 1] = -stiffness, 2 * stiffness, -stiffness
+    A[0, 0] = A[-1, -1] = 1.0
+    b = np.zeros(n)
+    b[0], b[-1] = 0.5, 1.5
+    b[1:-1] = stiffness * np.sin(np.linspace(0.0, 3.0, n - 2))
+    return jsp.BCOO.fromdense(jnp.asarray(A, dtype=jnp.float32)), jnp.asarray(b, dtype=jnp.float32), A, b
+
+
+def test_a_stiff_but_nonsingular_block_is_not_called_singular():
+    """On a GPU, spsolve's absolute `tol=1e-6` declared such a block "Singular matrix" (float32, as the suite runs it)
+    while the CPU's LU factored it; with the matrix-relative tolerance it solves. On the CPU this still pins the answer."""
+    jax.config.update("jax_enable_x64", False)
+    A, b, Ad, bd = _stiff_block()
+    x = np.asarray(sparse_lu_solve(A, b))
+    assert np.all(np.isfinite(x))
+    np.testing.assert_allclose(x, np.linalg.solve(Ad, bd), rtol=2e-3, atol=2e-3)
+
+
+def test_spsolve_is_asked_for_a_tolerance_relative_to_the_scaled_matrix(monkeypatch):
+    """The call itself, so it holds where the CPU never reads `tol`: the operator is divided by its largest entry, so a
+    tolerance of 1e-12 is relative; the library default 1e-6 is the absolute one that misfired."""
+    import jno.utils.solver.linear as L
+
+    seen = []
+    real = L.spsolve
+    monkeypatch.setattr(L, "spsolve", lambda *a, **k: seen.append(k.get("tol")) or real(*a, **k))
+    jax.clear_caches()  # a compiled solve of this size would not trace again
+    A, b, _, _ = _stiff_block(n=29)
+    sparse_lu_solve(A, b)
+    assert seen and all(t is not None and t <= 1e-10 for t in seen), f"spsolve called with tol={seen}"
+
+
+def test_a_singular_report_of_the_device_is_jnos_own_error(monkeypatch):
+    """What reaches the user names the backend and the way out, not an XLA internal."""
+    import jno.utils.solver.linear as L
+
+    def refuse(A, b):
+        raise jax.errors.JaxRuntimeError("INTERNAL: Singular matrix in linear solve. [executable_name='jit__lambda']")
+
+    monkeypatch.setattr(L, "_sparse_lu_solve", refuse)
+    A, b, _, _ = _stiff_block()
+    with pytest.raises(RuntimeError, match=r"backend 'device'.*lu\(backend='host'\)"):
+        sparse_lu_solve(A, b)
+    monkeypatch.setattr(L, "_sparse_lu_solve", lambda A, b: (_ for _ in ()).throw(jax.errors.JaxRuntimeError("OOM")))
+    with pytest.raises(jax.errors.JaxRuntimeError, match="OOM"):  # anything else passes through untouched
+        sparse_lu_solve(A, b)

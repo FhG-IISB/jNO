@@ -2,6 +2,8 @@
 
 Run with x64 (the solve accumulates in float64)."""
 
+import functools
+
 import numpy as np
 import pytest
 
@@ -1566,6 +1568,15 @@ def _max_rel(a, b):
     return float(np.abs(a - b).max() / np.abs(b).max())
 
 
+@functools.lru_cache(maxsize=None)
+def _default_answer(case):
+    """The unchanged matrix-free answer of one case: the oracle of every slot, solved once per module."""
+    time = None if case.startswith("steady") else (0.0, 0.1, 21)
+    return np.asarray(
+        _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")().solve()
+    )
+
+
 @pytest.mark.parametrize("slot", list(_SLOTS))
 @pytest.mark.parametrize("case", ["steady", "steady-nonlinear", "heat", "wave"])
 def test_solver_slots_reach_the_default_answer(slot, case):
@@ -1576,8 +1587,7 @@ def test_solver_slots_reach_the_default_answer(slot, case):
     time = None if case.startswith("steady") else (0.0, 0.1, 21)
     make = _slot_problem(time=time, order=2 if case == "wave" else 1, nonlinear=case == "steady-nonlinear")
     kw = _SLOTS[slot]()
-    ref = make().solve()
-    assert _max_rel(make().solve(**kw), ref) < 1e-7
+    assert _max_rel(make().solve(**kw), _default_answer(case)) < 1e-7
 
 
 def test_gmg_slot_on_a_structured_grid():

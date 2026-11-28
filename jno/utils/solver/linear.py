@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import os
 import warnings
 from collections import OrderedDict
 from typing import Any
@@ -27,6 +28,7 @@ from jax.experimental.sparse.linalg import spsolve
 from ..sets import unique_values
 
 __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
+
 
 #: Host SuperLU factorizations, keyed on the CONTENT of the operator that produced them.
 #:
@@ -61,8 +63,59 @@ __all__ = ["sparse_lu_solve", "jacobi", "matrix_diagonal"]
 #:
 #: Raising the cap cannot cost the monolithic case anything -- it is a CAP, not an allocation, and
 #: that case only ever inserts one key. 8 covers a four-field system and its transpose solves.
-_FACTOR_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+class _FactorCache(OrderedDict):
+    """The kept host factorizations, plus what decides which factorization is kept (see ``_host_solve``).
+
+    A factorization enters the dict only when its operator RECURS. ``seen`` remembers, as bare content keys,
+    the operators factored once and not kept (bounded by ``_FACTOR_SEEN_MAX``); ``last`` holds the most recent
+    factorization with the number of times it was asked for, so a forward solve and its adjoint on one
+    operator share a factorization without the dict keeping it. ``clear()`` empties all three."""
+
+    def __init__(self):
+        super().__init__()
+        self.seen: "OrderedDict[tuple, None]" = OrderedDict()
+        self.last: list | None = None  # [key, factorization, times asked for]
+
+    def clear(self):
+        super().clear()
+        self.seen.clear()
+        self.last = None
+
+
+_FACTOR_WORKER = None
+
+
+def _factor_worker():
+    """The ONE thread that factorises, solves with and frees every kept host factorization.
+
+    XLA runs each ``pure_callback`` on whichever thread is free, so a factorization built in one callback was
+    freed in a later one on another thread, and glibc does not give back what a thread's arena freed for another
+    thread: measured on a 3-D Laplacian (20^3, ~1.9M factor entries), 25 factorizations built on one thread and
+    dropped on others stranded 1.2 GB, against 150 MB when one thread did all of it. Serialising the factorizations
+    onto one thread costs nothing a single-threaded SuperLU would not (it runs one core per factorization), but
+    two host solves no longer factor at the same time."""
+    global _FACTOR_WORKER
+    if _FACTOR_WORKER is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _FACTOR_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jno-host-lu")
+    return _FACTOR_WORKER
+
+
+def _forget_factor_worker():
+    """A forked child inherits the executor but not its thread, so its first submit would wait forever."""
+    global _FACTOR_WORKER
+    _FACTOR_WORKER = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forget_factor_worker)
+
+
+_FACTOR_CACHE: "_FactorCache" = _FactorCache()
 _FACTOR_CACHE_MAX = 8
+#: Content keys (16-byte digests) remembered between a first factorization and the operator's return.
+_FACTOR_SEEN_MAX = 256
 
 #: Whether a host factorization built now may be KEPT in :data:`_FACTOR_CACHE`, read when
 #: :func:`host_lu_solve` is traced with ``reuse=None`` (the default). A Newton driver traces its forward
@@ -233,6 +286,13 @@ def jacobi(A):
     return lambda x: inv * x
 
 
+#: ``spsolve``'s singularity threshold, RELATIVE to the largest entry (the operator is divided by it first). The
+#: default ``1e-6`` is an absolute pivot threshold of cuSolver's sparse QR: a stiff but nonsingular block (unit
+#: Dirichlet rows beside stiffness entries scaled by a 1e-4 floor) was called "Singular matrix" on a GPU while the
+#: CPU's LU factored it, and ``1e-12`` solved it. A truly singular block still yields a zero pivot, far below this.
+_SPSOLVE_TOL = 1e-12
+
+
 @jax.jit
 def _sparse_lu_solve(A, b):
     """The triplets-to-CSR conversion and the ``spsolve`` itself, as ONE compiled program.
@@ -272,7 +332,13 @@ def _sparse_lu_solve(A, b):
         order = jnp.lexsort((second, first))  # CSR ordering: by row, then column
         rows = first[order]
         indptr = jnp.searchsorted(rows, jnp.arange(n + 1, dtype=rows.dtype)).astype(jnp.int32)
-        return spsolve(data0[order] / scale, second[order].astype(jnp.int32), indptr, rhs / scale.astype(rhs.dtype))
+        return spsolve(
+            data0[order] / scale,
+            second[order].astype(jnp.int32),
+            indptr,
+            rhs / scale.astype(rhs.dtype),
+            tol=_SPSOLVE_TOL,
+        )
 
     return jax.lax.custom_linear_solve(
         lambda x: A @ x,
@@ -297,7 +363,22 @@ def sparse_lu_solve(A, b):
 
     if not (hasattr(A, "indices") and hasattr(A, "sum_duplicates")):
         A = jsp.BCOO.fromdense(jnp.asarray(A))
-    return _sparse_lu_solve(A, b)
+    try:
+        x = _sparse_lu_solve(A, b)
+        if not isinstance(x, jax.core.Tracer):
+            jax.block_until_ready(x)  # dispatch is asynchronous: the device's refusal surfaces here, not at the caller
+        return x
+    except jax.errors.JaxRuntimeError as e:
+        if "Singular matrix" not in str(e):
+            raise
+        raise RuntimeError(
+            f"jno: the sparse direct solve (backend 'device': JAX spsolve, a sparse QR on a GPU) reports a singular "
+            f"{A.shape[0]} x {A.shape[0]} matrix. After scaling to its largest entry no pivot is above "
+            f"{_SPSOLVE_TOL:g}, so the operator is singular or numerically so (a missing boundary condition or "
+            "gauge, a zero row, a mesh with an unconnected node). If it should be nonsingular, factor it elsewhere: "
+            "linear=jno.solve.lu(backend='host') (CPU SuperLU), 'pardiso' (CPU) or, in float64 on a GPU, 'cudss'. "
+            f"Original error: {e}"
+        ) from e
 
 
 _CUDSS_PIN = "nvidia-cudss-cu12>=0.8,<0.9"  # what nvmath-python 1.0.x asks for (`nvidia-cudss-cu12==0.8.*`)
@@ -1698,16 +1779,44 @@ def host_lu_solve(A, b, *, reuse: bool | None = None):
             out = _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
             del lu, mat
             return out
-        lu = _FACTOR_CACHE.get(key)
-        if lu is None:
-            mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
-            lu = _splu(mat)
-            _FACTOR_CACHE[key] = lu
-            if len(_FACTOR_CACHE) > _FACTOR_CACHE_MAX:
-                _FACTOR_CACHE.popitem(last=False)
-        else:
-            _FACTOR_CACHE.move_to_end(key)
-        return _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+
+        # Kept only once the operator RECURS. A re-solve loop (a coefficient rescaled on every call) meets each
+        # operator only in one solve and its adjoint, so keeping every factorization held `_FACTOR_CACHE_MAX`
+        # dead ones (13,116 unknowns: RSS 886 -> 2441 MB in 13 calls, against 997 MB with reuse=False). So:
+        #   * the latest factorization is held in `last` (not in the dict) and answers the adjoint, or the
+        #     next step of a constant-operator march, for free;
+        #   * an operator met a second time anywhere else (a block sweep returns to its first block) has been
+        #     factored once already and is now kept in the dict, up to `_FACTOR_CACHE_MAX`, which stays what it
+        #     was; the price is ONE extra factorization per operator;
+        #   * an operator that `last` has answered three times is a constant operator and is kept too.
+        def _cached():
+            cache = _FACTOR_CACHE
+            lu = cache.get(key)
+            if lu is not None:
+                cache.move_to_end(key)
+            else:
+                last = cache.last
+                if last is not None and last[0] == key:
+                    lu = last[1]
+                    last[2] += 1
+                    keep = last[2] >= 3
+                else:
+                    mat = _sp.csc_matrix((dat, (idx[:, 0], idx[:, 1])), shape=shape)
+                    lu = _splu(mat)
+                    keep = key in cache.seen
+                    if not keep:
+                        cache.seen[key] = None
+                        if len(cache.seen) > _FACTOR_SEEN_MAX:
+                            cache.seen.popitem(last=False)
+                    cache.last = [key, lu, 1]
+                if keep:
+                    cache.seen.pop(key, None)
+                    cache[key] = lu
+                    if len(cache) > _FACTOR_CACHE_MAX:
+                        cache.popitem(last=False)
+            return _np.asarray(lu.solve(rhs, trans="T" if transpose else "N"), dtype=rhs.dtype)
+
+        return _factor_worker().submit(_cached).result()
 
     def _call(rhs, transpose):
         return jax.pure_callback(

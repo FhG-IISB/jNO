@@ -19,7 +19,9 @@ No external solver dependency (no optimistix / lineax).
 from __future__ import annotations
 
 import contextlib
+import functools
 import math
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -665,6 +667,45 @@ def _jacobi_bicgstab(mv, b, d, *, tol, maxit, raw=False):
     return solve(mv, b) if raw else jax.lax.custom_linear_solve(mv, b, solve, transpose_solve=solve)
 
 
+_CLOSURE_CONVERT_WARNED = [False]
+
+
+def _releases_closure_conversions(fn):
+    """Run the Newton driver ``fn``, then drop JAX's memo of the closure conversions it asked for.
+
+    ``jax.lax.custom_root`` and ``jax.closure_convert`` memoise their result in a cache keyed STRONGLY on the
+    residual function, with the constants it captured as the value (4096 entries). Every build of a problem
+    brings a fresh residual closure, so the cache kept each finished problem -- its mesh, its element kernels
+    and the constants of its traced residual -- alive for the life of the process (measured: ~16 MB per build
+    of a small transient problem, in a loop of 45 builds). The memo only pays when the same function object
+    is converted twice; the drivers convert once per call, so the entries are dropped as soon as the driver
+    has built its trace. JAX offers no public handle on this cache: if it is not found (a JAX release that
+    renamed it) the growth returns, and a warning says so once."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            try:
+                from jax._src.custom_derivatives import _closure_convert_for_avals
+
+                _closure_convert_for_avals.cache_clear()
+            except (ImportError, AttributeError):
+                if not _CLOSURE_CONVERT_WARNED[0]:
+                    _CLOSURE_CONVERT_WARNED[0] = True
+                    warnings.warn(
+                        "jno: this JAX release has no jax._src.custom_derivatives._closure_convert_for_avals cache to "
+                        "release, so every nonlinear solve built in this process stays in memory (JAX keeps its "
+                        "residual closure); report it to the jNO developers.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+    return wrapper
+
+
+@_releases_closure_conversions
 def newton_krylov(
     residual_fn,
     u0,
@@ -969,6 +1010,7 @@ def _ew_forcing(rn, rn_prev, eta_prev, k, target):
     return jnp.clip(jnp.maximum(ew, 0.5 * target / jnp.maximum(rn, 1e-300)), 0.0, _EW_ETA_MAX)
 
 
+@_releases_closure_conversions
 def newton_direct(
     residual_fn,
     jacobian_fn,

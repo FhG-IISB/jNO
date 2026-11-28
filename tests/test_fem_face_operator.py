@@ -12,6 +12,7 @@ integrating the surface curl by parts on the periodic face, is the term written 
 """
 
 import jax  # noqa: E402
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -252,6 +253,24 @@ def test_bloch_cell_exact_face_transmits_an_oblique_wave():
     err1 = _bloch(0.04, False)
     assert err[0] / err[1] > 3.0, f"Bloch exact face: {err} do not fall as h^2"
     assert err[1] < 0.2 * err1, f"first-order {err1:.3e} vs exact {err}"
+
+
+def test_face_block_of_a_complex_form_is_a_real_product_per_leg(monkeypatch):
+    """A complex form is solved as a real and an imaginary leg, and each leg stores one part of the dense face
+    block ``sum_m L_m C_m^T``. That part is a REAL product over the stacked (re, im) modes: half the flops and
+    memory of the complex product whose other half would be thrown away (the block build is O(n_face^2 M))."""
+    seen = []
+    einsum = jnp.einsum
+
+    def spy(sub, *ops, **kw):
+        if sub == "mci,mcj->ij":
+            seen.append([bool(jnp.iscomplexobj(o)) for o in ops])
+        return einsum(sub, *ops, **kw)
+
+    monkeypatch.setattr(jnp, "einsum", spy)
+    err = _bloch(0.08, True)
+    assert err < 0.05  # the legs still assemble the transmitting face
+    assert len(seen) >= 2 and not any(any(c) for c in seen), f"complex products in the face block build: {seen}"
 
 
 def test_transient_diffusion_with_the_exterior_laplace_face():

@@ -11,7 +11,7 @@ an Arnoldi + differentiable **Padé** exponential (:func:`jno.utils.solver.matfu
 Step **size** is a separate axis from which step to take, so it composes rather than being its own scheme:
 ``.adaptive(...)`` on any scheme chooses the step size from a **step-doubling** local-error estimate of
 *that* scheme's step, working for every transient case (real/complex, scalar/vector, plain/periodic) and
-staying reverse-mode differentiable (a fixed-budget ``lax.scan`` with the controller ``stop_gradient``-ed —
+staying reverse-mode differentiable (a bounded, chunked ``lax.scan`` with the controller ``stop_gradient``-ed —
 the state differentiates at the realized step schedule)::
 
     fem.solve(time=jno.solve.theta(0.5))                       # 2nd-order, fixed grid
@@ -23,6 +23,9 @@ to a second-order step is far cheaper per digit than the first-order default —
 """
 
 from __future__ import annotations
+
+import math
+from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
@@ -912,6 +915,7 @@ class _AdaptiveScheme(_TimeScheme):
             dense_degree=base.step_order,
             embedded=embedded,
             error_rows=_error_rows(block, args, u0),
+            tight_step_solve=_tight_step_solve(block, args),
         )
 
     def __repr__(self):
@@ -989,6 +993,7 @@ class _BDFScheme(_TimeScheme):
             vary_order=self.order is None,
             ndf=self.ndf,
             error_rows=_error_rows(block, args, u0),
+            tight_step_solve=_tight_step_solve(block, args),
         )
 
     def __repr__(self):
@@ -1028,6 +1033,38 @@ def _extrapolation_weights(x, tau):
     return out
 
 
+def _budgeted_scan(body, init, max_steps, *, settled, emit):
+    """Run ``body`` for at most ``max_steps`` attempts, paying only for the attempts the march needs.
+
+    ``body(carry, i) -> (carry, y)`` is one attempt (``i`` its index: ``i >= max_steps`` must count as settled).
+    The attempts run as an outer ``lax.scan`` over chunks of ``isqrt(max_steps)``; a chunk that starts settled
+    (``settled(carry)``: the march has reached ``t1``) takes a ``lax.cond`` branch that does nothing (its
+    outputs repeat ``emit(carry)``), so the idle tail of the budget costs one cheap branch per chunk instead of
+    one body evaluation per attempt. Each chunk is ``jax.checkpoint``-ed: reverse mode keeps the carry at the
+    chunk boundaries and recomputes one chunk at a time, instead of storing the intermediates of every attempt
+    of the budget. The trip count stays static, so it is ``jit`` / ``grad`` compatible; under ``vmap`` the
+    ``cond`` becomes a ``select`` that runs both branches, so a batch pays the whole budget as before.
+
+    Returns ``(final carry, outputs stacked over the max_steps attempts)``."""
+    n = int(max_steps)
+    c = max(1, math.isqrt(n))
+    nch = -(-n // c)
+    idx = jnp.arange(nch * c, dtype=jnp.int32).reshape(nch, c)
+
+    @jax.checkpoint
+    def chunk(carry, ix):
+        def run(cr):
+            return jax.lax.scan(body, cr, ix)
+
+        def skip(cr):
+            return cr, jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (c,) + x.shape), emit(cr))
+
+        return jax.lax.cond(settled(carry), skip, run, carry)
+
+    carry, ys = jax.lax.scan(chunk, init, idx)
+    return carry, jax.tree_util.tree_map(lambda y: y.reshape((nch * c,) + y.shape[2:])[:n], ys)
+
+
 def bdf_march(
     be_step,
     u0,
@@ -1043,6 +1080,7 @@ def bdf_march(
     vary_order=True,
     ndf=True,
     error_rows=None,
+    tight_step_solve=False,
     safety=0.9,
     min_factor=0.2,
     max_factor=2.0,
@@ -1068,14 +1106,20 @@ def bdf_march(
 
     **Step.** Factor ``safety * err^(-1/(k+1))`` clipped to ``[min_factor, max_factor]``; a factor in
     ``[1, deadband]`` keeps the step (variable-coefficient BDF is zero-stable under bounded step ratios, and an
-    unchanged step keeps the step operator). Fixed-length ``lax.scan`` of ``max_steps`` attempts; an exhausted
-    budget NaN-poisons the result. Output at ``save_ts``: degree-``max_order`` interpolation through the
+    unchanged step keeps the step operator). At most ``max_steps`` attempts, run by :func:`_budgeted_scan` (chunks
+    of a ``lax.scan``; cost and reverse-mode memory follow the attempts used); an exhausted budget NaN-poisons the
+    result. Output at ``save_ts``: degree-``max_order`` interpolation through the
     accepted states (:func:`_dense_sample`)."""
     u0 = jnp.asarray(u0).reshape(-1)
     rt = jnp.real(u0).dtype
     t0, t1 = jnp.asarray(t0, rt), jnp.asarray(t1, rt)
     span = jnp.abs(t1 - t0)
-    dt_min, dt_max = 1e-4 * span, span
+    # The step floor follows the tolerance: a constant 1e-4 * span left the first (unchecked) backward-Euler steps of
+    # a stiff problem on the floor, accepted whatever the estimate, with a start-up error near 1e-6 that no rtol
+    # removed. ``rtol * span`` lets the controller reach the tolerance; the lower bound keeps ``M + dt A`` well
+    # conditioned and the step representable (1e-9 in double, 100 eps in single precision).
+    floor = max(1e-9, 100.0 * float(jnp.finfo(rt).eps))
+    dt_min, dt_max = min(1e-4, max(float(rtol), floor)) * span, span
     dt_start = dt_min if dt0 is None else jnp.clip(jnp.asarray(dt0, rt), dt_min, dt_max)
     K = int(max_order)
     if not 1 <= K <= _BDF_MAX_ORDER:
@@ -1126,16 +1170,19 @@ def bdf_march(
         k, t, h, hist_t, hist_u, n_hist = operand
         t_new = t + h
 
-        def _one(kk):
+        def _pre(kk):
+            """The order-``kk`` formula's shifted state ``psi``, step ``g`` and warm start."""
             c, g = _formula(kk, t_new, h, hist_t, n_hist)
             psi = jnp.tensordot(c, hist_u, axes=1)
             # The step's solve starts from the predictor, O(h^(k+1)) from the answer, not from psi, which is
             # O(h) from it (CVODE / ode15s start Newton there too); before the predictor exists, from u^n.
             pred = _predictor(kk, t_new, hist_t, hist_u)
-            u_new = be_step(psi, t_new - g, g, guess=jnp.where(n_hist >= kk + 1, pred, hist_u[0]))
-            gap = u_new - pred
-            err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * gap, u_new, hist_u[0]), 0.0)
-            # the neighbouring orders' errors, for the order choice (inf where they cannot be estimated)
+            return psi, jnp.asarray(g, rt), jnp.where(n_hist >= kk + 1, pred, hist_u[0])
+
+        def _post(kk, u_new):
+            """The order-``kk`` error estimate, and the neighbouring orders' (inf where they cannot be estimated)."""
+            pred = _predictor(kk, t_new, hist_t, hist_u)
+            err = jnp.where(n_hist >= kk + 1, _rms(err_c[kk] * (u_new - pred), u_new, hist_u[0]), 0.0)
             lo = (
                 _rms(err_c[kk - 1] * _pred_gap(kk - 1, u_new, t_new, hist_t, hist_u), u_new, hist_u[0])
                 if kk > 1
@@ -1150,16 +1197,22 @@ def bdf_march(
                 if kk < K
                 else jnp.asarray(jnp.inf, rt)
             )
-            return u_new, err, jnp.asarray(lo, rt), jnp.asarray(hi, rt)
+            return jnp.asarray(err, rt), jnp.asarray(lo, rt), jnp.asarray(hi, rt)
 
-        return jax.lax.switch(k - 1, [lambda kk=kk: _one(kk) for kk in range(1, K + 1)])
+        # The order only changes cheap vector work (the formula's weights and the error estimates), so the
+        # switch sits around those and the step itself is traced ONCE: a switch around the whole step traced
+        # the Krylov solve, its adjoint and the residual gate once per order (5x the program to compile).
+        psi, g, guess = jax.lax.switch(k - 1, [lambda kk=kk: _pre(kk) for kk in range(1, K + 1)])
+        u_new = be_step(psi, t_new - g, g, guess=guess)
+        err, lo, hi = jax.lax.switch(k - 1, [lambda u, kk=kk: _post(kk, u) for kk in range(1, K + 1)], u_new)
+        return u_new, err, lo, hi
 
-    def body(carry, _):
+    def body(carry, i):
         t, hist_t, hist_u, n_hist, k, n_at_k, dt, grow_ok = carry
         u = hist_u[0]
         n_prev = n_hist  # past states this attempt's formula and estimate could read
         remaining = t1 - t
-        done = remaining <= dt_min
+        done = (remaining <= dt_min) | (i >= max_steps)
         dt_step = jnp.clip(jnp.minimum(jnp.clip(dt, dt_min, dt_max), remaining), dt_min, dt_max)
         _t, _h = jax.lax.stop_gradient(t), jax.lax.stop_gradient(dt_step)
         _ht = jax.lax.stop_gradient(hist_t)
@@ -1200,12 +1253,30 @@ def bdf_march(
     hist_u0 = jnp.broadcast_to(u0, (H, u0.shape[0]))
     init = (t0, hist_t0, hist_u0, jnp.asarray(1, jnp.int32), jnp.asarray(1, jnp.int32), jnp.asarray(0, jnp.int32),
             dt_start, jnp.asarray(True))  # fmt: skip
-    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+    from .backend_blocks import _step_solve_tolerance
+
+    # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
+    with (
+        nullcontext()
+        if tight_step_solve
+        else _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt)
+    ):
+        (t_end, *_), (ts, us) = _budgeted_scan(
+            body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[2][0])
+        )
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))
     us = jnp.concatenate([u0[None, :], us], axis=0)
     out = _dense_sample(jnp.asarray(save_ts, rt), ts, us, K)
     reached = t_end >= t1 - 2.0 * dt_min
     return out * jnp.where(reached, jnp.asarray(1.0, rt), jnp.asarray(jnp.nan, rt))
+
+
+def _tight_step_solve(block, args):
+    """Whether the march keeps the tight default step solve (a block with coupled constraint rows, see
+    ``backend_blocks._block_has_coupled_algebraic_rows``) instead of tying it to the march's tolerance."""
+    from .backend_blocks import _block_has_coupled_algebraic_rows
+
+    return _block_has_coupled_algebraic_rows(block, args)
 
 
 def _error_rows(block, args, u0):
@@ -1288,6 +1359,7 @@ def adaptive_march(
     dense_degree=1,
     embedded=None,
     error_rows=None,
+    tight_step_solve=False,
     safety=0.9,
     min_factor=0.2,
     max_factor=5.0,
@@ -1308,9 +1380,9 @@ def adaptive_march(
     ``error_rows`` marks (all rows when ``None``; the caller leaves out index-2 rows such as the
     incompressibility row, see ``_error_rows``). An attempt with error
     above 1 is REJECTED -- the state and time stay, the step shrinks -- unless it is already at the floor
-    ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march is a fixed-length
-    ``lax.scan`` of ``max_steps`` attempts (rejections count) -- a static trip count, so it stays reverse
-    differentiable -- where the settled tail consumes attempts without solving. The trajectory is sampled at
+    ``dt_min = 1e-4 * span``; after a rejection the next step may not grow. The march takes at most ``max_steps`` attempts (rejections count), run by
+    :func:`_budgeted_scan`: a static trip count, so it stays reverse differentiable, but a settled chunk is
+    skipped and each chunk is checkpointed, so time and gradient memory follow the attempts used. The trajectory is sampled at
     ``save_ts`` by a degree-``dense_degree`` interpolant through the accepted states (:func:`_dense_sample`;
     the caller passes the base step's order, so output between steps keeps it); an exhausted budget
     NaN-poisons the result (raise ``max_steps``).
@@ -1358,10 +1430,10 @@ def adaptive_march(
 
     k = int(order) + 1  # the estimate's local error is O(dt^k)
 
-    def body(carry, _):
+    def body(carry, i):
         t, u, dt, grow_ok = carry  # t, dt are the step SCHEDULE (control); the gradient flows through u only
         remaining = t1 - t
-        done = remaining <= dt_min
+        done = (remaining <= dt_min) | (i >= max_steps)
         dt_ctrl = jnp.clip(dt, dt_min, dt_max)
         dt_step = jnp.clip(jnp.minimum(dt_ctrl, remaining), dt_min, dt_max)  # land on t1; never a degenerate dt
         # Differentiate the numerical state at the REALIZED (t, dt) schedule; the controller is a discrete
@@ -1381,7 +1453,17 @@ def adaptive_march(
         return (t_new, u_new, dt_next, accept), (t_new, u_new)
 
     init = (t0, u0, dt_start, jnp.asarray(True))
-    (t_end, *_), (ts, us) = jax.lax.scan(body, init, None, length=int(max_steps))
+    from .backend_blocks import _step_solve_tolerance
+
+    # the default step solve is traced inside this scan: tie its tolerance to the march's (see the context)
+    with (
+        nullcontext()
+        if tight_step_solve
+        else _step_solve_tolerance(rtol, atol, jax.lax.stop_gradient(jnp.max(jnp.abs(u0))), rt)
+    ):
+        (t_end, *_), (ts, us) = _budgeted_scan(
+            body, init, max_steps, settled=lambda c: t1 - c[0] <= dt_min, emit=lambda c: (c[0], c[1])
+        )
     ts = jax.lax.stop_gradient(jnp.concatenate([t0[None], ts]))  # sample times are a fixed schedule (control)
     us = jnp.concatenate([u0[None, :], us], axis=0)
     save = jnp.asarray(save_ts, rt)

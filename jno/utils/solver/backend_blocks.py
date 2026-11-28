@@ -69,9 +69,9 @@ def _index2_rows(M, A, n, dtype):
     return _algebraic_rows(M, n, dtype) & (diag == 0)
 
 
-def _block_index2_rows(block, args=None, state=None):
-    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
-    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+def _block_mass_and_operator(block, args=None, state=None):
+    """The mass and the operator (the tangent at ``state``, or at the initial state, for a nonlinear block) a time
+    block's step uses, as ``(M, A)``; ``None`` when the block has neither."""
     import jax.numpy as jnp
 
     args = {} if args is None else args
@@ -85,7 +85,6 @@ def _block_index2_rows(block, args=None, state=None):
         return None
     if M is None or not hasattr(M, "shape") or len(M.shape) != 2:
         return None
-    n = M.shape[0]
     # the runtime operator when the arguments are at hand; else the assembled one (same sparsity and zero
     # pattern -- the static placeholder of a parametric block)
     if getattr(block, "operator_fn", None) is not None and args:
@@ -101,7 +100,45 @@ def _block_index2_rows(block, args=None, state=None):
         A = block.jacobian(jnp.asarray(u).reshape(-1), block.t0, args)
     else:
         return None
-    return _index2_rows(M, A, n, jnp.zeros((), M.dtype).real.dtype)
+    return M, A
+
+
+def _block_index2_rows(block, args=None, state=None):
+    """:func:`_index2_rows` of a time block, from the mass and operator its step uses (the tangent at
+    ``state``, or at the initial state, for a nonlinear block); ``None`` when the block has neither."""
+    import jax.numpy as jnp
+
+    MA = _block_mass_and_operator(block, args, state)
+    if MA is None:
+        return None
+    M, A = MA
+    return _index2_rows(M, A, M.shape[0], jnp.zeros((), M.dtype).real.dtype)
+
+
+def _block_has_coupled_algebraic_rows(block, args=None, state=None):
+    """``True`` when the block has a zero-mass row that is more than a Dirichlet-type row (more than one entry
+    in the operator): a constraint tying unknowns together (Darcy's continuity row, a saddle problem's pressure
+    row). A relative residual of the step solve measured against the whole right-hand side leaves a much larger
+    error in such a row, and the DAE passes it on to the differential rows divided by the step, so these blocks
+    keep the tight default solve. Also ``True`` when it cannot be decided (no mass or operator, or values that
+    are traced), so the tight default is the one kept by doubt."""
+    import jax
+    import jax.numpy as jnp
+
+    MA = _block_mass_and_operator(block, args, state)
+    if MA is None:
+        return True
+    M, A = MA
+    n = M.shape[0]
+    try:
+        alg = _algebraic_rows(M, n, jnp.float32)
+        if hasattr(A, "todense"):
+            count = jnp.zeros((n,), jnp.int32).at[A.indices[:, 0]].add((A.data != 0).astype(jnp.int32))
+        else:
+            count = jnp.sum(jnp.asarray(A) != 0, axis=1)
+        return bool(jnp.any(alg & (count > 1)))
+    except jax.errors.ConcretizationTypeError:
+        return True
 
 
 def _row_scaled(A, w):
@@ -131,6 +168,41 @@ def _theta_row_weights(M, theta, n, dtype):
     import jax.numpy as jnp
 
     return jnp.where(_algebraic_rows(M, n, dtype), jnp.asarray(1.0, dtype), jnp.asarray(theta, dtype))
+
+
+# Relative-residual target of the default step solve while an error-controlled march is being traced (set by
+# ``_step_solve_tolerance``); ``None`` outside one, which keeps the fixed 1e-10 target.
+_STEP_SOLVE_TOL: list = [None]
+# A step solve's own error is kept this fraction below the march's tolerance. Looser pollutes the error
+# estimate (a 1e-6 solve at rtol 1e-6 rejected steps until the budget ran out); the atol term matters as much:
+# a relative residual r leaves an absolute error of about r * max|u| in every component, and where that
+# exceeds atol the estimate never falls below 1 (rtol 1e-7 with atol 1e-10 and the fixed 1e-10 solve sat on
+# the step floor, 5900 attempts for 0.03 of the 0.05 span, where a tighter solve took 180 steps to the end).
+_STEP_SOLVE_RTOL_FRACTION = 1e-2
+_STEP_SOLVE_ATOL_FRACTION = 1e-1
+_STEP_SOLVE_LOOSEST = 1e-6
+
+
+class _step_solve_tolerance:
+    """Trace-time context: the default step solve of an error-controlled march (tolerances ``rtol``, ``atol``,
+    state of size ``scale = max|u0|``) stops at ``min(1e-2 rtol, 1e-1 atol / scale)``, kept within ``[10 eps,
+    1e-6]``, instead of the fixed ``1e-10``: a loose march does not pay for tight inner solves and a tight one
+    does not drown its error estimate in solver noise. Read when the step is TRACED, so it must wrap the
+    ``lax.scan`` that traces it."""
+
+    def __init__(self, rtol, atol, scale, dtype):
+        import jax.numpy as jnp
+
+        eps = float(jnp.finfo(dtype).eps)
+        tol = jnp.minimum(_STEP_SOLVE_RTOL_FRACTION * rtol, _STEP_SOLVE_ATOL_FRACTION * atol / jnp.maximum(scale, 1e-300))
+        self.tol = jnp.clip(tol, 10.0 * eps, max(_STEP_SOLVE_LOOSEST, 10.0 * eps))
+
+    def __enter__(self):
+        self._prev = _STEP_SOLVE_TOL[0]
+        _STEP_SOLVE_TOL[0] = self.tol
+
+    def __exit__(self, *exc):
+        _STEP_SOLVE_TOL[0] = self._prev
 
 
 def _default_step_solve(step_op, rhs, x0, diag, *, krylov=None):
@@ -197,6 +269,8 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
         # hard one. The 100x factor is not slack -- at 10*eps (1.2e-6) GMRES still never terminated
         # (5494.0 ms/step measured). In float64 the 1e-10 floor keeps the previous behaviour exactly.
         ktol = max(1e-10, 100.0 * float(jnp.finfo(rhs.dtype).eps))
+        if _STEP_SOLVE_TOL[0] is not None:
+            ktol = jnp.maximum(_STEP_SOLVE_TOL[0], 100.0 * float(jnp.finfo(rhs.dtype).eps))
         wn, _ = _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)
         return wn
     # BiCGStab asks for the same unreachable 1e-10 and is deliberately LEFT ALONE. It never grinds:
@@ -206,7 +280,8 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
     # transient's answer by ~3e-6 relative (0.141276836 -> 0.141277224) and its gradient by ~1e-5,
     # trading accuracy for 0.4 ms/step. Not worth it. If JAX's breakdown handling ever changes, this
     # becomes the GMRES bug and wants the same `ktol`.
-    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
+    tol = 1e-10 if _STEP_SOLVE_TOL[0] is None else _STEP_SOLVE_TOL[0]
+    wn, _ = jax.scipy.sparse.linalg.bicgstab(step_op, rhs, x0=x0, tol=tol, atol=0.0, maxiter=20_000, M=lambda x: inv * x)
     # BiCGStab's breakdown/stall exit is only benign on the SYMMETRIC blocks the default was
     # chosen for. Measured on a coupled first-order block with a velocity-identity coupling
     # (genuinely non-symmetric, cond(M+dtA)=54): with a degenerate warm start it returns NaN
@@ -222,8 +297,9 @@ def _krylov_step_solve(step_op, rhs, x0, inv, krylov):
     eps = float(jnp.finfo(rhs.dtype).eps)
     r_rel = jnp.linalg.norm(step_op(wn) - rhs) / jnp.maximum(jnp.linalg.norm(rhs), eps)
     ktol = max(1e-10, 100.0 * eps)
+    # the stall the rescue is for sits near 1e-2; a converged solve to a loosened target must not trip it
     return jax.lax.cond(
-        r_rel < max(1e-9, 1e4 * eps),
+        r_rel < jnp.maximum(max(1e-9, 1e4 * eps), 10.0 * tol),
         lambda: wn,
         lambda: _scaled_gmres(step_op, rhs, x0=x0, tol=ktol, atol=0.0, restart=min(n, 40), M=lambda x: inv * x)[0],
     )

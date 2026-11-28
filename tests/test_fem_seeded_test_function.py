@@ -9,7 +9,7 @@ Oracles: the seeded and the per-DOF evaluation assemble the same residual and th
 that read the test function every way the evaluator knows -- value, gradient, a P2 Hessian, a component
 gradient, a ``cellwise`` projection, a ``where`` selection; a test function under ``lag`` (a stop-gradient,
 whose gradient would be zero) keeps its load, so ``u - lag(v)`` still projects 1 onto 1; and a term not
-linear in ``v`` keeps the per-DOF number.
+linear in ``v`` keeps the per-DOF number. By default only a test field with several components is seeded.
 """
 
 from __future__ import annotations
@@ -144,3 +144,43 @@ def test_a_term_not_linear_in_its_test_function_keeps_the_per_dof_number(monkeyp
     r0, _ = _assemble(terms, False, monkeypatch)
     assert np.abs(r0).max() > 1e-3
     assert np.allclose(r1, r0, rtol=1e-13, atol=1e-15)
+
+
+def _scalar_reaction_diffusion():
+    """A scalar P1 form, the cheap kind: its test field has one component."""
+    d = jno.shape.rect(0, 0, 1, 1).structured(n=3).domain()
+    u, v = d.fem_symbols(names=("u", "v"))
+    x, y = d.variable("interior", split=True)[:2]
+    ui, vi = u.bind(x=x, y=y), v.bind(x=x, y=y)
+    return [dot(grad(u, [x, y]), grad(v, [x, y])) + ui * ui * vi - vi]
+
+
+@pytest.mark.parametrize(
+    "terms_of, seeds",
+    [(_scalar_reaction_diffusion, False), (_component_cellwise_where, True), (_flow, True)],
+    ids=["scalar", "vector_2d", "flow_3d"],
+)
+def test_by_default_only_a_test_field_with_several_components_is_seeded(terms_of, seeds, monkeypatch):
+    """Seeding removes the per-DOF path's one-hot component columns, so it pays only for a vector or tensor
+    test field. A scalar field has none: seeded, it only traces a reverse pass on top (and its tangent, forward
+    over reverse, runs no faster), which a problem rebuilt on every call pays every time. By default a scalar
+    kernel takes the per-DOF path and a several-component one the seeded path; the flow form's scalar
+    pressure kernel is per-DOF beside its seeded momentum kernel."""
+    monkeypatch.setattr(fn, "_SEEDED_TEST", [None])
+    monkeypatch.setattr(fu, "_ELEM_MAP_CACHE", type(fu._ELEM_MAP_CACHE)())
+    monkeypatch.setattr(fu, "_ELEM_MAP_CONTENT", type(fu._ELEM_MAP_CONTENT)())
+    asked, real = [], fn._seeded_piece
+
+    def spy(piece):
+        out = real(piece)
+        asked.append(out is not None)
+        return out
+
+    monkeypatch.setattr(fn, "_seeded_piece", spy)
+    fem = jno.fem(terms_of())
+    u0 = jnp.asarray(np.random.default_rng(0).standard_normal(fem.dofs) * 0.3)
+    r = np.asarray(fem.residual(u0))
+    assert any(asked) == seeds
+    monkeypatch.setattr(fn, "_seeded_piece", real)
+    r_ref, _ = _assemble(terms_of, False, monkeypatch)  # the per-DOF number, whichever path ran
+    assert np.allclose(r, r_ref, rtol=1e-12, atol=1e-13 * np.abs(r_ref).max())

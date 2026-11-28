@@ -9,8 +9,10 @@
 # shared JAX compilation cache keeps the fresh per-file processes from
 # recompiling the same kernels, so the wall-time cost stays modest.
 #
-# `-m 'not slow'` still skips slow-marked tests (heavy training-loop recoveries,
-# tutorials).
+# `-m 'not slow'` still skips slow-marked tests (heavy training-loop recoveries, long
+# convergence studies). The nightly's slow pass runs exactly those: CI_SLOW=1 swaps the marker
+# to `-m slow`. The tutorials (tests/test_tutorial_examples.py) are slow-marked too but are NOT
+# part of that pass; they have their own manual workflow (tutorials.yml).
 #
 # CI_COVERAGE=1 (the nightly) appends coverage across files into one `.coverage`
 # and writes `coverage.xml` at the end for the codecov upload. PR runs leave it
@@ -45,6 +47,9 @@ bash "$(dirname "$0")/ci_prune_cache.sh" "$JAX_COMPILATION_CACHE_DIR" "${CI_COMP
 
 rm -f .coverage coverage.xml ci-file-times.tsv
 
+marker='not slow'
+if [ "${CI_SLOW:-0}" = "1" ]; then marker='slow'; fi
+
 cov=()
 if [ "${CI_COVERAGE:-0}" = "1" ]; then cov=(--cov=jno --cov-append --cov-report=); fi
 
@@ -65,7 +70,7 @@ failed=()
 for f in "${files[@]}"; do
   echo "::group::${f}"
   start=$SECONDS
-  timeout -s KILL "$file_timeout" pytest "$f" -m 'not slow' "${cov[@]}" --durations=15 --tb=short -q
+  timeout -s KILL "$file_timeout" pytest "$f" -m "$marker" "${cov[@]}" --durations=15 --tb=short -q
   code=$?
   # Killed by a signal (exit > 128) before pytest could report anything: a native library crashed
   # (PETSc, for one, turns a crash into an MPI abort, i.e. SIGTERM, and the captured message is lost).
@@ -73,7 +78,7 @@ for f in "${files[@]}"; do
   # flake and is flagged as a warning, not hidden.
   if [ "$code" -gt 128 ]; then
     echo "::warning::${f} was killed by signal $((code - 128)); running it once more without capture"
-    timeout -s KILL "$file_timeout" pytest "$f" -m 'not slow' "${cov[@]}" --tb=short -q -s
+    timeout -s KILL "$file_timeout" pytest "$f" -m "$marker" "${cov[@]}" --tb=short -q -s
     code=$?
   fi
   printf '%s\t%s\n' "$f" "$((SECONDS - start))" >> ci-file-times.tsv

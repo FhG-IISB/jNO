@@ -140,31 +140,33 @@ def test_m_inner_product_lanczos_matches_dense_and_differentiates():
 
 
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
-def test_exponential_nonsymmetric_advection_diffusion():
+@pytest.mark.parametrize("h", [0.3, pytest.param(0.14, marks=pytest.mark.slow)], ids=["coarse", "fine-slow"])
+def test_exponential_nonsymmetric_advection_diffusion(h):
     """``symmetric=False`` advances a **non-symmetric** advection–diffusion operator with an Arnoldi + Padé
     exponential: exact in time (step-independent) and closer to the time-converged reference than backward
     Euler. The symmetric path is *invalid* here (it assumes ``A = Aᵀ``), so it is refused rather than run."""
     ns = jno.solve.exponential(symmetric=False, order=40)
-    e3 = _final(_advection_diffusion(3), time=ns)
-    e9 = _final(_advection_diffusion(9), time=ns)
+    e3 = _final(_advection_diffusion(3, h=h), time=ns)
+    e9 = _final(_advection_diffusion(9, h=h), time=ns)
     assert np.linalg.norm(e3 - e9) / np.linalg.norm(e9) < 1e-5  # exact in time
 
-    ref = _final(_advection_diffusion(300))  # fine backward-Euler reference
-    exp_err = np.linalg.norm(_final(_advection_diffusion(4), time=ns) - ref) / np.linalg.norm(ref)
-    be_err = np.linalg.norm(_final(_advection_diffusion(4)) - ref) / np.linalg.norm(ref)
+    ref = _final(_advection_diffusion(300, h=h))  # fine backward-Euler reference
+    exp_err = np.linalg.norm(_final(_advection_diffusion(4, h=h), time=ns) - ref) / np.linalg.norm(ref)
+    be_err = np.linalg.norm(_final(_advection_diffusion(4, h=h)) - ref) / np.linalg.norm(ref)
     assert exp_err < be_err  # exact-in-time beats backward Euler at coarse steps
     with pytest.raises(NotImplementedError, match="symmetric=False"):  # it used to run and return a wrong answer
-        _final(_advection_diffusion(4), time=jno.solve.exponential(order=40))
+        _final(_advection_diffusion(4, h=h), time=jno.solve.exponential(order=40))
 
 
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
-def test_exponential_nonsymmetric_is_differentiable():
+@pytest.mark.parametrize("h", [0.3, pytest.param(0.14, marks=pytest.mark.slow)], ids=["coarse", "fine-slow"])
+def test_exponential_nonsymmetric_is_differentiable(h):
     """A gradient flows through the non-symmetric (Arnoldi + Padé) exponential integrator — the whole point:
     differentiable transport for inverse problems. ``∂/∂β`` of the final-state energy matches central FD."""
     ns = jno.solve.exponential(symmetric=False, order=40)
 
     def loss(beta):
-        return jnp.sum(jnp.asarray(_advection_diffusion(3, beta=beta).solve(time=ns).fn())[-1] ** 2)
+        return jnp.sum(jnp.asarray(_advection_diffusion(3, h=h, beta=beta).solve(time=ns).fn())[-1] ** 2)
 
     g = float(jax.grad(loss)(6.0))
     fd = (float(loss(6.0 + 1e-4)) - float(loss(6.0 - 1e-4))) / 2e-4
@@ -172,13 +174,14 @@ def test_exponential_nonsymmetric_is_differentiable():
 
 
 @pytest.mark.skipif(not _HAS_MATFREE, reason="jno.solve.exponential needs the optional 'matfree' package")
-def test_exponential_nonsymmetric_time_varying_forcing_is_step_independent():
+@pytest.mark.parametrize("h", [0.3, pytest.param(0.14, marks=pytest.mark.slow)], ids=["coarse", "fine-slow"])
+def test_exponential_nonsymmetric_time_varying_forcing_is_step_independent(h):
     """The non-symmetric (Arnoldi + Padé) path also integrates a TIME-VARYING source by ETD2 — a ramp row
     in the augmented generator. For an AFFINE-in-time source it stays exact-in-time, so a coarse march
     equals a fine one on the non-symmetric advection–diffusion operator (backward Euler would not)."""
 
     def build(nsteps):
-        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.14, time=(0.0, 0.02, nsteps))
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h, time=(0.0, 0.02, nsteps))
         u, v = d.fem_symbols()
         xi, yi, ti = d.variable("interior", split=True)
         xb, yb, _ = d.variable("boundary", split=True)

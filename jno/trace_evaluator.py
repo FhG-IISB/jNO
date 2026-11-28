@@ -6,6 +6,7 @@ import functools
 import inspect
 import itertools
 import math
+import weakref
 from typing import Any, Dict, List, NamedTuple
 
 import folx
@@ -90,16 +91,30 @@ def fd_grid(domain):
     return {**grid, "periodic": active[1]}
 
 
-@functools.lru_cache(maxsize=1024)
+#: ``_accepts_key`` answers, keyed WEAKLY on the function: a strong key (``functools.lru_cache``) pinned every
+#: per-build closure the evaluator asked about, and through its cells the whole problem it was built from.
+_ACCEPTS_KEY: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
 def _accepts_key(fn) -> bool:
     """Whether ``fn`` declares a ``key=`` parameter.
 
     Cached on the *unbound* function: ``inspect.signature`` costs ~6 µs and the
-    evaluator asks this once per model / custom-function node per trace — a few
+    evaluator asks this once per model / custom-function node per trace -- a few
     thousand times for a multi-field residual, none of which can change answer
-    between calls.
+    between calls. The cache does not keep ``fn`` alive; an object that cannot be
+    weakly referenced is answered without caching.
     """
-    return "key" in inspect.signature(fn).parameters
+    try:
+        return _ACCEPTS_KEY[fn]
+    except (KeyError, TypeError):
+        pass
+    answer = "key" in inspect.signature(fn).parameters
+    try:
+        _ACCEPTS_KEY[fn] = answer
+    except TypeError:
+        pass
+    return answer
 
 
 from .differential_operators import DifferentialOperators

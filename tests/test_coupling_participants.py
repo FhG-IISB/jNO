@@ -238,19 +238,19 @@ def test_a_participant_marches_a_window_under_jit_and_differentiates_by_a_parame
     np.testing.assert_allclose(gk, fd, rtol=1e-6)
 
 
-def _heated_strip(n_steps, k=2.0):
+def _heated_strip(n_steps, k=2.0, timed=False):
     """u.t = k Δu on the strip [0, 1] x [0, 0.2] from u = 0 over t in [0, 0.04], u = 0 on the left, k ∂u/∂n = q (a data
     field) on the right, insulated top and bottom: the heat the strip takes in is q times the right edge's length times
     the time, less what leaves through the left edge. Returns the participant, the problem, the data setter and the
-    flux ``k ∂u/∂n`` on the left."""
+    flux ``k ∂u/∂n`` on the left. ``timed``: the left edge is held at 5 t, a problem that reads time."""
     d = jno.shape.rect(0.0, 0.0, 1.0, 0.2, size=0.1).domain(time=(0.0, 0.04, n_steps))
-    xl, yl, _ = d.variable("left", split=True)
+    xl, yl, tl = d.variable("left", split=True)
     xr, yr, _ = d.variable("right", split=True)
     x, y, t = d.variable("interior", split=True)
     xi, yi, _ = d.variable("initial", split=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y, t=t)
-    cons = [ui.t - k * (ui.xx + ui.yy), u(xl, yl) - 0.0, u(xi, yi) - 0.0 * xi]
+    cons = [ui.t - k * (ui.xx + ui.yy), u(xl, yl) - (5.0 * tl if timed else 0.0), u(xi, yi) - 0.0 * xi]
     for tag in ("top", "bottom"):
         xt, yt, _ = d.variable(tag, split=True)
         cons.append(u.bind(x=xt, y=yt).d(d.variable(tag, normals=True)) - 0.0)
@@ -307,3 +307,49 @@ def test_the_stage_mean_flux_of_a_window_differentiates_by_its_data():
     fd = (float(jax.jit(out)(q + h, start)) - float(jax.jit(out)(q - h, start))) / (2 * h)
     assert abs(g) > 1e-3
     np.testing.assert_allclose(g, fd, rtol=1e-6)
+
+
+@pytest.mark.parametrize("withflux", [False, True], ids=["states", "stage-flux"])
+@pytest.mark.parametrize("scheme", ["ssprk3", "imex"])
+def test_a_problem_that_reads_time_compiles_its_march_once_for_every_window(scheme, withflux):
+    # Name the break: a problem that reads t had its window's start in the key of its compiled march and in the
+    # program itself, so every window compiled again (7 compiles and 3 to 6 s each, whatever the data). The start is now a traced argument (a shift of the clock the window marches on). Oracle: the same
+    # window marched eagerly by the problem from its own start, and its dependence on that start.
+    import logging
+
+    time = jno.solve.erk("ssprk3", cfl=0.5) if scheme == "ssprk3" else jno.solve.imex("ars222", cfl=0.5)
+    part, prob, setter, expr = _heated_strip(9, timed=True)
+    assert not part.autonomous()
+    left, right = part.interface("left"), part.interface("right")
+    kw = dict(flux=[(expr, "left", left)]) if withflux else {}
+    counted = []
+
+    class Count(logging.Handler):
+        def emit(self, record):
+            counted.append(record.getMessage()) if "Compiling" in record.getMessage() else None
+
+    logger = logging.getLogger("jax")
+    handler = Count()
+    logger.addHandler(handler)
+    state, per_window = part.initial(prob), []
+    try:
+        with jax.log_compiles():
+            for w in range(5):
+                data = setter(part.nodal(right, np.full(right.points.shape[0], 3.0 + w)), prob)
+                before = len(counted)
+                out = part.march(prob, state, 0.04 * w, 0.04, data, time=time, **kw)
+                jax.block_until_ready(out[0])
+                per_window.append(len(counted) - before)
+                if w == 3:  # the oracle: this window by the problem itself, the data through its override
+                    prob._override = part._scope(prob, data, None)
+                    try:
+                        ref = np.asarray(prob._march(time=time, x0=state, span=(0.04 * w, 0.04 * (w + 1))))
+                    finally:
+                        prob._override = None
+                    np.testing.assert_allclose(np.asarray(out[1]), ref.reshape(ref.shape[0], -1), rtol=1e-10, atol=1e-12)
+                    early = part.march(prob, state, 0.0, 0.04, data, time=time, **kw)
+                    assert np.abs(np.asarray(early[1]) - np.asarray(out[1])).max() > 1e-3  # the start does matter
+                state = out[0]
+    finally:
+        logger.removeHandler(handler)
+    assert per_window[0] > 0 and per_window[1:] == [0] * 4, per_window

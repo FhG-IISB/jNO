@@ -321,6 +321,22 @@ def test_applyfun_nonsymmetric_is_differentiable():
     assert abs(g - fd) / abs(fd) < 1e-5
 
 
+def test_diagonal_matches_dense_few_samples():
+    """The CI version of the diagonal estimator test: the same two estimands on the same operator with 8x and
+    4x fewer probes. The Hutchinson error falls as 1/sqrt(samples) (measured over 6 keys: diag A 0.022 at 4000
+    probes and 0.061-0.068 at 500; diag A^-1 0.095-0.103 at 6000 and 0.26-0.30 at 750), so the gates are the
+    slow test's margin over the expected error: 0.1 for diag A (expected 0.065) and 0.4 for diag A^-1 at
+    1500 probes (expected 0.19). A wrong estimand (diag A for diag A^-1, say) is off by far more than either."""
+    op, dense = _spd_fem()
+    d0 = jno.solve.diagonal(op, samples=500, key=jax.random.PRNGKey(0))
+    true0 = jnp.diagonal(dense)
+    assert float(jnp.linalg.norm(d0 - true0) / jnp.linalg.norm(true0)) < 0.1
+    di = jno.solve.diagonal(op, fun=lambda z: 1.0 / z, samples=1500, order=30, key=jax.random.PRNGKey(1))
+    truei = jnp.diagonal(jnp.linalg.inv(dense))
+    assert float(jnp.linalg.norm(di - truei) / jnp.linalg.norm(truei)) < 0.4
+
+
+@pytest.mark.slow
 def test_diagonal_matches_dense():
     """``diagonal`` estimates the per-DOF diagonal field — of ``A`` and (the key use) of ``A⁻¹``, the
     pointwise variance map. Stochastic, so the whole-field error is loose."""

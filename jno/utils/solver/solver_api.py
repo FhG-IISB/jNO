@@ -2389,7 +2389,7 @@ def compose_transient_step_solvers(nonlinear, linear, precond, fem, block, schem
         # dt = 1e-3 and NaN at dt = 1e-4 and below -- where an adaptive march starts.
         from ... import solve as _solve_ns
 
-        linear = _solve_ns.lu()
+        linear = at_solve_spec(_solve_ns.lu())  # the backend lu() resolves to where this solve runs
 
     if linear is None:
         from ... import solve as _solve_ns
@@ -2810,9 +2810,9 @@ def run_continuation(fem, spec, *, nonlinear=None, linear=None, precond=None, x0
                         solve = compose_linear_solve_fn(linear, precond, prev, fem)  # per step: x0 changes
                         u = solve(A, b)
                     else:
-                        from .linear import sparse_lu_solve
+                        from ..._fem import _preferred_direct_solve
 
-                        u = sparse_lu_solve(A, b)  # direct: warm start is meaningless, robustness is not
+                        u = _preferred_direct_solve(A, b)  # direct: warm start is meaningless, robustness is not
                 # Materialize INSIDE the try: dispatch is async, so a GPU-side failure (cuSolver raises on
                 # a singular matrix where the CPU path returns NaN) surfaces at the first host read -- which
                 # must be here, where the step context exists, not at the caller's first use.
