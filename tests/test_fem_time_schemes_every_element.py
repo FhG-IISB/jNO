@@ -186,13 +186,11 @@ FAMILIES = {
 }
 GAUGE = {"taylor_hood_stokes": 1}  # the pressure block of a gauge-free Stokes: compared mean-free
 # How the consistent-mass exponential is expected to do. Algebraic rows that are not walls (the RT flux, the
-# Stokes pressure) are refused by design; a one-way coupling makes the operator non-symmetric (Arnoldi); the
-# Argyris mass (condition near 1e9) caps its CG mass solve near 1e-3 (an open issue).
+# Stokes pressure) are refused by design; a one-way coupling makes the operator non-symmetric (Arnoldi).
 EXPONENTIAL = {
     "rt_p0_darcy": "refused",
     "taylor_hood_stokes": "refused",
     "coupled_P2_P1": ("symmetric=False", 1e-6),
-    "argyris": ("consistent", 2e-3),
 }
 S = jno.solve
 

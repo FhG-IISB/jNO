@@ -218,6 +218,19 @@ def assemble_fem_nonnodal(
                 raise ValueError(f"jno.fem: order={_o} on the {_sp} field; the lowest order is 1.")
         _orders.append(_o)
     _EDGE_FAMILIES = ("RT", "N1E", "N2E")
+    # Components per scalar DOF: a vector (or tensor) Lagrange field is stored component-wise, DOF
+    # ``node * n_comp + comp`` -- the layout the native assembler uses -- so the one scalar P_k dof map
+    # serves every component. The other point-value families here are scalar by construction.
+    _ncomp = []
+    for _i, _f in enumerate(fields):
+        _nc = int(_f.get("vec", 1) or 1)
+        if _nc > 1 and spaces[_i] in ("P0", "DG", "Hermite", "Argyris", "Morley"):
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): a {spaces[_i]} field with {_nc} components is not supported: "
+                f"{spaces[_i]} fields hold SCALAR DOFs here, and only Lagrange takes a vector value_shape. "
+                f"Declare one scalar {spaces[_i]} unknown per component."
+            )
+        _ncomp.append(_nc if spaces[_i] == "Lagrange" else 1)
     has_edge = any(s in _EDGE_FAMILIES for s in spaces)
     has_hermite = "Hermite" in spaces
     has_argyris = "Argyris" in spaces
@@ -824,7 +837,7 @@ def assemble_fem_nonnodal(
     def _field_ndof(i):
         s = spaces[i]
         if i in dofmaps:  # edge families (any degree) and Lagrange P_k, k >= 2: entity DOF map
-            return int(dofmaps[i].n_dofs)
+            return int(dofmaps[i].n_dofs) * _ncomp[i]
         if s == "Hermite":
             return 3 * n_verts + n_cells
         if s == "Argyris":
@@ -832,7 +845,7 @@ def assemble_fem_nonnodal(
         if s == "Morley":
             return n_verts + n_edges
         if s == "Lagrange":
-            return n_verts
+            return n_verts * _ncomp[i]
         return n_cells
 
     ndof = [_field_ndof(i) for i in range(len(spaces))]
@@ -842,6 +855,9 @@ def assemble_fem_nonnodal(
     total = offs[-1]
 
     def _field_cdofs(i):
+        if _ncomp[i] > 1:  # component-wise: scalar node ids -> (node * n_comp + comp), node-major per cell
+            _sc = jnp.asarray(dofmaps[i].cell_dofs, dtype=jnp.int32) if i in dofmaps else cells_j
+            return offs[i] + (_sc[:, :, None] * _ncomp[i] + jnp.arange(_ncomp[i], dtype=jnp.int32)).reshape(n_cells, -1)
         if i in dofmaps:  # (n_cells, n_local) -- equals the edge ids `ce` for degree-1 N1E / 2-D RT
             return offs[i] + jnp.asarray(dofmaps[i].cell_dofs, dtype=jnp.int32)
         if spaces[i] == "Hermite":
@@ -908,8 +924,8 @@ def assemble_fem_nonnodal(
                 per.append(
                     {
                         "shape_vals": lv,
-                        "shape_grads": lg @ jnp.linalg.inv(J),
-                        "cell_sol": cell_sols[i][:, None],
+                        "shape_grads": lg @ small_inv(J),
+                        "cell_sol": cell_sols[i].reshape(-1, _ncomp[i]),
                         "space": "Lagrange",
                     }
                 )
@@ -926,7 +942,7 @@ def assemble_fem_nonnodal(
                     {
                         "shape_vals": T["p1"],  # (n_quad, dim+1)
                         "shape_grads": jnp.broadcast_to(g, (T["n"], dim + 1, dim)),
-                        "cell_sol": cell_sols[i][:, None],
+                        "cell_sol": cell_sols[i].reshape(-1, _ncomp[i]),
                         "space": "Lagrange",
                     }
                 )
@@ -1708,7 +1724,7 @@ def assemble_fem_nonnodal(
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if ("Lagrange" in spaces) and dirichlet_raw:  # Lagrange value-Dirichlet: pin the region's vertex DOFs to g
         pins = pins + _lagrange_dirichlet_pins(
-            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, dofmaps=dofmaps, cells=cells
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, dofmaps=dofmaps, cells=cells, ncomp=_ncomp
         )
     extra = getattr(domain, "_extra_dof_pins", None)
     if extra:  # caller-supplied (dof, value) pins — e.g. a tree-cotree gauge + air-V restriction,
@@ -2776,7 +2792,7 @@ def _with_cell_size(ctx, meas, xq, verts=None):
         if verts is None:
             raise NotImplementedError("dom.cell_metric on this non-nodal path needs the cell's vertices.")
         J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)
-        K = jnp.linalg.inv(J)
+        K = small_inv(J)
         out["cell_metric"] = jnp.broadcast_to(K.T @ K, (nq, dim, dim))
     return out
 
@@ -3599,7 +3615,9 @@ def _region_field_pins(fields, spaces, cdofs, offs, domain):
     return out
 
 
-def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None):
+def _lagrange_dirichlet_pins(
+    dirichlet_raw, domain, field_index, spaces, pts_np, offs, dofmaps=None, cells=None, ncomp=None
+):
     """Value-Dirichlet ``(dof, value)`` pins for a P1 Lagrange field on the non-nodal path: one DOF per
     mesh vertex, so ``u = g`` on a region pins DOF ``offs[fidx] + v`` to ``g(vertex v)`` for every vertex
     the region's location predicate selects. This is the scalar-potential half of the A-V (N1E x Lagrange)
@@ -3614,16 +3632,24 @@ def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np,
     u_i = 0``, correct only for real ``g``), and a value/vertex-count mismatch.
     """
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     pins = []
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Lagrange":
             continue
+        nc = 1 if ncomp is None else int(ncomp[fidx])
+        if nc > 1 and dofmaps is not None and fidx in dofmaps:
+            raise NotImplementedError(
+                f"jno.fem (non-nodal): an essential condition on the vector Lagrange field of degree >= 2 "
+                f"(region {region!r}) is not wired next to a non-nodal field -- only degree 1 is. Use "
+                "degree 1, or declare one scalar unknown per component."
+            )
         if dofmaps is not None and fidx in dofmaps:  # P_k, k >= 2: every DOF on the region, by interpolation
             pins.extend(_general_trace_pins(dofmaps[fidx], "value", region, value_node, domain, pts_np, cells, offs[fidx]))
             continue
+        _refuse_pin_off_the_boundary(domain, region, "non-nodal Lagrange")
         vs = np.asarray(_region_node_ids(domain, region), dtype=np.int64)
         if vs.size == 0:
             raise ValueError(
@@ -3642,6 +3668,21 @@ def _lagrange_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np,
                     "the source) or split the constraint yourself."
                 )
             g = g.real
+        if nc > 1:  # vector field, DOF ``v * nc + comp``: one component (u[c](region) - g) or all of them
+            comps = [int(_comp)] if _comp is not None else list(range(nc))
+            if _comp is not None and not 0 <= comps[0] < nc:
+                raise ValueError(f"jno.fem (non-nodal): Dirichlet component {_comp} of a {nc}-component field.")
+            g = g.reshape(-1) if g.size in (1, vs.size) else g.reshape(vs.size, -1)
+            if g.ndim == 1:  # a scalar per vertex (or one constant) applies to every selected component
+                g = np.broadcast_to(g if g.size == vs.size else np.full(vs.size, float(g[0])), (len(comps), vs.size)).T
+            elif g.shape[1] != len(comps):
+                raise ValueError(
+                    f"jno.fem (non-nodal): the Dirichlet value on region {region!r} has {g.shape[1]} components "
+                    f"per vertex for {len(comps)} constrained component(s) of the field."
+                )
+            base = int(offs[fidx])
+            pins.extend((base + int(v) * nc + c, float(gv)) for v, row in zip(vs, g) for c, gv in zip(comps, row))
+            continue
         g = g.reshape(-1)
         if g.shape[0] == 1 and vs.size > 1:  # a constant value node evaluates once; broadcast it
             g = np.full(vs.size, float(g[0]))
@@ -3663,13 +3704,14 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     ``g`` is the Dirichlet value node, evaluated at the vertex coordinate. (A clamped BC -- additionally
     pinning the gradient DOFs to ``∇g`` -- is a follow-on; needed for optimal rates and the C¹ elements.)"""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     pins = []
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Hermite":
             continue
+        _refuse_pin_off_the_boundary(domain, region, "Hermite")
         for v in _region_node_ids(domain, region):
             v = int(v)
             g = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[v][None, :]))).reshape(-1)
@@ -3690,7 +3732,7 @@ def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, o
     derivative along the assembler's globally-oriented normal ``R90·(P[hi]-P[lo])``, so ``h`` (given as the
     *outward* normal derivative) is multiplied by the per-edge sign relating the two."""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     def _val(value_node, xy):
         return float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(xy)[None, :])).reshape(()))
@@ -3712,6 +3754,7 @@ def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, o
         if fidx is None or spaces[fidx] != "Morley":
             continue
         base = offs[fidx]
+        _refuse_pin_off_the_boundary(domain, region, "Morley")
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
         if kind == "value":
             for v in region_nodes:  # deflection: value DOF at each boundary vertex
@@ -3747,7 +3790,7 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     loudly**. Pins are dict-unioned per edge, so a corner is consistently pinned by both incident edges. (For
     Morley — no Hessian DOFs, edge-normal DOF is ``∂ₙ`` — the same two BCs work on *any* orientation.)"""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
 
     def _derivs(value_node, xy):
         def gfun(p):
@@ -3774,6 +3817,7 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
             continue
         base = offs[fidx]
         edge_base = base + 6 * n_verts
+        _refuse_pin_off_the_boundary(domain, region, "Argyris")
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
         for eid in boundary_edges:
             va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi)
@@ -3833,7 +3877,7 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
     (an interior edge can join two boundary vertices through the volume). Homogeneous PEC, lowest order;
     every other case (nonzero ``u×n = g``, degree k, N2E, RT) goes through :func:`_general_trace_pins`."""
     from ..._fem import _constant_of
-    from .fem_1d import _region_node_ids
+    from .fem_1d import _refuse_pin_off_the_boundary, _region_node_ids
     from .fem_facets import build_facet_connectivity
 
     cells = np.asarray(domain.mesh.cells_dict["tetra"])
@@ -3851,6 +3895,7 @@ def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
                 "jno.fem (non-nodal, 3D): only the homogeneous PEC tangential BC `n×E = 0` is wired; a "
                 "prescribed nonzero tangential trace is a follow-on."
             )
+        _refuse_pin_off_the_boundary(domain, region, "N1E")
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for f in range(fc.n_bfaces):
             fn = [int(x) for x in fc.face_nodes[f]]
@@ -3876,6 +3921,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
     evaluating anything. Facet criterion: boundary facets whose vertices all lie in the region (for a
     value BC on a region with no boundary facet, every facet, plus whole cells, of the region)."""
     from ..._fem import _constant_of, _eval_value_node_at
+    from .fem_1d import _refuse_pin_off_the_boundary
     from .fem_dofmap import (
         entity_dofs_of_tasks,
         facet_outward_normals,
@@ -3884,6 +3930,7 @@ def _general_trace_pins(dm, kind, region, value_node, domain, pts_np, cells, bas
         region_trace_entities,
     )
 
+    _refuse_pin_off_the_boundary(domain, region, "non-nodal")
     mask = domain.tag_node_mask(region, np.asarray(domain.mesh.points), closure=True)
     if mask is None:
         raise ValueError(f"jno.fem (non-nodal): essential region {region!r} has no location function.")
@@ -4015,7 +4062,7 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
     if dim == 3:  # 3-D N1E tangential (PEC) — facet-based boundary edges, not the 2-D single-use rule
         return out + _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _line_quadrature, _region_node_ids
+    from .fem_1d import _line_quadrature, _refuse_pin_off_the_boundary, _region_node_ids
 
     cell_edges = np.asarray(top.cell_edges)
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
@@ -4036,6 +4083,7 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
                 "jno.fem (non-nodal): an essential edge-trace BC is supported on RT (u·n) and N1E (u×n) only."
             )
         is_n1e = spaces[fidx] == "N1E"
+        _refuse_pin_off_the_boundary(domain, region, "N1E/RT")
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for eid in boundary:
             va, vb = (int(x) for x in top.edge_vertices[eid])
@@ -4198,7 +4246,7 @@ def _readback_kernel(dofmap, pts, derivative):
     def _one(c, cell, cf, rv, rg):
         V = pts[cell]
         J = jnp.stack([V[k] - V[0] for k in range(1, tdim + 1)], axis=1)
-        K = jnp.linalg.inv(J)
+        K = small_inv(J)
         B = jnp.diag(signs[c]) if signs is not None else transform_from_tables(tables, dofmap.ndof_local, c)
         v = jnp.einsum("ij,qjv->qiv", B, rv)
         g = jnp.einsum("ij,qjvm->qivm", B, rg)
@@ -4206,7 +4254,7 @@ def _readback_kernel(dofmap, pts, derivative):
             phi = jnp.einsum("ji,qnj->qni", K, v)
             gp = jnp.einsum("ji,qnjm,ml->qnil", K, g, K)
         elif mt == "contravariant":
-            dJ = jnp.linalg.det(J)
+            dJ = small_det(J)
             phi = jnp.einsum("ij,qnj->qni", J, v) / dJ
             gp = jnp.einsum("ik,qnkm,ml->qnil", J, g, K) / dJ
         else:

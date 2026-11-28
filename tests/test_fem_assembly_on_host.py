@@ -114,3 +114,35 @@ def test_the_solution_is_unchanged():
         ref = np.asarray(jno.np.asarray(_poisson().solve()))
     assert np.allclose(got, ref, rtol=1e-12, atol=1e-14)
     assert np.isfinite(got).all() and np.abs(got).max() > 0.0
+
+
+@_gpu_only
+def test_without_a_cpu_platform_assembly_runs_on_the_device_and_solve_names_the_setting():
+    """`JAX_PLATFORMS=cuda` (no `cpu`) used to die in assembly with JAX's bare "Unknown backend cpu", because
+    `jax.devices("cpu")` raises instead of returning []. Assembly now falls back to the device; the solve, whose
+    convergence gate reaches the host through a CPU callback, refuses once, naming `JAX_PLATFORMS=cuda,cpu`."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    platform = "cuda" if jax.devices()[0].platform == "gpu" else jax.devices()[0].platform
+    code = textwrap.dedent(
+        """
+        import jax, jno
+        d = jno.shape.rect(0, 0, 1, 1, size=0.2).domain()
+        x, y, _ = d.variable("interior", split=True); b = d.variable("boundary", split=True)
+        u, v = d.fem_symbols()
+        a, t = u.bind(x=x, y=y), v.bind(x=x, y=y)
+        fem = jno.fem([a.x * t.x + a.y * t.y - 1.0 * t, u(b[0], b[1]) - 0.0])  # assembles
+        assert fem.dofs > 0
+        try:
+            fem.solve()
+        except RuntimeError as e:
+            assert "JAX_PLATFORMS=cuda,cpu" in str(e) and "Unknown backend" not in str(e), str(e)
+            print("REFUSED-CLEARLY")
+        """
+    )
+    env = {**os.environ, "JAX_PLATFORMS": platform, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0 and "REFUSED-CLEARLY" in r.stdout, r.stderr[-1500:]

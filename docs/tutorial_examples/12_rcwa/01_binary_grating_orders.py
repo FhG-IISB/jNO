@@ -25,7 +25,10 @@ faces, the layer stack and ε from the volume coefficient, the wavelength from �
 superstrate, and the polarization from the equation itself: for a grating whose ridges run along y the
 scalar equation is exactly Maxwell's for E_y, so it is solved TE -- the same equation ``jno.fem`` solves.
 Only the truncation is genuinely ours to choose: ``orders`` Fourier terms and a ``grid`` for sampling ε,
-which converge the reflectance here to about 2e-3 of an exact-coefficient reference (0.8441 at Λ = 1.5). Because ε
+which converge the reflectance here to about 2e-3 of an exact-coefficient reference (0.8441 at Λ = 1.5). That
+2e-3 is the truncation in ``orders`` (R = 0.8459 at 160 orders, 0.8445 at 320, grid 256 both times); the grid
+adds under 4e-4 (grid 1024: 0.8463, 0.8449). It is not an edge error: samples sit at cell centres, so the ridge
+edge ``x < 0.5 Λ`` falls on a cell boundary instead of on a sample, where rounding would decide its side. Because ε
 is an analytic ``jno.fn``, it is sampled directly on the RCWA grid, so the tetrahedral mesh only
 has to carry the tags and can stay coarse. The modal method itself is Moharam & Gaylord,
 *J. Opt. Soc. Am.* 71, 811 (1981).

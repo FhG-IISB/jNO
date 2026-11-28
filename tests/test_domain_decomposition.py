@@ -573,22 +573,17 @@ def test_normal_derivative_evaluates_as_flux_value():
     assert np.max(np.abs(out - 1.0)) < 0.02, f"u.d(n) must evaluate to the flux 2x·nx = 1.0 at x=0.5, got {out.mean():.3f}"
 
 
-@pytest.mark.slow
-def test_material_interface_via_overlap_and_kx():
-    """A **material interface** (different conductivity each side) done the robust way: don't couple *on*
-    the jump. Instead let the FEM subdomain carry the discontinuity via a spatially-varying ``k(x)`` (FEM
-    handles a jump exactly when it lands on a mesh line), and overlap the two subdomains in the *uniform*
-    region so plain **overlapping-Schwarz value exchange** couples them — no one-sided flux recovery.
-
-    kL=1, kR=3 bar with the outer boundary held at the analytic profile; the interface value at x=0.5 is
-    the material kink ``kL/(kL+kR) = 0.25`` (a uniform-k / naive coupling would give the symmetric 0.5)."""
+def _material_interface_error(h):
+    """Relative L2 error at the nodes of the bar kL=1, kR=3 (outer boundary held at the analytic profile, kink
+    at x = 0.5) coupled as FEM on x <= 0.6 (carries the jump) and finite differences on x >= 0.5, plus the
+    interface value. The finite-difference region STARTS ON the jump."""
     import jno.jnp_ops as jnn
     from jno.dd import couple
 
     kL, kR = 1.0, 3.0
     a, b = 2 * kR / (kL + kR), 2 * kL / (kL + kR)  # analytic slopes: u = 1-a·x (left), u = b·(1-x) (right)
     boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # FEM covers the jump; overlap [0.5,0.6] uniform kR
-    d = jno.domain(boxA.union(boxB), mesh_size=0.05)
+    d = jno.domain(boxA.union(boxB), mesh_size=h)
     sA, sB = jno.shape.rect(0.0, 0.0, 0.6, 1.0), jno.shape.rect(0.5, 0.0, 1.0, 1.0)
     p = np.asarray(d.mesh_connectivity["points"])[:, :2]
     on = np.abs(p[:, 0] - 0.5) < 1e-6
@@ -608,8 +603,26 @@ def test_material_interface_via_overlap_and_kx():
     fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)), u(xb, yb) - g(xb, yb)])  # uniform kR (smooth region)
 
     sol = np.asarray(couple([(femA, sA), (fdmB, sB)]).solve(max_iter=200)).reshape(-1)
-    iface_val = float(np.mean(sol[on]))
-    assert abs(iface_val - kL / (kL + kR)) < 0.03, f"material kink should be {kL / (kL + kR):.2f}, got {iface_val:.3f}"
+    exact = np.where(p[:, 0] <= 0.5, 1 - a * p[:, 0], b * (1 - p[:, 0]))
+    return float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)), float(np.mean(sol[on]))
+
+
+@pytest.mark.slow
+def test_material_interface_via_overlap_and_kx():
+    """A **material interface** (different conductivity each side): the FEM subdomain carries the
+    discontinuity via a spatially-varying ``k(x)`` (FEM handles a jump exactly when it lands on a mesh line),
+    and the two subdomains are coupled by plain **overlapping-Schwarz value exchange** — no one-sided flux
+    recovery. The finite-difference region may start ON the jump (its region-edge nodes take their values from
+    the FEM field instead of being solved with the uniform-``k`` stencil, #206).
+
+    kL=1, kR=3 bar; the interface value at x=0.5 is the material kink ``kL/(kL+kR) = 0.25`` (a uniform-k /
+    naive coupling would give the symmetric 0.5). The profile is piecewise linear, so the error against it
+    is the discretisation error and falls at about second order (the mesh is not conformed to the jump, which
+    caps it near 1e-3): it fell at order ~0.5 before #206."""
+    e1, iface1 = _material_interface_error(0.1)
+    e2, iface2 = _material_interface_error(0.05)
+    assert abs(iface1 - 0.25) < 0.01 and abs(iface2 - 0.25) < 0.01, (iface1, iface2)  # 0.268 at h=0.05 before #206
+    assert e2 < 5e-3 and e1 / e2 > 3.0, (e1, e2)  # 2.4e-2 and a ratio of 1.3 before #206
 
 
 @pytest.mark.slow
@@ -875,7 +888,7 @@ def test_couple_with_declared_interface_conditions():
     assert rel < 5e-2, f"declared-interface coupling must match the MMS solution, got {rel:.2e}"
 
 
-def _fem_fdm_overlap_coupling():
+def _fem_fdm_overlap_coupling(h=0.1):
     """`-div(k grad u) = f` on the unit square with a coefficient jump at x = 0.5: FEM on x <= 0.7, finite
     differences on x >= 0.6, so the two methods differ in the overlap by their discretisation error."""
     import jno.jnp_ops as jnn
@@ -892,7 +905,7 @@ def _fem_fdm_overlap_coupling():
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
     d.region("soft", box(0.0, 0.0, 0.5, 1.0))
     d.region("stiff", box(0.5, 0.0, 1.0, 1.0))
-    d.build_mesh(mesh_size=0.1)
+    d.build_mesh(mesh_size=h)
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     f, g = source(xi, yi, jnn), exact(xb, yb, jnn)
@@ -908,14 +921,14 @@ def _fem_fdm_overlap_coupling():
 
 def test_overlap_schwarz_of_two_discretisations_stops_on_the_iterate_change():
     """With FEM on one side and finite differences on the other, the overlap jump settles at their
-    discretisation gap (here ~2.6e-3, far above tol) at any number of sweeps; the plain loop stopped on it and
+    discretisation gap (here ~1.6e-4, far above tol) at any number of sweeps; the plain loop stopped on it and
     always ran to max_iter. It stops on the change of the iterate, like the differentiable path, and reports the
     jump as information."""
-    cpl = _fem_fdm_overlap_coupling()
+    cpl = _fem_fdm_overlap_coupling(0.05)  # the overlap holds nodes the finite-difference side solves itself
     _, info = cpl.solve(tol=1e-9, max_iter=400, return_info=True)
     assert info["iterations"] < 200, info
     assert info["iterate_change"] < 1e-9
-    assert info["overlap_jump"] > 1e-4  # the discretisation gap: reported, not the stopping test
+    assert info["overlap_jump"] > 1e-5  # the discretisation gap: reported, not the stopping test
 
 
 def test_overlap_schwarz_warns_when_tol_is_not_met_by_max_iter():
@@ -923,3 +936,48 @@ def test_overlap_schwarz_warns_when_tol_is_not_met_by_max_iter():
     with pytest.warns(UserWarning, match="did not reach tol"):
         _, info = cpl.solve(tol=1e-12, max_iter=2, return_info=True)
     assert info["iterations"] == 2
+
+
+def _jump_layout_error(h, fdm_start):
+    """Relative L2 error of the FEM (x <= 0.7) + finite-differences (x >= fdm_start) coupling of
+    ``-div(k grad u) = f`` with k = 1 below x = 0.5 and 10 above, against the exact solution; the mesh is
+    conformed to the jump."""
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    cond = lambda x, m: m.where(x < 0.5, 1.0, 10.0)
+    exact = lambda x, y, m: m.sin(np.pi * y) * ((x - 0.5) / cond(x, m) + m.cos(2 * np.pi * (x - 0.5)))
+
+    def source(x, y, m):
+        k = cond(x, m)
+        phi = (x - 0.5) / k + m.cos(2 * np.pi * (x - 0.5))
+        return -k * (-4 * np.pi**2 * m.cos(2 * np.pi * (x - 0.5)) - np.pi**2 * phi) * m.sin(np.pi * y)
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("soft", box(0.0, 0.0, 0.5, 1.0))
+    d.region("stiff", box(0.5, 0.0, 1.0, 1.0))
+    d.build_mesh(mesh_size=h)
+    pts = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f, g = source(xi, yi, jnn), exact(xb, yb, jnn)
+    uf, vf = d.fem_symbols()
+    ui, vi = uf.bind(x=xi, y=yi), vf.bind(x=xi, y=yi)
+    fem = jno.fem([cond(xi, jnn) * (ui.x * vi.x + ui.y * vi.y) - f * vi, uf(xb, yb) - g])
+    u = d.unknown()
+    us = u.bind(x=xi, y=yi)
+    fdm = jno.fdm([-10.0 * (us.d2(xi) + us.d2(yi)) - f, u(xb, yb) - g])
+    left, right = jno.shape.rect(0.0, 0.0, 0.7, 1.0), jno.shape.rect(fdm_start, 0.0, 1.0, 1.0)
+    sol = np.asarray(couple([(fem, left), (fdm, right)]).solve(tol=1e-9, max_iter=80)).reshape(-1)
+    ex = exact(pts[:, 0], pts[:, 1], np)
+    return float(np.linalg.norm(sol - ex) / np.linalg.norm(ex))
+
+
+@pytest.mark.parametrize("fdm_start", [0.6, 0.5])
+def test_fdm_region_keeps_second_order_whether_or_not_it_starts_on_a_coefficient_jump(fdm_start):
+    """#206: a finite-difference region starting ON the jump (x = 0.5) applied its uniform-coefficient stencil
+    at the jump and converged at order ~0.6 (errors 1.7e-2, 1.2e-2, 7.3e-3 for h = 0.1, 0.05, 0.025); starting
+    inside the uniform material (x = 0.6) gave order ~2.3. Its region-edge nodes are now received from the FEM
+    field, so both layouts are second order."""
+    e1, e2 = _jump_layout_error(0.1, fdm_start), _jump_layout_error(0.05, fdm_start)
+    assert e2 < 2.5e-3 and e1 / e2 > 3.0, (e1, e2)

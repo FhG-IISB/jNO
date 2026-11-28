@@ -86,13 +86,13 @@ def test_tag_mesh_free_sampling_resamples_in_region():
     assert not np.array_equal(np.asarray(a), np.asarray(b)), "region must be resampled each step"
 
 
-def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
-    """A tagged Dirichlet must constrain ONLY the boundary, even when the predicate selects a *thick*
-    region (a band around a cylinder, not just its surface) -- otherwise the assembler (which applies a
-    location-fn to every node) would pin the interior velocity and silently zero the interior
-    pressure rows. Here: Stokes past a cylinder, inlet + no-slip walls/cylinder via tags, **untagged
-    outlet** = natural outflow. Assert the system is non-singular (the bug gave many zero rows), the
-    cylinder is no-slip, and the flow leaves through the open outlet."""
+def test_surface_tag_dirichlet_leaves_the_interior_free_and_enables_natural_outflow():
+    """A tag written as a boundary-only predicate (the cylinder's SURFACE, a thin shell around its radius)
+    constrains the boundary nodes and no interior node: a pin reaches every node its predicate selects, so
+    a boundary pin is spelled with a predicate that holds on the boundary only. Here: Stokes past a
+    cylinder, inlet + no-slip walls/cylinder via tags, **untagged outlet** = natural outflow. Assert the
+    system is non-singular (no zero rows), the cylinder is no-slip, the fluid next to it is free and
+    carries flow, and the flow leaves through the open outlet."""
     inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
     L, H, mu, cx, cy, r = 3.0, 1.0, 1.0, 1.0, 0.5, 0.2
     cyl = Point(cx, cy).buffer(r)
@@ -103,7 +103,7 @@ def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
     dom.point_region("ppin", (L - 0.02, 0.5))
     dom.tag("inlet", lambda x, y: x < 1e-6)
     dom.tag("walls", lambda x, y: (y < 1e-6) | (y > H - 1e-6))
-    dom.tag("cyl", lambda x, y: (x - cx) ** 2 + (y - cy) ** 2 < (r + 0.05) ** 2)  # a thick BAND, not the surface
+    dom.tag("cyl", lambda x, y: jnp.abs(jnp.sqrt((x - cx) ** 2 + (y - cy) ** 2) - r) < 1e-3)  # the cylinder's surface only
     u, v = dom.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
     p, q = dom.fem_symbols(names=("p", "q"), order=1)
     xi, yi, _ = dom.variable("interior", split=True)
@@ -125,7 +125,7 @@ def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
         ]
     )
     A = np.asarray(dense(fem.A))
-    assert int((np.abs(A).sum(1) == 0).sum()) == 0, "thick boundary predicate must not over-constrain the interior"
+    assert int((np.abs(A).sum(1) == 0).sum()) == 0, "a surface predicate must not pin interior nodes"
     sol = np.linalg.solve(A, np.asarray(fem.b).reshape(-1))
     assert np.all(np.isfinite(sol))
     off = fem.offsets

@@ -2526,13 +2526,11 @@ class domain(MeshIOMixin):
             callable | None: Function returning whether a point belongs to the tagged region, or ``None`` if
                 the tag is unknown.
         """
-        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary.
-        # the assembler applies a location-fn to EVERY node, so a bare predicate selecting a thick region
-        # would also pin interior dofs (a thick boundary predicate pinned the interior velocity and
-        # silently zeroed the interior pressure rows). Intersecting with the full-boundary region
-        # keeps Dirichlet boundary-restricted, while the exact predicate misses no boundary node
-        # (per-facet proximity alone can miss nodes on a curved boundary). NB: such a predicate is
-        # evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic, not bare numpy).
+        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary, for a
+        # location function (a surface term, sampling). A Dirichlet pin on the tag is not resolved here: the
+        # native assembler reaches EVERY node the predicate selects, interior ones too (`_boundary_node_ids`).
+        # NB: such a predicate is evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic,
+        # not bare numpy).
         where = getattr(self, "_tag_predicates", {}).get(tag, None)
         if where is not None:
             dim = self.dimension
@@ -2711,10 +2709,10 @@ class domain(MeshIOMixin):
         One general method for naming any subset of the domain -- interior *or* boundary. The
         region is abstract (predicate-based), so it is carried even without a mesh: the PINN
         sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
-        to mesh nodes/facets, and a ``jno.fem`` boundary condition bound to ``name`` is applied on
-        exactly the boundary facets where ``where`` holds (FEM location-functions are evaluated only
-        against the boundary, so a bare predicate selects the right subset -- there is no
-        interior/boundary flag). Untagged boundary stays natural (do-nothing), which is how you get a
+        to mesh nodes/facets, and a surface term bound to ``name`` integrates over exactly the
+        boundary facets where ``where`` holds, and a Dirichlet pin ``u(name) - g`` fixes EVERY mesh node where
+        ``where`` holds -- boundary and interior alike, so a boundary-only pin is written with a predicate that
+        holds on the boundary only (a thin shell, not a thick band). Untagged boundary stays natural (do-nothing), which is how you get a
         natural outflow on a complex geometry.
 
         Only the **spatial** coordinates are passed to ``where`` (never time): a region is the same
@@ -4999,8 +4997,10 @@ class domain(MeshIOMixin):
 
         def _vol(*vals):
             v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
+            from ..utils.solver.small_linalg import small_det  # lazy: jno.utils.solver imports the domain
+
             jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
-            return jnp.abs(jnp.linalg.det(jac)) / fact
+            return jnp.abs(small_det(jac)) / fact
 
         def _vol_quad(*vals):
             """The shoelace area, which is exact for a quadrilateral of ANY shape.
@@ -5213,7 +5213,9 @@ class domain(MeshIOMixin):
             v = rebuild(*vals)[cells]  # (n_cells, dim+1, dim)
             longest = jnp.max(jnp.stack([jnp.linalg.norm(v[:, j] - v[:, i], axis=-1) for i, j in pairs], axis=-1), axis=-1)
             jac = jnp.stack([v[:, i + 1] - v[:, 0] for i in range(dim)], axis=-1)
-            vol = jnp.abs(jnp.linalg.det(jac)) / fact
+            from ..utils.solver.small_linalg import small_det  # lazy: jno.utils.solver imports the domain
+
+            vol = jnp.abs(small_det(jac)) / fact
             # Facet measures by the Gram determinant, which is the one formula that covers both
             # dimensions: a triangle's facet is an edge (length) and a tet's is a triangle (area).
             surf = 0.0
@@ -5221,7 +5223,7 @@ class domain(MeshIOMixin):
                 keep = [i for i in range(dim + 1) if i != k]
                 e = jnp.stack([v[:, keep[i + 1]] - v[:, keep[0]] for i in range(dim - 1)], axis=-1)
                 gram = jnp.einsum("cij,cik->cjk", e, e)
-                surf = surf + jnp.sqrt(jnp.clip(jnp.linalg.det(gram), 0.0, None)) / fac_fact
+                surf = surf + jnp.sqrt(jnp.clip(small_det(gram), 0.0, None)) / fac_fact
             inradius = dim * vol / (surf + eps)  # r = d V / S for a d-simplex
             return longest / (norm * inradius + eps)
 

@@ -13,8 +13,12 @@ model it added.
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import functools
 import itertools
 import math
+import sys
 from typing import Dict, List, Optional, Tuple
 
 from .naming import classify_boundary
@@ -740,6 +744,46 @@ MESH_THREADS = 1
 MESH_ALGORITHM_2D = 6
 
 
+@contextlib.contextmanager
+def _keep_openmp_threads():
+    """Leave the calling thread's OpenMP thread count as it was found.
+
+    gmsh applies ``General.NumThreads`` through ``omp_set_num_threads``, which sets the CALLING thread's
+    count and is never undone, so after a mesh build every un-compiled OpenMP routine run from that thread
+    (a PARDISO symbolic analysis, BLAS) stayed on :data:`MESH_THREADS` threads for the rest of the process.
+    The count of every OpenMP runtime loaded in the process is read before and restored after. Linux only
+    (the runtimes are found through the memory map); elsewhere this is a no-op.
+    """
+    runtimes = []
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/maps") as f:
+                paths = {ln.split()[-1] for ln in f if any(k in ln for k in ("libomp", "libgomp", "libiomp"))}
+            for path in sorted(paths):
+                try:
+                    lib = ctypes.CDLL(path)
+                    runtimes.append((lib, int(lib.omp_get_max_threads())))
+                except (OSError, AttributeError):
+                    continue  # not an OpenMP runtime we can query (e.g. a stub): nothing to restore
+        except OSError:
+            pass
+    try:
+        yield
+    finally:
+        for lib, n in runtimes:
+            lib.omp_set_num_threads(n)
+
+
+def _preserving_openmp_threads(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _keep_openmp_threads():
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@_preserving_openmp_threads
 def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, order=1):
     import gmsh
 
@@ -872,6 +916,7 @@ def build(shape, periodic=None, *, algorithm=None, threads=None, order=1):
         raise
 
 
+@_preserving_openmp_threads
 def _boundary_once(shape, split_full, *, algorithm=None, threads=None):
     """One attempt at a boundary-only mesh -> ``(points (P,3), facets (F,k))``."""
     import gmsh

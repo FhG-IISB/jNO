@@ -1052,7 +1052,19 @@ def inv(x) -> FunctionCall:
     Returns:
         FunctionCall: the inverse.
     """
-    return _attach_coords(FunctionCall(jnp.linalg.inv, [_u(x)], name="inv"), [x])
+    return _attach_coords(FunctionCall(_small_inv, [_u(x)], name="inv"), [x])
+
+
+def _small_inv(a):
+    from .utils.solver.small_linalg import small_inv  # lazy: jno.utils.solver imports this module's users
+
+    return small_inv(a)
+
+
+def _small_det(a):
+    from .utils.solver.small_linalg import small_det  # lazy: see _small_inv
+
+    return small_det(a)
 
 
 def det(x) -> FunctionCall:
@@ -1068,7 +1080,7 @@ def det(x) -> FunctionCall:
     Returns:
         FunctionCall: the determinant per point.
     """
-    return _attach_coords(FunctionCall(jnp.linalg.det, [_u(x)], name="det"), [x])
+    return _attach_coords(FunctionCall(_small_det, [_u(x)], name="det"), [x])
 
 
 def diff(target, wrt) -> Diff:
@@ -1753,8 +1765,25 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
         FunctionCall: the contraction.
     """
 
-    from .trace import _component_keeps_axis
+    from .trace import Jacobian, TestFunction, TrialFunction, _component_keeps_axis
     from .trace.views import ScalarView
+
+    def _scalar_fe_derivative(e):
+        # ``grad(u, [x])`` of a scalar FE symbol along ONE variable: ``(n_q,)`` for the trial, ``(n_q, n_dof)`` for the
+        # test, with no direction axis (it is the same convention as ``u.x``), so there is nothing to contract.
+        e = _u(e)
+        return (
+            isinstance(e, Jacobian)
+            and len(e.variables) == 1
+            and isinstance(e.target, (TrialFunction, TestFunction))
+            and not getattr(e.target, "value_shape", ())
+        )
+
+    if n_contract == 1 and not keepdims and _scalar_fe_derivative(x) and _scalar_fe_derivative(y):
+        # ``inner(grad(u, [x]), grad(v, [x]))`` is ``u.x * v.x``. Contracting the last axis summed the DOF axis of the
+        # test derivative away (a singular operator on a 1-D line, a wrong one on a 2-D domain, a reshape error
+        # in a transient form).
+        return _attach_coords(_u(x) * _u(y), [x, y])
 
     if (
         n_contract == 1

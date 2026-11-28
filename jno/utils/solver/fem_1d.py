@@ -238,6 +238,39 @@ def complex_dirichlet_regions(domain: Any, dirichlet_values: Dict[str, Any]) -> 
     return out
 
 
+def _refuse_pin_off_the_boundary(domain: Any, region: str, what: str) -> None:
+    """Refuse an essential condition on a ``domain.tag`` whose predicate also holds at nodes OFF the boundary.
+
+    A pin on a point-set tag reaches every node its predicate selects (boundary and interior) on the native
+    Lagrange assembler. ``what`` names a field kind that resolves a tag through the boundary only, where those
+    interior nodes would stay free without a word: say so instead, and say how to write the pin.
+    """
+    pred = (getattr(domain, "_tag_predicates", {}) or {}).get(region)
+    if (
+        pred is None
+        or region == "boundary"
+        or region in (getattr(domain, "_tag_regions", {}) or {})
+        or region in (getattr(domain, "_interior_face_tags", ()) or ())
+    ):
+        return
+    pts = np.asarray(domain.mesh.points, dtype=np.float64)
+    dim = int(domain.dimension)
+    sel = np.flatnonzero(np.asarray(pred(*(pts[:, i] for i in range(dim)))).reshape(-1).astype(bool))
+    if sel.size == 0:
+        return
+    on_boundary = domain.tag_node_mask("boundary", pts[sel])
+    if on_boundary is None:
+        return
+    n_off = int((~np.asarray(on_boundary, dtype=bool).reshape(-1)).sum())
+    if n_off:
+        raise NotImplementedError(
+            f"jno.fem ({what}): the essential condition on tag {region!r} selects {n_off} node(s) off the boundary, "
+            f"and {what} fields pin boundary nodes only, so they would stay free. Pinning interior nodes is "
+            "supported on the native Lagrange assembler. Here, tag the boundary part alone (a predicate that "
+            "holds on the boundary only)."
+        )
+
+
 def _essential_node_ids(domain: Any, region: str) -> List[int]:
     """``_region_node_ids`` for a region carrying an ESSENTIAL condition -- empty is an error.
 
@@ -246,6 +279,7 @@ def _essential_node_ids(domain: Any, region: str) -> List[int]:
     condition. Refusing here is what makes a mis-specified tag cost a traceback instead of a
     plausible wrong field.
     """
+    _refuse_pin_off_the_boundary(domain, region, "1D")
     nids = _region_node_ids(domain, region)
     if not nids:
         known = sorted(getattr(domain, "_boundary_regions", {}) or {})
@@ -1426,6 +1460,7 @@ def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, of
         if fidx is None:
             continue
         vt = int(fields[fidx]["vec"])
+        _refuse_pin_off_the_boundary(domain, region, "1D")
         for nid in _region_node_ids(domain, region):
             p = pts[nid]
             g = float(value(p)) if callable(value) else float(value)

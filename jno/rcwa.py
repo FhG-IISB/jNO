@@ -1315,12 +1315,22 @@ def _extract_volume_source(volume_term):
     return None
 
 
+def _cell_centres(length, n):
+    """The ``n`` sample positions of one period ``[0, length)``: the CENTRES of its ``n`` equal cells.
+
+    This is the convention of the Fourier transform the layers go through (fmmax places array element
+    ``j`` at ``(j + 1/2) * length / n``), so the Fourier coefficients carry the right phase and a material
+    edge at a simple fraction of the period (``y < 0.5 * period``) never lands exactly on a sample, where
+    floating-point rounding would decide its side and move the edge by half a cell (a first-order error)."""
+    return (np.arange(n) + 0.5) * (length / n)
+
+
 def _localize_source(src_node, is_vector, period, z_range, grid, nz, params):
     """Locate an internal source by its ``|·|²`` distribution on the cell volume: the centroid ``(x₀,y₀,z₀)``
     and lateral width → **point** (``dirac_delta_source``) vs **Gaussian** (``gaussian_source`` with a fwhm).
     Returns ``dict(x0, y0, z0, kind, fwhm)`` (all static geometry; the amplitude flows separately)."""
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = _cell_centres(period[0], grid)
+    ys = _cell_centres(period[1], grid)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
@@ -1465,8 +1475,8 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None, sub=
     values, e.g. a K0 parameter). ``sub`` supersamples each pixel ``sub×sub`` and averages (subpixel
     smoothing)."""
     g = grid * sub
-    xs = np.linspace(0, period[0], g, endpoint=False)
-    ys = np.linspace(0, period[1], g, endpoint=False)
+    xs = _cell_centres(period[0], g)
+    ys = _cell_centres(period[1], g)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
@@ -1572,8 +1582,8 @@ def _sample_grid(domain, eps_nodes, grid, nz, period, z_range, sub=1):
 
     g = grid * sub
     pts = np.asarray(domain.points)
-    xs = np.linspace(0, period[0], g, endpoint=False)
-    ys = np.linspace(0, period[1], g, endpoint=False)
+    xs = _cell_centres(period[0], g)
+    ys = _cell_centres(period[1], g)
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY = np.meshgrid(xs, ys, indexing="ij")
     E = np.empty((nz, grid, grid), complex)
@@ -1661,8 +1671,8 @@ def _source_kin(femobj, domain, params=None):
 
 
 def _cell_grid_at_z(period, grid, z):
-    xs = np.linspace(0, period[0], grid, endpoint=False)
-    ys = np.linspace(0, period[1], grid, endpoint=False)
+    xs = _cell_centres(period[0], grid)
+    ys = _cell_centres(period[1], grid)
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
     return np.stack([gx.ravel(), gy.ravel(), np.full(grid * grid, z)], 1)
 
@@ -1914,6 +1924,13 @@ class _RcwaProblem:
         return _profile_solve(run, eng) if profile else run()
 
 
+def _vacuum_ambient_index(first_coeff, last_coeff):
+    """Layer index (0 or -1) of the ambient k0 is read from. The coefficient only carries k0^2*eps, so which
+    ambient is vacuum is not written in the term list: take the one with the smaller coefficient (a substrate
+    under the source has eps = n^2 > 1 and must not rescale k0 to n*k0)."""
+    return 0 if first_coeff <= last_coeff else -1
+
+
 def _build_emitter_problem(
     femobj,
     domain,
@@ -1963,11 +1980,15 @@ def _build_emitter_problem(
     zm = [zmids[i] for i in o]
     zsp = [zspans[i] for i in o]
 
-    super_coeff = float(np.real(cl[0][1]).mean())  # top ambient (vacuum) ⇒ coeff = k0²
+    # k0 from the vacuum ambient (the smaller coefficient of the two), as in the plane-wave entry (#246)
+    ki = _vacuum_ambient_index(*(float(np.real(c[1]).mean()) for c in (cl[0], cl[-1])))
+    super_coeff = float(np.real(cl[ki][1]).mean())
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)
     elif super_coeff <= 0:
-        raise RcwaError("cannot infer wavelength: the superstrate permittivity is non-positive; pass wavelength=.")
+        raise RcwaError(
+            "cannot infer wavelength: the vacuum-ambient permittivity coefficient is non-positive; pass wavelength=."
+        )
     else:
         k0 = float(np.sqrt(super_coeff))
     layers = [(t, np.asarray(e) / (k0 * k0)) for t, e in cl]  # scalar relative permittivity
@@ -1986,8 +2007,8 @@ def _build_emitter_problem(
         )
 
     # static volume grid for the DIFFERENTIABLE re-derivation of the source's centroid / width from params
-    _xs = np.linspace(0, period[0], grid, endpoint=False)
-    _ys = np.linspace(0, period[1], grid, endpoint=False)
+    _xs = _cell_centres(period[0], grid)
+    _ys = _cell_centres(period[1], grid)
     _zs = np.linspace(z_range[0], z_range[1], nz)
     _GX, _GY, _GZ = np.meshgrid(_xs, _ys, _zs, indexing="ij")
     _pts = np.stack([_GX.ravel(), _GY.ravel(), _GZ.ravel()], 1)
@@ -2022,7 +2043,7 @@ def _build_emitter_problem(
 
     def resample(params):
         g = grid * sub  # supersampled lattice for subpixel smoothing
-        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[0]), params))))
+        k0p = jnp.sqrt(jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zm[ki]), params))))
         out = []
         for (thick, _), zmid in zip(layers, zm):
             cfine = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, g, zmid), params), (g, g))
@@ -2266,7 +2287,7 @@ def rcwa(
             return float(np.real(_eval_coeff_points(coeff_node, center, cparams)).reshape(-1)[0])
         return float(np.real(coeff_layers[i][1]).mean())
 
-    ki = 0 if _ambient_coeff(0) <= _ambient_coeff(-1) else -1  # the ambient k0 is read from (layer index)
+    ki = _vacuum_ambient_index(_ambient_coeff(0), _ambient_coeff(-1))  # the ambient k0 is read from (layer index)
     super_coeff = _ambient_coeff(ki)
     if wavelength is not None:
         k0 = 2 * np.pi / float(wavelength)

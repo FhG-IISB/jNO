@@ -1113,11 +1113,25 @@ class _TraceFVM(StrongFormProblem):
         return stable
 
     def _march(
-        self, *, nonlinear=None, linear=None, precond=None, time=None, save_ts=None, x0=None, span=None, substeps=None
+        self,
+        *,
+        nonlinear=None,
+        linear=None,
+        precond=None,
+        time=None,
+        save_ts=None,
+        x0=None,
+        span=None,
+        substeps=None,
+        flux=None,
     ):
         """Method of lines: ``M u̇ + R(u, t) = 0`` with ``M = diag(c·V)`` (zero on pinned cells), marched by
         ``time=`` (backward Euler by default, any ``jno.solve`` scheme, ``jno.solve.erk`` explicitly).
-        A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``."""
+        A ``u.tt`` problem marches ``[u; v]``: ``u̇ = v``, ``m v̇ + c v + R(u) = 0``.
+
+        ``flux=f`` (``f(u, t)`` an array, e.g. a flux through a boundary) of an explicit or IMEX march also returns
+        the scheme's own quadrature of ``f`` over the window, ``(states, acc)``: the sum over its stages of
+        ``b_i dt f(U_i, t_i)``."""
         from ..utils.solver.backend_blocks import _block_time_grid
         from ..utils.solver.time_route import _infer_time_window
 
@@ -1136,8 +1150,24 @@ class _TraceFVM(StrongFormProblem):
         from ..utils.solver.backend_blocks import window_block
 
         block = window_block(block, span, x0, who="jno.fvm([...]).solve", substeps=substeps)
+        if flux is not None:
+            from ..utils.solver.imex import IMEXScheme
+            from ..utils.solver.timeschemes import _ERKScheme
+
+            if not isinstance(time, (_ERKScheme, IMEXScheme)) or second:
+                raise NotImplementedError(
+                    "jno.fvm([...])._march(flux=): the stage quadrature of a flux is taken by an explicit or IMEX "
+                    f"first-order-in-time march; this one uses {time!r}."
+                )
+            import copy
+
+            block = copy.copy(block)  # the cached block stays as it is: the functional holds this window's data
+            block.metadata = {**(block.metadata or {}), "flux_functional": flux}
         ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
         traj = _integrate_transient(block, ts, time, *steppers)
+        if flux is not None:
+            traj, acc = traj
+            return jnp.asarray(traj), acc
         return jnp.asarray(traj)[:, :n] if second else jnp.asarray(traj)
 
     def _march_parts(self, nonlinear, linear, precond, time, t0, t1, dt):

@@ -236,3 +236,74 @@ def test_a_participant_marches_a_window_under_jit_and_differentiates_by_a_parame
     h = 1e-4  # linear in q, smooth in k: the central difference's error is O(h²) ~ 1e-8 relative
     fd = (float(right_mean(q, k + h)) - float(right_mean(q, k - h))) / (2 * h)
     np.testing.assert_allclose(gk, fd, rtol=1e-6)
+
+
+def _heated_strip(n_steps, k=2.0):
+    """u.t = k Δu on the strip [0, 1] x [0, 0.2] from u = 0 over t in [0, 0.04], u = 0 on the left, k ∂u/∂n = q (a data
+    field) on the right, insulated top and bottom: the heat the strip takes in is q times the right edge's length times
+    the time, less what leaves through the left edge. Returns the participant, the problem, the data setter and the
+    flux ``k ∂u/∂n`` on the left."""
+    d = jno.shape.rect(0.0, 0.0, 1.0, 0.2, size=0.1).domain(time=(0.0, 0.04, n_steps))
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    x, y, t = d.variable("interior", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    cons = [ui.t - k * (ui.xx + ui.yy), u(xl, yl) - 0.0, u(xi, yi) - 0.0 * xi]
+    for tag in ("top", "bottom"):
+        xt, yt, _ = d.variable(tag, split=True)
+        cons.append(u.bind(x=xt, y=yt).d(d.variable(tag, normals=True)) - 0.0)
+    part = participant(jno.fvm(cons))
+    q, setter = part.data("q")
+    prob = part.rebuild([k * u.bind(x=xr, y=yr).d(d.variable("right", normals=True)) - q])
+    return part, prob, setter, k * u.bind(x=xl, y=yl).d(d.variable("left", normals=True))
+
+
+@pytest.mark.parametrize("scheme", ["ssprk3", "imex"])
+@pytest.mark.parametrize("n_steps", [5, 9, 17])
+def test_an_explicit_march_hands_over_the_window_mean_flux_of_its_own_stages(scheme, n_steps):
+    # Name the break: the window mean of the flux a sender gives out was the trapezoid rule over its frames, off at
+    # the first step after a jump (here: u = 0 against the left edge's own u = 0 while q heats the strip, a
+    # singular start). Oracle: the heat balance of the strip, which the scheme's own stage sum of the flux closes to
+    # the transfer's lumping (1e-8, whatever the step), where the trapezoid is off by 5e-4 and falls as dt².
+    time = jno.solve.erk("ssprk3", cfl=0.5) if scheme == "ssprk3" else jno.solve.imex("ars222", cfl=0.5)
+    part, prob, setter, expr = _heated_strip(n_steps)
+    left, right = part.interface("left"), part.interface("right")
+    data = setter(part.nodal(right, np.full(right.points.shape[0], 3.0)), prob)
+    start = part.initial(prob)
+    end, frames, means = part.march(prob, start, 0.0, 0.04, data, time=time, flux=[(expr, "left", left)])
+    moved = np.asarray(prob.volumes) @ (np.asarray(end) - np.asarray(start))
+    inflow = 3.0 * right.total * 0.04
+    w = np.asarray(left.weights)
+    stage = inflow + 0.04 * (w @ np.asarray(means[0]))
+    m = frames.shape[0] - 1
+    tw = np.full(m + 1, 1.0 / m)
+    tw[0] = tw[-1] = 0.5 / m
+    sampled = [np.asarray(part.sample(prob, frames[k], expr, "left", left, data)) for k in range(m + 1)]
+    trap = inflow + 0.04 * (w @ sum(a * b for a, b in zip(tw, sampled)))
+    assert abs(stage - moved) < 1e-6 * moved
+    assert abs(trap - moved) > 1e3 * abs(stage - moved)
+
+
+def test_the_stage_mean_flux_of_a_window_differentiates_by_its_data():
+    # The accumulator rides the traced march a coupling's gradient goes through: the derivative of the left edge's
+    # window-mean heat out by the uniform load q (the problem is linear in q) against a central difference.
+    import jax.numpy as jnp
+
+    part, prob, setter, expr = _heated_strip(41)  # dt = 1e-3, inside the explicit limit: no cfl substeps (reverse mode
+    # does not go through a traced substep count)
+    left, right = part.interface("left"), part.interface("right")
+    start, time = part.initial(prob), jno.solve.erk("ssprk3")
+    w = jnp.asarray(left.weights)
+
+    def out(q, start):  # the start is an argument too: a coupling's windows after the first start from traced states
+        data = setter(part.nodal(right, jnp.full(right.points.shape[0], 1.0) * q), prob)
+        return jnp.sum(w * part.march(prob, start, 0.0, 0.04, data, time=time, flux=[(expr, "left", left)])[2][0])
+
+    q = jnp.asarray(3.0)
+    g = float(jax.jit(jax.grad(out))(q, start))
+    h = 1e-3
+    fd = (float(jax.jit(out)(q + h, start)) - float(jax.jit(out)(q - h, start))) / (2 * h)
+    assert abs(g) > 1e-3
+    np.testing.assert_allclose(g, fd, rtol=1e-6)

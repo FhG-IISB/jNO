@@ -1618,7 +1618,14 @@ def _eval_integrand(domain, node, local):
             arr = jnp.asarray(local["domain_context"][node.tag])
             if arr.ndim >= 1 and arr.shape[0] == 1:
                 arr = arr[0]
-            return arr[..., dim_start:dim_end]
+            out = arr[..., dim_start:dim_end]
+            if local.get("surface", False) and str(node.tag).startswith("n_") and out.ndim == 1 and dim_end - dim_start > 1:
+                # A facet's normal is ONE vector for all its quadrature points: `(1, dim)`, a per-point vector
+                # of length one in the quadrature axis. A bare `(dim,)` met a per-point scalar `(n_q, 1)` in
+                # `_prefix_align`, which read its first axis as the quadrature axis, and `c * n` then broadcast
+                # silently whenever `n_q == dim` (2 points on a 2-D P1 edge, 3 on a 3-D P1 face).
+                out = out[None, :]
+            return out
 
         raise KeyError(f"Variable tag '{node.tag}' not found in local/domain context.")
 
