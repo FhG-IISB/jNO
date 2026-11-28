@@ -89,6 +89,30 @@ CASES = {
         layers=[(0.6, _BAR)],
         truncations=[4, 8],
     ),
+    # 1-D gratings (orders (m, 0) only): Meent's Li rule is exactly jNO's vector rule here (inverse rule for E_x,
+    # Laurent's for E_y), so these also check the vector formulations against an independent code.
+    "bar1d_te": dict(
+        period=(0.8, 0.8),
+        wavelength=1.0,
+        eps_top=1.0,
+        eps_bottom=2.25,
+        k_in=(0.22, 0.0),
+        pol="s",
+        layers=[(0.6, _BAR)],
+        truncations=[4, 8],
+        one_d=True,
+    ),
+    "bar1d_tm": dict(
+        period=(0.8, 0.8),
+        wavelength=1.0,
+        eps_top=1.0,
+        eps_bottom=2.25,
+        k_in=(0.22, 0.0),
+        pol="p",
+        layers=[(0.6, _BAR)],
+        truncations=[4, 8],
+        one_d=True,
+    ),
 }
 for _c in CASES.values():
     _c["polarization"] = pure(_c["k_in"], _c["pol"])

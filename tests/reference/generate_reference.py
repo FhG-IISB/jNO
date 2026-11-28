@@ -7,8 +7,9 @@ truncated problem as jNO's ``formulation="FFT"`` (Laurent's rule) with the paral
 ``|m|, |n| <= M``:
 
 * fmmax 1.7.1: ``Formulation.FFT``, ``Truncation.PARALLELOGRAMIC``, pixel-centred Fourier coefficients;
-* torcwa: Laurent's rule (``_material_conv``), ``order=[M, M]``; it samples the grid at pixel corners, which only
-  shifts the structure by half a pixel and leaves every diffraction efficiency unchanged.
+* torcwa: Laurent's rule (``_material_conv``), ``order=[M, M]`` (``[M, 0]`` in 1-D); it samples the grid at pixel
+  corners, which only shifts the structure by half a pixel and leaves every diffraction efficiency unchanged;
+* Meent 0.13 (1-D cases only): Li's rule, which in 1-D is jNO's vector rule (compared with ``NORMAL``).
 
 Usage (in the rcwa-ref env): ``python tests/reference/generate_reference.py [OUT.json]``.
 """
@@ -87,14 +88,15 @@ def torcwa_tr(case, m):
     sin_t = math.hypot(kx, ky) / n_top
     inc = math.asin(sin_t)
     azi = math.atan2(ky, kx) if sin_t > 0 else 0.0
-    sim = torcwa.rcwa(freq=1.0 / wl, order=[m, m], L=list(case["period"]), dtype=torch.complex128, device="cpu")
+    order = [m, 0] if case.get("one_d") else [m, m]
+    sim = torcwa.rcwa(freq=1.0 / wl, order=order, L=list(case["period"]), dtype=torch.complex128, device="cpu")
     sim.add_input_layer(eps=case["eps_top"])
     sim.add_output_layer(eps=case["eps_bottom"])
     sim.set_incident_angle(inc_ang=inc, azi_ang=azi)
     for d, spec in case["layers"]:
         sim.add_layer(thickness=d, eps=torch.as_tensor(grid_of(spec), dtype=torch.complex128))
     sim.solve_global_smatrix()
-    orders = [[i, j] for i in range(-m, m + 1) for j in range(-m, m + 1)]
+    orders = [[i, j] for i in range(-order[0], order[0] + 1) for j in range(-order[1], order[1] + 1)]
     pin = case["pol"]  # a pure s or p input, so no s/p sign convention can enter
     out = []
     for port in ("transmission", "reflection"):
@@ -108,7 +110,38 @@ def torcwa_tr(case, m):
     return out[0], out[1]
 
 
-LIBRARIES = {"fmmax": fmmax_tr, "torcwa": torcwa_tr}
+def meent_tr(case, m):
+    """Meent (numpy backend, float64), 1-D cases only: there its discrete Fourier factorization (Li's rule) is
+    the inverse rule for E_x and Laurent's for E_y, as jNO's vector formulations. ``enhanced_dfs=False`` and a grid
+    of at least 4M + 1 points keep its coefficients the plain DFT of the samples."""
+    import meent
+
+    grid = grid_of(case["layers"][0][1])[:, 0]  # the grating varies along x only
+    if len(case["layers"]) != 1 or grid.size < 4 * m + 1:
+        raise ValueError("the Meent wrapper handles one 1-D layer on a grid of >= 4M + 1 points")
+    n_top, n_bot = math.sqrt(case["eps_top"]), math.sqrt(case["eps_bottom"])
+    theta = math.asin(case["k_in"][0] / n_top)
+    mee = meent.call_mee(
+        backend=0,
+        pol={"s": 0, "p": 1}[case["pol"]],
+        n_top=n_top,
+        n_bot=n_bot,
+        theta=theta,
+        phi=0.0,
+        fto=[m, 0],
+        wavelength=case["wavelength"],
+        period=list(case["period"]),
+        ucell=np.sqrt(grid.astype(complex))[None, None, :],
+        thickness=[case["layers"][0][0]],
+        type_complex=np.complex128,
+        fourier_type=0,
+        enhanced_dfs=False,
+    )
+    res = mee.conv_solve().res
+    return float(np.sum(res.de_ti)), float(np.sum(res.de_ri))
+
+
+LIBRARIES = {"fmmax": fmmax_tr, "torcwa": torcwa_tr, "meent": meent_tr}
 
 
 def main():
@@ -118,7 +151,11 @@ def main():
 
     for lib in LIBRARIES:
         versions[lib] = md.version(lib)
-    jobs = [(name, m, lib) for name, case in CASES.items() for m in case["truncations"] for lib in LIBRARIES]
+
+    def libs(case):  # Meent only where its rule equals one of jNO's (1-D); fmmax/torcwa on the 2-D truncation
+        return ["meent", "torcwa"] if case.get("one_d") else ["fmmax", "torcwa"]
+
+    jobs = [(name, m, lib) for name, case in CASES.items() for m in case["truncations"] for lib in libs(case)]
     t0 = time.perf_counter()
     for i, (name, m, lib) in enumerate(jobs):
         t, r = LIBRARIES[lib](CASES[name], m)
