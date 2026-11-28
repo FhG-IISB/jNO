@@ -96,10 +96,7 @@ def test_gradient_in_the_pixels_matches_finite_differences(formulation):
     """The topology-optimization gradient: dT along a random smooth pixel direction, autodiff against a central
     difference, on a grey design (every pixel is a design variable).
 
-    The design is an off-centre ellipse, not a disk: the vector formulations scale the gradient field by its
-    maximum magnitude, and on a symmetric design several pixels share that maximum exactly. T then has a kink
-    there (a central difference averages only the steepest and the flattest tied slope, autodiff all of them),
-    which showed up as a 0.1 % mismatch that no step size removes. Off symmetry the two agree to 1e-8."""
+    An off-centre ellipse; the symmetric case has its own test below."""
     rng = np.random.default_rng(0)
     base = np.asarray(1.0 + 3.0 * jax.nn.sigmoid((0.3 - np.sqrt(((GX - 0.05) / 1.2) ** 2 + (GY + 0.03) ** 2)) / 0.08))
 
@@ -206,3 +203,26 @@ def test_a_thickness_inside_the_margin_equals_a_fresh_build():
         polarization="x",
     )
     assert float(T(d1)) == pytest.approx(float(fresh.solve().efficiency("T")), rel=1e-11)
+
+
+@pytest.mark.parametrize("formulation", ["POL", "JONES_DIRECT_FOURIER", "JONES"])
+def test_gradient_of_a_symmetric_design_matches_finite_differences(formulation):
+    """A centred disk: many pixels tie for the largest permittivity gradient. When the tangent field was scaled by
+    that maximum, T had a kink there and autodiff disagreed with central differences by 1e-4 to 1.4e-3 at every
+    step size (git-bug a3cd6ef). With the smooth p-norm scale the two agree like on any other design."""
+    rng = np.random.default_rng(1)
+    base = np.asarray(1.0 + 3.0 * jax.nn.sigmoid((0.3 - np.sqrt(GX**2 + GY**2)) / 0.08))
+
+    def smooth(a):
+        f = np.fft.fft2(a)
+        k = np.fft.fftfreq(N) * N
+        return np.real(np.fft.ifft2(f * np.exp(-(k[:, None] ** 2 + k[None, :] ** 2) / 18.0)))
+
+    direction = smooth(rng.standard_normal((N, N)))
+    direction /= np.abs(direction).max()
+    T = _transmission(formulation, base)
+    g = float(np.sum(np.asarray(jax.grad(T)(jnp.asarray(base))) * direction))
+    for h in (1e-4, 1e-5):
+        fd = (float(T(jnp.asarray(base + h * direction))) - float(T(jnp.asarray(base - h * direction)))) / (2 * h)
+        assert abs(fd) > 1e-4
+        assert g == pytest.approx(fd, rel=2e-6), f"{formulation} h={h}: autodiff {g} vs finite difference {fd}"
