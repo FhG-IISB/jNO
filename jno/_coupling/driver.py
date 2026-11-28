@@ -358,6 +358,14 @@ class Coupled:
                 if given is self.parts[i].problem:
                     return i
             raise ValueError("jno.solve.coupling(dirichlet=...): pass one of the coupled problems.")
+        takes = {i: getattr(self.parts[i], "takes_flux", True) for i in (a, b)}
+        if not takes[a] and not takes[b]:
+            raise NotImplementedError(
+                "jno.core([...]): neither coupled side can receive a flux condition (two high-order jno.fem sides). "
+                "Make one of them P1, or couple a high-order side to a jno.spectral / jno.fdm / jno.fvm / P1 one."
+            )
+        if takes[a] != takes[b]:  # the side that cannot take the flux takes the value
+            return a if not takes[a] else b
         s = {i: self._stiffness(i, kv, kf) for i in (a, b)}
         return a if s[a] <= s[b] else b
 
@@ -803,7 +811,7 @@ class Coupled:
         from ..utils.solver.timeschemes import _ERKScheme
 
         w = np.full(m + 1, 1.0 / m)
-        if isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)):
+        if isinstance(self._time_of(i), (_ERKScheme, IMEXScheme)) or getattr(self._time_of(i), "continuous_flux", False):
             w[0] = w[-1] = 0.5 / m
         else:
             w[0] = 0.0
@@ -813,7 +821,16 @@ class Coupled:
         cache = self.__dict__.setdefault("_maps", {})
         key = (d.receiver, d.receiver_tag, d.sender, d.sender_tag, d.flux)
         if key not in cache:
-            cache[key] = (conservative if d.flux else consistent)(dst, src)
+            send, recv = self.parts[d.sender], self.parts[d.receiver]
+            interp = getattr(send, "spectral_interp", None) or getattr(send, "edge_interp", None)
+            if interp is not None and (not d.flux or getattr(recv, "kind", None) == "spectral"):
+                # a spectral sender's interpolant read at the receiver's nodes: spectrally accurate (a flux too, when
+                # the receiver is spectral: both sides hold it pointwise)
+                import scipy.sparse as _sp
+
+                cache[key] = _sp.csr_matrix(interp(d.sender_tag, dst.points))
+            else:
+                cache[key] = (conservative if d.flux else consistent)(dst, src)
         return cache[key]
 
     def _map_jnp(self, d, dst, src):
@@ -1345,9 +1362,10 @@ def detect(constraints):
     shared-mesh region; those are ``jno.dd``'s) and, besides them, only conditions; else ``None``."""
     from .._fem import FEM
     from .._fvm.trace import _TraceFVM
+    from .._spectral.trace import _TraceSpectral
     from ..fdm import _TraceFDM
 
-    kinds = (FEM, _TraceFVM, _TraceFDM)
+    kinds = (FEM, _TraceFVM, _TraceFDM, _TraceSpectral)
     problems = [c for c in constraints if isinstance(c, kinds)]
     if len(problems) < 2 or any(getattr(p, "region_geometry", None) is not None for p in problems):
         return None

@@ -1228,6 +1228,55 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _sumfact_slot(local, node):
+    """``node``'s field slot when the field is evaluated by sum factorisation -- a Lagrange ``Q_k`` field on a
+    quadrilateral / hexahedron, see :class:`fem_lagrange.TensorFactors` -- else ``None``."""
+    fields = local.get("fields")
+    if fields is None:
+        return None
+    idx = _field_slot_or_none(local, node)
+    if idx is None:
+        return None
+    fd = fields[idx]
+    if fd.get("sumfact") is None or fd.get("cell_sol") is None:
+        return None
+    return fd
+
+
+def _sumfact_memo(fd, key, build):
+    """``build(cell_sol)``, computed once per slot and cell solution.
+
+    ``u.x``, ``u.y`` and ``u.z`` are three nodes of the trace and each asks for the field's gradient: computed
+    per node, the forward pass ran the three axis contractions three times, and -- what no compiler pass can
+    merge afterwards -- reverse mode pulled each direction back through its own transposed pass (measured on a
+    Q5 hexahedral Poisson: 18 contractions and 9 scatters per apply where 6 and 1 do). One shared array has its
+    cotangents summed first and is pulled back once. The memo is tied to the ``cell_sol`` it was built from, so
+    a slot copied for another solution (the seeded test function) does not inherit it."""
+    cs = fd["cell_sol"]
+    memo = fd.get(key)
+    if memo is None or memo[0] is not cs:
+        memo = (cs, build(cs))
+        fd[key] = memo
+    return memo[1]
+
+
+def _sumfact_values(local, node):
+    """``(n_quad, vec)``: ``Σ_n φ_n(ξ_q) cell_sol[n]`` by 1-D contractions, or ``None`` (use the tables)."""
+    fd = _sumfact_slot(local, node)
+    if fd is None:
+        return None
+    return _sumfact_memo(fd, "_sf_values", fd["sumfact"][0].values)
+
+
+def _sumfact_grads(local, node):
+    """``(n_quad, vec, dim)``: ``Σ_n ∂φ_n/∂x(ξ_q) cell_sol[n]`` by 1-D contractions, or ``None``."""
+    fd = _sumfact_slot(local, node)
+    if fd is None:
+        return None
+    factors, K = fd["sumfact"]
+    return _sumfact_memo(fd, "_sf_grads", lambda cs: factors.grads(cs, K))
+
+
 def _frozen_cell_values(local, node):
     """This cell's frozen nodal slice ``(n_local, vec)`` for a :class:`FrozenField`.
 
@@ -1655,7 +1704,9 @@ def _eval_integrand(domain, node, local):
             if vals.ndim == 2:
                 return jnp.einsum("qn,n->q", vals, cell_sol)
             return jnp.einsum("qnc,n->qc", vals, cell_sol)
-        flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
+        flat_interp = _sumfact_values(local, node)  # (n_quad, vec) by 1-D contractions, where they apply
+        if flat_interp is None:
+            flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
             # A scalar field is ``(n_quad,)``, NOT ``(n_quad, 1)`` -- ``value_shape == ()`` says there is
@@ -1810,6 +1861,15 @@ def _eval_integrand(domain, node, local):
                 contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
                 return contracted[..., 0] if len(dims) == 1 else contracted
             value_shape = getattr(node.target, "value_shape", ())
+            G = _sumfact_grads(local, node.target)  # (n_quad, vec, dim) by 1-D contractions, where they apply
+            if G is not None:
+                if len(value_shape) == 0 or len(dims) == 1:
+                    grad_list = [G[:, :, dim0] for dim0 in dims]
+                    if len(value_shape) == 0:
+                        return _drop_scalar_component_axis(grad_list)
+                    return _unpack_components(grad_list[0], node.target, axis=1)
+                flat = G if list(dims) == list(range(G.shape[-1])) else G[:, :, jnp.asarray(dims)]
+                return _unpack_components(flat, node.target, axis=1)
             if len(value_shape) == 0 or len(dims) == 1:
                 grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
                 if len(value_shape) == 0:
@@ -1875,6 +1935,9 @@ def _eval_integrand(domain, node, local):
                     else:
                         onehot = jnp.zeros((n_comp,), dtype=grads.dtype).at[comp].set(1.0)
                         comps = [grads[..., d][:, :, None] * onehot[None, None, :] for d in dims]
+                elif _sumfact_slot(local, field) is not None:
+                    G = _sumfact_grads(local, field)  # every component, shared with the field's other terms
+                    comps = [G[:, comp, d] for d in dims]
                 else:
                     comps = [jnp.sum(grads[..., d] * cell_sol[None, :, comp], axis=1) for d in dims]  # (n_quad,)
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
@@ -4708,6 +4771,13 @@ _CHUNK_OVERRIDE = [None]
 _QUAD_EXPLICIT = [False]
 #: Floors already reported during the current ``jno.fem`` call, so one request is reported once.
 _QUAD_REPORTED: set = set()
+#: The quadrature RULE of the ``jno.fem`` call being assembled (``jno.fem(quadrature=...)``, set and restored like
+#: ``_QUAD_EXPLICIT``): ``None`` the default Gauss rule, ``"gll"`` the Gauss-Lobatto-Legendre rule at the nodes of
+#: a tensor-product element (read by :func:`jno.utils.solver.fem_lagrange.lagrange_on`).
+_QUAD_RULE = [None]
+# ``jno.fem(..., matrix_free=True)``: the steady linear operator is applied through the (sum-factorised) residual
+# and never stored. Set and restored around one assembly, like the rule above.
+_MATRIX_FREE = [False]
 
 
 def quad_floor(quad_degree: int, minimum: int, what: str) -> int:
@@ -4796,15 +4866,31 @@ _CHUNK_FLOOR_BYTES = 400 << 20
 _CHUNK_FALLBACK_BYTES = 8 << 20  # CPU / unknown device: no saturation pressure, just bound memory
 
 
+def _device_bytes_limit():
+    """The default device's memory limit in bytes, ``None`` where it exposes none (a CPU backend)."""
+    try:
+        return jax.local_devices()[0].memory_stats().get("bytes_limit")
+    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
+        return None
+
+
 def chunk_budget_bytes():
     """Bytes one element chunk may occupy, taken from the device rather than tuned to one."""
-    try:
-        limit = jax.local_devices()[0].memory_stats().get("bytes_limit")
-    except Exception:  # noqa: BLE001 -- CPU backends expose no memory stats
-        limit = None
+    limit = _device_bytes_limit()
     if not limit:
         return _CHUNK_FALLBACK_BYTES
     return max(_CHUNK_FALLBACK_BYTES // 2, int(limit * _CHUNK_MEMORY_FRACTION))
+
+
+#: Share of the device a residual pass with no element blocks (sum-factorised) may take in one piece.
+_WHOLE_PASS_FRACTION = 0.25
+_WHOLE_PASS_FALLBACK_BYTES = 1 << 30  # CPU / unknown device: host memory, 1 GiB
+
+
+def whole_pass_budget_bytes():
+    """Bytes a residual pass may use when it runs over every cell at once (see ``fem_native._residual_chunk``)."""
+    limit = _device_bytes_limit()
+    return _WHOLE_PASS_FALLBACK_BYTES if not limit else int(limit * _WHOLE_PASS_FRACTION)
 
 
 def _balanced_chunk(n_items: int, chunk: int) -> int:
@@ -4825,7 +4911,7 @@ def _balanced_chunk(n_items: int, chunk: int) -> int:
     return max(1, -(-int(n_items) // k))
 
 
-def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
+def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None, *, per_bytes: int | None = None):
     """Cells per chunk, or ``None`` to keep the plain single `vmap`.
 
     The per-cell cost is the element block *including its AD tangent* (`n_test * n_local**2`), the
@@ -4835,12 +4921,16 @@ def cell_chunk(n_items: int, n_test: int, n_local: int, setting=None):
 
     Whatever size that policy (or an explicit ``setting``) lands on is then rebalanced by
     :func:`_balanced_chunk` so the chunks come out even where they can. That is a compile-time
-    concern, not a memory one, and it never raises either cost -- see there."""
+    concern, not a memory one, and it never raises either cost -- see there.
+
+    ``per_bytes`` states the per-cell cost instead, for a pass that holds no element block: a sum-factorised
+    residual keeps ``O(n_quad)`` numbers per cell, and sized as a block (``n_local**3``) a Q5 hexahedron got 5
+    cells per scan step."""
     if setting == 0:
         return None  # explicitly disabled: one vmap over every cell
     if setting is not None:  # explicit cells/chunk: an upper bound, so rebalancing still honours it
         return None if n_items <= setting else _balanced_chunk(n_items, int(setting))
-    per = max(1, int(n_test) * int(n_local) * int(n_local) * 8)
+    per = max(1, int(n_test) * int(n_local) * int(n_local) * 8) if per_bytes is None else max(1, int(per_bytes))
     chunk = max(1, chunk_budget_bytes() // per)
     chunk = max(chunk, min(_CHUNK_MIN_CELLS, _CHUNK_FLOOR_BYTES // per))  # never starve the device to honour the byte cap
     if n_items <= chunk:
@@ -5347,6 +5437,10 @@ def _leaf_content_token(leaf, seen):
     if isinstance(leaf, _Ph):
         d = _expr_digest(leaf)
         return None if d is None else ("expr", d)
+    if isinstance(leaf, type):
+        # a class held in a closure cell (one imported inside the assembler: `TensorFactors`), keyed by name as
+        # a class read from the globals is (`_fn_content_key`); bailing here made every Q_k rebuild recompile
+        return ("type", leaf.__module__, leaf.__qualname__)
     tname = type(leaf).__name__
     # MRO walk, not a name match on the leaf class: ``PolygonDomain(domain)`` and any other subclass
     # must token the same way -- matching only the base name made every shapely-built domain bail,

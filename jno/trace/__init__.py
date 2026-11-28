@@ -3967,6 +3967,19 @@ class ModelCall(Placeholder):
             )
         return sym
 
+    @property
+    def basis(self):
+        """The spectral space of a spectral unknown (``domain.unknown(space="spectral", order=...)``): its
+        ``nodes``, ``coeffs(values)`` / ``values(coeffs)``, interpolation ``basis(values, x, y)``,
+        ``refine(values, order)``, ``integrate`` and ``wavenumbers``. See :mod:`jno._spectral.space`."""
+        sp = getattr(self.model, "__dict__", {}).get("_spectral_space")
+        if sp is None:
+            raise AttributeError(
+                "`.basis` belongs to a spectral unknown (domain.unknown(space='spectral', order=...)); this is a "
+                f"{type(self.model).__name__} output."
+            )
+        return sp
+
     def test(self) -> "TestFunction":
         """The FEM **test function** of this unknown (``domain.unknown()``): ``v = u.test()``. In ``jno.fem``
         the unknown is the trial function and ``v`` its test function -- same space, shape and order."""
@@ -6038,6 +6051,10 @@ class FemResidualOperator:
         self.jacobian = jacobian_fn
         # ``(u, args) -> diag J(u)`` without the matrix, when the assembler provides it (see `_jacobian_handle`)
         self.jacobian_diag = None
+        # ``(u, args) -> SemData`` and ``() -> SemData`` at a concrete reference state: the spectral-element
+        # preconditioners' data of the tangent (``jno.fem(matrix_free=True)``, sem_precond.py); ``None`` elsewhere
+        self.jacobian_sem = None
+        self.jacobian_sem_ref = None
         self.size = size
         self.runtime_parameter_exprs = runtime_parameter_exprs or {}
         self.residual_basis = residual_basis or {}
@@ -6085,6 +6102,10 @@ class FemResidualOperator:
 
         if self.jacobian_diag is not None:
             jac.diag = lambda u: self.jacobian_diag(u, args)
+        # ``jno.fem(matrix_free=True)``: a default Newton reads this and runs on JVPs and ``diag``, never ``jac(u)``
+        jac.matrix_free = bool(getattr(self, "matrix_free", False))
+        if getattr(self, "jacobian_sem", None) is not None:
+            jac.sem = lambda u: self.jacobian_sem(u, args)
         return jac
 
     def solve(self, solve_fn=None, *, u0=None, values=None):

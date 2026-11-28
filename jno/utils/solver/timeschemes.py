@@ -1825,6 +1825,8 @@ def _mass_structure(M, n):
     its zero (algebraic) rows."""
     import jax.experimental.sparse as jsparse
 
+    if getattr(M, "matrix_free", False):  # an unstored mass: its zero rows are its zero diagonal entries
+        return ("general", None), np.asarray(M.diag()) == 0
     if isinstance(M, jsparse.BCOO):
         idx = np.asarray(M.indices)
         if np.all(idx[:, 0] == idx[:, 1]):
@@ -1844,7 +1846,10 @@ def _apply_mass_inverse(M, structure, algebraic, r):
     """``M⁻¹ r`` on the differential rows (0 on the algebraic ones), for the structure of :func:`_mass_structure`."""
     kind, rows = structure
     if kind == "general":
-        return jax.scipy.sparse.linalg.cg(lambda v: M @ v, r, tol=1e-12, maxiter=10 * r.shape[0])[0]
+        # the algebraic rows (zero rows and columns of M) are taken out by an identity on them
+        keep = jnp.where(algebraic, 0.0, 1.0).astype(r.dtype)
+        x = jax.scipy.sparse.linalg.cg(lambda v: M @ v + (1.0 - keep) * v, keep * r, tol=1e-12, maxiter=10 * r.shape[0])[0]
+        return keep * x
     if kind == "diag":
         diag = jnp.zeros(r.shape[0], r.dtype).at[jnp.asarray(rows)].add(M.data)
     elif kind == "vector":
@@ -1898,6 +1903,25 @@ class _ERKScheme(_TimeScheme):
                 structure, alg_np = _mass_structure(mass(float(block.t0)), n)
         algebraic = jnp.asarray(alg_np)
         has_alg = bool(alg_np.any())
+        # Rows that only HOLD a value (a constant Dirichlet row ``u_d = g``) are set, not solved: the block says
+        # which and to what (``metadata["held_rows"]``). Otherwise every stage would run the Newton-Jacobi
+        # projection below, a residual evaluation per iteration -- on an unstored operator, 8 stiffness applies
+        # per stage for rows whose answer is known.
+        held = (block.metadata or {}).get("held_rows")
+        if held is not None and has_alg:
+            h_rows, h_vals = jnp.asarray(held[0]), jnp.asarray(held[1])
+            covered = np.zeros(n, dtype=bool)
+            covered[np.asarray(held[0])] = True
+            if not np.array_equal(covered, alg_np):
+                held = None  # not exactly the constraint rows: solve them
+        if held is not None and has_alg:
+
+            def project(U, t):
+                return U.at[h_rows].set(h_vals.astype(U.dtype))
+        else:
+
+            def project(U, t):
+                return self._project(residual, U, t, algebraic)
 
         def rate(U, t):
             return -_apply_mass_inverse(mass(t), structure, algebraic, residual(U, t))
@@ -1910,7 +1934,7 @@ class _ERKScheme(_TimeScheme):
                     if A[i, j] != 0:
                         U = U + (dt * A[i, j]) * ks[j]
                 if has_alg:
-                    U = self._project(residual, U, t + c[i] * dt, algebraic)
+                    U = project(U, t + c[i] * dt)
                 ks.append(rate(U, t + c[i] * dt))
                 if flux is not None and b[i] != 0:
                     part = (dt * b[i]) * flux(U, t + c[i] * dt)
@@ -1919,7 +1943,7 @@ class _ERKScheme(_TimeScheme):
             for i in range(b.size):
                 if b[i] != 0:
                     out = out + (dt * b[i]) * ks[i]
-            out = self._project(residual, out, t + dt, algebraic) if has_alg else out
+            out = project(out, t + dt) if has_alg else out
             return out if flux is None else (out, acc)
 
         return step_fn
@@ -1964,6 +1988,26 @@ class _ERKScheme(_TimeScheme):
         else:
             run = _flux_run(step, flux, dt, s0, grid[0])
 
+        from .backend_blocks import _march_eagerly, _march_to_host
+
+        if self.cfl is None and not traced and _march_eagerly(args, save_ts):
+            # Evaluated eagerly at a fixed step: chunks, frames to the host as they are made, and on the device
+            # only the states a save time reads (`_march_to_host`). The one-scan march below keeps every step:
+            # 51 states of a 4.3M-entry wave state in float64, 1.75 GB, to return two frames.
+            def make_step(args_, t_start):
+                stp = self.stepper(block, args_)
+
+                def step_(u, t_next):
+                    un = stp(u, t_next - dt, dt)
+                    return un, un
+
+                return step_
+
+            grid_np = np.asarray(grid, dtype=float)
+            return _march_to_host(
+                block, args, ("erk", *ident), make_step, s0, grid_np, s0.dtype, save_ts,
+                state_of=lambda c: c, prefix_ts=grid_np[:1], prefix_states=[s0], degree=self._order,
+            )  # fmt: skip
         if self.cfl is not None and not traced:
             # Evaluated eagerly: the substeps of every interval come from the CFL limit of the state at its start,
             # so a wave that speeds up during the march is followed.

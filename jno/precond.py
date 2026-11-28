@@ -44,6 +44,8 @@ from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exporte
 __all__ = [
     "PrecondContext",
     "jacobi",
+    "fdm_schwarz",
+    "pmg",
     "chebyshev",
     "form",
     "inner",
@@ -63,6 +65,7 @@ __all__ = [
     "fsai",
     "schwarz",
     "coarse",
+    "spectral",
 ]
 
 
@@ -449,6 +452,135 @@ class _Jacobi(_Spec):
 
     def __repr__(self):
         return "jno.precond.jacobi()"
+
+
+def _sem_data(ctx, who):
+    """The spectral-element preconditioners' data of ``ctx.A`` at its state (``sem_precond.SemData``)."""
+    fn = getattr(ctx.A, "sem_fn", None)
+    if fn is None:
+        raise ValueError(
+            f"{who} preconditions an operator of jno.fem(..., matrix_free=True) on one Q_k field (k >= 3, "
+            "quadrilaterals or hexahedra); this operator is not one. Use jno.precond.jacobi(), or build the "
+            "problem with matrix_free=True."
+        )
+    return fn()
+
+
+def _sem_levels(spec, ctx, data):
+    """The frozen AMG hierarchy of the coarse operator (``None``: it is solved densely), kept on the spec per
+    problem. Built from concrete data: here when ``data`` is concrete (a linear form), else by :func:`_sem_prepare`
+    before the solve is traced (a Newton solve, whose iterate is a tracer)."""
+    from .utils.solver.sem_precond import DENSE_COARSE_MAX, coarse_levels
+
+    if data.st.n_coarse <= DENSE_COARSE_MAX:
+        return None
+    # Kept on the problem's own structure, not on the spec: `fem.solve(precond=jno.precond.pmg())` builds a new spec
+    # per call, and rebuilding the hierarchy each time cost 1.2 s of a 1.7 s solve (Q3, 551k DOFs, 21952 vertices).
+    levels = data.st.cache.get("amg_levels")
+    if levels is None:
+        if isinstance(data.coarse_data, jax.core.Tracer):
+            raise TypeError(
+                f"{spec!r}: the coarse operator ({data.st.n_coarse} unknowns) needs an AMG hierarchy built from a "
+                "concrete state, and this solve is traced without one. Solve through fem.solve(precond=...), which "
+                "builds it first."
+            )
+        levels = data.st.cache["amg_levels"] = coarse_levels(data)
+    return levels
+
+
+def _sem_prepare(spec, fem):
+    """Before a solve is traced: the AMG hierarchy of a large coarse operator, from the problem's reference state,
+    once per problem (kept on its structure, see :func:`_sem_levels`)."""
+    from .utils.solver.sem_precond import DENSE_COARSE_MAX, coarse_levels
+
+    op = getattr(fem, "_op", None)
+    holder = op[0] if isinstance(op, tuple) and op else op
+    statics = getattr(holder, "sem_statics", None)
+    ref = getattr(holder, "jacobian_sem_ref", None) or getattr(holder, "sem_fn", None)
+    if statics is None or ref is None:
+        return
+    st = statics()
+    if st.n_coarse <= DENSE_COARSE_MAX or st.cache.get("amg_levels") is not None:
+        return
+    st.cache["amg_levels"] = coarse_levels(ref())
+
+
+class _FDMSchwarz(_Spec):
+    """Spec for the element fast-diagonalisation Schwarz preconditioner; see :func:`fdm_schwarz`."""
+
+    # Built from the operator it is handed, inside the trace (a Newton step's iterate): the one host step, the AMG
+    # hierarchy of a large coarse operator, reads a concrete reference state the operator offers. So a solve
+    # holding it compiles once and is reused (`precond_compiles`).
+    traceable = True
+
+    def __init__(self, coarse):
+        self.coarse = bool(coarse)
+        self.key = ("fdm_schwarz", self.coarse)
+
+    def prepare(self, fem):
+        if self.coarse:
+            _sem_prepare(self, fem)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.sem_precond import coarse_correction
+
+        data = _sem_data(ctx, "jno.precond.fdm_schwarz()")
+        if not self.coarse:
+            return PrecondApplier(data.schwarz)
+        corr = coarse_correction(data, _sem_levels(self, ctx, data))
+        return PrecondApplier(lambda r: data.schwarz(r) + corr(r))  # both symmetric: so is the sum
+
+    def __repr__(self):
+        return f"jno.precond.fdm_schwarz(coarse={self.coarse})"
+
+
+class _PMG(_Spec):
+    """Spec for the two-level p-multigrid V-cycle; see :func:`pmg`."""
+
+    traceable = True  # as `_FDMSchwarz`
+
+    def __init__(self, smoother, degree, lmin_ratio, bound_iters, safety):
+        if smoother not in ("schwarz", "jacobi"):
+            raise ValueError(f"jno.precond.pmg(smoother={smoother!r}): use 'schwarz' or 'jacobi'.")
+        if int(degree) < 1:
+            raise ValueError(f"jno.precond.pmg(degree={degree!r}): the smoothing polynomial needs degree >= 1.")
+        self.smoother, self.degree = smoother, int(degree)
+        self.lmin_ratio, self.bound_iters, self.safety = float(lmin_ratio), int(bound_iters), float(safety)
+        self.key = ("pmg", self.smoother, self.degree, self.lmin_ratio, self.bound_iters, self.safety)
+
+    def prepare(self, fem):
+        _sem_prepare(self, fem)
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.krylov import chebyshev_apply, power_iteration_bound
+        from .utils.solver.sem_precond import coarse_correction
+
+        data = _sem_data(ctx, "jno.precond.pmg()")
+        mv = ctx.A.mv
+        n = int(ctx.A.shape[0])
+        if self.smoother == "schwarz":
+            M = data.schwarz
+        else:
+            d = ctx.diag()
+            inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+            M = lambda v: inv * v  # noqa: E731
+        hi = self.safety * power_iteration_bound(mv, n, dtype=data.mask.dtype, iters=self.bound_iters, M=M)
+        lo = self.lmin_ratio * hi
+        corr = coarse_correction(data, _sem_levels(self, ctx, data))
+        deg = self.degree
+
+        def smooth(r):
+            return chebyshev_apply(mv, r, lmin=lo, lmax=hi, degree=deg, M=M)
+
+        def vcycle(r):
+            x = smooth(r)
+            x = x + corr(r - mv(x))
+            return x + smooth(r - mv(x))
+
+        return PrecondApplier(vcycle)  # the same polynomial before and after a Galerkin correction: symmetric
+
+    def __repr__(self):
+        return f"jno.precond.pmg(smoother={self.smoother!r}, degree={self.degree})"
 
 
 class _RealEquivalent(_Spec):
@@ -1061,6 +1193,31 @@ def jacobi(*, float32: bool = False) -> _Jacobi:
     double -- see :func:`_materialize_in_float32`.
     """
     return _precision(_Jacobi(), float32)
+
+
+@_reusable
+def fdm_schwarz(*, coarse: bool = True) -> _FDMSchwarz:
+    """Element **fast-diagonalisation Schwarz** for ``jno.fem(..., matrix_free=True)`` on a Q_k field (k >= 3,
+    quadrilaterals or hexahedra): each cell's problem, extended by one node into its neighbours, is replaced by
+    its separable approximation at the current state and inverted exactly by fast diagonalisation (Lynch, Rice &
+    Thomas, Numer. Math. 6, 1964; Lottes & Fischer, J. Sci. Comput. 24, 2005), ``O(k^(d+1))`` per cell like an
+    apply; the cells' corrections are added. ``coarse=True`` adds the Q1 Galerkin coarse correction on the mesh
+    vertices (two-level additive Schwarz). Symmetric, so ``jno.solve.cg()`` may use it. Rebuilt at every Newton
+    iterate. See ``jno/utils/solver/sem_precond.py`` and docs/spectral.md."""
+    return _FDMSchwarz(coarse)
+
+
+@_reusable
+def pmg(
+    *, smoother: str = "schwarz", degree: int = 2, lmin_ratio: float = 0.1, bound_iters: int = 12, safety: float = 1.1
+) -> _PMG:
+    """Two-level **p-multigrid** V-cycle for ``jno.fem(..., matrix_free=True)`` on a Q_k field (k >= 3,
+    quadrilaterals or hexahedra): Chebyshev smoothing of ``degree`` on the Q_k operator (preconditioned by the
+    element fast-diagonalisation Schwarz, ``smoother="schwarz"``, or by its diagonal, ``"jacobi"``; the spectrum's
+    top by ``bound_iters`` power iterations, the smoothed window ``[lmin_ratio, 1] x safety x top``), and a Q1
+    Galerkin coarse correction on the mesh vertices, solved by LU when small and by an AMG V-cycle otherwise.
+    Symmetric where the operator is. Rebuilt at every Newton iterate. See ``jno/utils/solver/sem_precond.py``."""
+    return _PMG(smoother, degree, lmin_ratio, bound_iters, safety)
 
 
 @_reusable
@@ -4279,3 +4436,15 @@ def chebyshev(
     double -- see :func:`_materialize_in_float32`.
     """
     return _precision(_Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters), float32)
+
+
+@_reusable
+def spectral(*, max_block: int = 4096, rcond: float = 1e-12):
+    """The **Fourier-mode block** preconditioner of a ``jno.spectral`` problem: the operator's dense block per Fourier
+    mode (over the polynomial nodes of every unknown), read by probing and inverted mode by mode. Exact for an
+    operator whose coefficients do not vary along the Fourier axes (walls included), so GMRES takes one or two
+    iterations; the default of a large spectral solve. ``max_block`` bounds the block size (an all-Chebyshev
+    problem is one block: a dense LU). See :mod:`jno._spectral.precond`."""
+    from ._spectral.precond import SpectralPrecond
+
+    return SpectralPrecond(max_block=max_block, rcond=rcond)

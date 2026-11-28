@@ -28,6 +28,8 @@ from . import bayesian, fn, litho, lora, optimizers, precond, solve, space, trac
 from . import jnp_ops as np
 from ._fem import Solution, derived, fem, lag
 from ._fvm import fv, fvm
+from ._spectral.scheme import sp
+from ._spectral.trace import spectral
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -261,6 +263,8 @@ __all__ = [
     "fv",
     "fvm",
     "fd",
+    "sp",
+    "spectral",
     "rcwa",
     "Rcwa",
     "RcwaError",

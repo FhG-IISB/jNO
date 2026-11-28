@@ -43,6 +43,10 @@ def _algebraic_rows(M, n, dtype):
 
     if hasattr(M, "todense"):  # BCOO: duplicates are summed, so a row is zero iff its |data| sums to zero
         mass = jnp.zeros((n,), dtype).at[M.indices[:, 0]].add(jnp.abs(M.data).astype(dtype))
+    elif getattr(M, "matrix_free", False):
+        # an unstored mass (``jno.fem(matrix_free=True)``): positive semidefinite with the constrained rows AND
+        # columns zeroed, so a row is zero exactly where its diagonal is
+        mass = jnp.abs(jnp.asarray(M.diag(), dtype))
     else:
         mass = jnp.sum(jnp.abs(jnp.asarray(M, dtype)), axis=1)
     return mass == 0
@@ -58,6 +62,8 @@ def _index2_rows(M, A, n, dtype):
     if hasattr(A, "todense"):  # BCOO: duplicates are summed
         i, j = A.indices[:, 0], A.indices[:, 1]
         diag = jnp.zeros((n,), dtype).at[i].add(jnp.where(i == j, jnp.abs(A.data), 0).astype(dtype))
+    elif getattr(A, "matrix_free", False):  # an unstored operator knows its diagonal
+        diag = jnp.abs(jnp.asarray(A.diag())).astype(dtype)
     else:
         diag = jnp.abs(jnp.diagonal(jnp.asarray(A))).astype(dtype)
     return _algebraic_rows(M, n, dtype) & (diag == 0)
@@ -573,7 +579,9 @@ class SemidiscreteTimeBlock:
 
         # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
         def _operand(x):
-            return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
+            if hasattr(x, "todense") or getattr(x, "matrix_free", False):  # applied, never densified
+                return x
+            return jnp.asarray(x, dtype)
 
         if self.is_nonlinear():
             from .newton_krylov import newton_krylov
@@ -653,6 +661,32 @@ class SemidiscreteTimeBlock:
                 r_next = jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
                 g = (M_t @ (wn - u)) / dt + (r_next if w is None else w * r_next)
                 return g if r_now is None else g + r_now
+
+            # ``jno.fem(matrix_free=True)``: no tangent to assemble, only its diagonal. The step is Newton-Krylov on
+            # JVPs of G, preconditioned by diag(∂G/∂wn) = diag(M)/dt + w·diag(J_R(wn)).
+            _jd = (self.metadata or {}).get("jacobian_diag") if self.jacobian is None else None
+            if _jd is not None:
+                from .linear import matrix_diagonal
+                from .solver_api import step_form
+
+                d_m = jnp.asarray(matrix_diagonal(M_t), dtype).reshape(-1) / dt
+
+                def step_diag(wn):
+                    d_j = jnp.asarray(_jd(wn, t_next, args), dtype).reshape(-1)
+                    return d_m + (d_j if w is None else w * d_j)
+
+                if nonlinear_solve is None:
+                    return _verdict(G, u, newton_krylov(G, x0, jacobian_diag=step_diag), report)
+
+                def no_tangent(wn):
+                    raise ValueError(
+                        "jno.fem(matrix_free=True) assembles no step tangent for a direct solve: use "
+                        "jno.solve.newton() (direct=None or False), or leave matrix_free out."
+                    )
+
+                no_tangent.matrix_free, no_tangent.diag = True, step_diag
+                with step_form(1.0 / dt, thn, t_next):
+                    return _verdict(G, u, nonlinear_solve(G, x0, jacobian=no_tangent), report)
 
             if nonlinear_solve is not None:
                 # A sparse-direct Newton (``jno.solve.newton(direct=True)``) factorizes the ASSEMBLED

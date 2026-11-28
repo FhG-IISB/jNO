@@ -143,9 +143,15 @@ def _nodal_scheme(expr, scheme=None):
             continue
         seen.add(id(n))
         if getattr(getattr(n, "model", None), "_fem_field", None) == "node":
-            return "finite_difference"
+            # a spectral unknown differentiates with its own basis (jno.spectral), any other nodal field by stencils
+            return "spectral_basis" if "_spectral_space" in getattr(n.model, "__dict__", {}) else "finite_difference"
         stack.extend(iter_children(n) or ())
     return "automatic_differentiation"
+
+
+#: the families that differentiate a nodal field's stored values (``u.t`` of such a field is the strong-form time
+#: derivative, ``u.xx`` one second-derivative node)
+_NODAL_FAMILIES = ("finite_difference", "spectral_basis")
 
 
 def _view_scheme(view, scheme=None):
@@ -3279,7 +3285,9 @@ class FieldViewWithPartials(ScalarView):
 
         cv = object.__getattribute__(self, "_coord_vars")
         result = self._expr
-        fd_scheme = getattr(self, "_bind_scheme", None) or "finite_difference"  # `.bind(..., scheme=jno.fd(...))`
+        fd_scheme = getattr(self, "_bind_scheme", None) or (  # `.bind(..., scheme=jno.fd(...))`
+            "spectral_basis" if _nodal_scheme(self._expr) == "spectral_basis" else "finite_difference"
+        )
 
         i = 0
         n = len(seq)
@@ -3417,14 +3425,14 @@ def _make_named_with_partials_cls(view_cls):
                 while i < len(seq):
                     var = cv[seq[i]]
                     scheme = getattr(self, "_bind_scheme", None) or _nodal_scheme(result)
-                    if getattr(var, "axis", None) == "temporal" and str(scheme).split(":", 1)[0] == "finite_difference":
+                    if getattr(var, "axis", None) == "temporal" and str(scheme).split(":", 1)[0] in _NODAL_FAMILIES:
                         # `u.t` of a nodal field is the strong-form time derivative (as the scalar view builds
                         # it), which a march recognises; a Jacobian in the time coordinate is not.
                         result = TemporalDerivative(result, var)
                         i += 1
                         continue
                     if (
-                        str(scheme).split(":", 1)[0] == "finite_difference"
+                        str(scheme).split(":", 1)[0] in _NODAL_FAMILIES
                         and i + 1 < len(seq)
                         and seq[i + 1] == seq[i]
                         and getattr(var, "axis", None) != "temporal"

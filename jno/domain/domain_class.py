@@ -2318,6 +2318,21 @@ class domain(MeshIOMixin):
         region=None,
     ) -> "Unknown":
         """Build an unknown -- see :attr:`unknown`."""
+        from .._spectral.domain import is_spectral_space, make_spectral_unknown
+
+        if is_spectral_space(space):
+            # a spectral trial space: its nodes come from the basis, so no mesh is built
+            return make_spectral_unknown(
+                self,
+                value_shape,
+                name,
+                order,
+                space,
+                complex=complex,
+                symmetric=symmetric,
+                constant=constant,
+                region=region,
+            )
         if self.__dict__.get("_lazy_plan") is not None:
             _ = self.mesh
         if constant and region is not None:
@@ -4694,6 +4709,7 @@ class domain(MeshIOMixin):
         time_value: Optional[float] = None,
         where=None,
         region=None,
+        nodes=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -4712,6 +4728,7 @@ class domain(MeshIOMixin):
         time_value: Optional[float] = None,
         where=None,
         region=None,
+        nodes=None,
     ) -> Any: ...
     @property
     @_mesh_readout
@@ -5672,6 +5689,7 @@ class domain(MeshIOMixin):
         time_value: Optional[float] = None,
         where=None,
         region=None,
+        nodes=None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -5738,6 +5756,10 @@ class domain(MeshIOMixin):
                 slice is taken (default: the start time).
             region: With ``where=``, restrict the new tag to one body or region -- the way to pick a
                 single side of a non-conforming interface.
+            nodes: For a spectral problem (``domain.unknown(space="spectral", ...)``): the node set the points
+                belong to -- a spectral unknown (its own nodes) or ``jno.sp.gauss(...)`` /
+                ``jno.sp.lobatto(...)``. Without it, a domain with a spectral unknown hands back the first such
+                unknown's nodes on ``tag``; no mesh is built. See ``docs/spectral.md``.
 
         Returns:
             For point sets: Tuple of Variable placeholders, one per dimension.
@@ -5749,6 +5771,19 @@ class domain(MeshIOMixin):
             For tensor tags: Single TensorTag placeholder.
         """
 
+        # A spectral problem's points are the nodes of a spectral space, resolved by tag (no mesh, no sampling).
+        if nodes is not None or (
+            self.__dict__.get("_spectral_unknowns")
+            and isinstance(sample, tuple)
+            and sample == (None, None)
+            and where is None
+            and not point_data
+        ):
+            from .._spectral.domain import spectral_variable
+
+            handled = spectral_variable(self, tag, nodes, normals=normals, split=split, time_value=time_value)
+            if handled is not None:
+                tag, sample, normals = handled, None, normals
         # Define-and-fetch: a predicate names the region here, then we return its coordinates.
         # `region=` restricts it to one body -- the only way to pick a single side of a
         # non-conforming interface, whose two surfaces share coordinates exactly. See `tag`.

@@ -1,7 +1,7 @@
 # Coupling problems on their own meshes
 
-`jno.core` couples `jno.fem`, `jno.fdm` and `jno.fvm` problems, each on its own mesh, through **interface
-conditions written as for one problem**: a value that agrees on both sides, a flux that leaves one side and
+`jno.core` couples `jno.fem`, `jno.fdm`, `jno.fvm` and [`jno.spectral`](spectral.md#coupling) problems, each on
+its own mesh, through **interface conditions written as for one problem**: a value that agrees on both sides, a flux that leaves one side and
 enters the other, a load one side puts on the other. Each problem keeps its own discretisation, mesh, time step
 and solver. The coupling solves them in turn until the interface conditions hold (a partitioned scheme, as
 preCICE does).

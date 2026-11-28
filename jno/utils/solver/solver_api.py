@@ -1763,6 +1763,8 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
                 if callable(operator) and not hasattr(operator, "shape")
                 else LinearOperator(operator)
             )
+            if getattr(operator, "sem_fn", None) is not None:  # spectral-element preconditioners' data (sem_precond)
+                op.sem_fn = operator.sem_fn
             M = materialize_precond(pc, PrecondContext(op, fem)) if pc is not None else None
             # ``rtol``: the inexact-Newton forcing term for this step, taken by the Krylov solvers only.
             return solver(op, rhs, M=M) if rtol is None else solver(op, rhs, M=M, rtol=rtol)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 from .._strong_form import _iter, _map_children, _unwrap
+from ..utils.sets import unique_values
 from .transfer import Interface
 
 
@@ -123,6 +124,8 @@ class Participant:
     """What the driver needs of one problem; subclasses implement it per discretisation."""
 
     kind = "?"
+    #: Can it receive a flux condition (a Neumann data field)? A side that cannot takes the value condition.
+    takes_flux = True
 
     def __init__(self, problem):
         self.problem = problem
@@ -617,7 +620,12 @@ class FEMParticipant(Participant):
 
         from .. import solve as _solve
 
-        out = problem.solve(linear=_solve.lu(), **self._args(problem, data, params))
+        op = getattr(problem, "_op", None)
+        mf = getattr(op[0] if isinstance(op, tuple) and op else op, "matrix_free", False)
+        # an unstored operator (jno.fem(matrix_free=True)) has nothing to factor: a Krylov solve to round-off level
+        linear = _solve.bicgstab(tol=1e-13) if mf else _solve.lu()
+        kw = {"precond": __import__("jno").precond.jacobi()} if mf else {}
+        out = problem.solve(linear=linear, **kw, **self._args(problem, data, params))
         out = out.fn() if hasattr(out, "fn") else out
         return jnp.asarray(out).reshape(-1)
 
@@ -784,13 +792,281 @@ class FEMParticipant(Participant):
         return found[0]
 
 
+class SpectralParticipant(_StrongForm):
+    """A ``jno.spectral`` problem. Its interface is the face nodes of its unknown's grid; what it sends is read from
+    its own basis (a flux is the spectral normal derivative), and to another spectral side its data cross by
+    spectral interpolation along the face (:meth:`spectral_interp`), so two spectral sides keep spectral accuracy
+    whatever their node counts. Data to or from a mesh side cross by the usual maps over its face nodes."""
+
+    kind = "spectral"
+
+    def __init__(self, problem):
+        self.problem = problem
+        self.domain = problem.domain
+        grids = {problem._grid_of(u) for u in problem.unknowns}
+        if len(grids) != 1:
+            raise NotImplementedError("coupling: a jno.spectral problem with unknowns on several grids is not coupled yet.")
+        self.grid = grids.pop()
+        self.points = np.asarray(self.grid.points, dtype=float)
+        self.dim = self.grid.ndim
+        self._interfaces = {}
+        self._faces = {}
+
+    def _face(self, tag):
+        from .._spectral.domain import FACE_NAMES, region_points
+
+        hit = self._faces.get(tag)
+        if hit is None:
+            region = self.problem._region_of(tag)
+            names = FACE_NAMES.get(self.dim, ())
+            axis = next((i for i, pair in enumerate(names) if region in pair), None)
+            if axis is None:
+                raise ValueError(f"coupling: a spectral interface is a face of the box (left, right, ...); got {region!r}.")
+            pts, idx, _ = region_points(self.grid, region)
+            hit = self._faces[tag] = (axis, np.asarray(idx), np.asarray(pts))
+        return hit
+
+    def interface(self, tag, measure=None):
+        key = (tag, measure if isinstance(measure, (str, type(None))) else id(measure))
+        if key not in self._interfaces:
+            axis, idx, pts = self._face(tag)
+            others = [i for i in range(self.dim) if i != axis]
+            shape = tuple(self.grid.shape[i] for i in others)
+            local = np.arange(idx.size).reshape(shape)
+            if len(others) == 1:
+                facets = np.stack([local[:-1], local[1:]], axis=1)
+            else:
+                a, b = local[:-1, :-1].ravel(), local[1:, :-1].ravel()
+                c, d = local[1:, 1:].ravel(), local[:-1, 1:].ravel()
+                facets = np.stack([a, b, c, d], axis=1)
+            self._interfaces[key] = Interface.from_facets(idx, pts, facets, measure)
+        return self._interfaces[key]
+
+    def spectral_interp(self, tag, points):
+        """``(m, n_face)``: the face values' spectral interpolant at ``points`` (the other side's interface nodes)."""
+        axis, idx, _ = self._face(tag)
+        others = [i for i in range(self.dim) if i != axis]
+        pts = np.asarray(points, dtype=float)
+        H = None
+        for i in others:
+            L = self.grid.axes[i].interp_matrix(pts[:, i])
+            H = L if H is None else np.einsum("mi,mj->mij", H, L).reshape(pts.shape[0], -1)
+        return H
+
+    def march(self, problem, state, t0, window, data, time=None, params=None):
+        import jax.numpy as jnp
+
+        span = self._span(t0, window)
+        problem._override = self._scope(problem, data, params)
+        try:
+            traj = problem._march(time=time, x0=jnp.asarray(state).reshape(-1), span=span)
+        finally:
+            problem._override = None
+        traj = jnp.asarray(traj)
+        return self._frames(traj.reshape(traj.shape[0], -1))
+
+    def initial(self, problem):
+        import jax.numpy as jnp
+
+        return jnp.asarray(problem._initial_state()).reshape(-1)
+
+    def rebuild(self, extra):
+        import jno
+
+        return jno.spectral(self.constraints() + list(extra))
+
+    def solve(self, problem, data, x0=None, params=None):
+        import jax.numpy as jnp
+
+        from .. import solve as _solve
+
+        scope = self._scope(problem, data, params)
+        x0 = None if x0 is None else jnp.asarray(x0).reshape(-1)
+        linear = _solve.dense() if problem._Ntot <= 4096 else None
+        return jnp.asarray(problem._steady_solve(x0=x0, extra_params=scope, linear=linear)).reshape(-1)
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        import jax.numpy as jnp
+
+        scope = {
+            **problem._params_scope(self._scope(problem, data or {}, params)),
+            **problem._inject(jnp.asarray(state).reshape(-1)),
+        }
+        vals = problem._evaluate_on(expr, self.grid, scope, None, {})
+        return jnp.asarray(vals)[np.asarray(iface.nodes), 0]
+
+
+class FEMHighOrderParticipant(FEMParticipant):
+    """A ``jno.fem`` problem whose one scalar field is of order >= 2 (P2, the GLL spectral elements Q_k): its
+    interface is the field's own nodes on the tagged edges (:class:`EdgeInterface`), what it sends is read with the
+    edge's Lagrange basis (:meth:`edge_interp`) and a flux by the field's nodal quadrature, and what it receives
+    is a value per field node. It takes the VALUE condition of a Dirichlet-Neumann pair (a received flux would
+    need a data field in the field's own space). 2-D."""
+
+    takes_flux = False
+
+    def __init__(self, problem):
+        super().__init__(problem)
+        if self.dim != 2:
+            raise NotImplementedError(
+                "coupling: a high-order (order >= 2) jno.fem side couples in 2-D only so far (its interface edges "
+                "carry the field's nodes; faces in 3-D are not built). Use a P1 field for this side."
+            )
+        self.points = np.asarray(problem.field_points[0], dtype=float)[:, : self.dim]
+        self._order = int(problem._native_field_orders[0])
+        self._cells = np.asarray(problem._native_cells_all[0])
+
+    def _reference_edges(self):
+        """Per reference edge of the cell: its local nodes in order, with their positions ``s`` in [0, 1]."""
+        import basix
+
+        from ..utils.solver.fem_lagrange import _lagrange_basix, basix_cell
+
+        cell, _tdim = basix_cell(self.problem._native_cell_type)
+        X = np.asarray(_lagrange_basix(cell, self._order).points, float)
+        V = np.asarray(basix.geometry(cell), float)
+        out = []
+        for a, b in basix.topology(cell)[1]:
+            d = V[b] - V[a]
+            t = (X - V[a]) @ d / (d @ d)
+            on = np.linalg.norm(X - V[a] - t[:, None] * d[None, :], axis=1) < 1e-10
+            on &= (t > -1e-10) & (t < 1 + 1e-10)
+            idx = np.flatnonzero(on)
+            order = np.argsort(t[idx])
+            out.append((idx[order], t[idx][order]))
+        return out
+
+    def interface(self, tag, measure=None):
+        from scipy.spatial import cKDTree
+
+        from .transfer import EdgeInterface
+
+        if measure is not None:
+            raise NotImplementedError("coupling: a high-order jno.fem side takes no interface measure= yet.")
+        key = (tag, None)
+        if key in self._interfaces:
+            return self._interfaces[key]
+        facets = self.domain.tag_facets(tag)
+        if facets is None:
+            raise ValueError(f"interface: the domain has no boundary facets tagged {tag!r}.")
+        mesh_pts = np.asarray(self.domain.mesh_connectivity["points"], dtype=float)[:, : self.dim]
+        tree = cKDTree(self.points)
+        dist, vnode = tree.query(mesh_pts[unique_values(facets)])
+        vmap = dict(zip(unique_values(facets).tolist(), vnode.tolist()))
+        wanted = {frozenset((vmap[int(a)], vmap[int(b)])) for a, b in np.asarray(facets)}
+        found = {}
+        for loc, s_ref in self._reference_edges():
+            ends = self._cells[:, [loc[0], loc[-1]]]
+            for c in range(self._cells.shape[0]):
+                k = frozenset(ends[c].tolist())
+                if k in wanted and k not in found:
+                    found[k] = (self._cells[c, loc], s_ref)
+        if len(found) != len(wanted):
+            raise ValueError(
+                f"coupling: {len(wanted) - len(found)} of the {len(wanted)} edges tagged {tag!r} are not edges of the "
+                "high-order field's cells (a hanging node?)."
+            )
+        nodes = unique_values(np.concatenate([g for g, _ in found.values()]))
+        pos = {int(n): i for i, n in enumerate(nodes)}
+        edges = [np.array([pos[int(n)] for n in g]) for g, _ in found.values()]
+        s = [sr for _, sr in found.values()]
+        iface = EdgeInterface.from_edges(nodes, self.points[nodes], edges, s)
+        self._interfaces[key] = iface
+        return iface
+
+    def sample(self, problem, state, expr, tag, iface, data=None, params=None):
+        import jax.numpy as jnp
+
+        vals = super().sample(problem, state, expr, tag, iface, data, params)
+        if not has_derivative(expr, self.owns):
+            return vals
+        # Where the interface meets the rest of the boundary (the end nodes of its polyline), the reaction also holds
+        # what that boundary imposes: a Dirichlet row's constraint force, or its own flux load. Measured: 0.87 off
+        # at a Dirichlet corner, which the edge's Lagrange basis then carried along the whole interface (1e-3 at
+        # every degree). Their density is the edge's interpolant through its other nodes instead.
+        ends, coeff, others = self._end_fix(iface)
+        if ends.size == 0:
+            return vals
+        v = jnp.asarray(vals)
+        return v.at[jnp.asarray(ends)].set(jnp.sum(jnp.asarray(coeff) * v[jnp.asarray(others)], axis=1))
+
+    def _end_fix(self, iface):
+        """``(ends, coeff, others)``: each polyline end node, and the weights of its edge's other nodes that
+        interpolate a value there. Cached on the interface."""
+        from .transfer import _lagrange_values
+
+        hit = iface.__dict__.get("_end_fix")
+        if hit is not None:
+            return hit
+        count = np.zeros(iface.points.shape[0], dtype=int)
+        for e in iface.edges:
+            count[e[[0, -1]]] += 1
+        ends, coeff, others = [], [], []
+        for e, se in zip(iface.edges, iface.s):
+            for j in (0, len(e) - 1):
+                if count[e[j]] == 1 and len(e) > 2:
+                    keep = [m for m in range(len(e)) if m != j]
+                    ends.append(int(e[j]))
+                    coeff.append(_lagrange_values(se[keep], se[j]))
+                    others.append(e[keep])
+        hit = (
+            np.asarray(ends, dtype=np.int64),
+            np.asarray(coeff) if coeff else np.zeros((0, 0)),
+            np.asarray(others, dtype=np.int64) if others else np.zeros((0, 0), dtype=np.int64),
+        )
+        object.__setattr__(iface, "_end_fix", hit)
+        return hit
+
+    def edge_interp(self, tag, points):
+        """``(m, n_iface)``: this side's interface values read at ``points`` with each edge's Lagrange basis."""
+        return self.interface(tag).interp(points).toarray()
+
+    def data(self, name):
+        import jno
+
+        n = int(self.points.shape[0])
+        node = jno.np.parameter((n,), name=name)  # one value per field node; no optimizer: data
+        node.model._runtime_field = True  # an essential value reads it per solve (gathered at its boundary nodes)
+        self.__dict__.setdefault("_data_names", set()).add(name)
+
+        def setter(values, problem=None):
+            import jax.numpy as jnp
+
+            return {name: jnp.asarray(values)}
+
+        return node, setter
+
+    def _field_nodal(self, problem, state, field):
+        import jax.numpy as jnp
+
+        sl = problem.blocks[problem.block_index(field)]
+        vals = jnp.asarray(state).reshape(-1)[sl.start : sl.stop]
+        if vals.size != self.points.shape[0]:
+            raise NotImplementedError(
+                f"coupling: the high-order field has {vals.size} DOFs on {self.points.shape[0]} nodes (a vector field?)."
+            )
+        return vals
+
+
 def participant(problem) -> Participant:
-    """The adapter for a ``jno.fem``, ``jno.fdm`` or ``jno.fvm`` problem."""
+    """The adapter for a ``jno.fem``, ``jno.fdm``, ``jno.fvm`` or ``jno.spectral`` problem."""
     from .._fem import FEM
     from .._fvm.trace import _TraceFVM
+    from .._spectral.trace import _TraceSpectral
     from ..fdm import _TraceFDM
 
+    if isinstance(problem, _TraceSpectral):
+        return SpectralParticipant(problem)
     if isinstance(problem, FEM):
+        orders = list(getattr(problem, "_native_field_orders", None) or ())
+        vecs = list(getattr(problem, "_block_vecs", None) or ())
+        if (
+            len(orders) == 1
+            and orders[0] >= 2
+            and (not vecs or vecs[0] == 1)
+            and getattr(problem, "_native_cells_all", None) is not None
+        ):
+            return FEMHighOrderParticipant(problem)
         return FEMParticipant(problem)
     if isinstance(problem, _TraceFVM):
         return FVMParticipant(problem)

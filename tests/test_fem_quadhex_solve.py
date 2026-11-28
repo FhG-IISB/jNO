@@ -459,17 +459,19 @@ def test_patch_test_on_a_recombined_disk():
     assert np.abs(sol - (1.0 + 2.0 * p[:, 0] + 3.0 * p[:, 1])).max() < 1e-10
 
 
-def test_shape_quad_refuses_an_unstructured_3d_plan_and_a_curved_one():
-    """gmsh cannot hex-mesh general 3-D geometry, and a curved quad needs a 9-node block neither the
-    emitter nor the element path has. Both refuse by name instead of silently meshing simplices.
+def test_shape_quad_refuses_an_unstructured_3d_plan_and_meshes_a_curved_one_bilinear():
+    """gmsh cannot hex-mesh general 3-D geometry: that refuses by name instead of silently meshing simplices.
 
     The 3-D refusal fires at BUILD time, not inside ``.quad()``: a lattice can be hex-meshed, so the
     answer depends on whether ``.structured()`` is anywhere in the plan, and requiring it to come
-    first would make the chain order-dependent."""
+    first would make the chain order-dependent.
+
+    A curved quadrilateral plan builds a plain bilinear mesh: the boundary is curved when a field of degree
+    k > 1 is put on it, at that degree (``fem_curved.curve_boundary_nodes``, tested in test_fem_curved_quads)."""
     with pytest.raises(NotImplementedError, match=r"\.structured\(\)"):
         jno.shape.box(0, 0, 0, 1, 1, 1, size=0.5).quad().build()
-    with pytest.raises(NotImplementedError, match="curved"):
-        jno.shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()
+    mesh = jno.shape.rect(0, 0, 1, 1, size=0.5).quad().curved().build()[0]
+    assert "quad" in mesh.cells_dict and "quad9" not in mesh.cells_dict
 
 
 def test_shape_quad_survives_the_other_modifiers():

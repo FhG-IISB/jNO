@@ -139,6 +139,7 @@ nav:
       - Limits & build time: fem/limitations.md
     - Finite Difference Method: fdm.md
     - Finite Volume Method: fvm.md
+    - Spectral Methods: spectral.md
     - Coupling problems on their own meshes: coupling.md
     - Rigorous Coupled-Wave Analysis: rcwa.md
     - Partial-Element Equivalent Circuits: peec.md

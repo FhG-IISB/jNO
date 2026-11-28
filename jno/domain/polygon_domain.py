@@ -1678,6 +1678,10 @@ class PolygonDomain(domain):
                 slice is taken (default: the start time).
             region: With ``where=``, restrict the new tag to one body or region -- the way to pick a
                 single side of a non-conforming interface.
+            nodes: For a spectral problem (``domain.unknown(space="spectral", ...)``): the node set the points
+                belong to -- a spectral unknown (its own nodes) or ``jno.sp.gauss(...)`` /
+                ``jno.sp.lobatto(...)``. Without it, a domain with a spectral unknown hands back the first such
+                unknown's nodes on ``tag``; no mesh is built. See ``docs/spectral.md``.
 
         Returns:
             For point sets: Tuple of Variable placeholders, one per dimension.

@@ -152,6 +152,8 @@ def matrix_diagonal(A):
         idx = A.indices
         on_diag = idx[:, 0] == idx[:, 1]
         return jnp.zeros(A.shape[0], A.data.dtype).at[idx[:, 0]].add(jnp.where(on_diag, A.data, 0.0))
+    if getattr(A, "matrix_free", False):  # an unstored operator (``jno.fem(matrix_free=True)``) knows its diagonal
+        return jnp.asarray(A.diag())
     return jnp.diagonal(jnp.asarray(A))
 
 

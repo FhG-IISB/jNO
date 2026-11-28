@@ -536,12 +536,10 @@ def _to_meshio(
         if cell == "quad":
             # Recombined 2-D: the volume block is quadrilaterals; the boundary is still 2-node edges,
             # because a quad's facet is a straight edge exactly as a triangle's is.
-            if curved:
-                raise NotImplementedError(
-                    "shape.quad().curved() is not supported: curved (isoparametric) geometry is order-2 "
-                    "simplices only, and a curved quadrilateral needs its own 9-node block."
-                )
+            # `.curved()` on quadrilaterals: the mesh stays bilinear here, and the nodes of a Q_k field are put
+            # on the boundary when the field is built (`fem_curved.curve_boundary_nodes`), at the field's degree.
             vtype, npv, vblock = _QUAD, 4, "quad"
+            curved = False
         else:
             vtype, npv, vblock = (_TRI6, 6, "triangle6") if curved else (_TRI, 3, "triangle")
         btype, npb, bblock = (_LINE3, 3, "line3") if curved else (_LINE, 2, "line")
@@ -865,7 +863,7 @@ def _build_once(shape, split_full, periodic=None, algorithm=None, threads=None, 
                     f"shape.quad(): gmsh left {left} triangles after subdividing into quadrilaterals; "
                     "the quad mesh would miss them."
                 )
-        if int(order) > 1:
+        if int(order) > 1 and _cell != "quad":  # quadrilaterals are curved at the field's degree instead
             # CURVED (isoparametric) geometry. Without this the mesh is straight-sided and jNO
             # SYNTHESISES its higher-order nodes by interpolating reference points through the affine
             # map (`fem_native._get_mesh` -> `_promote_to_degree`), so a P2 midside node lands on the

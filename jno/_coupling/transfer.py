@@ -226,6 +226,91 @@ class Interface:
         return _compiled(cache, None, solve, jnp.asarray(loads, dtype=dtype))  # compiled once, eagerly
 
 
+@dataclass(frozen=True)
+class EdgeInterface(Interface):
+    """The interface of a high-order (P2, Q_k) ``jno.fem`` field in 2-D: its nodes are the field's own nodes on the
+    tagged edges, its facets the segments between consecutive nodes of an edge (what the generic maps read), and
+    each edge keeps its nodes in order with their reference positions ``s`` in [0, 1]. ``weights`` are the edge
+    nodes' interpolatory quadrature weights times the isoparametric length element (the GLL weights for a Q_k field
+    on GLL nodes), so a flux density is the reaction divided by them (:meth:`project`), and :meth:`interp` reads the
+    field at any point of an edge with the edge's own Lagrange basis: the field's order, not piecewise-linear."""
+
+    edges: tuple = ()  # per edge: (k + 1,) indices into ``nodes``, in order along the edge
+    s: tuple = ()  # per edge: (k + 1,) reference positions in [0, 1]
+
+    @classmethod
+    def from_edges(cls, nodes, points, edges, s):
+        points = np.asarray(points, dtype=float)
+        facets = np.concatenate([np.stack([e[:-1], e[1:]], axis=1) for e in edges])
+        w = np.zeros(points.shape[0])
+        for e, se in zip(edges, s):
+            q = _lagrange_weights(se)
+            D = _lagrange_diff(se)
+            tang = D @ points[e]  # dx/ds at the nodes: the isoparametric length element
+            np.add.at(w, e, q * np.linalg.norm(tang, axis=1))
+        return cls(nodes=np.asarray(nodes), points=points, facets=facets, weights=w, measure=None,
+                   edges=tuple(np.asarray(e) for e in edges), s=tuple(np.asarray(v, float) for v in s))  # fmt: skip
+
+    def project(self, loads):
+        """Nodal densities from their loads ``∫ q φ_i ds``: divided by the lumped weights (the field's own nodal
+        quadrature of ``∫ q φ_i``, spectrally accurate on GLL nodes); traceable."""
+        import jax.numpy as jnp
+
+        return jnp.asarray(loads) / jnp.asarray(self.weights)
+
+    def interp(self, points):
+        """``(m, n_nodes)``: the field's edge interpolant at ``points``, each read on its closest edge."""
+        pts = np.asarray(points, dtype=float)
+        seg_edge = np.concatenate([np.full(len(e) - 1, i) for i, e in enumerate(self.edges)])
+        seg_pos = np.concatenate([np.arange(len(e) - 1) for e in self.edges])
+        _cols, _lam, facet, t = _stencil(self, pts)
+        rows, cols, vals = [], [], []
+        for q in range(pts.shape[0]):
+            ei, j = int(seg_edge[facet[q]]), int(seg_pos[facet[q]])
+            se = self.s[ei]
+            s_q = se[j] + float(t[q]) * (se[j + 1] - se[j])
+            L = _lagrange_values(se, s_q)
+            rows.extend([q] * L.size)
+            cols.extend(self.edges[ei].tolist())
+            vals.extend(L.tolist())
+        H = sp.csr_matrix((vals, (rows, cols)), shape=(pts.shape[0], self.points.shape[0]))
+        H.sum_duplicates()
+        return H
+
+
+def _lagrange_values(nodes, x):
+    """The Lagrange basis on ``nodes`` at the point ``x``."""
+    nodes = np.asarray(nodes, float)
+    out = np.ones(nodes.size)
+    for j in range(nodes.size):
+        for m in range(nodes.size):
+            if m != j:
+                out[j] *= (x - nodes[m]) / (nodes[j] - nodes[m])
+    return out
+
+
+def _lagrange_diff(nodes):
+    """``D_ij = ℓ_j'(x_i)`` on ``nodes``."""
+    x = np.asarray(nodes, float)
+    n = x.size
+    c = np.array([np.prod([x[i] - x[m] for m in range(n) if m != i]) for i in range(n)])
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                D[i, j] = c[i] / (c[j] * (x[i] - x[j]))
+        D[i, i] = -D[i].sum()
+    return D
+
+
+def _lagrange_weights(nodes):
+    """``w_j = ∫_0^1 ℓ_j(s) ds``: the interpolatory rule on ``nodes`` (GLL weights on GLL nodes)."""
+    x = np.asarray(nodes, float)
+    g, gw = np.polynomial.legendre.leggauss(x.size + 1)
+    g, gw = 0.5 * (g + 1.0), 0.5 * gw
+    return np.array([np.sum(gw * np.array([_lagrange_values(x, gi)[j] for gi in g])) for j in range(x.size)])
+
+
 def _closest_on_segments(p, a, b):
     """Closest point of each query ``p`` (q, d) on each candidate segment ``a``-``b`` (q, k, d): the parameter
     (q, k) and the squared distance (q, k)."""

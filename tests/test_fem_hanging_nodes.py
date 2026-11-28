@@ -514,3 +514,21 @@ def test_the_covering_filter_is_told_the_facet_kind_not_left_to_guess():
     assert len(kept) == 1 and kept[0][0] == 2, "the covered order-3 edge was not dropped"
     # read as a 4-vertex face, the same rows are not recognised at all
     assert len(drop_covered_facets(order3_edges, hang, n_v=4)) == 2
+
+
+@pytest.mark.parametrize("order", [4, 5])
+def test_orders_above_3_are_constrained_at_the_gauss_lobatto_edge_nodes(x64, order):
+    """A quadrilateral of order > 2 carries Gauss-Lobatto-Legendre nodes, so its edge DOFs are not at ``k/order``
+    and a 2:1 neighbour's are not at ``k/(2*order)``. Looking for them there found none at order 3 (no constraint
+    at all, the interface left free: the centre value off by 5.45e-02); the constraints read the element's own
+    edge parameters instead."""
+    from jno.utils.solver.fem_lagrange import edge_node_parameters
+
+    ts = edge_node_parameters("quad", order)
+    assert ts.size == order + 1 and np.abs(ts - np.linspace(0.0, 1.0, order + 1)).max() > 1e-2
+    assert np.allclose(ts + ts[::-1], 1.0) and np.allclose(edge_node_parameters("quad", 2), [0.0, 0.5, 1.0])
+    d = _refined_centre()
+    sol = _poisson_order(d, order)
+    pts = np.asarray(d._fem_native_dof_points)[:, :2]
+    got = float(sol[int(np.argmin(np.linalg.norm(pts - 0.5, axis=1)))])
+    assert abs(got - POISSON_CENTRE) < 1e-6
